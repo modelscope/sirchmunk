@@ -8,7 +8,7 @@ from loguru import logger
 from agentic_search.base import BaseSearch
 from agentic_search.learnings.knowledge_bank import KnowledgeBank
 from agentic_search.llm.openai import OpenAIChat
-from agentic_search.llm.prompts import QUERY_KEYWORDS_EXTRACTION
+from agentic_search.llm.prompts import QUERY_KEYWORDS_EXTRACTION, SEARCH_RESULT_SUMMARY
 from agentic_search.retrieve.text_retriever import GrepRetriever
 from agentic_search.schema.request import ContentItem, ImageURL, Message, Request
 
@@ -98,6 +98,7 @@ class AgenticSearch(BaseSearch):
         logger.info("Total grep files: {}", len(grep_results))
 
         # Build knowledge cluster
+        logger.info("Building knowledge cluster...")
         cluster = self.knowledge_bank.build(
             request=request,
             retrieved_infos=grep_results,
@@ -110,4 +111,22 @@ class AgenticSearch(BaseSearch):
         if self.verbose:
             logger.info(json.dumps(cluster.to_dict(), ensure_ascii=False, indent=2))
 
-        return f"{cluster.name}\n{cluster.description}"
+        # return f"{cluster.name}\n{cluster.description}"
+
+        sep: str = "\n"
+        cluster_text_content: str = (f"{cluster.name}\n\n"
+                                     f"{sep.join(cluster.description)}\n\n"
+                                     f"{cluster.content if isinstance(cluster.content, str) else sep.join(cluster.content)}")
+
+        result_sum_prompt: str = SEARCH_RESULT_SUMMARY.format(
+            user_input=request.get_user_query(),
+            text_content=cluster_text_content,
+        )
+
+        logger.info("Generating search result summary...")
+        search_result: str = self.llm.chat(
+            messages=[{"role": "user", "content": result_sum_prompt}],
+            stream=True,
+        )
+
+        return search_result

@@ -71,3 +71,21 @@ Synthesize a structured response based on the User Input and the provided Eviden
 <NAME>[Short title]</NAME>
 <CONTENT>[Detailed summary]</CONTENT>
 """
+
+
+SEARCH_RESULT_SUMMARY = """
+### Task
+Analyze the provided {text_content} and generate a concise summary in the form of a Markdown Briefing.
+
+### Constraints
+1. **Language Continuity**: The output must be in the SAME language as the User Input.
+2. **Format**: Use Markdown (headings, bullet points, and bold text) for high readability.
+3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
+
+### Input Data
+- **User Input**: {user_input}
+- **Search Result Text**: {text_content}
+
+### Output
+[Generate the Markdown Briefing here]
+"""
