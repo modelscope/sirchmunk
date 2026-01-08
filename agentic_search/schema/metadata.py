@@ -12,7 +12,7 @@ from loguru import logger
 
 from agentic_search.llm.openai import OpenAIChat
 from agentic_search.schema.snapshot import SnapshotInfo
-from agentic_search.utils.file_utils import md5_head
+from agentic_search.utils.file_utils import get_fast_hash
 
 
 class FileType(enum.Enum):
@@ -134,7 +134,7 @@ class FileInfo:
         Get the MD5 hash of a file if it exists.
         """
         file_path = Path(file_path)
-        return md5_head(filepath=file_path) if file_path.is_file() else ""
+        return get_fast_hash(file_path=file_path) if file_path.is_file() else ""
 
     @staticmethod
     def get_cache_key(file_or_url: Union[str, Path]) -> str:

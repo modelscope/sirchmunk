@@ -79,7 +79,8 @@ class KnowledgeBank:
         self,
         request: Request,
         retrieved_infos: List[Dict[str, Any]],
-        top_k_files: Optional[int] = 5,
+        top_k_files: Optional[int] = 3,
+        top_k_lines: Optional[int] = 50,
     ) -> Union[KnowledgeCluster, None]:
         """Build a knowledge cluster from retrieved information and metadata dynamically."""
 
@@ -89,7 +90,6 @@ class KnowledgeBank:
             )
             return None
 
-        retrieved_infos.sort(key=lambda x: x["total_matches"], reverse=True)
         retrieved_infos = retrieved_infos[:top_k_files]
 
         # Get evidence units (regions of interest) from raw retrieved infos
@@ -97,7 +97,12 @@ class KnowledgeBank:
         for info in retrieved_infos:
             file_path_or_url: str = info["path"]
             with MonteCarloEvidenceSampling(file_path=file_path_or_url) as processor:
-                roi_list: List[Dict[str, Any]] = processor.get_roi(info["lines"])
+                roi_list: List[Dict[str, Any]] = processor.get_roi(
+                    [
+                        item["data"]["lines"]["text"]
+                        for item in info["matches"][:top_k_lines]
+                    ]
+                )
                 for roi_d in roi_list:
                     if not roi_d.get("content"):
                         continue

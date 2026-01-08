@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Tuple, Union
 import numpy as np
 from rapidfuzz import fuzz
 
+from agentic_search.llm.openai import OpenAIChat
+
 
 class MonteCarloEvidenceSampling:
     """
@@ -16,7 +18,12 @@ class MonteCarloEvidenceSampling:
     """
 
     def __init__(
-        self, file_path: Union[str, Path], sample_size: int = 50, max_scan: int = 20000
+        self,
+        file_path: Union[str, Path],
+        sample_size: int = 50,
+        max_scan: int = 20000,
+        llm: OpenAIChat = None,
+        query: str = None,
     ):
         self.file_path = Path(file_path)
         if not self.file_path.exists():
@@ -27,6 +34,15 @@ class MonteCarloEvidenceSampling:
         self.file_size = self.file_path.stat().st_size
         self.f = open(file_path, "rb")
         self.mm = mmap.mmap(self.f.fileno(), 0, access=mmap.ACCESS_READ)
+
+        # Usage:
+        # resp: str = self.llm.chat(
+        #             messages=[{"role": "user", "content": prompt}],
+        #             stream=True,
+        #         )
+        self.llm: OpenAIChat = llm
+
+        self.query: str = query
 
     def __enter__(self):
         return self

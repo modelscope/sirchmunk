@@ -871,6 +871,7 @@ class GrepRetriever(BaseRetriever):
                             "matches": top_matches,  # full match objects
                             "lines": lines,  # list of line strings
                             "total_matches": total_count,  # before limiting
+                            "total_score": 0.0,
                         }
                     )
 

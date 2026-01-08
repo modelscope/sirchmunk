@@ -1,4 +1,5 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import ast
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -11,6 +12,12 @@ from agentic_search.llm.openai import OpenAIChat
 from agentic_search.llm.prompts import QUERY_KEYWORDS_EXTRACTION, SEARCH_RESULT_SUMMARY
 from agentic_search.retrieve.text_retriever import GrepRetriever
 from agentic_search.schema.request import ContentItem, ImageURL, Message, Request
+from agentic_search.utils.file_utils import get_fast_hash
+from agentic_search.utils.utils import (
+    KeywordValidation,
+    extract_fields,
+    log_tf_norm_penalty,
+)
 
 
 class AgenticSearch(BaseSearch):
@@ -34,11 +41,140 @@ class AgenticSearch(BaseSearch):
 
         self.verbose: bool = verbose
 
+    @staticmethod
+    def _extract_and_validate_keywords(llm_resp: str) -> dict:
+        """
+        Extract and validate keywords with IDF scores from LLM response.
+        """
+        res: Dict[str, float] = {}
+
+        # Extract JSON-like content within <KEYWORDS></KEYWORDS> tags
+        tag: str = "KEYWORDS"
+        keywords_json: Optional[str, None] = extract_fields(
+            content=llm_resp,
+            tags=[tag],
+        ).get(tag.lower(), None)
+
+        if not keywords_json:
+            return res
+
+        # Try to parse as dict format
+        try:
+            res = json.loads(keywords_json)
+        except json.JSONDecodeError:
+            try:
+                res = ast.literal_eval(keywords_json)
+            except Exception as e:
+                logger.warning("Failed to parse keywords: {}", e)
+                return {}
+
+        # Validate using Pydantic model
+        try:
+            return KeywordValidation(root=res).model_dump()
+        except Exception as e:
+            logger.warning("Keyword validation failed: {}", e)
+            return {}
+
+    @staticmethod
+    def fast_deduplicate_by_content(data: List[dict]):
+        """
+        Deduplicates results based on content fingerprints.
+        Keeps the document with the highest total_score for each unique content.
+
+        Args:
+            data: sorted grep results by 'total_score' field.
+
+        Returns:
+            deduplicated grep results.
+        """
+        unique_fingerprints = set()
+        deduplicated_results = []
+
+        for item in data:
+            path = item["path"]
+
+            # 2. Generate a fast fingerprint instead of full MD5
+            fingerprint = get_fast_hash(path)
+
+            # 3. Add to results only if this content hasn't been seen yet
+            if fingerprint and fingerprint not in unique_fingerprints:
+                unique_fingerprints.add(fingerprint)
+                deduplicated_results.append(item)
+
+        return deduplicated_results
+
+    def process_grep_results(
+        self, results: List[Dict[str, Any]], keywords_with_idf: Dict[str, float]
+    ) -> List[Dict[str, Any]]:
+        """
+        Process grep results to calculate total scores for doc and scores for lines based on keywords with IDF.
+
+        Args:
+            results: List of grep result dictionaries.
+            keywords_with_idf: Dictionary of keywords with their corresponding IDF scores.
+
+        Returns:
+            Processed and sorted list of grep result dictionaries.
+        """
+        results = [
+            res
+            for res in results
+            if res.get("total_matches", 0) >= len(keywords_with_idf)
+        ]
+
+        for grep_res in results:
+            keywords_tf_in_doc: Dict[str, int] = {
+                k.lower(): 0 for k, v in keywords_with_idf.items()
+            }
+            matches = grep_res.get("matches", [])
+            for match_item in matches:
+                keywords_tf_in_line: Dict[str, int] = {
+                    k.lower(): 0 for k, v in keywords_with_idf.items()
+                }
+                submatches = match_item.get("data", {}).get("submatches", [])
+                for submatch_item in submatches:
+                    hit_word: str = submatch_item["match"]["text"].lower()
+                    if hit_word in keywords_tf_in_doc:
+                        keywords_tf_in_doc[hit_word] += 1
+                    if hit_word in keywords_tf_in_line:
+                        keywords_tf_in_line[hit_word] += 1
+                match_item_score: float = 0.0
+                for w, idf in keywords_with_idf.items():
+                    match_item_score += idf * log_tf_norm_penalty(
+                        keywords_tf_in_line.get(w.lower(), 0)
+                    )
+                match_item["score"] = (
+                    match_item["score"]
+                    * match_item_score
+                    * log_tf_norm_penalty(
+                        count=len(match_item["data"]["lines"]["text"]),
+                        ideal_range=(50, 200),
+                    )
+                )
+            # Calculate total score for current document
+            total_score: float = 0.0
+            for w, idf in keywords_with_idf.items():
+                total_score += idf * log_tf_norm_penalty(
+                    keywords_tf_in_doc.get(w.lower(), 0)
+                )
+
+            grep_res["total_score"] = total_score
+            matches.sort(key=lambda x: x["score"], reverse=True)
+
+        results.sort(key=lambda x: x["total_score"], reverse=True)
+        results = self.fast_deduplicate_by_content(results)
+
+        return results
+
     def search(
         self,
         query: str,
-        data_folder: Union[str, Path],
+        search_path: Union[str, Path],
+        *,
         images: Optional[list] = None,
+        max_depth: Optional[int] = 5,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
     ) -> str:
 
         # Build request
@@ -64,26 +200,26 @@ class AgenticSearch(BaseSearch):
             ],
         )
 
-        # Get enhanced query keywords
+        # Get enhanced query keywords with IDF scores
         resp_keywords: str = self.llm.chat(
             messages=request.to_payload(prompt_template=QUERY_KEYWORDS_EXTRACTION),
-            stream=True,
+            stream=False,
         )
-        query_keywords: List[str] = [
-            w.strip() for w in resp_keywords.split(",") if w.strip()
-        ]
+        query_keywords: Dict[str, float] = self._extract_and_validate_keywords(
+            resp_keywords
+        )
         logger.info("Enhanced query keywords: {}", query_keywords)
 
         # Get grep results
         grep_results: List[Dict[str, Any]] = self.grep_retriever.retrieve(
-            terms=query_keywords,
-            path=data_folder,
+            terms=list(query_keywords.keys()),
+            path=search_path,
             logic="or",
             case_sensitive=False,
             whole_word=False,
             literal=False,
             regex=True,
-            max_depth=3,
+            max_depth=max_depth,
             include=None,
             exclude=["*.pyc", "*.log"],
             file_type=None,
@@ -94,15 +230,22 @@ class AgenticSearch(BaseSearch):
             rank=True,
         )
 
-        grep_results = self.grep_retriever.merge_results(grep_results)
-        logger.info("Total grep files: {}", len(grep_results))
+        # Example: [{"path": "", "matches": [], "lines": [], "total_matches": 20, "total_score": 39.70}, ...]
+        grep_results: List[Dict[str, Any]] = self.grep_retriever.merge_results(
+            grep_results
+        )
+        grep_results = self.process_grep_results(
+            results=grep_results, keywords_with_idf=query_keywords
+        )
+        logger.info("Grep retrieved {} files.", len(grep_results))
 
         # Build knowledge cluster
         logger.info("Building knowledge cluster...")
         cluster = self.knowledge_bank.build(
             request=request,
             retrieved_infos=grep_results,
-            top_k_files=5,
+            top_k_files=3,
+            top_k_lines=50,
         )
 
         self.knowledge_bank.update(cluster=cluster)
@@ -114,9 +257,11 @@ class AgenticSearch(BaseSearch):
         # return f"{cluster.name}\n{cluster.description}"
 
         sep: str = "\n"
-        cluster_text_content: str = (f"{cluster.name}\n\n"
-                                     f"{sep.join(cluster.description)}\n\n"
-                                     f"{cluster.content if isinstance(cluster.content, str) else sep.join(cluster.content)}")
+        cluster_text_content: str = (
+            f"{cluster.name}\n\n"
+            f"{sep.join(cluster.description)}\n\n"
+            f"{cluster.content if isinstance(cluster.content, str) else sep.join(cluster.content)}"
+        )
 
         result_sum_prompt: str = SEARCH_RESULT_SUMMARY.format(
             user_input=request.get_user_query(),

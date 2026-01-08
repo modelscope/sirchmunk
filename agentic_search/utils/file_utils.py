@@ -1,23 +1,40 @@
 import hashlib
+import os
 from pathlib import Path
 from typing import Union
 
+from loguru import logger
 
-def md5_head(filepath: Union[str, Path], head_size: int = 1024 * 1024) -> str:
+
+def get_fast_hash(file_path: Union[str, Path], sample_size: int = 8192):
     """
-    Calculate the MD5 hash of the first `head_size` bytes of a file for quick identification.
-
-    Args:
-        filepath (Union[str, Path]): The path to the file.
-        head_size (int): The number of bytes to read from the start of the file. Default is 1MB.
-
-    Returns:
-        str: The MD5 hash of the file's head as a hexadecimal string.
+    Computes a partial hash (fingerprint) by combining:
+    File Size + Head Chunk + Tail Chunk.
+    This is extremely efficient for large-scale file hash calculation.
     """
-    hasher = hashlib.md5(usedforsecurity=False)
-    with open(filepath, "rb") as f:
-        hasher.update(f.read(head_size))
-    return hasher.hexdigest()
+    file_path = Path(file_path)
+    try:
+        # Get metadata first (O(1) operation)
+        file_size = file_path.stat().st_size
+
+        # If the file is smaller than the combined sample size, read it entirely
+        if file_size <= sample_size * 2:
+            with open(file_path, "rb") as f:
+                return f"{hashlib.md5(f.read()).hexdigest()}_{file_size}"
+
+        # Large file sampling: Read head and tail to avoid full disk I/O
+        hash_content = hashlib.md5()
+        with open(file_path, "rb") as f:
+            hash_content.update(f.read(sample_size))
+            f.seek(-sample_size, os.SEEK_END)
+            hash_content.update(f.read(sample_size))
+
+        # Mix the file size into the hash string to minimize collisions
+        return f"{hash_content.hexdigest()}_{file_size}"
+    except (FileNotFoundError, PermissionError):
+        # Handle cases where files are deleted during scan or access is denied
+        logger.warning("File not found or inaccessible: {}", file_path)
+        return None
 
 
 class StorageStructure:

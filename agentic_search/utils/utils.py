@@ -1,5 +1,47 @@
+import math
 import re
 from typing import Dict, List, LiteralString, Optional
+
+from pydantic import RootModel, model_validator
+
+
+class KeywordValidation(RootModel):
+    root: Dict[str, float]
+
+    @model_validator(mode="after")
+    def validate_values(self) -> "KeywordValidation":
+        """Ensure all keyword scores are within the range [1.0, 10.0]."""
+        for k, v in self.root.items():
+            self.root[k] = max(1.0, min(10.0, v))
+        return self
+
+
+def log_tf_norm(count: int):
+    """Log normalization for term frequency."""
+    return 1 + math.log(count) if count > 0 else 0
+
+
+def log_tf_norm_penalty(count, ideal_range=(1, 5), penalty_alpha=0.2):
+    """Refined Log Normalization with Double-Ended Penalty for Term Frequency."""
+    if count <= 0:
+        return 0.0
+
+    min_t, max_t = ideal_range
+
+    # Base Log Scale
+    score = math.log(count + 1)
+
+    # 1. Low Frequency Penalty
+    if count < min_t:
+        score *= count / min_t
+
+    # 2. High Frequency Penalty
+    if count > max_t:
+        overage = count - max_t
+        penalty = math.exp(-penalty_alpha * (overage**0.5))
+        score *= penalty
+
+    return score
 
 
 def extract_fields(

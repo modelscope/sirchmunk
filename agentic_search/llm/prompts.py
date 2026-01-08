@@ -31,16 +31,21 @@ Requirements:
 
 
 QUERY_KEYWORDS_EXTRACTION = """
-### Role: Search Optimization Expert
+### Role: Search Optimization Expert & Information Retrieval Specialist
+
 ### Task:
-Analyze the provided user query to extract core keywords. Output the result as a comma-separated list of optimized keywords.
-Output **fine-grained** and **coarse-grained** keywords.
-ONLY from the user query, do NOT add any external information.
+1. Analyze the provided user query to extract core keywords, including both **fine-grained** and **coarse-grained** terms.
+2. Estimate the **IDF (Inverse Document Frequency)** value for each keyword based on its rarity in the latest general-purpose technical and web corpus.
+3. Normalize the IDF values to a scale of **[1, 10]**, where 10 is the most rare/specific, and 1 is the most common.
+4. ONLY extract keywords from the user query; do NOT add external information.
+
+### Output Format:
+Output the result strictly in the following JSON-like dict format within tags: <KEYWORDS></KEYWORDS>
 
 ### User Query:
 {user_input}
 
-### Optimized Keywords:
+### Optimized Keywords with IDF:
 """
 
 
