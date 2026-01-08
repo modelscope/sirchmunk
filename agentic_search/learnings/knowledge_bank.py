@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -5,7 +6,10 @@ from typing import Any, Dict, List, Optional, Union
 
 from loguru import logger
 
-from agentic_search.learnings.evidence_processor import MonteCarloEvidenceSampling
+from agentic_search.learnings.evidence_processor import (
+    MonteCarloEvidenceSampling,
+    RoiResult,
+)
 from agentic_search.llm.openai import OpenAIChat
 from agentic_search.llm.prompts import EVIDENCE_SUMMARY
 from agentic_search.schema.knowledge import (
@@ -80,7 +84,9 @@ class KnowledgeBank:
         request: Request,
         retrieved_infos: List[Dict[str, Any]],
         top_k_files: Optional[int] = 3,
-        top_k_lines: Optional[int] = 50,
+        top_k_snippets: Optional[int] = 5,
+        confidence_threshold: Optional[float] = 8.5,
+        verbose: bool = True,
     ) -> Union[KnowledgeCluster, None]:
         """Build a knowledge cluster from retrieved information and metadata dynamically."""
 
@@ -96,43 +102,45 @@ class KnowledgeBank:
         evidences: List[EvidenceUnit] = []
         for info in retrieved_infos:
             file_path_or_url: str = info["path"]
-            with MonteCarloEvidenceSampling(file_path=file_path_or_url) as processor:
-                roi_list: List[Dict[str, Any]] = processor.get_roi(
-                    [
-                        item["data"]["lines"]["text"]
-                        for item in info["matches"][:top_k_lines]
-                    ]
+
+            # TODO: handle more file types; deal with large files; Async adaptive
+            with open(file_path_or_url, "r", encoding="utf-8") as f:
+                file_content = f.read()
+            sampler = MonteCarloEvidenceSampling(
+                llm=self.llm,
+                doc_content=file_content,
+                verbose=verbose,
+            )
+            roi_result: RoiResult = asyncio.run(
+                sampler.get_roi(
+                    query=request.get_user_input(),
+                    confidence_threshold=confidence_threshold,
+                    top_k=top_k_snippets,
                 )
-                for roi_d in roi_list:
-                    if not roi_d.get("content"):
-                        continue
-                    evidence_unit = EvidenceUnit(
-                        doc_id=FileInfo.get_cache_key(file_path_or_url),
-                        file_or_url=Path(file_path_or_url),
-                        segment=dict(
-                            content=roi_d.get("content"),
-                            type="text",
-                            meta=roi_d.get("meta"),
-                        ),
-                        score=roi_d.get("score", 0.0),
-                        extracted_at=datetime.now(),
-                    )
-                    evidences.append(evidence_unit)
+            )
+
+            evidence_unit = EvidenceUnit(
+                doc_id=FileInfo.get_cache_key(file_path_or_url),
+                file_or_url=Path(file_path_or_url),
+                summary=roi_result.summary,
+                is_found=roi_result.is_found,
+                snippets=roi_result.snippets,
+                extracted_at=datetime.now(),
+                conflict_group=[],
+            )
+            evidences.append(evidence_unit)
+
         if len(evidences) == 0:
             logger.warning("No evidence units extracted from retrieved information.")
             return None
 
         # Get `name`, `description` and `content` from user request and evidences using LLM
         # TODO: to be processed other type of segments
-        evidence_segments: List[Dict[str, Any]] = [
-            {"content": ev.segment.get("content"), "score": ev.score}
-            for ev in evidences
-            if ev.segment.get("type") == "text"
-        ]
+        evidence_contents: List[str] = [ev.summary for ev in evidences]
 
         evidence_summary_prompt: str = EVIDENCE_SUMMARY.format(
-            user_input=request.get_user_query(),
-            evidences=json.dumps(evidence_segments, ensure_ascii=False),
+            user_input=request.get_user_input(),
+            evidences="\n\n".join(evidence_contents),
         )
 
         evidence_summary_response: str = self.llm.chat(

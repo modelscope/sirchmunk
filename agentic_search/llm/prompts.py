@@ -94,3 +94,45 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 ### Output
 [Generate the Markdown Briefing here]
 """
+
+
+EVALUATE_EVIDENCE_SAMPLE = """
+You are a document retrieval assistant. Please evaluate if the text snippet contains clues to answer the user's question.
+
+### Language Constraint:
+Detect the language of the "Query" and provide the "reasoning" and "output" in the same language (e.g., if the query is in Chinese, the reasoning must be in Chinese).
+
+### Inputs:
+Query: "{query}"
+
+Text Snippet (Source: {sample_source}):
+"...{sample_content}..."
+
+### Output Requirement:
+Return JSON:
+- score (0-10):
+  0-3: Completely irrelevant.
+  4-7: Contains relevant keywords or context but no direct answer.
+  8-10: Contains exact data, facts, or direct answer.
+- reasoning: Short reasoning in the SAME language as the query.
+
+JSON format only.
+"""
+
+
+ROI_RESULT_SUMMARY = """
+### Task
+Analyze the provided {text_content} and generate a concise summary in the form of a Markdown Briefing.
+
+### Constraints
+1. **Language Continuity**: The output must be in the SAME language as the User Input.
+2. **Format**: Use Markdown (headings, bullet points, and bold text) for high readability.
+3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
+
+### Input Data
+- **User Input**: {user_input}
+- **Search Result Text**: {text_content}
+
+### Output
+[Generate the Markdown Briefing here]
+"""

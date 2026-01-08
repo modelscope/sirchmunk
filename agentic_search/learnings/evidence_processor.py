@@ -1,256 +1,499 @@
-import mmap
+import asyncio
+import json
+import math
 import random
-import re
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Set, Tuple
 
-import numpy as np
-from rapidfuzz import fuzz
+from loguru import logger
+from rapidfuzz import fuzz, process
 
 from agentic_search.llm.openai import OpenAIChat
+from agentic_search.llm.prompts import EVALUATE_EVIDENCE_SAMPLE, ROI_RESULT_SUMMARY
+
+
+@dataclass
+class SampleWindow:
+    """
+    Sampling window configuration and metadata.
+    """
+
+    start_idx: int
+
+    end_idx: int
+
+    content: str
+
+    # Relevance score from LLM
+    score: float = 0.0
+
+    # Literal match score from RapidFuzz
+    fuzz_score: float = 0.0
+
+    reasoning: str = ""
+
+    round_num: int = 0
+    # 'fuzz', 'stratified', 'gaussian'
+
+    source: str = "unknown"
+
+
+@dataclass
+class RoiResult:
+    """
+    Data class to store the final Region of Interest (ROI) result and metadata.
+    """
+
+    summary: str
+
+    is_found: bool
+
+    # Segments within the document (e.g., paragraph, code snippet)
+    # Format: {"snippet": "xxx", "start": 7, "end": 65, "score": 9.0, "reasoning": "xxx"}
+    snippets: List[Dict[str, Any]]
+
+    def to_dict(self):
+        """
+        Convert RoiResult to a dictionary.
+        """
+        return {
+            "summary": self.summary,
+            "is_found": self.is_found,
+            "snippets": self.snippets,
+        }
 
 
 class MonteCarloEvidenceSampling:
     """
-    Identifies Regions of Interest (ROI) in large files using Monte Carlo Importance Sampling with given evidence snippets.
+    Monte Carlo Evidence Importance Sampling for Document Retrieval.
     """
 
     def __init__(
         self,
-        file_path: Union[str, Path],
-        sample_size: int = 50,
-        max_scan: int = 20000,
-        llm: OpenAIChat = None,
-        query: str = None,
+        llm: OpenAIChat,
+        doc_content: str,
+        verbose: bool = True,
     ):
-        self.file_path = Path(file_path)
-        if not self.file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
+        self.llm = llm
+        self.doc = doc_content
+        self.doc_len = len(doc_content)
+        self.verbose = verbose
 
-        self.sample_size = sample_size  # Number of Monte Carlo sampling iterations
-        self.max_scan = max_scan
-        self.file_size = self.file_path.stat().st_size
-        self.f = open(file_path, "rb")
-        self.mm = mmap.mmap(self.f.fileno(), 0, access=mmap.ACCESS_READ)
+        self.max_rounds = 3
+        # Size of each probe sampling window
+        self.probe_window = 500
+        # Size of the final expanded context
+        self.roi_window = 2000
 
-        # Usage:
-        # resp: str = self.llm.chat(
-        #             messages=[{"role": "user", "content": prompt}],
-        #             stream=True,
-        #         )
-        self.llm: OpenAIChat = llm
+        # ---Sampling Configuration--- #
+        # Number of anchors from Fuzz
+        self.fuzz_candidates_num = 5
+        # Number of random points for exploration
+        self.random_exploration_num = 2
+        # Samples per round for Gaussian sampling
+        self.samples_per_round = 5
+        # Top K samples to keep as seeds for next round
+        self.top_k_seeds = 2
 
-        self.query: str = query
+        self.visited_starts: Set[int] = set()
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def _get_weighted_anchors(self, evidence_list: List[str]) -> Dict[bytes, float]:
+    def _get_content(self, start: int) -> Tuple[int, int, str]:
         """
-        Calculates anchor weights. Logic: shorter anchors or those appearing
-        frequently across evidence snippets receive lower weights.
+        Safely retrieves a document slice with boundary checks.
+        """
+        start = max(0, min(start, self.doc_len - self.probe_window))
+        end = min(start + self.probe_window, self.doc_len)
+        return start, end, self.doc[start:end]
+
+    def _get_fuzzy_anchors(
+        self, query: str, threshold: float = 30.0
+    ) -> List[SampleWindow]:
+        """
+        Uses RapidFuzz to find heuristic anchors based on literal matching.
+        Logic: Sliding window slices -> Calculate similarity with Query -> Top K.
 
         Args:
-            evidence_list: Snippets to guide the sampling.
+            query (str): The user query string.
+            threshold (float): Minimum similarity score to consider.
 
         Returns:
-            Dictionary mapping anchor bytes to their normalized sampling probability.
+            List[SampleWindow]: List of sampled windows based on fuzzy matching.
         """
-        raw_anchors = []
-        for ev in evidence_list:
-            # Simplified anchor extraction: remove whitespace and slide a window
-            clean_text = re.sub(r"\s+", "", ev)
-            n = 8
-            for i in range(0, len(clean_text) - n, 4):
-                raw_anchors.append(clean_text[i : i + n].encode("utf-8"))
+        if self.verbose:
+            logger.info(">> Executing RapidFuzz heuristic pre-filtering...")
 
-        if not raw_anchors:
-            return {}
+        # 1. Build sliding window slices (stride = half window size)
+        stride = self.probe_window // 2
+        chunks = []
+        for i in range(0, self.doc_len, stride):
+            chunks.append(i)
 
-        # Count frequencies: higher frequency leads to lower weight (1/freq)
-        counts = defaultdict(int)
-        for a in raw_anchors:
-            counts[a] += 1
+        # 2. Construct text list for matching
+        chunk_texts = [self.doc[i : i + self.probe_window] for i in chunks]
 
-        # Calculate importance weight: combines length and rarity
-        weights = {a: (len(a) / (counts[a] ** 2)) for a, count in counts.items()}
-        total_w = sum(weights.values())
-        return {a: w / total_w for a, w in weights.items()}
-
-    def get_roi(self, evidence_list: List[str], k: int = 10) -> List[Dict[str, Any]]:
-        """
-        Performs Monte Carlo sampling to identify Regions of Interest (ROI) within the file.
-
-        Args:
-            evidence_list: List of reference strings to search for.
-            k: Number of top candidate regions to return.
-
-        Returns:
-            List of dictionaries containing matched content, scores, and metadata. Output format:
-                [
-                  {
-                    "content": "嵌入维度**：从1536增加到4096。\n- **更大的Patch Size**：使用16x16的patch size。\n- **RoPE位置编码**：采用旋转位置编码（Rotary Positional Embeddings），增强了模型对不同分辨率和长宽比的适应性。",
-                    "score": 70.3,
-                    "meta": {
-                      "range": [
-                        5317,
-                        5668
-                      ],
-                      "hit_count": 1
-                    }
-                  },
-                  ... ,
-                ]
-        """
-        anchor_probs = self._get_weighted_anchors(evidence_list)
-        if not anchor_probs:
-            return []
-
-        anchors = list(anchor_probs.keys())
-        probs = list(anchor_probs.values())
-
-        # Sample anchors based on calculated probabilities
-        sampled_anchors = np.random.choice(
-            anchors, size=min(len(anchors), self.sample_size), p=probs, replace=False
+        # 3. Extract most similar fragments
+        results = process.extract(
+            query=query,
+            choices=chunk_texts,
+            scorer=fuzz.partial_token_set_ratio,
+            limit=self.fuzz_candidates_num * 2,
         )
-        hit_map = defaultdict(list)
 
-        def scan_anchor(anchor: bytes) -> List[Tuple[int, int]]:
-            pos_list = []
-            # Monte Carlo sampling: start searching from a random file offset
-            search_start = random.randint(0, max(0, self.file_size - 1024))
-            idx = self.mm.find(anchor, search_start)
+        anchors = []
+        for text, score, index in results:
+            start_idx = chunks[index]
 
-            if idx != -1:
-                # Key: identify the semantic boundaries surrounding the match point
-                p_start = self._find_boundary(idx, direction="back")
-                p_end = self._find_boundary(idx, direction="forward")
-                pos_list.append((p_start, p_end))
-            return pos_list
-
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(scan_anchor, a) for a in sampled_anchors]
-            for f in as_completed(futures):
-                for bounds in f.result():
-                    # 'bounds' is a (start, end) tuple used as a dictionary key
-                    hit_map[bounds].append(bounds)
-
-        candidates = []
-        for (p_start, p_end), hits in hit_map.items():
-            # Boundary check
-            p_start = max(0, p_start)
-            p_end = min(self.file_size, p_end)
-
-            if p_start >= p_end:
+            # Simple deduplication
+            if start_idx in self.visited_starts:
                 continue
 
-            p_text = self.mm[p_start:p_end].decode("utf-8", errors="ignore").strip()
-            if not p_text:
+            # Threshold filtering (e.g., > 30)
+            if score < threshold:
                 continue
 
-            # Calculate similarity score using fuzzy matching against evidence snippets
-            max_fuzz_score = max(
-                [fuzz.partial_ratio(ev, p_text) for ev in evidence_list]
+            self.visited_starts.add(start_idx)
+            _, end, content = self._get_content(start_idx)
+
+            anchors.append(
+                SampleWindow(
+                    start_idx=start_idx,
+                    end_idx=end,
+                    content=content,
+                    fuzz_score=score,
+                    round_num=1,
+                    source="fuzz",
+                )
             )
 
-            candidates.append(
+            if len(anchors) >= self.fuzz_candidates_num:
+                break
+
+        top_score = anchors[0].fuzz_score if anchors else 0.0
+        if self.verbose:
+            logger.info(
+                f"   Anchors hit: {len(anchors)} (Top Fuzz Score: {top_score:.1f})"
+            )
+
+        return anchors
+
+    def _sample_stratified_supplement(self, count: int) -> List[SampleWindow]:
+        """
+        Adds a small amount of global random sampling for 'Exploration',
+        preventing cases where Query is semantically relevant but lacks keyword matches.
+
+        Args:
+            count (int): Number of random samples to generate.
+
+        Returns:
+            List[SampleWindow]: List of randomly sampled windows.
+        """
+        samples = []
+        if count <= 0:
+            return samples
+
+        step = self.doc_len // count
+        for i in range(count):
+            section_start = i * step
+            section_end = min((i + 1) * step, self.doc_len)
+
+            # Random selection within section
+            max_start = max(section_start, section_end - self.probe_window)
+            rand_start = random.randint(section_start, max_start)
+
+            start, end, content = self._get_content(rand_start)
+
+            # Check for overlap with existing points
+            is_duplicate = False
+            for v in self.visited_starts:
+                if abs(v - start) < (self.probe_window // 2):
+                    is_duplicate = True
+                    break
+
+            if not is_duplicate:
+                self.visited_starts.add(start)
+                samples.append(
+                    SampleWindow(
+                        start_idx=start,
+                        end_idx=end,
+                        content=content,
+                        round_num=1,
+                        source="stratified",
+                    )
+                )
+
+        return samples
+
+    def _sample_gaussian(
+        self, seeds: List[SampleWindow], current_round: int
+    ) -> List[SampleWindow]:
+        """
+        [Subsequent Rounds] Gaussian Importance Sampling.
+
+        Args:
+            seeds (List[SampleWindow]): High-value seeds from previous round.
+            current_round (int): Current round number.
+
+        Returns:
+            List[SampleWindow]: List of newly sampled windows.
+        """
+        samples = []
+        # Sigma Decay: Shrink search range as rounds progress
+        base_sigma = self.doc_len / 20
+        sigma = base_sigma / (2 ** (current_round - 1))
+
+        samples_needed = self.samples_per_round
+
+        for seed in seeds:
+            if samples_needed <= 0:
+                break
+
+            # Allocate children per seed
+            num_children = max(1, math.ceil(samples_needed / len(seeds)))
+            center = (seed.start_idx + seed.end_idx) // 2
+
+            for _ in range(num_children):
+                new_center = int(random.gauss(center, sigma))
+                raw_start = new_center - (self.probe_window // 2)
+                start, end, content = self._get_content(raw_start)
+
+                # Deduplication check
+                too_close = False
+                for existing in self.visited_starts:
+                    if abs(existing - start) < (self.probe_window // 3):
+                        too_close = True
+                        break
+
+                if not too_close:
+                    self.visited_starts.add(start)
+                    samples.append(
+                        SampleWindow(
+                            start_idx=start,
+                            end_idx=end,
+                            content=content,
+                            round_num=current_round,
+                            source="gaussian",
+                        )
+                    )
+                    samples_needed -= 1
+
+        return samples
+
+    async def _evaluate_sample_async(
+        self, sample: SampleWindow, query: str
+    ) -> SampleWindow:
+        """
+        Evaluates a single sample asynchronously.
+        """
+        prompt = EVALUATE_EVIDENCE_SAMPLE.format(
+            query=query,
+            sample_source=sample.source,
+            sample_content=sample.content,
+        )
+        try:
+            resp: str = await self.llm.achat([{"role": "user", "content": prompt}])
+
+            clean_resp = resp.replace("```json", "").replace("```", "").strip()
+            data = json.loads(clean_resp)
+            sample.score = float(data.get("score", 0))
+            sample.reasoning = data.get("reasoning", "")
+        except Exception as e:
+            logger.warning(f"Error evaluating sample at {sample.start_idx}: {e}")
+            sample.score = 0.0
+
+        return sample
+
+    async def _evaluate_batch(
+        self, samples: List[SampleWindow], query: str
+    ) -> List[SampleWindow]:
+        """
+        Evaluates a batch of samples concurrently.
+        """
+        if self.verbose:
+            logger.info(f"   Evaluating {len(samples)} samples with LLM...")
+
+        # Create async tasks
+        tasks = [self._evaluate_sample_async(s, query) for s in samples]
+
+        # Run concurrently
+        evaluated_samples = await asyncio.gather(*tasks)
+        return list(evaluated_samples)
+
+    async def _generate_summary(
+        self, top_samples: List[SampleWindow], query: str
+    ) -> str:
+        """
+        Expands the context windows for multiple top samples and generates a summary.
+        """
+        combined_context = ""
+        half_window = self.roi_window // 2
+
+        # Sort by index to maintain document flow if needed, or by score
+        processed_samples = sorted(top_samples, key=lambda x: x.start_idx)
+
+        for i, sample in enumerate(processed_samples):
+            center = (sample.start_idx + sample.end_idx) // 2
+            start = max(0, center - half_window)
+            end = min(self.doc_len, center + half_window)
+            expanded_content = self.doc[start:end]
+            combined_context += (
+                f"\n--- Context Fragment {i + 1} ---\n...{expanded_content}...\n"
+            )
+
+        prompt = ROI_RESULT_SUMMARY.format(
+            user_input=query,
+            text_content=combined_context,
+        )
+
+        return await self.llm.achat([{"role": "user", "content": prompt}])
+
+    async def get_roi(
+        self, query: str, confidence_threshold: float = 8.5, top_k: int = 3
+    ) -> RoiResult:
+        """
+        Get the Region of Interest (ROI) for the given query.
+
+        Args:
+            query (str): The user query string.
+            confidence_threshold (float): Confidence score threshold for early stopping.
+            top_k (int): Number of top snippets to consider for final summary.
+
+        Returns:
+            RoiResult: The final ROI result with metadata.
+        """
+        if self.verbose:
+            logger.info(
+                f"=== Starting Hybrid Adaptive Retrieval (Doc Len: {self.doc_len}) ==="
+            )
+            logger.info(f"Query: {query}")
+
+        all_candidates: List[SampleWindow] = []
+        top_seeds: List[SampleWindow] = []
+
+        for r in range(1, self.max_rounds + 1):
+            if self.verbose:
+                logger.info(f"--- Round {r}/{self.max_rounds} ---")
+            current_samples = []
+
+            if r == 1:
+                # === Strategy: Fuzz Anchors + Random Supplement ===
+                # 1. Get Fuzz Anchors (Exploitation)
+                # Note: Fuzz is CPU bound, so we keep it sync
+                fuzz_samples = self._get_fuzzy_anchors(query)
+                current_samples.extend(fuzz_samples)
+
+                # 2. Supplement with Random Sampling (Exploration)
+                needed_random = self.random_exploration_num
+                if len(fuzz_samples) == 0:
+                    needed_random += 3  # Downgrade to random mode
+
+                random_samples = self._sample_stratified_supplement(needed_random)
+                current_samples.extend(random_samples)
+
+                if self.verbose:
+                    logger.info(
+                        f"Sampling Distribution: Fuzz Anchors={len(fuzz_samples)}, Random Exploration={len(random_samples)}"
+                    )
+
+            else:
+                # === Subsequent Rounds: Gaussian Focusing ===
+                # Filter low score seeds
+                valid_seeds = [s for s in top_seeds if s.score >= 4.0]
+
+                if not valid_seeds:
+                    logger.warning(
+                        "No high-value regions found, attempting global random sampling again..."
+                    )
+                    current_samples = self._sample_stratified_supplement(
+                        self.samples_per_round
+                    )
+                else:
+                    max_score = valid_seeds[0].score
+                    if self.verbose:
+                        logger.info(
+                            f"Focusing: Based on {len(valid_seeds)} seeds (Max Score: {max_score})"
+                        )
+                    current_samples = self._sample_gaussian(valid_seeds, r)
+
+            if not current_samples and self.verbose:
+                logger.info("No new samples generated this round, skipping.")
+            else:
+                evaluated = await self._evaluate_batch(current_samples, query)
+                all_candidates.extend(evaluated)
+
+                for s in evaluated:
+                    logger.info(
+                        f"  [Pos {s.start_idx:6d} | Src: {s.source:8s}] Score: {s.score} | {s.reasoning[:30]}..."
+                    )
+
+            # Sort and update seeds
+            all_candidates.sort(key=lambda x: x.score, reverse=True)
+            top_seeds = all_candidates[: self.top_k_seeds]
+
+            # Early stopping check
+            if top_seeds and top_seeds[0].score >= confidence_threshold:
+                if self.verbose:
+                    logger.info(
+                        f">> High confidence target found (Score >= {confidence_threshold}), stopping early."
+                    )
+                break
+
+        # --- Final Result Processing ---
+        if not all_candidates:
+            logger.warning("Failed to retrieve any content.")
+            return RoiResult(
+                summary="Could not retrieve relevant content.",
+                is_found=False,
+                snippets=[],
+            )
+
+        # Collect top candidates that are relevant enough
+        # Using 4.0 as a soft threshold for relevance inclusion
+        relevant_candidates = [c for c in all_candidates if c.score >= 4.0]
+
+        # If nothing meets the threshold, fallback to the single best candidate
+        if not relevant_candidates:
+            best = all_candidates[0]
+            return RoiResult(
+                summary="No exact answer found in the document.",
+                is_found=False,
+                snippets=[
+                    {
+                        "snippet": best.content,
+                        "start": best.start_idx,
+                        "end": best.end_idx,
+                        "score": best.score,
+                        "reasoning": best.reasoning,
+                    }
+                ],
+            )
+
+        # Take up to top_k_seeds (e.g., 2 or 3) as the final set for summarization
+        final_candidates = relevant_candidates[:top_k]
+        best_score = final_candidates[0].score
+
+        if self.verbose:
+            logger.info(
+                f"=== Final Lock: {len(final_candidates)} snippets, Top Score {best_score} ==="
+            )
+
+        # Generate summary
+        summary = await self._generate_summary(final_candidates, query)
+
+        # Construct new snippet format
+        roi_snippets = []
+        for c in final_candidates:
+            roi_snippets.append(
                 {
-                    "content": p_text,
-                    "score": round(float(max_fuzz_score), 2),
-                    "meta": {"range": [p_start, p_end], "hit_count": len(hits)},
+                    "snippet": c.content,
+                    "start": c.start_idx,
+                    "end": c.end_idx,
+                    "score": c.score,
+                    "reasoning": c.reasoning,
                 }
             )
 
-        # Rank candidates by relevance score
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-        return candidates[:k]
-
-    def _find_boundary(self, pos: int, direction: str = "back") -> int:
-        """
-        Greedily search for the nearest semantic boundary in a specified direction.
-
-        Args:
-            pos (int): Starting position for the search.
-            direction (str): Search direction, either 'back' or 'forward'.
-
-        Returns:
-            int: The detected boundary offset.
-        """
-        step = 1024
-        # Pattern: Paragraph break (\n\n), Sentence break (punc + \n), or Line break (\n)
-        pattern = re.compile(r"\r?\n\s*\r?\n|[\u3002\uff01\uff1f\.!\?]\s*\r?\n|\r?\n")
-
-        for offset in range(0, self.max_scan, step):
-            if direction == "back":
-                start = max(0, pos - offset - step)
-                end = pos - offset
-            else:
-                start = pos + offset
-                end = min(self.file_size, pos + offset + step)
-
-            if start >= end:
-                break
-
-            chunk = self.mm[start:end].decode("utf-8", errors="ignore")
-
-            if direction == "back":
-                matches = list(pattern.finditer(chunk))
-                if matches:
-                    return start + matches[-1].end()
-                if start == 0:
-                    return 0
-            else:
-                match = pattern.search(chunk)
-                if match:
-                    return start + match.start()
-                if end == self.file_size:
-                    return self.file_size
-
-        return 0 if direction == "back" else self.file_size
-
-    def close(self):
-        """Releases memory map and file handles."""
-        if hasattr(self, "mm"):
-            self.mm.close()
-        if hasattr(self, "f"):
-            self.f.close()
-
-
-if __name__ == "__main__":
-
-    import json
-
-    file_path: str = "/path/to/DINOv3_zh/report.md"
-
-    with MonteCarloEvidenceSampling(file_path=file_path) as processor:
-
-        results = processor.get_roi(
-            [
-                "**表 2: DINOv2 与 DINOv3 教师模型架构对比**\n",
-                "DINOv3将模型规模扩展到了70亿（7B）参数，远超DINOv2的11亿参数。关键架构更新包括：\n",
-                "- **3D理解** (表 13): 将VGGT框架中的DINOv2替换为DINOv3 ViT-L，在相机姿态估计、多视图重建等任务上均取得了一致的性能提升。\n",
-            ]
+        return RoiResult(
+            summary=summary,
+            is_found=True,
+            snippets=roi_snippets,
         )
-
-        # Outputs:
-        # [
-        #   {
-        #     "content": "嵌入维度**：从1536增加到4096。\n- **更大的Patch Size**：使用16x16的patch size。\n- **RoPE位置编码**：采用旋转位置编码（Rotary Positional Embeddings），增强了模型对不同分辨率和长宽比的适应性。\n\n**表 2: DINOv2 与 DINOv3 教师模型架构对比**\n\n| 特性 | DINOv2 (ViT-giant) | DINOv3 (ViT-7B) |",
-        #     "score": 70.3,
-        #     "meta": {
-        #       "range": [
-        #         5317,
-        #         5668
-        #       ],
-        #       "hit_count": 1
-        #     }
-        #   },
-        #   ... ,
-        # ]
-
-        print(json.dumps(results, ensure_ascii=False, indent=2))
