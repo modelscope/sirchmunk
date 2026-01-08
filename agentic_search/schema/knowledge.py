@@ -40,19 +40,21 @@ class EvidenceUnit:
     # From `file_or_url` in FileInfo
     file_or_url: Union[str, Path]
 
-    # Segment content or snippet that supports this cluster
-    # e.g. {'content': '...', 'type': 'text', 'meta': {'range': [5317, 5669], 'hit_count': 2}}
-    # The `content` value may be text, code snippet, image base64, etc.
-    segment: Dict[str, Any]
+    # Summarized of snippets
+    summary: str
 
-    # Source reliability weight [0.0, 1.0]; e.g., journal=0.95, forum=0.4
-    score: float
+    # Segment within the document (e.g., paragraph, code snippet)
+    is_found: bool
+
+    # Segments within the document (e.g., paragraph, code snippet)
+    # Format: {"snippet": "xxx", "start": 7, "end": 65, "score": 9.0, "reasoning": "xxx"}
+    snippets: List[Dict[str, Any]]
 
     # When this evidence was processed
     extracted_at: datetime
 
-    # ID of conflict group if this evidence contradicts others
-    conflict_group: Optional[str] = None
+    # IDs of conflict group if this evidence contradicts others
+    conflict_group: Optional[List[str]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -61,25 +63,12 @@ class EvidenceUnit:
         return {
             "doc_id": self.doc_id,
             "file_or_url": str(self.file_or_url),
-            "segment": self.segment,
-            "score": self.score,
+            "summary": self.summary,
+            "is_found": self.is_found,
+            "snippets": self.snippets,
             "extracted_at": self.extracted_at.isoformat(),
             "conflict_group": self.conflict_group,
         }
-
-    @staticmethod
-    def from_dict(data: Dict[str, Any]) -> "EvidenceUnit":
-        """
-        Deserialize EvidenceUnit from a dictionary.
-        """
-        return EvidenceUnit(
-            doc_id=data["doc_id"],
-            file_or_url=Path(data["file_or_url"]),
-            segment=data["segment"],
-            score=data["score"],
-            extracted_at=datetime.fromisoformat(data["extracted_at"]),
-            conflict_group=data.get("conflict_group"),
-        )
 
 
 @dataclass

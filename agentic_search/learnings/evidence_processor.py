@@ -48,6 +48,8 @@ class RoiResult:
 
     is_found: bool
 
+    # Segments within the document (e.g., paragraph, code snippet)
+    # Format: {"snippet": "xxx", "start": 7, "end": 65, "score": 9.0, "reasoning": "xxx"}
     snippets: List[Dict[str, Any]]
 
     def to_dict(self):

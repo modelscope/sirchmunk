@@ -68,7 +68,7 @@ class Request:
         """Get the system prompt."""
         return self.system
 
-    def get_user_query(self) -> str:
+    def get_user_input(self) -> str:
         """Extract the user query from the messages."""
         for m in self.messages:
             if m.role == "user":
@@ -215,6 +215,6 @@ if __name__ == "__main__":
         f"\nOpenAI Payload:\n{json.dumps(req_openai.to_payload(prompt_template=prompt_template), ensure_ascii=False, indent=2)}"
     )
 
-    print(f"\nUser Query (OpenAI format): {req_openai.get_user_query()}")
+    print(f"\nUser Query (OpenAI format): {req_openai.get_user_input()}")
 
     print(f"\nImage URLs (OpenAI format): {req_openai.get_image_urls()}")

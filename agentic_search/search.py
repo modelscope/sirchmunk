@@ -173,8 +173,10 @@ class AgenticSearch(BaseSearch):
         *,
         images: Optional[list] = None,
         max_depth: Optional[int] = 5,
+        top_k_files: Optional[int] = 3,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
+        verbose: Optional[bool] = True,
     ) -> str:
 
         # Build request
@@ -237,15 +239,21 @@ class AgenticSearch(BaseSearch):
         grep_results = self.process_grep_results(
             results=grep_results, keywords_with_idf=query_keywords
         )
-        logger.info("Grep retrieved {} files.", len(grep_results))
+        if verbose:
+            tmp_sep = "\n"
+            logger.info(
+                f"Grep retrieved files:\n{tmp_sep.join([str(r['path']) for r in grep_results[:top_k_files]])}"
+            )
 
         # Build knowledge cluster
-        logger.info("Building knowledge cluster...")
+        if verbose:
+            logger.info("Building knowledge cluster...")
         cluster = self.knowledge_bank.build(
             request=request,
             retrieved_infos=grep_results,
-            top_k_files=3,
-            top_k_lines=50,
+            top_k_files=top_k_files,
+            top_k_snippets=5,
+            verbose=verbose,
         )
 
         self.knowledge_bank.update(cluster=cluster)
@@ -264,7 +272,7 @@ class AgenticSearch(BaseSearch):
         )
 
         result_sum_prompt: str = SEARCH_RESULT_SUMMARY.format(
-            user_input=request.get_user_query(),
+            user_input=request.get_user_input(),
             text_content=cluster_text_content,
         )
 
