@@ -100,7 +100,10 @@ v0.0.1 Key features:
 * knowledge cluster动态生成，为后续自我进化打基础
 * 个性化：基于用户的搜索历史和行为，动态调整knowledge cluster和搜索策略
 * 增加对title的match和加权
+* 蒙特卡洛采样过程，对于超大文件，需要单独处理，提高效率
+* 蒙特卡洛采样过程，对应在应用端增加文件片段预览功能；在chat输出区域嵌入预览窗口
 
 v0.0.2 Key Features:
 * 多模态检索
 * evidence和knowledge cluster中增加原文的位置引用
+* 考虑跨语种的召回能力
