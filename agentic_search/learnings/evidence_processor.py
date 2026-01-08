@@ -3,13 +3,13 @@ import json
 import math
 import random
 from dataclasses import dataclass
-from typing import List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from loguru import logger
 from rapidfuzz import fuzz, process
 
 from agentic_search.llm.openai import OpenAIChat
-from agentic_search.llm.prompts import EVALUATE_EVIDENCE_SAMPLE
+from agentic_search.llm.prompts import EVALUATE_EVIDENCE_SAMPLE, ROI_RESULT_SUMMARY
 
 
 @dataclass
@@ -44,19 +44,21 @@ class RoiResult:
     Data class to store the final Region of Interest (ROI) result and metadata.
     """
 
-    final_answer: str
+    summary: str
 
     is_found: bool
 
-    confidence_score: float
+    snippets: List[Dict[str, Any]]
 
-    best_content_snippet: str
-
-    start_idx: int
-
-    end_idx: int
-
-    reasoning: str
+    def to_dict(self):
+        """
+        Convert RoiResult to a dictionary.
+        """
+        return {
+            "summary": self.summary,
+            "is_found": self.is_found,
+            "snippets": self.snippets,
+        }
 
 
 class MonteCarloEvidenceSampling:
@@ -314,32 +316,44 @@ class MonteCarloEvidenceSampling:
         evaluated_samples = await asyncio.gather(*tasks)
         return list(evaluated_samples)
 
-    async def _expand_and_verify(self, best_sample: SampleWindow, query: str) -> str:
+    async def _generate_summary(
+        self, top_samples: List[SampleWindow], query: str
+    ) -> str:
         """
-        Expands the context window and generates the final answer.
+        Expands the context windows for multiple top samples and generates a summary.
         """
-        center = (best_sample.start_idx + best_sample.end_idx) // 2
+        combined_context = ""
         half_window = self.roi_window // 2
-        start = max(0, center - half_window)
-        end = min(self.doc_len, center + half_window)
-        expanded_content = self.doc[start:end]
 
-        prompt = f"""
-        Answer the question based on the context. If you don't know, say you don't know.
-        Question: "{query}"
-        Context:
-        "...{expanded_content}..."
-        """
-        # Async call
+        # Sort by index to maintain document flow if needed, or by score
+        processed_samples = sorted(top_samples, key=lambda x: x.start_idx)
+
+        for i, sample in enumerate(processed_samples):
+            center = (sample.start_idx + sample.end_idx) // 2
+            start = max(0, center - half_window)
+            end = min(self.doc_len, center + half_window)
+            expanded_content = self.doc[start:end]
+            combined_context += (
+                f"\n--- Context Fragment {i + 1} ---\n...{expanded_content}...\n"
+            )
+
+        prompt = ROI_RESULT_SUMMARY.format(
+            user_input=query,
+            text_content=combined_context,
+        )
+
         return await self.llm.achat([{"role": "user", "content": prompt}])
 
-    async def get_roi(self, query: str, confidence_threshold: float = 8.5) -> RoiResult:
+    async def get_roi(
+        self, query: str, confidence_threshold: float = 8.5, top_k: int = 3
+    ) -> RoiResult:
         """
         Get the Region of Interest (ROI) for the given query.
 
         Args:
             query (str): The user query string.
             confidence_threshold (float): Confidence score threshold for early stopping.
+            top_k (int): Number of top snippets to consider for final summary.
 
         Returns:
             RoiResult: The final ROI result with metadata.
@@ -425,39 +439,59 @@ class MonteCarloEvidenceSampling:
         if not all_candidates:
             logger.warning("Failed to retrieve any content.")
             return RoiResult(
-                final_answer="Could not retrieve relevant content.",
+                summary="Could not retrieve relevant content.",
                 is_found=False,
-                confidence_score=0.0,
-                best_content_snippet="",
-                start_idx=-1,
-                end_idx=-1,
-                reasoning="No candidates generated.",
+                snippets=[],
             )
 
-        best = all_candidates[0]
-        if self.verbose:
-            logger.info(f"=== Final Lock: Pos {best.start_idx}, Score {best.score} ===")
+        # Collect top candidates that are relevant enough
+        # Using 4.0 as a soft threshold for relevance inclusion
+        relevant_candidates = [c for c in all_candidates if c.score >= 4.0]
 
-        if best.score < 4.0:
+        # If nothing meets the threshold, fallback to the single best candidate
+        if not relevant_candidates:
+            best = all_candidates[0]
             return RoiResult(
-                final_answer="No exact answer found in the document.",
+                summary="No exact answer found in the document.",
                 is_found=False,
-                confidence_score=best.score,
-                best_content_snippet=best.content,
-                start_idx=best.start_idx,
-                end_idx=best.end_idx,
-                reasoning=best.reasoning,
+                snippets=[
+                    {
+                        "snippet": best.content,
+                        "start": best.start_idx,
+                        "end": best.end_idx,
+                        "score": best.score,
+                        "reasoning": best.reasoning,
+                    }
+                ],
             )
 
-        # Generate final answer
-        final_ans = await self._expand_and_verify(best, query)
+        # Take up to top_k_seeds (e.g., 2 or 3) as the final set for summarization
+        final_candidates = relevant_candidates[:top_k]
+        best_score = final_candidates[0].score
+
+        if self.verbose:
+            logger.info(
+                f"=== Final Lock: {len(final_candidates)} snippets, Top Score {best_score} ==="
+            )
+
+        # Generate summary
+        summary = await self._generate_summary(final_candidates, query)
+
+        # Construct new snippet format
+        roi_snippets = []
+        for c in final_candidates:
+            roi_snippets.append(
+                {
+                    "snippet": c.content,
+                    "start": c.start_idx,
+                    "end": c.end_idx,
+                    "score": c.score,
+                    "reasoning": c.reasoning,
+                }
+            )
 
         return RoiResult(
-            final_answer=final_ans,
+            summary=summary,
             is_found=True,
-            confidence_score=best.score,
-            best_content_snippet=best.content,
-            start_idx=best.start_idx,
-            end_idx=best.end_idx,
-            reasoning=best.reasoning,
+            snippets=roi_snippets,
         )
