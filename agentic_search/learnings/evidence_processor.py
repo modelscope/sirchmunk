@@ -1,9 +1,9 @@
-import json
-import random
-import math
 import asyncio
-from typing import List, Tuple, Set
+import json
+import math
+import random
 from dataclasses import dataclass
+from typing import List, Set, Tuple
 
 from loguru import logger
 from rapidfuzz import fuzz, process
@@ -17,6 +17,7 @@ class SampleWindow:
     """
     Sampling window configuration and metadata.
     """
+
     start_idx: int
 
     end_idx: int
@@ -42,6 +43,7 @@ class RoiResult:
     """
     Data class to store the final Region of Interest (ROI) result and metadata.
     """
+
     final_answer: str
 
     is_found: bool
@@ -61,11 +63,13 @@ class MonteCarloEvidenceSampling:
     """
     Monte Carlo Evidence Importance Sampling for Document Retrieval.
     """
-    def __init__(self,
-                 llm: OpenAIChat,
-                 doc_content: str,
-                 verbose: bool = True,
-                 ):
+
+    def __init__(
+        self,
+        llm: OpenAIChat,
+        doc_content: str,
+        verbose: bool = True,
+    ):
         self.llm = llm
         self.doc = doc_content
         self.doc_len = len(doc_content)
@@ -97,7 +101,9 @@ class MonteCarloEvidenceSampling:
         end = min(start + self.probe_window, self.doc_len)
         return start, end, self.doc[start:end]
 
-    def _get_fuzzy_anchors(self, query: str, threshold: float = 30.0) -> List[SampleWindow]:
+    def _get_fuzzy_anchors(
+        self, query: str, threshold: float = 30.0
+    ) -> List[SampleWindow]:
         """
         Uses RapidFuzz to find heuristic anchors based on literal matching.
         Logic: Sliding window slices -> Calculate similarity with Query -> Top K.
@@ -119,14 +125,14 @@ class MonteCarloEvidenceSampling:
             chunks.append(i)
 
         # 2. Construct text list for matching
-        chunk_texts = [self.doc[i: i + self.probe_window] for i in chunks]
+        chunk_texts = [self.doc[i : i + self.probe_window] for i in chunks]
 
         # 3. Extract most similar fragments
         results = process.extract(
             query=query,
             choices=chunk_texts,
             scorer=fuzz.partial_token_set_ratio,
-            limit=self.fuzz_candidates_num * 2
+            limit=self.fuzz_candidates_num * 2,
         )
 
         anchors = []
@@ -144,21 +150,25 @@ class MonteCarloEvidenceSampling:
             self.visited_starts.add(start_idx)
             _, end, content = self._get_content(start_idx)
 
-            anchors.append(SampleWindow(
-                start_idx=start_idx,
-                end_idx=end,
-                content=content,
-                fuzz_score=score,
-                round_num=1,
-                source="fuzz"
-            ))
+            anchors.append(
+                SampleWindow(
+                    start_idx=start_idx,
+                    end_idx=end,
+                    content=content,
+                    fuzz_score=score,
+                    round_num=1,
+                    source="fuzz",
+                )
+            )
 
             if len(anchors) >= self.fuzz_candidates_num:
                 break
 
         top_score = anchors[0].fuzz_score if anchors else 0.0
         if self.verbose:
-            logger.info(f"   Anchors hit: {len(anchors)} (Top Fuzz Score: {top_score:.1f})")
+            logger.info(
+                f"   Anchors hit: {len(anchors)} (Top Fuzz Score: {top_score:.1f})"
+            )
 
         return anchors
 
@@ -197,17 +207,21 @@ class MonteCarloEvidenceSampling:
 
             if not is_duplicate:
                 self.visited_starts.add(start)
-                samples.append(SampleWindow(
-                    start_idx=start,
-                    end_idx=end,
-                    content=content,
-                    round_num=1,
-                    source="stratified"
-                ))
+                samples.append(
+                    SampleWindow(
+                        start_idx=start,
+                        end_idx=end,
+                        content=content,
+                        round_num=1,
+                        source="stratified",
+                    )
+                )
 
         return samples
 
-    def _sample_gaussian(self, seeds: List[SampleWindow], current_round: int) -> List[SampleWindow]:
+    def _sample_gaussian(
+        self, seeds: List[SampleWindow], current_round: int
+    ) -> List[SampleWindow]:
         """
         [Subsequent Rounds] Gaussian Importance Sampling.
 
@@ -220,7 +234,7 @@ class MonteCarloEvidenceSampling:
         """
         samples = []
         # Sigma Decay: Shrink search range as rounds progress
-        base_sigma = (self.doc_len / 20)
+        base_sigma = self.doc_len / 20
         sigma = base_sigma / (2 ** (current_round - 1))
 
         samples_needed = self.samples_per_round
@@ -247,18 +261,22 @@ class MonteCarloEvidenceSampling:
 
                 if not too_close:
                     self.visited_starts.add(start)
-                    samples.append(SampleWindow(
-                        start_idx=start,
-                        end_idx=end,
-                        content=content,
-                        round_num=current_round,
-                        source="gaussian"
-                    ))
+                    samples.append(
+                        SampleWindow(
+                            start_idx=start,
+                            end_idx=end,
+                            content=content,
+                            round_num=current_round,
+                            source="gaussian",
+                        )
+                    )
                     samples_needed -= 1
 
         return samples
 
-    async def _evaluate_sample_async(self, sample: SampleWindow, query: str) -> SampleWindow:
+    async def _evaluate_sample_async(
+        self, sample: SampleWindow, query: str
+    ) -> SampleWindow:
         """
         Evaluates a single sample asynchronously.
         """
@@ -280,7 +298,9 @@ class MonteCarloEvidenceSampling:
 
         return sample
 
-    async def _evaluate_batch(self, samples: List[SampleWindow], query: str) -> List[SampleWindow]:
+    async def _evaluate_batch(
+        self, samples: List[SampleWindow], query: str
+    ) -> List[SampleWindow]:
         """
         Evaluates a batch of samples concurrently.
         """
@@ -325,7 +345,9 @@ class MonteCarloEvidenceSampling:
             RoiResult: The final ROI result with metadata.
         """
         if self.verbose:
-            logger.info(f"=== Starting Hybrid Adaptive Retrieval (Doc Len: {self.doc_len}) ===")
+            logger.info(
+                f"=== Starting Hybrid Adaptive Retrieval (Doc Len: {self.doc_len}) ==="
+            )
             logger.info(f"Query: {query}")
 
         all_candidates: List[SampleWindow] = []
@@ -353,7 +375,8 @@ class MonteCarloEvidenceSampling:
 
                 if self.verbose:
                     logger.info(
-                        f"Sampling Distribution: Fuzz Anchors={len(fuzz_samples)}, Random Exploration={len(random_samples)}")
+                        f"Sampling Distribution: Fuzz Anchors={len(fuzz_samples)}, Random Exploration={len(random_samples)}"
+                    )
 
             else:
                 # === Subsequent Rounds: Gaussian Focusing ===
@@ -361,12 +384,18 @@ class MonteCarloEvidenceSampling:
                 valid_seeds = [s for s in top_seeds if s.score >= 4.0]
 
                 if not valid_seeds:
-                    logger.warning("No high-value regions found, attempting global random sampling again...")
-                    current_samples = self._sample_stratified_supplement(self.samples_per_round)
+                    logger.warning(
+                        "No high-value regions found, attempting global random sampling again..."
+                    )
+                    current_samples = self._sample_stratified_supplement(
+                        self.samples_per_round
+                    )
                 else:
                     max_score = valid_seeds[0].score
                     if self.verbose:
-                        logger.info(f"Focusing: Based on {len(valid_seeds)} seeds (Max Score: {max_score})")
+                        logger.info(
+                            f"Focusing: Based on {len(valid_seeds)} seeds (Max Score: {max_score})"
+                        )
                     current_samples = self._sample_gaussian(valid_seeds, r)
 
             if not current_samples and self.verbose:
@@ -377,16 +406,19 @@ class MonteCarloEvidenceSampling:
 
                 for s in evaluated:
                     logger.info(
-                        f"  [Pos {s.start_idx:6d} | Src: {s.source:8s}] Score: {s.score} | {s.reasoning[:30]}...")
+                        f"  [Pos {s.start_idx:6d} | Src: {s.source:8s}] Score: {s.score} | {s.reasoning[:30]}..."
+                    )
 
             # Sort and update seeds
             all_candidates.sort(key=lambda x: x.score, reverse=True)
-            top_seeds = all_candidates[:self.top_k_seeds]
+            top_seeds = all_candidates[: self.top_k_seeds]
 
             # Early stopping check
             if top_seeds and top_seeds[0].score >= confidence_threshold:
                 if self.verbose:
-                    logger.info(f">> High confidence target found (Score >= {confidence_threshold}), stopping early.")
+                    logger.info(
+                        f">> High confidence target found (Score >= {confidence_threshold}), stopping early."
+                    )
                 break
 
         # --- Final Result Processing ---
@@ -399,7 +431,7 @@ class MonteCarloEvidenceSampling:
                 best_content_snippet="",
                 start_idx=-1,
                 end_idx=-1,
-                reasoning="No candidates generated."
+                reasoning="No candidates generated.",
             )
 
         best = all_candidates[0]
@@ -414,7 +446,7 @@ class MonteCarloEvidenceSampling:
                 best_content_snippet=best.content,
                 start_idx=best.start_idx,
                 end_idx=best.end_idx,
-                reasoning=best.reasoning
+                reasoning=best.reasoning,
             )
 
         # Generate final answer
@@ -427,5 +459,5 @@ class MonteCarloEvidenceSampling:
             best_content_snippet=best.content,
             start_idx=best.start_idx,
             end_idx=best.end_idx,
-            reasoning=best.reasoning
+            reasoning=best.reasoning,
         )
