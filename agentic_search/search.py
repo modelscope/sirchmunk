@@ -178,6 +178,7 @@ class AgenticSearch(BaseSearch):
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         verbose: Optional[bool] = True,
+        grep_timeout: Optional[float] = 60.0,
     ) -> str:
 
         # Build request
@@ -214,8 +215,7 @@ class AgenticSearch(BaseSearch):
         logger.info("Enhanced query keywords: {}", query_keywords)
 
         # Get grep results
-        # TODO: async for fastapi
-        grep_results: List[Dict[str, Any]] = self.grep_retriever.retrieve(
+        grep_results: List[Dict[str, Any]] = await self.grep_retriever.retrieve(
             terms=list(query_keywords.keys()),
             path=search_path,
             logic="or",
@@ -235,6 +235,7 @@ class AgenticSearch(BaseSearch):
             rga_no_cache=False,
             rga_cache_max_blob_len=10000000,
             rga_cache_path=None,
+            timeout=grep_timeout,
         )
 
         # Example: [{"path": "", "matches": [], "lines": [], "total_matches": 20, "total_score": 39.70}, ...]
