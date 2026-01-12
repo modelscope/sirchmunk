@@ -106,7 +106,7 @@ class MonteCarloEvidenceSampling:
         return start, end, self.doc[start:end]
 
     def _get_fuzzy_anchors(
-        self, query: str, threshold: float = 30.0
+        self, query: str, keywords: List[str] = None, threshold: float = 10.0
     ) -> List[SampleWindow]:
         """
         Uses RapidFuzz to find heuristic anchors based on literal matching.
@@ -114,13 +114,15 @@ class MonteCarloEvidenceSampling:
 
         Args:
             query (str): The user query string.
-            threshold (float): Minimum similarity score to consider.
+            threshold (float): Minimum similarity score to consider between 0-100.
 
         Returns:
             List[SampleWindow]: List of sampled windows based on fuzzy matching.
         """
         if self.verbose:
             logger.info(">> Executing RapidFuzz heuristic pre-filtering...")
+
+        keywords = keywords or []
 
         # 1. Build sliding window slices (stride = half window size)
         stride = self.probe_window // 2
@@ -132,11 +134,13 @@ class MonteCarloEvidenceSampling:
         chunk_texts = [self.doc[i : i + self.probe_window] for i in chunks]
 
         # 3. Extract most similar fragments
+        # TODO: try to add `fuzz.token_set_ratio` for multi-channel retrieval
         results = process.extract(
-            query=query,
-            choices=chunk_texts,
-            scorer=fuzz.partial_token_set_ratio,
-            limit=self.fuzz_candidates_num * 2,
+            query=f"{query} {' '.join(keywords)}".strip(),
+            choices=list(chunk_texts),
+            scorer=fuzz.token_set_ratio,
+            limit=int(self.fuzz_candidates_num * 2),
+            score_cutoff=None,
         )
 
         anchors = []
@@ -347,13 +351,18 @@ class MonteCarloEvidenceSampling:
         return await self.llm.achat([{"role": "user", "content": prompt}])
 
     async def get_roi(
-        self, query: str, confidence_threshold: float = 8.5, top_k: int = 3
+        self,
+        query: str,
+        keywords: Dict[str, float] = None,
+        confidence_threshold: float = 8.5,
+        top_k: int = 5,
     ) -> RoiResult:
         """
         Get the Region of Interest (ROI) for the given query.
 
         Args:
             query (str): The user query string.
+            keywords (Dict[str, float], optional): Enhanced keywords with IDF scores for fuzzy matching.
             confidence_threshold (float): Confidence score threshold for early stopping.
             top_k (int): Number of top snippets to consider for final summary.
 
@@ -364,7 +373,9 @@ class MonteCarloEvidenceSampling:
             logger.info(
                 f"=== Starting Hybrid Adaptive Retrieval (Doc Len: {self.doc_len}) ==="
             )
-            logger.info(f"Query: {query}")
+            logger.info(f"Query: {query}, optional keywords: {keywords}")
+
+        keywords = keywords or {}
 
         all_candidates: List[SampleWindow] = []
         top_seeds: List[SampleWindow] = []
@@ -378,7 +389,11 @@ class MonteCarloEvidenceSampling:
                 # === Strategy: Fuzz Anchors + Random Supplement ===
                 # 1. Get Fuzz Anchors (Exploitation)
                 # Note: Fuzz is CPU bound, so we keep it sync
-                fuzz_samples = self._get_fuzzy_anchors(query)
+                fuzz_samples = self._get_fuzzy_anchors(
+                    query=query,
+                    keywords=list(keywords.keys()),
+                    threshold=10.0,
+                )
                 current_samples.extend(fuzz_samples)
 
                 # 2. Supplement with Random Sampling (Exploration)

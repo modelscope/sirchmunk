@@ -3,7 +3,17 @@ import os
 from pathlib import Path
 from typing import Union
 
+from kreuzberg import ExtractionResult, extract_file
 from loguru import logger
+
+
+async def fast_extract(file_path: Union[str, Path]) -> ExtractionResult:
+    """
+    Automatically detects and extracts text content from various file formats like docx, pptx, pdf, xlsx.
+    """
+    result: ExtractionResult = await extract_file(file_path=file_path)
+
+    return result
 
 
 def get_fast_hash(file_path: Union[str, Path], sample_size: int = 8192):
@@ -45,6 +55,8 @@ class StorageStructure:
     CACHE_DIR = ".cache"
 
     METADATA_DIR = "metadata"
+
+    GREP_DIR = "rga"
 
     KNOWLEDGE_DIR = "knowledge"
 

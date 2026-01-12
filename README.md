@@ -102,8 +102,13 @@ v0.0.1 Key features:
 * 增加对title的match和加权
 * 蒙特卡洛采样过程，对于超大文件，需要单独处理，提高效率
 * 蒙特卡洛采样过程，对应在应用端增加文件片段预览功能；在chat输出区域嵌入预览窗口
+* ripgrep-all： 支持多种文件格式的检索（pdf、word、excel、ppt、markdown等），默认需要开启缓存
+* 多类型文件支持：
+  * heavy模式下，默认统一使用markitdown，结合cache机制进行深度解析  [P1]
+  * fast模式下，默认使用kreuzberg，配合缓存功能进行快速扫描  --- 已基本满足需求
 
 v0.0.2 Key Features:
+* 支持web reader, 利用fetch工具，读取url内容并缓存（如github文档等，支持recursive），实现在线文档的检索
 * 多模态检索
 * evidence和knowledge cluster中增加原文的位置引用
 * 考虑跨语种的召回能力
