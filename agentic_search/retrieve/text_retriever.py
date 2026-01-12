@@ -1,3 +1,4 @@
+import asyncio
 import json
 import math
 import re
@@ -7,8 +8,11 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from loguru import logger
 
+from ..utils.constants import GREP_CONCURRENT_LIMIT
 from ..utils.file_utils import StorageStructure
 from .base import BaseRetriever
+
+RGA_SEMAPHORE = asyncio.Semaphore(value=GREP_CONCURRENT_LIMIT)
 
 
 class GrepRetriever(BaseRetriever):
@@ -48,7 +52,7 @@ class GrepRetriever(BaseRetriever):
 
         install_rga()
 
-    def retrieve(
+    async def retrieve(
         self,
         terms: Union[str, List[str]],
         path: Optional[str] = None,
@@ -71,6 +75,7 @@ class GrepRetriever(BaseRetriever):
         rga_no_cache: bool = False,
         rga_cache_max_blob_len: int = 10000000,
         rga_cache_path: Optional[Union[str, Path]] = None,
+        timeout: float = 60.0,
     ) -> List[Dict[str, Any]]:
         """Search for terms in files using ripgrep-all, supporting AND/OR/NOT logic.
 
@@ -99,6 +104,7 @@ class GrepRetriever(BaseRetriever):
             rga_cache_max_blob_len: Max blob length for rga cache (`--rga-cache-max-blob-len`). Defaults to 10MB.
             rga_cache_path: Custom path for rga cache (`--rga-cache-path`).
                 If None, then set the path to `/path/to/your_work_path/.cache/rga`
+            timeout: Maximum time in seconds to wait for the search to complete.
 
         Returns:
             List of match objects (from `rga --json`), or list of {'path': str, 'count': int} if `count_only=True`.
@@ -117,7 +123,7 @@ class GrepRetriever(BaseRetriever):
 
         # Multi-term logic routing
         if logic == "or":
-            results, retrieve_pattern = self._retrieve_or(
+            results, retrieve_pattern = await self._retrieve_or(
                 terms=terms,
                 path=path,
                 case_sensitive=case_sensitive,
@@ -135,9 +141,10 @@ class GrepRetriever(BaseRetriever):
                 rga_no_cache=rga_no_cache,
                 rga_cache_max_blob_len=rga_cache_max_blob_len,
                 rga_cache_path=rga_cache_path,
+                timeout=timeout,
             )
         elif logic == "and":
-            results = self._retrieve_and(
+            results = await self._retrieve_and(
                 terms=terms,
                 path=path,
                 case_sensitive=case_sensitive,
@@ -155,13 +162,14 @@ class GrepRetriever(BaseRetriever):
                 rga_no_cache=rga_no_cache,
                 rga_cache_max_blob_len=rga_cache_max_blob_len,
                 rga_cache_path=rga_cache_path,
+                timeout=timeout,
             )
         elif logic == "not":
             if len(terms) < 2:
                 raise ValueError(
                     "logic='not' requires at least two terms: [positive, negative1, ...]"
                 )
-            results = self._retrieve_not(
+            results = await self._retrieve_not(
                 positive=terms[0],
                 negatives=terms[1:],
                 path=path,
@@ -179,6 +187,7 @@ class GrepRetriever(BaseRetriever):
                 rga_no_cache=rga_no_cache,
                 rga_cache_max_blob_len=rga_cache_max_blob_len,
                 rga_cache_path=rga_cache_path,
+                timeout=timeout,
             )
         else:
             raise ValueError(
@@ -289,7 +298,7 @@ class GrepRetriever(BaseRetriever):
         return results
 
     @staticmethod
-    def _run_rg(
+    def _run_rga(
         args: List[str], json_output: bool = True
     ) -> subprocess.CompletedProcess:
         """Run ripgrep-all with given arguments.
@@ -305,8 +314,6 @@ class GrepRetriever(BaseRetriever):
         if json_output:
             cmd.append("--json")
         cmd.extend(args)
-
-        print(cmd)
 
         try:
             result = subprocess.run(
@@ -331,7 +338,65 @@ class GrepRetriever(BaseRetriever):
             )
 
     @staticmethod
-    def _retrieve_single(**kwargs) -> List[Dict[str, Any]]:
+    async def _run_rga_async(
+        args: List[str], json_output: bool = True, timeout: float = 60.0
+    ) -> Dict[str, Any]:
+        cmd = ["rga", "--no-config"]
+        if json_output:
+            cmd.append("--json")
+        cmd.extend(args)
+
+        # 1. Wait for a slot in the semaphore with a timeout
+        # We await the acquire() method specifically.
+        try:
+            await asyncio.wait_for(RGA_SEMAPHORE.acquire(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"rga search timed out while waiting for a queue slot ({timeout}s)."
+            )
+
+        try:
+            # 2. Launch and wait for the subprocess
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+
+            try:
+                # 3. Wait for the process to finish
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout
+                )
+
+                stdout_str = stdout.decode().strip()
+                stderr_str = stderr.decode().strip()
+                returncode = process.returncode
+
+                # 4. Parse JSON Lines
+                parsed_stdout = stdout_str
+                if json_output and returncode in (0, 1) and stdout_str:
+                    parsed_stdout = [
+                        json.loads(line) for line in stdout_str.splitlines() if line
+                    ]
+
+                return {
+                    "returncode": returncode,
+                    "stdout": parsed_stdout,
+                    "stderr": stderr_str,
+                }
+            except asyncio.TimeoutError:
+                # Kill the process if it times out
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                raise RuntimeError(f"rga process execution timed out ({timeout}s).")
+
+        finally:
+            # 5. release the semaphore slot
+            RGA_SEMAPHORE.release()
+
+    @staticmethod
+    async def _retrieve_single(**kwargs) -> List[Dict[str, Any]]:
         """Wrapper for original single-pattern search (extracted for reuse)."""
         pattern = kwargs.pop("pattern")
         args = []
@@ -350,6 +415,7 @@ class GrepRetriever(BaseRetriever):
         exclude = kwargs.get("exclude")
         file_type = kwargs.get("file_type")
         path = kwargs.get("path")
+        timeout = kwargs.get("timeout", 60.0)
 
         # Additional ripgrep-all args
         rga_no_cache = kwargs.get("rga_no_cache", False)
@@ -407,9 +473,14 @@ class GrepRetriever(BaseRetriever):
             else:
                 raise TypeError(f"Unsupported type for 'path': {type(path)}")
 
-        result = GrepRetriever._run_rg(args, json_output=not count_only)
+        # keys: returncode, stdout, stderr
+        result: Dict[str, Any] = await GrepRetriever._run_rga_async(
+            args=args,
+            json_output=not count_only,
+            timeout=timeout,
+        )
 
-        if result.returncode == 0:
+        if result["returncode"] == 0:
             if count_only:
                 counts = []
                 for line in result.stdout.strip().splitlines():
@@ -418,16 +489,16 @@ class GrepRetriever(BaseRetriever):
                         counts.append({"path": p, "count": int(c)})
                 return counts
             else:
-                return result.stdout
-        elif result.returncode == 1:
+                return result["stdout"]
+        elif result["returncode"] == 1:
             return []
         else:
             raise RuntimeError(
-                f"ripgrep-all failed (exit {result.returncode}): {result.stderr.strip()}"
+                f"ripgrep-all failed (exit {result['returncode']}): {result['stderr'].strip()}"
             )
 
     @staticmethod
-    def _retrieve_or(
+    async def _retrieve_or(
         terms: List[str],
         **kwargs,
     ) -> (List[Dict[str, Any]], str):
@@ -445,10 +516,12 @@ class GrepRetriever(BaseRetriever):
             pattern = "|".join(f"(?:{term})" for term in terms)
             kwargs["literal"] = False
 
-        return GrepRetriever._retrieve_single(pattern=pattern, **kwargs), pattern
+        result = await GrepRetriever._retrieve_single(pattern=pattern, **kwargs)
+
+        return result, pattern
 
     @staticmethod
-    def _retrieve_and(
+    async def _retrieve_and(
         terms: List[str],
         match_same_line: bool = False,
         **kwargs,
@@ -457,7 +530,7 @@ class GrepRetriever(BaseRetriever):
         count_only = kwargs.get("count_only", False)
 
         # Step 1: Get files containing first term
-        first_matches = GrepRetriever._retrieve_single(pattern=terms[0], **kwargs)
+        first_matches = await GrepRetriever._retrieve_single(pattern=terms[0], **kwargs)
         if not first_matches:
             return []
 
@@ -491,7 +564,7 @@ class GrepRetriever(BaseRetriever):
             for f in files_with_first:
                 valid = True
                 for term in terms[1:]:
-                    res = GrepRetriever._retrieve_single(
+                    res = await GrepRetriever._retrieve_single(
                         pattern=term,
                         path=f,
                         count_only=count_only,
@@ -513,12 +586,12 @@ class GrepRetriever(BaseRetriever):
             kwargs["pattern"] = target_term
             for f in qualifying_files:
                 kwargs["path"] = f
-                matches = GrepRetriever._retrieve_single(**kwargs)
+                matches = await GrepRetriever._retrieve_single(**kwargs)
                 all_matches.extend(matches)
             return all_matches
 
     @staticmethod
-    def _retrieve_not(
+    async def _retrieve_not(
         positive: str,
         negatives: List[str],
         **kwargs,
@@ -527,7 +600,7 @@ class GrepRetriever(BaseRetriever):
         # count_only = kwargs.get("count_only", False)
 
         # Step 1: Get matches for positive term
-        pos_matches = GrepRetriever._retrieve_single(pattern=positive, **kwargs)
+        pos_matches = await GrepRetriever._retrieve_single(pattern=positive, **kwargs)
         if not pos_matches:
             return []
 
@@ -540,7 +613,7 @@ class GrepRetriever(BaseRetriever):
 
         for f in files_with_positive:
             for neg in negatives:
-                res = GrepRetriever._retrieve_single(
+                res = await GrepRetriever._retrieve_single(
                     pattern=neg,
                     path=f,
                     count_only=True,
@@ -563,7 +636,7 @@ class GrepRetriever(BaseRetriever):
 
         return kept_matches
 
-    def list_files(
+    async def list_files(
         self,
         path: Optional[str] = None,
         *,
@@ -606,10 +679,15 @@ class GrepRetriever(BaseRetriever):
         if path:
             args.append(path)
 
-        result = GrepRetriever._run_rg(args, json_output=False)
-        if result.returncode not in (0, 1):
-            raise RuntimeError(f"ripgrep-all --files failed: {result.stderr.strip()}")
-        return result.stdout.strip().splitlines() if result.stdout.strip() else []
+        result: Dict[str, Any] = await GrepRetriever._run_rga_async(
+            args, json_output=False
+        )
+        if result["returncode"] not in (0, 1):
+            raise RuntimeError(
+                f"ripgrep-all --files failed: {result['stderr'].strip()}"
+            )
+
+        return result["stdout"].strip().splitlines() if result["stdout"].strip() else []
 
     def file_types(self) -> Dict[str, List[str]]:
         """List supported file types and their associated globs/extensions.
@@ -631,7 +709,7 @@ class GrepRetriever(BaseRetriever):
                 types[name.strip()] = [g.strip() for g in globs.split(",") if g.strip()]
         return types
 
-    def replace(
+    async def replace(
         self,
         pattern: str,
         replacement: str,
@@ -689,10 +767,13 @@ class GrepRetriever(BaseRetriever):
         if path:
             args.append(path)
 
-        result = GrepRetriever._run_rg(args)
-        if result.returncode not in (0, 1):
-            raise RuntimeError(f"ripgrep-all replace failed: {result.stderr.strip()}")
-        return result.stdout
+        result = await GrepRetriever._run_rga_async(args)
+        if result["returncode"] not in (0, 1):
+            raise RuntimeError(
+                f"ripgrep-all replace failed: {result['stderr'].strip()}"
+            )
+
+        return result["stdout"]
 
     def version(self) -> str:
         """Get ripgrep-all version string.
