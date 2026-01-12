@@ -7,28 +7,46 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from loguru import logger
 
+from ..utils.file_utils import StorageStructure
 from .base import BaseRetriever
 
 
 class GrepRetriever(BaseRetriever):
-    """A Python wrapper for ripgrep (rg), exposing its functionality via static methods.
+    """A Python wrapper for ripgrep-all (rga), exposing its functionality via static methods.
 
     All methods are static and return parsed results. JSON output is preferred where possible
     for reliable parsing. Shell injection is mitigated by using `subprocess.run` with `shell=False`
     and explicit argument lists.
+
+    For more information about ripgrep-all, please refer to `https://github.com/phiresky/ripgrep-all`
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, work_path: Union[str, Path], **kwargs):
         super().__init__()
 
-    @staticmethod
-    def init_ripgrep():
-        """
-        Ensure ripgrep is installed. If not, install it.
-        """
-        from agentic_search.utils.installation_utils import install_ripgrep
+        self.work_path: Path = Path(work_path)
+        self.rga_cache: Path = (
+            self.work_path / StorageStructure.CACHE_DIR / StorageStructure.GREP_DIR
+        )
+        self.rga_cache.mkdir(parents=True, exist_ok=True)
 
-        install_ripgrep()
+        try:
+            self.init_rga()
+        except Exception as e:
+            logger.warning(
+                f"Failed to initialize `ripgrep-all`: {e}"
+                f"You can try to install it manually, refer to `https://github.com/phiresky/ripgrep-all`."
+            )
+            raise
+
+    @staticmethod
+    def init_rga():
+        """
+        Ensure ripgrep-all is installed. If not, install it.
+        """
+        from agentic_search.utils.installation_utils import install_rga
+
+        install_rga()
 
     def retrieve(
         self,
@@ -50,8 +68,11 @@ class GrepRetriever(BaseRetriever):
         with_filename: bool = True,
         rank: bool = True,
         rank_kwargs: Optional[Dict] = None,
+        rga_no_cache: bool = False,
+        rga_cache_max_blob_len: int = 10000000,
+        rga_cache_path: Optional[Union[str, Path]] = None,
     ) -> List[Dict[str, Any]]:
-        """Search for terms in files using ripgrep, supporting AND/OR/NOT logic.
+        """Search for terms in files using ripgrep-all, supporting AND/OR/NOT logic.
 
         Args:
             terms: Single pattern (str) or list of patterns (List[str]).
@@ -74,9 +95,13 @@ class GrepRetriever(BaseRetriever):
             with_filename: Show filenames (`-H`, default True).
             rank: If True, rerank results by relevance score.
             rank_kwargs: Additional kwargs for ranking (see `_rerank_results`).
+            rga_no_cache: If True, disable rga caching (`--rga-no-cache`).
+            rga_cache_max_blob_len: Max blob length for rga cache (`--rga-cache-max-blob-len`). Defaults to 10MB.
+            rga_cache_path: Custom path for rga cache (`--rga-cache-path`).
+                If None, then set the path to `/path/to/your_work_path/.cache/rga`
 
         Returns:
-            List of match objects (from `rg --json`), or list of {'path': str, 'count': int} if `count_only=True`.
+            List of match objects (from `rga --json`), or list of {'path': str, 'count': int} if `count_only=True`.
             For "and"/"not", matches correspond to the **last term** (or first, if only one) in qualifying files/lines.
         """
         results: List[Dict[str, Any]] = []
@@ -86,6 +111,9 @@ class GrepRetriever(BaseRetriever):
             terms = [terms]
         if not terms:
             return results
+
+        rga_cache_path = rga_cache_path or self.rga_cache
+        rga_cache_path = str(Path(rga_cache_path).resolve())
 
         # Multi-term logic routing
         if logic == "or":
@@ -104,6 +132,9 @@ class GrepRetriever(BaseRetriever):
                 count_only=count_only,
                 line_number=line_number,
                 with_filename=with_filename,
+                rga_no_cache=rga_no_cache,
+                rga_cache_max_blob_len=rga_cache_max_blob_len,
+                rga_cache_path=rga_cache_path,
             )
         elif logic == "and":
             results = self._retrieve_and(
@@ -121,6 +152,9 @@ class GrepRetriever(BaseRetriever):
                 line_number=line_number,
                 with_filename=with_filename,
                 match_same_line=False,  # file-level AND (most useful)
+                rga_no_cache=rga_no_cache,
+                rga_cache_max_blob_len=rga_cache_max_blob_len,
+                rga_cache_path=rga_cache_path,
             )
         elif logic == "not":
             if len(terms) < 2:
@@ -142,6 +176,9 @@ class GrepRetriever(BaseRetriever):
                 count_only=count_only,
                 line_number=line_number,
                 with_filename=with_filename,
+                rga_no_cache=rga_no_cache,
+                rga_cache_max_blob_len=rga_cache_max_blob_len,
+                rga_cache_path=rga_cache_path,
             )
         else:
             raise ValueError(
@@ -255,16 +292,16 @@ class GrepRetriever(BaseRetriever):
     def _run_rg(
         args: List[str], json_output: bool = True
     ) -> subprocess.CompletedProcess:
-        """Run ripgrep with given arguments.
+        """Run ripgrep-all with given arguments.
 
         Args:
-            args: List of ripgrep CLI arguments.
+            args: List of ripgrep-all CLI arguments.
             json_output: If True, forces `--json` and parses stdout as JSON Lines.
 
         Returns:
             CompletedProcess object with parsed stdout (as list of dicts if json_output=True).
         """
-        cmd = ["rg", "--no-config"]  # disable user config for reproducibility
+        cmd = ["rga", "--no-config"]  # disable user config for reproducibility
         if json_output:
             cmd.append("--json")
         cmd.extend(args)
@@ -284,11 +321,11 @@ class GrepRetriever(BaseRetriever):
             return result
         except FileNotFoundError:
             raise RuntimeError(
-                "ripgrep ('rg') not found. Please install ripgrep first."
+                "ripgrep-all ('rga') not found. Please install ripgrep-all first."
             )
         except json.JSONDecodeError as e:
             raise RuntimeError(
-                f"Failed to parse ripgrep JSON output: {e}\nRaw output: {result.stdout}"
+                f"Failed to parse ripgrep-all JSON output: {e}\nRaw output: {result.stdout}"
             )
 
     @staticmethod
@@ -297,6 +334,7 @@ class GrepRetriever(BaseRetriever):
         pattern = kwargs.pop("pattern")
         args = []
 
+        # Basic ripgrep-all args
         regex = kwargs.get("regex", True)
         literal = kwargs.get("literal", False)
         case_sensitive = kwargs.get("case_sensitive", False)
@@ -309,8 +347,16 @@ class GrepRetriever(BaseRetriever):
         include = kwargs.get("include")
         exclude = kwargs.get("exclude")
         file_type = kwargs.get("file_type")
-        path = kwargs.get("path")  # str | Path | List[str|Path] | None
+        path = kwargs.get("path")
 
+        # Additional ripgrep-all args
+        rga_no_cache = kwargs.get("rga_no_cache", False)
+        rga_cache_max_blob_len = kwargs.get(
+            "rga_cache_max_blob_len", 10000000
+        )  # Default 10MB
+        rga_cache_path = kwargs.get("rga_cache_path")
+
+        # Build argument list
         if not regex:
             literal = True
         if literal:
@@ -340,6 +386,14 @@ class GrepRetriever(BaseRetriever):
         if file_type:
             args.extend(["-t", file_type])
 
+        if rga_no_cache:
+            args.append("--rga-no-cache")
+
+        args.extend(["--rga-cache-max-blob-len", str(rga_cache_max_blob_len)])
+
+        if rga_cache_path:
+            args.extend(["--rga-cache-path", str(rga_cache_path)])
+
         args.append(pattern)
 
         if path is not None:
@@ -367,7 +421,7 @@ class GrepRetriever(BaseRetriever):
             return []
         else:
             raise RuntimeError(
-                f"ripgrep failed (exit {result.returncode}): {result.stderr.strip()}"
+                f"ripgrep-all failed (exit {result.returncode}): {result.stderr.strip()}"
             )
 
     @staticmethod
@@ -375,7 +429,7 @@ class GrepRetriever(BaseRetriever):
         terms: List[str],
         **kwargs,
     ) -> (List[Dict[str, Any]], str):
-        """OR: Match any term — simply concatenate with | (ripgrep supports alternation)."""
+        """OR: Match any term — simply concatenate with | (ripgrep-all supports alternation)."""
         # Escape terms if literal mode
         literal = kwargs.get("literal", False)
         if literal:
@@ -518,7 +572,7 @@ class GrepRetriever(BaseRetriever):
         hidden: bool = False,
         follow_symlinks: bool = False,
     ) -> List[str]:
-        """List files that would be searched by ripgrep (like `rg --files`).
+        """List files that would be searched by ripgrep-all (like `rga --files`).
 
         Args:
             path: Path to list files in.
@@ -552,7 +606,7 @@ class GrepRetriever(BaseRetriever):
 
         result = GrepRetriever._run_rg(args, json_output=False)
         if result.returncode not in (0, 1):
-            raise RuntimeError(f"ripgrep --files failed: {result.stderr.strip()}")
+            raise RuntimeError(f"ripgrep-all --files failed: {result.stderr.strip()}")
         return result.stdout.strip().splitlines() if result.stdout.strip() else []
 
     def file_types(self) -> Dict[str, List[str]]:
@@ -562,7 +616,7 @@ class GrepRetriever(BaseRetriever):
             Dict mapping type names (e.g., 'python') to list of globs (e.g., ['*.py', '*.pyi']).
         """
         result = subprocess.run(
-            ["rg", "--type-list"],
+            ["rga", "--type-list"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -589,7 +643,7 @@ class GrepRetriever(BaseRetriever):
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """Perform search-and-replace using ripgrep (via `--replace`).
+        """Perform search-and-replace using ripgrep-all (via `--replace`).
 
         Caution: This modifies files in-place if dry_run=False.
 
@@ -605,7 +659,7 @@ class GrepRetriever(BaseRetriever):
             include/exclude: Globs to include/exclude.
 
         Returns:
-            List of replacement events (from `rg --json` output).
+            List of replacement events (from `rga --json` output).
         """
         args = ["--replace", replacement]
         if dry_run:
@@ -635,17 +689,17 @@ class GrepRetriever(BaseRetriever):
 
         result = GrepRetriever._run_rg(args)
         if result.returncode not in (0, 1):
-            raise RuntimeError(f"ripgrep replace failed: {result.stderr.strip()}")
+            raise RuntimeError(f"ripgrep-all replace failed: {result.stderr.strip()}")
         return result.stdout
 
     def version(self) -> str:
-        """Get ripgrep version string.
+        """Get ripgrep-all version string.
 
         Returns:
-            Version string (e.g., "ripgrep 14.1.0").
+            Version string.
         """
         result = subprocess.run(
-            ["rg", "--version"],
+            ["rga", "--version"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -655,16 +709,16 @@ class GrepRetriever(BaseRetriever):
 
     def supports_feature(self, feature: str) -> bool:
         """
-        Check if ripgrep supports a given feature (e.g., 'pcre2', 'json').
+        Check if ripgrep-all supports a given feature (e.g., 'pcre2', 'json').
 
         Args:
             feature: Feature name (e.g., 'json', 'pcre2', 'lz4').
 
         Returns:
-            True if feature is available in this rg build.
+            True if feature is available in this rga build.
         """
         result = subprocess.run(
-            ["rg", "--help"],
+            ["rga", "--help"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -805,7 +859,7 @@ class GrepRetriever(BaseRetriever):
         raw_results: List[Dict[str, Any]], limit: int = 50
     ) -> List[Dict[str, Any]]:
         """
-        Merge ripgrep --json output into a structured per-file result list.
+        Merge ripgrep-all --json output into a structured per-file result list.
 
         This function:
           - Groups 'match' entries by file path (bounded by 'begin' and 'end' events).
@@ -815,7 +869,7 @@ class GrepRetriever(BaseRetriever):
           - Returns a list of unified file results.
 
         Args:
-            raw_results: List of parsed JSON objects from `rg --json` output.
+            raw_results: List of parsed JSON objects from `rga --json` output.
             limit: Maximum number of match items to keep per file (default: 50).
 
         Returns:

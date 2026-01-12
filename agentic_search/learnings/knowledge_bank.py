@@ -83,9 +83,10 @@ class KnowledgeBank:
         self,
         request: Request,
         retrieved_infos: List[Dict[str, Any]],
+        keywords: Dict[str, float] = None,
         top_k_files: Optional[int] = 3,
         top_k_snippets: Optional[int] = 5,
-        confidence_threshold: Optional[float] = 8.5,
+        confidence_threshold: Optional[float] = 8.0,
         verbose: bool = True,
     ) -> Union[KnowledgeCluster, None]:
         """Build a knowledge cluster from retrieved information and metadata dynamically."""
@@ -97,6 +98,8 @@ class KnowledgeBank:
             return None
 
         retrieved_infos = retrieved_infos[:top_k_files]
+
+        keywords = keywords or {}
 
         # Get evidence units (regions of interest) from raw retrieved infos
         evidences: List[EvidenceUnit] = []
@@ -114,6 +117,7 @@ class KnowledgeBank:
             roi_result: RoiResult = asyncio.run(
                 sampler.get_roi(
                     query=request.get_user_input(),
+                    keywords=keywords,
                     confidence_threshold=confidence_threshold,
                     top_k=top_k_snippets,
                 )

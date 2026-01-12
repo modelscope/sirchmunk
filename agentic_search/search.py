@@ -35,7 +35,7 @@ class AgenticSearch(BaseSearch):
 
         self.llm: OpenAIChat = llm
 
-        self.grep_retriever: GrepRetriever = GrepRetriever()
+        self.grep_retriever: GrepRetriever = GrepRetriever(work_path=self.work_path)
 
         self.knowledge_bank = KnowledgeBank(llm=self.llm, work_path=self.work_path)
 
@@ -251,10 +251,14 @@ class AgenticSearch(BaseSearch):
         cluster = self.knowledge_bank.build(
             request=request,
             retrieved_infos=grep_results,
+            keywords=query_keywords,
             top_k_files=top_k_files,
             top_k_snippets=5,
             verbose=verbose,
         )
+
+        if cluster is None:
+            return f"No relevant information found for the query: {query}"
 
         self.knowledge_bank.update(cluster=cluster)
         self.knowledge_bank.save(cluster=cluster)

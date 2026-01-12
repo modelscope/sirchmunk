@@ -46,6 +46,8 @@ class StorageStructure:
 
     METADATA_DIR = "metadata"
 
+    GREP_DIR = "rga"
+
     KNOWLEDGE_DIR = "knowledge"
 
     COGNITION_DIR = "cognition"
