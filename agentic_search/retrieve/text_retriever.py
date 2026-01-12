@@ -306,6 +306,8 @@ class GrepRetriever(BaseRetriever):
             cmd.append("--json")
         cmd.extend(args)
 
+        print(cmd)
+
         try:
             result = subprocess.run(
                 cmd,
@@ -389,10 +391,10 @@ class GrepRetriever(BaseRetriever):
         if rga_no_cache:
             args.append("--rga-no-cache")
 
-        args.extend(["--rga-cache-max-blob-len", str(rga_cache_max_blob_len)])
+        args.extend([f"--rga-cache-max-blob-len={str(rga_cache_max_blob_len)}"])
 
         if rga_cache_path:
-            args.extend(["--rga-cache-path", str(rga_cache_path)])
+            args.extend([f"--rga-cache-path={str(rga_cache_path)}"])
 
         args.append(pattern)
 

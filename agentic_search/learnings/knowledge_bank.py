@@ -1,4 +1,3 @@
-import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +20,7 @@ from agentic_search.schema.knowledge import (
 from agentic_search.schema.metadata import FileInfo
 from agentic_search.schema.request import Request
 from agentic_search.storage.knowledge_storage import KnowledgeStorage
-from agentic_search.utils.file_utils import StorageStructure
+from agentic_search.utils.file_utils import StorageStructure, fast_extract
 from agentic_search.utils.utils import extract_fields
 
 # In-memory knowledge storage, keyed by cluster ID
@@ -79,7 +78,7 @@ class KnowledgeBank:
 
         return FileInfo.from_dict(info=metadata_content)
 
-    def build(
+    async def build(
         self,
         request: Request,
         retrieved_infos: List[Dict[str, Any]],
@@ -107,20 +106,19 @@ class KnowledgeBank:
             file_path_or_url: str = info["path"]
 
             # TODO: handle more file types; deal with large files; Async adaptive
-            with open(file_path_or_url, "r", encoding="utf-8") as f:
-                file_content = f.read()
+            extraction_result = await fast_extract(file_path=file_path_or_url)
+            doc_content: str = extraction_result.content
+
             sampler = MonteCarloEvidenceSampling(
                 llm=self.llm,
-                doc_content=file_content,
+                doc_content=doc_content,
                 verbose=verbose,
             )
-            roi_result: RoiResult = asyncio.run(
-                sampler.get_roi(
-                    query=request.get_user_input(),
-                    keywords=keywords,
-                    confidence_threshold=confidence_threshold,
-                    top_k=top_k_snippets,
-                )
+            roi_result: RoiResult = await sampler.get_roi(
+                query=request.get_user_input(),
+                keywords=keywords,
+                confidence_threshold=confidence_threshold,
+                top_k=top_k_snippets,
             )
 
             evidence_unit = EvidenceUnit(
@@ -147,7 +145,7 @@ class KnowledgeBank:
             evidences="\n\n".join(evidence_contents),
         )
 
-        evidence_summary_response: str = self.llm.chat(
+        evidence_summary_response: str = await self.llm.achat(
             messages=[{"role": "user", "content": evidence_summary_prompt}],
             stream=True,
         )
@@ -184,13 +182,13 @@ class KnowledgeBank:
 
         return cluster
 
-    def get(self, cluster_id: str) -> Optional[KnowledgeCluster]:
+    async def get(self, cluster_id: str) -> Optional[KnowledgeCluster]:
         """
         Get knowledge cluster by ID.
         """
         return _KNOWLEDGE_MAP.get(cluster_id, None)
 
-    def update(self, cluster: KnowledgeCluster):
+    async def update(self, cluster: KnowledgeCluster):
         """
         Update or add a knowledge cluster in the in-memory storage.
         """
@@ -198,25 +196,25 @@ class KnowledgeBank:
         if cluster is not None:
             _KNOWLEDGE_MAP[cluster.id] = cluster
 
-    def save(self, cluster: KnowledgeCluster):
+    async def save(self, cluster: KnowledgeCluster):
         """
         Save a knowledge cluster to persistent storage.
         """
         self.knowledge_storage.insert_cluster(cluster=cluster)
 
-    def merge(self, clusters: List[KnowledgeCluster]) -> KnowledgeCluster:
+    async def merge(self, clusters: List[KnowledgeCluster]) -> KnowledgeCluster:
         """
         Merge multiple similar knowledge clusters into a single cluster.
         """
         ...
 
-    def split(self, cluster: KnowledgeCluster) -> List[KnowledgeCluster]:
+    async def split(self, cluster: KnowledgeCluster) -> List[KnowledgeCluster]:
         """
         Split a knowledge cluster into more focused clusters.
         """
         ...
 
-    def remove(self, cluster_id: str) -> None:
+    async def remove(self, cluster_id: str) -> None:
         """
         Remove a knowledge cluster by ID from the in-memory storage.
         """
@@ -227,13 +225,13 @@ class KnowledgeBank:
                 "Knowledge cluster with ID {} not found for removal.", cluster_id
             )
 
-    def clear(self) -> None:
+    async def clear(self) -> None:
         """
         Clear all knowledge clusters from the in-memory storage.
         """
         _KNOWLEDGE_MAP.clear()
 
-    def find(self, query: str) -> List[KnowledgeCluster]:
+    async def find(self, query: str) -> List[KnowledgeCluster]:
         """
         Find knowledge clusters relevant to the query.  TODO ...
         """

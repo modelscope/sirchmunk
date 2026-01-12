@@ -11,6 +11,7 @@ from agentic_search.learnings.knowledge_bank import KnowledgeBank
 from agentic_search.llm.openai import OpenAIChat
 from agentic_search.llm.prompts import QUERY_KEYWORDS_EXTRACTION, SEARCH_RESULT_SUMMARY
 from agentic_search.retrieve.text_retriever import GrepRetriever
+from agentic_search.schema.knowledge import KnowledgeCluster
 from agentic_search.schema.request import ContentItem, ImageURL, Message, Request
 from agentic_search.utils.file_utils import get_fast_hash
 from agentic_search.utils.utils import (
@@ -166,7 +167,7 @@ class AgenticSearch(BaseSearch):
 
         return results
 
-    def search(
+    async def search(
         self,
         query: str,
         search_path: Union[str, Path],
@@ -203,7 +204,7 @@ class AgenticSearch(BaseSearch):
         )
 
         # Get enhanced query keywords with IDF scores
-        resp_keywords: str = self.llm.chat(
+        resp_keywords: str = await self.llm.achat(
             messages=request.to_payload(prompt_template=QUERY_KEYWORDS_EXTRACTION),
             stream=False,
         )
@@ -213,6 +214,7 @@ class AgenticSearch(BaseSearch):
         logger.info("Enhanced query keywords: {}", query_keywords)
 
         # Get grep results
+        # TODO: async for fastapi
         grep_results: List[Dict[str, Any]] = self.grep_retriever.retrieve(
             terms=list(query_keywords.keys()),
             path=search_path,
@@ -230,6 +232,9 @@ class AgenticSearch(BaseSearch):
             line_number=True,
             with_filename=True,
             rank=True,
+            rga_no_cache=False,
+            rga_cache_max_blob_len=10000000,
+            rga_cache_path=None,
         )
 
         # Example: [{"path": "", "matches": [], "lines": [], "total_matches": 20, "total_score": 39.70}, ...]
@@ -248,7 +253,7 @@ class AgenticSearch(BaseSearch):
         # Build knowledge cluster
         if verbose:
             logger.info("Building knowledge cluster...")
-        cluster = self.knowledge_bank.build(
+        cluster: KnowledgeCluster = await self.knowledge_bank.build(
             request=request,
             retrieved_infos=grep_results,
             keywords=query_keywords,
@@ -260,8 +265,8 @@ class AgenticSearch(BaseSearch):
         if cluster is None:
             return f"No relevant information found for the query: {query}"
 
-        self.knowledge_bank.update(cluster=cluster)
-        self.knowledge_bank.save(cluster=cluster)
+        # self.knowledge_bank.update(cluster=cluster)
+        # self.knowledge_bank.save(cluster=cluster)
 
         if self.verbose:
             logger.info(json.dumps(cluster.to_dict(), ensure_ascii=False, indent=2))
@@ -281,7 +286,7 @@ class AgenticSearch(BaseSearch):
         )
 
         logger.info("Generating search result summary...")
-        search_result: str = self.llm.chat(
+        search_result: str = await self.llm.achat(
             messages=[{"role": "user", "content": result_sum_prompt}],
             stream=True,
         )
