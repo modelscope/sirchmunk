@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING, Any, Dict, List
 
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI, OpenAI
 
 if TYPE_CHECKING:
     pass
@@ -59,10 +59,7 @@ class OpenAIChat:
             str: The generated chat completion.
         """
         resp = self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            stream=stream,
-            **self._kwargs
+            model=self._model, messages=messages, stream=stream, **self._kwargs
         )
 
         res_content: str = ""
@@ -97,10 +94,7 @@ class OpenAIChat:
             str: The generated chat completion.
         """
         resp = await self._async_client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            stream=stream,
-            **self._kwargs
+            model=self._model, messages=messages, stream=stream, **self._kwargs
         )
 
         res_content: str = ""

@@ -2,19 +2,22 @@
 import ast
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from loguru import logger
 
-from agentic_search.base import BaseSearch
-from agentic_search.learnings.knowledge_bank import KnowledgeBank
-from agentic_search.llm.openai import OpenAIChat
-from agentic_search.llm.prompts import QUERY_KEYWORDS_EXTRACTION, SEARCH_RESULT_SUMMARY
-from agentic_search.retrieve.text_retriever import GrepRetriever
-from agentic_search.schema.knowledge import KnowledgeCluster
-from agentic_search.schema.request import ContentItem, ImageURL, Message, Request
-from agentic_search.utils.file_utils import get_fast_hash
-from agentic_search.utils.utils import (
+from src.agentic_search.base import BaseSearch
+from src.agentic_search.learnings.knowledge_bank import KnowledgeBank
+from src.agentic_search.llm.openai import OpenAIChat
+from src.agentic_search.llm.prompts import (
+    QUERY_KEYWORDS_EXTRACTION,
+    SEARCH_RESULT_SUMMARY,
+)
+from src.agentic_search.retrieve.text_retriever import GrepRetriever
+from src.agentic_search.schema.knowledge import KnowledgeCluster
+from src.agentic_search.schema.request import ContentItem, ImageURL, Message, Request
+from src.agentic_search.utils.file_utils import get_fast_hash
+from src.agentic_search.utils.utils import (
     KeywordValidation,
     extract_fields,
     log_tf_norm_penalty,
@@ -171,6 +174,7 @@ class AgenticSearch(BaseSearch):
         self,
         query: str,
         search_path: Union[str, Path],
+        mode: Literal["fast", "deep"] = "deep",  # TODO
         *,
         images: Optional[list] = None,
         max_depth: Optional[int] = 5,

@@ -1,6 +1,6 @@
 from typing import List, Union
 
-from agentic_search.scan.base import BaseScanner
+from src.agentic_search.scan.base import BaseScanner
 
 
 class WebScanner(BaseScanner):

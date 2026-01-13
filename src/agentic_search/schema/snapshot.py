@@ -7,9 +7,9 @@ from typing import Any, List, Optional, Union
 
 from loguru import logger
 
-from agentic_search.insight.text_insights import TextInsights
-from agentic_search.llm.openai import OpenAIChat
-from agentic_search.utils.tokenizer_util import TokenizerUtil
+from src.agentic_search.insight.text_insights import TextInsights
+from src.agentic_search.llm.openai import OpenAIChat
+from src.agentic_search.utils.tokenizer_util import TokenizerUtil
 
 
 @dataclass

@@ -4,8 +4,8 @@ from typing import Any, Dict, Iterator, List, Tuple, Union
 import msgpack
 from loguru import logger
 
-from agentic_search.schema.knowledge import KnowledgeCluster
-from agentic_search.utils.file_utils import StorageStructure
+from src.agentic_search.schema.knowledge import KnowledgeCluster
+from src.agentic_search.utils.file_utils import StorageStructure
 
 from .base import Storage
 
