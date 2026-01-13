@@ -1,88 +1,106 @@
 # Web Frontend
 
-The Web frontend is a Next.js 16 application that provides the user interface for the DeepTutor system.
+The Web frontend is a Next.js application that provides the user interface for the OpenCowork system.
 
 ## 📋 Overview
 
 The frontend provides:
 
-- Dashboard with activity tracking
-- Knowledge base management
-- Problem solving interface
-- Question generation interface
-- Research interface
-- Guided learning interface
-- Co-Writer interface
-- Notebook management
-- Idea generation interface
+- Interactive chat interface with AI assistant
+- Knowledge base management and document upload
+- Problem solving with multi-agent reasoning
+- Deep research reports with comprehensive analysis
+- Notebook management for organizing content
+- System monitoring and analytics
+- Settings and configuration management
+- History tracking for all activities
 
 ## 🏗️ Architecture
 
 ```
 web/
 ├── app/                      # Next.js app directory
-│   ├── page.tsx             # Dashboard (home page)
-│   ├── layout.tsx            # Root layout
-│   ├── globals.css           # Global styles
-│   ├── knowledge/            # Knowledge base pages
-│   ├── solver/               # Problem solving pages
-│   ├── question/             # Question generation pages
-│   ├── research/             # Research pages
-│   ├── guide/                # Guided learning pages
-│   ├── co_writer/            # Co-Writer pages
-│   ├── notebook/             # Notebook pages
-│   ├── ideagen/              # Idea generation pages
-│   └── settings/             # Settings pages
+│   ├── page.tsx             # Home page with chat interface
+│   ├── layout.tsx            # Root layout with sidebar
+│   ├── globals.css           # Global styles and themes
+│   ├── history/              # Activity history pages
+│   ├── knowledge/            # Knowledge base management
+│   ├── solver/               # Problem solving interface
+│   ├── research/             # Research tools and reports
+│   ├── notebook/             # Notebook management
+│   ├── monitor/              # System monitoring dashboard
+│   └── settings/             # Settings and configuration
 ├── components/               # React components
-│   ├── Sidebar.tsx           # Navigation sidebar
-│   ├── SystemStatus.tsx      # System status indicator
-│   ├── ActivityDetail.tsx    # Activity detail view
-│   ├── CoWriterEditor.tsx    # Co-Writer editor
-│   ├── AddToNotebookModal.tsx # Add to notebook modal
-│   └── ui/                   # UI components
+│   ├── Sidebar.tsx           # Main navigation sidebar
+│   ├── RightSidebar.tsx      # Hub files and quick actions
+│   ├── SystemStatus.tsx      # System health indicator
+│   ├── ActivityDetail.tsx    # Activity detail modal
+│   ├── ChatSessionDetail.tsx # Chat session viewer
+│   ├── AddToNotebookModal.tsx # Add content to notebook
+│   ├── NotebookImportModal.tsx # Import notebook records
+│   ├── ThemeScript.tsx       # Theme initialization
+│   ├── Mermaid.tsx           # Mermaid diagram renderer
+│   ├── research/             # Research-specific components
+│   │   ├── ActiveTaskDetail.tsx
+│   │   ├── ResearchDashboard.tsx
+│   │   └── TaskGrid.tsx
+│   └── ui/                   # Reusable UI components
 │       ├── Button.tsx
 │       └── Modal.tsx
-├── context/                  # React context
+├── context/                  # React context providers
 │   └── GlobalContext.tsx     # Global state management
-├── lib/                      # Utilities
-│   └── api.ts                # API client
-├── package.json              # Dependencies
-├── tsconfig.json             # TypeScript configuration
-├── tailwind.config.js        # Tailwind CSS configuration
-└── postcss.config.js         # PostCSS configuration
+├── hooks/                    # Custom React hooks
+│   ├── useTheme.ts           # Theme management
+│   ├── useQuestionReducer.ts # Question generation state
+│   └── useResearchReducer.ts # Research workflow state
+├── lib/                      # Utility libraries
+│   ├── api.ts                # API client configuration
+│   ├── i18n.ts               # Internationalization
+│   ├── latex.ts              # LaTeX processing
+│   ├── theme.ts              # Theme utilities
+│   ├── debounce.ts           # Debounce utility
+│   └── pdfExport.ts          # PDF export functionality
+├── types/                    # TypeScript type definitions
+│   └── research.ts           # Research-related types
+└── public/                   # Static assets
+    └── logo.png              # Application logo
 ```
 
 ## 🛠️ Technology Stack
 
-- **Framework**: Next.js 16 (App Router + Turbopack)
+- **Framework**: Next.js (App Router)
 - **Runtime**: React 19
 - **Language**: TypeScript
-- **Styling**: Tailwind CSS
+- **Styling**: Tailwind CSS with dark mode support
 - **UI Components**: Custom components with Lucide React icons
-- **Markdown**: react-markdown with KaTeX for math
-- **PDF Export**: jsPDF + html2canvas
-- **Animations**: Framer Motion 11
+- **Markdown**: react-markdown with KaTeX for mathematical expressions
+- **PDF Export**: jsPDF + html2canvas for document generation
+- **Charts**: Mermaid for diagram rendering
+- **State Management**: React Context with custom hooks
+- **Internationalization**: Built-in i18n support (English/Chinese)
 
-## 📦 Dependencies
+## 📦 Key Features
 
-### Core Dependencies
+### 🎨 Modern UI/UX
+- **Dark/Light Theme**: Automatic theme switching with system preference detection
+- **Responsive Design**: Mobile-first approach with adaptive layouts
+- **Smooth Animations**: Micro-interactions and transitions for better UX
+- **Accessibility**: WCAG compliant with keyboard navigation support
 
-```json
-{
-  "next": "^16.1.1",
-  "react": "^19.0.0",
-  "react-dom": "^19.0.0",
-  "react-markdown": "^9.0.1",
-  "rehype-katex": "^7.0.1",
-  "remark-math": "^6.0.0",
-  "lucide-react": "^0.460.0",
-  "framer-motion": "^11.15.0",
-  "jspdf": "^2.5.2",
-  "html2canvas": "^1.4.1"
-}
-```
+### 🔧 Core Functionality
+- **Real-time Chat**: WebSocket-based chat with streaming responses
+- **Knowledge Search**: Intelligent search with auto-suggestions
+- **File Management**: Document upload, processing, and organization
+- **Multi-language**: Support for English and Chinese interfaces
+- **Export Options**: PDF, Markdown, and other format exports
 
 ## 🚀 Getting Started
+
+### Prerequisites
+
+- Node.js 18+
+- npm or yarn package manager
+- Backend API server running on port 8001
 
 ### Installation
 
@@ -97,9 +115,7 @@ npm install
 npm run dev
 ```
 
-This uses **Turbopack** by default for faster development builds.
-
-The frontend will be available at `http://localhost:3782` (or port configured in `config/main.yaml`).
+The development server will start on `http://localhost:3000` with hot reload enabled.
 
 ### Build
 
@@ -108,240 +124,268 @@ npm run build
 npm start
 ```
 
-## 📁 Key Components
+### Environment Configuration
 
-### Dashboard (app/page.tsx)
+Create a `.env.local` file in the web directory:
 
-Main dashboard showing:
+```bash
+# API Configuration
+NEXT_PUBLIC_API_BASE=http://localhost:8001
+NEXT_PUBLIC_WS_BASE=ws://localhost:8001
 
-- Recent activities
-- Knowledge base overview
-- Notebook statistics
-- Quick access to modules
+# Optional: Custom port
+PORT=3000
+```
 
-### API Client (lib/api.ts)
+## 📁 Key Pages & Components
 
-Centralized API client for backend communication:
+### 🏠 Home Page (app/page.tsx)
+Interactive chat interface featuring:
+- **Smart Chat**: Real-time conversation with AI assistant
+- **Knowledge Integration**: RAG-enabled search with file suggestions
+- **Web Search**: External information retrieval
+- **Quick Actions**: Direct access to problem solving and research tools
+- **Responsive Design**: Adaptive layout for different screen sizes
+
+### 📚 Knowledge Base (app/knowledge/page.tsx)
+Document management system with:
+- **File Upload**: Drag-and-drop document upload with progress tracking
+- **Knowledge Base Creation**: Organize documents into themed collections
+- **Processing Status**: Real-time upload and processing feedback
+- **Document Management**: View, delete, and organize uploaded files
+
+### 🔬 Research Tools (app/research/page.tsx)
+Comprehensive research platform including:
+- **Multi-Agent Research**: Parallel research task execution
+- **Research Dashboard**: Visual progress tracking with task grid
+- **Report Generation**: Structured research reports with citations
+- **Export Options**: PDF and Markdown export capabilities
+
+### 📖 Notebook System (app/notebook/page.tsx)
+Content organization and management:
+- **Record Management**: Create, edit, and organize research records
+- **Import/Export**: Cross-notebook record sharing and Markdown export
+- **Search & Filter**: Advanced content discovery
+- **Categorization**: Organize records by type and topic
+
+### 📊 System Monitor (app/monitor/page.tsx)
+Real-time system analytics:
+- **Task Monitoring**: Track active and completed tasks
+- **File Management**: Monitor file processing status
+- **Token Usage**: Track API usage and costs
+- **System Health**: Monitor system performance metrics
+
+### ⚙️ Settings (app/settings/page.tsx)
+Comprehensive configuration management:
+- **LLM Providers**: Configure and test AI model providers
+- **Environment Variables**: Manage system configuration
+- **UI Preferences**: Theme, language, and interface settings
+- **System Testing**: Health checks and service validation
+
+## 🔌 API Integration
+
+The frontend integrates with the backend API through both REST endpoints and WebSocket connections.
+
+### REST API Examples
 
 ```typescript
 import { apiUrl } from "@/lib/api";
 
-// REST API
-const response = await fetch(`${apiUrl}/knowledge/list`);
+// Fetch knowledge bases
+const response = await fetch(`${apiUrl}/api/v1/knowledge/list`);
+const knowledgeBases = await response.json();
 
-// WebSocket
-const ws = new WebSocket(`${wsUrl}/api/v1/solve`);
-```
-
-### Global Context (context/GlobalContext.tsx)
-
-Manages global state:
-
-- System status
-- User preferences
-- Active sessions
-
-### Sidebar (components/Sidebar.tsx)
-
-Navigation sidebar with links to all modules.
-
-## 🔌 API Integration
-
-### REST API
-
-```typescript
-const response = await fetch(`${apiUrl}/api/v1/knowledge/list`, {
-  method: "GET",
-  headers: {
-    "Content-Type": "application/json",
-  },
+// Upload documents
+const formData = new FormData();
+formData.append('files', file);
+const uploadResponse = await fetch(`${apiUrl}/api/v1/knowledge/${kbName}/upload`, {
+  method: 'POST',
+  body: formData
 });
-const data = await response.json();
+
+// Get system status
+const statusResponse = await fetch(`${apiUrl}/api/v1/settings/system/status`);
+const systemStatus = await statusResponse.json();
 ```
 
-### WebSocket
+### WebSocket Integration
 
 ```typescript
-const ws = new WebSocket(`${wsUrl}/api/v1/solve`);
+import { wsUrl } from "@/lib/api";
 
-ws.onopen = () => {
-  ws.send(
-    JSON.stringify({
-      question: "Your question",
-      kb_name: "ai_textbook",
-    }),
-  );
-};
-
-ws.onmessage = (event) => {
+// Chat WebSocket
+const chatWs = new WebSocket(`${wsUrl}/api/v1/chat/ws`);
+chatWs.onmessage = (event) => {
   const data = JSON.parse(event.data);
-  // Handle streaming data
+  if (data.type === 'message') {
+    // Handle streaming chat response
+  }
 };
 
-ws.onerror = (error) => {
-  console.error("WebSocket error:", error);
-};
-
-ws.onclose = () => {
-  console.log("WebSocket closed");
+// Research WebSocket
+const researchWs = new WebSocket(`${wsUrl}/api/v1/research/ws`);
+researchWs.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  if (data.type === 'progress') {
+    // Update research progress
+  }
 };
 ```
 
-## 🎨 Styling
+## 🎨 Styling & Theming
 
-### Tailwind CSS
+### Tailwind CSS Configuration
+The project uses Tailwind CSS with custom configuration for:
+- **Color Palette**: Carefully selected colors for light and dark themes
+- **Typography**: Optimized font scales and line heights
+- **Spacing**: Consistent spacing system throughout the application
+- **Animations**: Custom animations for smooth interactions
 
-The project uses Tailwind CSS for styling. Configuration in `tailwind.config.js`.
+### Dark Mode Support
+Comprehensive dark mode implementation:
+- **System Preference Detection**: Automatically detects user's system theme
+- **Manual Toggle**: Users can override system preference
+- **Persistent Storage**: Theme preference saved in localStorage
+- **Smooth Transitions**: Animated theme switching
 
-### Global Styles
+### Global Styles (app/globals.css)
+- **CSS Variables**: Dynamic color variables for theme switching
+- **Base Styles**: Consistent typography and element styling
+- **Utility Classes**: Custom utilities for common patterns
+- **Component Styles**: Specialized styles for complex components
 
-Global styles in `app/globals.css` including:
+## 🗺️ Page Routes & Navigation
 
-- Base styles
-- Custom CSS variables
-- Utility classes
+### Core Pages
+- **`/`** - Home page with interactive chat interface
+- **`/history`** - Activity history and chat session management
+- **`/knowledge`** - Knowledge base and document management
+- **`/notebook`** - Content organization and record management
+- **`/settings`** - System configuration and preferences
 
-## 📱 Pages
+### Specialized Tools
+- **`/solver`** - Multi-agent problem solving interface
+- **`/research`** - Deep research tools with comprehensive reporting
+- **`/monitor`** - System monitoring and analytics dashboard
 
-### Knowledge Base (`/knowledge`)
+### Navigation Features
+- **Collapsible Sidebar**: Space-efficient navigation with tooltips
+- **Breadcrumb Navigation**: Clear page hierarchy indication
+- **Quick Actions**: Contextual shortcuts to related functionality
+- **Search Integration**: Global search across all content types
 
-- List knowledge bases
-- Create new knowledge base
-- Upload documents
-- View knowledge base details
+## ⚙️ Configuration & Customization
 
-### Problem Solving (`/solver`)
-
-- Input problem
-- Select knowledge base
-- Real-time solving with streaming
-- View solution
-
-### Question Generation (`/question`)
-
-- Configure question requirements
-- Generate questions
-- View generated questions
-
-### Research (`/research`)
-
-- Input research topic
-- Select research mode
-- Real-time research progress
-- View research report
-
-### Guided Learning (`/guide`)
-
-- Select notebook
-- Generate learning plan
-- Interactive learning pages
-- Q&A during learning
-
-### Co-Writer (`/co_writer`)
-
-- Markdown editor
-- AI text editing
-- Automatic annotation
-- TTS narration
-
-### Notebook (`/notebook`)
-
-- List notebooks
-- Create/edit notebooks
-- View notebook records
-- Organize records
-
-### Idea Generation (`/ideagen`)
-
-- Select notebook
-- Generate research ideas
-- View generated ideas
-
-## ⚙️ Configuration
-
-### API Base URL
-
-Configured in `lib/api.ts`:
+### API Configuration (lib/api.ts)
+Centralized API endpoint management:
 
 ```typescript
-export const apiUrl =
-  process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8001";
-export const wsUrl = process.env.NEXT_PUBLIC_WS_BASE || "ws://localhost:8001";
+export function apiUrl(path: string): string {
+  const base = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8001";
+  return `${base}${path}`;
+}
+
+export function wsUrl(path: string): string {
+  const base = process.env.NEXT_PUBLIC_WS_BASE || "ws://localhost:8001";
+  return `${base}${path}`;
+}
 ```
 
-Set in `.env.local`:
+### Internationalization (lib/i18n.ts)
+Multi-language support with:
+- **Language Detection**: Automatic language preference detection
+- **Translation Keys**: Structured translation key system
+- **Dynamic Loading**: Efficient translation resource loading
+- **Fallback Support**: Graceful fallback to default language
 
+### Theme System (lib/theme.ts)
+Advanced theming capabilities:
+- **CSS Variable Management**: Dynamic theme variable updates
+- **Theme Persistence**: localStorage-based theme preference storage
+- **System Integration**: Automatic system theme detection
+- **Smooth Transitions**: Animated theme switching
+
+## 🔗 Integration & Architecture
+
+### Backend Integration
+- **API Server**: FastAPI backend (`src/api/`) providing REST and WebSocket endpoints
+- **Database**: DuckDB integration (`src/db/`) for data persistence
+- **Real-time Communication**: WebSocket connections for streaming responses
+
+### State Management Architecture
+- **Global Context**: Centralized state management with React Context
+- **Custom Hooks**: Specialized hooks for complex state logic
+- **Local Storage**: Persistent user preferences and settings
+- **Real-time Updates**: WebSocket-driven state synchronization
+
+## 🛠️ Development Guidelines
+
+### Code Organization
+```typescript
+// Follow consistent import order
+import React from 'react';
+import { NextPage } from 'next';
+import { useGlobal } from '@/context/GlobalContext';
+import { apiUrl } from '@/lib/api';
+import ComponentName from '@/components/ComponentName';
+```
+
+### Component Development
+- **TypeScript First**: All components use TypeScript with proper typing
+- **Responsive Design**: Mobile-first approach with Tailwind breakpoints
+- **Accessibility**: ARIA labels, keyboard navigation, and screen reader support
+- **Performance**: Lazy loading, memoization, and efficient re-renders
+
+### Styling Standards
+- **Tailwind Classes**: Use utility-first approach with consistent spacing
+- **Dark Mode**: Always implement both light and dark variants
+- **Animations**: Subtle transitions and micro-interactions
+- **Consistency**: Follow established design patterns and color schemes
+
+### Testing & Quality
+- **Type Safety**: Comprehensive TypeScript coverage
+- **Error Handling**: Graceful error states and user feedback
+- **Loading States**: Proper loading indicators and skeleton screens
+- **Performance**: Optimized bundle size and runtime performance
+
+## 🚀 Deployment & Production
+
+### Build Optimization
+- **Static Generation**: Optimized static assets and pages
+- **Code Splitting**: Automatic code splitting for better performance
+- **Image Optimization**: Next.js Image component with automatic optimization
+- **Bundle Analysis**: Built-in bundle analyzer for size optimization
+
+### Environment Setup
 ```bash
-NEXT_PUBLIC_API_BASE=http://localhost:8001
-NEXT_PUBLIC_WS_BASE=ws://localhost:8001
+# Production environment variables
+NEXT_PUBLIC_API_BASE=https://your-api-domain.com
+NEXT_PUBLIC_WS_BASE=wss://your-api-domain.com
+NODE_ENV=production
 ```
 
-### Next.js Configuration
+### Performance Features
+- **Lazy Loading**: Components and routes loaded on demand
+- **Caching**: Intelligent caching strategies for API responses
+- **Prefetching**: Automatic prefetching of likely navigation targets
+- **Compression**: Gzip compression for all static assets
 
-Key settings in `next.config.js`:
+## ⚠️ Important Notes
 
-```javascript
-const nextConfig = {
-  // Dev indicator position
-  devIndicators: {
-    position: "bottom-right",
-  },
-  // Turbopack configuration
-  turbopack: {
-    resolveAlias: {
-      cytoscape: "cytoscape/dist/cytoscape.cjs.js",
-    },
-  },
-  // Transpile packages
-  transpilePackages: ["mermaid"],
-};
-```
+### Security Considerations
+- **Environment Variables**: Use `NEXT_PUBLIC_` prefix only for client-safe variables
+- **API Security**: All API calls include proper error handling and validation
+- **XSS Protection**: Sanitized user input and secure markdown rendering
+- **CORS Configuration**: Backend CORS settings must allow frontend domain
 
-## 🔗 Related Modules
+### Browser Compatibility
+- **Modern Browsers**: Optimized for Chrome, Firefox, Safari, and Edge
+- **Progressive Enhancement**: Graceful degradation for older browsers
+- **Mobile Support**: Full responsive design with touch-friendly interactions
+- **Accessibility**: WCAG 2.1 AA compliance for screen readers and keyboard navigation
 
-- **Backend API**: `src/api/` - FastAPI backend
-- **Agents**: `src/agents/` - Agent implementations
-- **Config**: `config/` - Configuration files
-
-## 🛠️ Development
-
-### Adding a New Page
-
-1. Create page in `app/`:
-
-   ```typescript
-   // app/my-page/page.tsx
-   export default function MyPage() {
-     return <div>My Page</div>
-   }
-   ```
-
-2. Add navigation link in `components/Sidebar.tsx`
-
-### Adding a New Component
-
-1. Create component in `components/`:
-
-   ```typescript
-   // components/MyComponent.tsx
-   export default function MyComponent() {
-     return <div>My Component</div>
-   }
-   ```
-
-2. Export from `components/index.ts` if needed
-
-### Styling Guidelines
-
-- Use Tailwind CSS utility classes
-- Follow existing component patterns
-- Use Lucide React for icons
-- Maintain responsive design
-
-## ⚠️ Notes
-
-1. **API URL**: Ensure API base URL matches backend configuration
-2. **WebSocket**: WebSocket URL should use `wss://` for secure production environments (fallback to `ws://` for local development only)
-3. **CORS**: Backend must allow frontend origin in CORS settings
-4. **Environment Variables**: Use `NEXT_PUBLIC_` prefix for client-side variables
-5. **Turbopack**: Development mode uses Turbopack by default for faster builds
+### Development Best Practices
+- **Hot Reload**: Fast development with instant feedback
+- **Error Boundaries**: Comprehensive error handling and user feedback
+- **Type Safety**: Full TypeScript coverage with strict mode enabled
+- **Code Quality**: ESLint and Prettier integration for consistent code style
