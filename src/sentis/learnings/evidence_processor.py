@@ -8,8 +8,8 @@ from typing import Any, Dict, List, Set, Tuple
 from loguru import logger
 from rapidfuzz import fuzz, process
 
-from src.agentic_search.llm.openai import OpenAIChat
-from src.agentic_search.llm.prompts import EVALUATE_EVIDENCE_SAMPLE, ROI_RESULT_SUMMARY
+from sentis.llm.openai_chat import OpenAIChat
+from sentis.llm.prompts import EVALUATE_EVIDENCE_SAMPLE, ROI_RESULT_SUMMARY
 
 
 @dataclass

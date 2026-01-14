@@ -1,6 +1,6 @@
 from typing import List, Union
 
-from src.agentic_search.scan.base import BaseScanner
+from sentis.scan.base import BaseScanner
 
 
 class WebScanner(BaseScanner):

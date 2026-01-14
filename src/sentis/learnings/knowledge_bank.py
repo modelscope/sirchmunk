@@ -5,23 +5,23 @@ from typing import Any, Dict, List, Optional, Union
 
 from loguru import logger
 
-from src.agentic_search.learnings.evidence_processor import (
+from sentis.learnings.evidence_processor import (
     MonteCarloEvidenceSampling,
     RoiResult,
 )
-from src.agentic_search.llm.openai import OpenAIChat
-from src.agentic_search.llm.prompts import EVIDENCE_SUMMARY
-from src.agentic_search.schema.knowledge import (
+from sentis.llm.openai_chat import OpenAIChat
+from sentis.llm.prompts import EVIDENCE_SUMMARY
+from sentis.schema.knowledge import (
     AbstractionLevel,
     EvidenceUnit,
     KnowledgeCluster,
     Lifecycle,
 )
-from src.agentic_search.schema.metadata import FileInfo
-from src.agentic_search.schema.request import Request
-from src.agentic_search.storage.knowledge_storage import KnowledgeStorage
-from src.agentic_search.utils.file_utils import StorageStructure, fast_extract
-from src.agentic_search.utils.utils import extract_fields
+from sentis.schema.metadata import FileInfo
+from sentis.schema.request import Request
+from sentis.storage.knowledge_storage import KnowledgeStorage
+from sentis.utils.file_utils import StorageStructure, fast_extract
+from sentis.utils.utils import extract_fields
 
 # In-memory knowledge storage, keyed by cluster ID
 _KNOWLEDGE_MAP: Dict[str, KnowledgeCluster] = {}

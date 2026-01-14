@@ -1,14 +1,14 @@
 [project]
-name = "open-agentic-search"
+name = "sentis"
 dynamic = ["version", "dependencies", "optional-dependencies"]
-description = "Open-Agentic-Search: A native Agentic Search framework"
+description = "Sentis: From raw data to self-evolving real-time intelligence."
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {text = "Apache License 2.0"}
 authors = [
-  {name = "ModelScope team"},
+  {name = "ModelScope Team"},
   {email = "contact@modelscope.cn"}
 ]
-keywords = ["LLM", "Agentic", "Search", "RAG"]
+keywords = ["LLM", "Agentic", "Search", "RAG", "Indexless", "Self-evolving", "Real-time Intelligence", "Multi-modal"]
 requires-python = ">=3.10"
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -21,19 +21,11 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License"
 ]
 
-[tool.setuptools.dynamic]
-version = {attr = "agentic_search.version.__version__"}
-dependencies = {file = "requirements/framework.txt"}
-
-[tool.setuptools.dynamic.optional-dependencies]
-docs = {file = "requirements/docs.txt"}
-tests = {file = "requirements/tests.txt"}
-
 [project.urls]
-Homepage = "https://github.com/modelscope/open-agentic-search"
+Homepage = "https://github.com/modelscope/sentis"
 
 [project.scripts]
-agentic_search = "agentic_search.cli.cli:run_cmd"
+sentis = "sentis.cli.cli:run_cmd"
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]
@@ -42,13 +34,16 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 include-package-data = true
 
+[tool.setuptools.dynamic]
+version = {attr = "sentis.version.__version__"}
+
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["agentic_search*"]
+where = ["src"]
+include = ["sentis*"]
 
 [tool.black]
 line-length = 88
-target-version = ["py311"]
+target-version = ["py313"]
 include = "\\.pyi?$"
 exclude = '''
 /(
@@ -62,12 +57,12 @@ exclude = '''
   | buck-out
   | build
   | dist
-  | agentic_search/.*/__pycache__
+  | src/sentis/.*/__pycache__
 )/
 '''
 
 [tool.ruff]
 select = ["E", "W", "F", "I"]
 ignore = ["E501"]
-target-version = "py311"
+target-version = "py313"
 line-length = 88

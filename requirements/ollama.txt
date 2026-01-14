@@ -1,0 +1,6 @@
+uvloop
+httptools
+prometheus_client
+httpx
+httpx[http2]
+uvicorn

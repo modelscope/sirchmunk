@@ -7,9 +7,8 @@ from typing import Any, List, Optional, Union
 
 from loguru import logger
 
-from src.agentic_search.insight.text_insights import TextInsights
-from src.agentic_search.llm.openai import OpenAIChat
-from src.agentic_search.utils.tokenizer_util import TokenizerUtil
+from sentis.llm.openai_chat import OpenAIChat
+from sentis.utils.tokenizer_util import TokenizerUtil
 
 
 @dataclass
@@ -77,6 +76,8 @@ class TextSnapshot(Snapshot):
     MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
 
     def __init__(self, llm: Optional[OpenAIChat] = None, **kwargs):
+
+        from sentis.insight.text_insights import TextInsights
 
         super().__init__(llm=llm, **kwargs)
 

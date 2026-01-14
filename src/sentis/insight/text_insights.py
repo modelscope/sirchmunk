@@ -4,8 +4,8 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 from modelscope import snapshot_download
 
-from src.agentic_search.llm.openai import OpenAIChat
-from src.agentic_search.llm.prompts import (
+from sentis.llm.openai_chat import OpenAIChat
+from sentis.llm.prompts import (
     SNAPSHOT_KEYWORDS_EXTRACTION,
     SNAPSHOT_TOC_EXTRACTION,
 )

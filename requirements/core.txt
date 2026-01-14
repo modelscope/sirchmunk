@@ -1,17 +1,11 @@
 loguru
 fastapi
-uvicorn
 openai
 genson
 pillow
 pypdf
 pandas
 numpy
-uvloop
-httptools
-prometheus_client
-httpx
-httpx[http2]
 msgpack
 sentencepiece
 tqdm

@@ -6,18 +6,18 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from loguru import logger
 
-from src.agentic_search.base import BaseSearch
-from src.agentic_search.learnings.knowledge_bank import KnowledgeBank
-from src.agentic_search.llm.openai import OpenAIChat
-from src.agentic_search.llm.prompts import (
+from sentis.base import BaseSearch
+from sentis.learnings.knowledge_bank import KnowledgeBank
+from sentis.llm.openai_chat import OpenAIChat
+from sentis.llm.prompts import (
     QUERY_KEYWORDS_EXTRACTION,
     SEARCH_RESULT_SUMMARY,
 )
-from src.agentic_search.retrieve.text_retriever import GrepRetriever
-from src.agentic_search.schema.knowledge import KnowledgeCluster
-from src.agentic_search.schema.request import ContentItem, ImageURL, Message, Request
-from src.agentic_search.utils.file_utils import get_fast_hash
-from src.agentic_search.utils.utils import (
+from sentis.retrieve.text_retriever import GrepRetriever
+from sentis.schema.knowledge import KnowledgeCluster
+from sentis.schema.request import ContentItem, ImageURL, Message, Request
+from sentis.utils.file_utils import get_fast_hash
+from sentis.utils.utils import (
     KeywordValidation,
     extract_fields,
     log_tf_norm_penalty,

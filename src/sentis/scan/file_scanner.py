@@ -9,10 +9,10 @@ from typing import Any, Dict, List, Optional, Set, Union
 from loguru import logger
 from tqdm.auto import tqdm
 
-from src.agentic_search.llm.openai import OpenAIChat
-from src.agentic_search.scan.base import BaseScanner
-from src.agentic_search.schema.metadata import FileInfo, build_file_schema
-from src.agentic_search.utils.file_utils import StorageStructure
+from sentis.llm.openai_chat import OpenAIChat
+from sentis.scan.base import BaseScanner
+from sentis.schema.metadata import FileInfo, build_file_schema
+from sentis.utils.file_utils import StorageStructure
 
 METADATA_NAME = ".metadata"
 
