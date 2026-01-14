@@ -213,3 +213,44 @@ __marimo__/
 **/tmp/
 /temp/
 .DS_Store
+
+
+# Node modules
+node_modules/
+**/node_modules/
+
+# Next.js build output
+.next/
+web/.next/
+out/
+web/out/
+
+# ============================================
+# Database Files
+# ============================================
+*.db
+*.sqlite
+*.sqlite3
+
+# ============================================
+# Compressed Files
+# ============================================
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# ============================================
+# Reference Papers (large binary files)
+# ============================================
+# Keep structure but ignore large PDFs in reference_papers
+# question_agents/reference_papers/**/*.pdf
+
+# ============================================
+# Audio/Video Output (TTS generated)
+# ============================================
+*.mp3
+*.wav
+*.ogg
+!demo/*.mp4

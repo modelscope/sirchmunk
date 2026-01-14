@@ -1,0 +1,551 @@
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Load environment variables from .env file if it exists
+# This allows users to configure NEXT_PUBLIC_API_BASE for remote access
+project_root = Path(__file__).parent.parent
+env_files = [project_root / "DeepTutor.env", project_root / ".env"]
+
+for env_file in env_files:
+    if env_file.exists():
+        try:
+            from dotenv import load_dotenv
+
+            load_dotenv(env_file, override=False)
+            print(f"✅ Loaded environment from {env_file}")
+        except ImportError:
+            print("⚠️ python-dotenv not installed, skipping .env file loading")
+            break
+
+# Force unbuffered output for the main process
+os.environ["PYTHONUNBUFFERED"] = "1"
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+
+
+def print_flush(*args, **kwargs):
+    """Print with flush=True by default"""
+    kwargs.setdefault("flush", True)
+    print(*args, **kwargs)
+
+
+# Windows-specific: Use SetConsoleCtrlHandler to prevent Ctrl+C from propagating to children
+# and handle it only in the parent process
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+
+    # Define the handler function type
+    HANDLER_ROUTINE = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+    # Global flag to track if we received Ctrl+C
+    _ctrl_c_received = False
+
+    def _ctrl_handler(ctrl_type):
+        """Handle console control events on Windows."""
+        global _ctrl_c_received
+        if ctrl_type == 0:  # CTRL_C_EVENT
+            _ctrl_c_received = True
+            return True  # Return True to indicate we handled it
+        return False
+
+    # Keep a reference to prevent garbage collection
+    _handler = HANDLER_ROUTINE(_ctrl_handler)
+
+    def setup_windows_ctrl_handler():
+        """Set up Windows Ctrl+C handler to prevent propagation to children."""
+        # Add our handler
+        if not kernel32.SetConsoleCtrlHandler(_handler, True):
+            print_flush("⚠️ Warning: Failed to set console control handler")
+
+    def check_ctrl_c_received():
+        """Check if Ctrl+C was received."""
+        return _ctrl_c_received
+
+else:
+
+    def setup_windows_ctrl_handler():
+        pass
+
+    def check_ctrl_c_received():
+        return False
+
+
+def terminate_process_tree(process, name="Process", timeout=5):
+    """
+    Terminate a process and all its children (process group).
+
+    On Unix: Uses process group (PGID) to kill all children including uvicorn workers.
+    On Windows: Uses taskkill /T to kill the process tree.
+
+    Args:
+        process: subprocess.Popen object
+        name: Display name for logging
+        timeout: Seconds to wait for graceful termination before SIGKILL
+    """
+    if process is None or process.poll() is not None:
+        return  # Process already terminated
+
+    pid = process.pid
+    print_flush(f"🛑 Stopping {name} (PID: {pid})...")
+
+    try:
+        if os.name == "nt":
+            # Windows: Use taskkill with /T to kill the entire process tree
+            # /F = Force termination, /T = Kill child processes too
+            result = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            print(result)
+            # Wait for process to actually terminate
+            try:
+                process.wait(timeout=timeout)
+                print_flush(f"   ✅ {name} terminated successfully")
+            except subprocess.TimeoutExpired:
+                print_flush(f"   ⚠️ {name} did not terminate within {timeout}s")
+                # Force kill via process.kill() as backup
+                try:
+                    process.kill()
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
+        else:
+            # Unix: Kill the entire process group
+            pgid = os.getpgid(pid)
+
+            # Step 1: Send SIGTERM to the process group for graceful shutdown
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+                print_flush(f"   Sent SIGTERM to process group {pgid}")
+            except ProcessLookupError:
+                print_flush(f"   Process group {pgid} already terminated")
+                return
+            except PermissionError:
+                # Fallback: try to terminate just the main process
+                print_flush("   Cannot kill process group, trying single process")
+                process.terminate()
+
+            # Step 2: Wait for graceful termination
+            try:
+                process.wait(timeout=timeout)
+                print_flush(f"   ✅ {name} terminated gracefully")
+                return
+            except subprocess.TimeoutExpired:
+                print_flush(
+                    f"   ⚠️ {name} did not terminate in {timeout}s, sending SIGKILL..."
+                )
+
+            # Step 3: Force kill with SIGKILL
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+                process.wait(timeout=2)
+                print_flush(f"   ✅ {name} force killed")
+            except ProcessLookupError:
+                print_flush("   Process group already terminated")
+            except Exception as e:
+                print_flush(f"   ⚠️ Error during force kill: {e}")
+                # Last resort: try to kill just the main process
+                try:
+                    process.kill()
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
+
+    except Exception as e:
+        print_flush(f"   ⚠️ Error stopping {name}: {e}")
+
+
+def get_backend_port():
+    """Get backend port from environment or use default"""
+    return int(os.environ.get("BACKEND_PORT", os.environ.get("API_PORT", "8001")))
+
+
+def get_frontend_port():
+    """Get frontend port from environment or use default"""
+    return int(os.environ.get("FRONTEND_PORT", os.environ.get("PORT", "3782")))
+
+
+def start_backend():
+    print_flush(f"🚀 Starting FastAPI Backend using {sys.executable}...")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(base_dir)
+    print_flush(f"📁 Working directory: {base_dir}")
+    print_flush(f"📁 Project root: {project_root}")
+
+    # Ensure project root is in Python path
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    # Get port from environment variable (default: 8001)
+    backend_port = get_backend_port()
+    print_flush(f"✅ Backend port: {backend_port}")
+
+    # Check if src.api.main can be imported
+    try:
+
+        print_flush("✅ Backend module import successful")
+    except Exception as e:
+        print_flush(f"❌ Failed to import backend module: {e}")
+        import traceback
+
+        traceback.print_exc()
+        raise
+
+    # Use uvicorn to run the FastAPI application directly
+    cmd = [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        "src.api.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(backend_port),
+        "--reload",
+        "--log-level",
+        "info",
+    ]
+
+    # Set environment variables for encoding and unbuffered output
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    if os.name == "nt":
+        env["PYTHONLEGACYWINDOWSSTDIO"] = "0"
+
+    # Use start_new_session=True on Unix to create a new process group
+    # This allows us to kill all child processes (including uvicorn workers) at once
+    popen_kwargs = {
+        "cwd": project_root,  # Run in project root directory, not scripts directory
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "bufsize": 1,
+        "shell": False,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "env": env,
+    }
+
+    # On Unix, create a new session so we can kill the entire process group
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    else:
+        # On Windows, create a new process group so Ctrl+C doesn't propagate to children
+        # This prevents child processes from receiving Ctrl+C signals directly
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    process = subprocess.Popen(cmd, **popen_kwargs)
+
+    # Start a thread to output logs in real-time
+    import threading
+
+    def log_output():
+        try:
+            for line in iter(process.stdout.readline, ""):
+                if line:
+                    print_flush(f"[Backend]  {line.rstrip()}")
+        except Exception as e:
+            print_flush(f"[Backend]  Log output error: {e}")
+
+    log_thread = threading.Thread(target=log_output, daemon=True)
+    log_thread.start()
+
+    print_flush(f"✅ Backend process started (PID: {process.pid})")
+    if os.name != "nt":
+        print_flush(f"   Process group ID (PGID): {os.getpgid(process.pid)}")
+    return process
+
+
+def start_frontend():
+    print_flush("🚀 Starting Next.js Frontend...")
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    web_dir = os.path.join(project_root, "web")
+
+    # Get port from environment variable (default: 3782)
+    frontend_port = get_frontend_port()
+    print_flush(f"✅ Frontend port: {frontend_port}")
+
+    # Check if npm is available
+    npm_path = shutil.which("npm")
+    if not npm_path:
+        print_flush("❌ Error: 'npm' command not found!")
+        print_flush("   Please install Node.js and npm first.")
+        print_flush("   You can install it from: https://nodejs.org/")
+        print_flush("   Or use a package manager like Homebrew: brew install node")
+        raise RuntimeError("npm is not installed or not in PATH")
+
+    print_flush(f"✅ Found npm at: {npm_path}")
+
+    # Check if node_modules exists
+    if not os.path.exists(os.path.join(web_dir, "node_modules")):
+        print_flush("📦 Installing frontend dependencies...")
+        print_flush("   This may take a few minutes, please wait...")
+        try:
+            npm_cmd = shutil.which("npm") or "npm"
+            process = subprocess.Popen(
+                [npm_cmd, "install"],
+                cwd=web_dir,
+                shell=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+
+            for line in iter(process.stdout.readline, ""):
+                if line:
+                    if any(
+                        keyword in line.lower()
+                        for keyword in [
+                            "error",
+                            "failed",
+                            "added",
+                            "audited",
+                            "vulnerabilities",
+                        ]
+                    ):
+                        print_flush(f"   {line.rstrip()}")
+
+            process.wait()
+
+            if process.returncode != 0:
+                if os.path.exists(os.path.join(web_dir, "node_modules")):
+                    print_flush("✅ Frontend dependencies installed (with warnings)")
+                else:
+                    print_flush(
+                        f"❌ Failed to install frontend dependencies (exit code: {process.returncode})"
+                    )
+                    raise RuntimeError(
+                        f"npm install failed with exit code {process.returncode}"
+                    )
+            else:
+                print_flush("✅ Frontend dependencies installed successfully")
+        except Exception as e:
+            print_flush(f"❌ Failed to install frontend dependencies: {e}")
+            raise
+
+    print_flush("🚀 Starting Next.js development server...")
+    # Get backend port for frontend API configuration
+    backend_port = get_backend_port()
+
+    # Determine API base URL with priority:
+    # 1. NEXT_PUBLIC_API_BASE_EXTERNAL (for cloud/remote deployment)
+    # 2. NEXT_PUBLIC_API_BASE (custom API URL)
+    # 3. Default: http://localhost:{backend_port}
+    api_base_url = (
+        os.environ.get("NEXT_PUBLIC_API_BASE_EXTERNAL")
+        or os.environ.get("NEXT_PUBLIC_API_BASE")
+        or f"http://localhost:{backend_port}"
+    )
+
+    if os.environ.get("NEXT_PUBLIC_API_BASE_EXTERNAL"):
+        print_flush(f"📌 Using external API URL from env: {api_base_url}")
+    elif os.environ.get("NEXT_PUBLIC_API_BASE"):
+        print_flush(f"📌 Using custom API URL from env: {api_base_url}")
+    else:
+        print_flush(f"📌 Using default API URL: {api_base_url}")
+        print_flush("   💡 For remote access, set NEXT_PUBLIC_API_BASE in .env file")
+
+    # Generate/update .env.local file with port configuration
+    # This ensures Next.js can read the backend port even if environment variables are not passed
+    env_local_path = os.path.join(web_dir, ".env.local")
+    try:
+        with open(env_local_path, "w", encoding="utf-8") as f:
+            f.write("# ============================================\n")
+            f.write("# Auto-generated by start_web.py\n")
+            f.write("# ============================================\n")
+            f.write("# This file is automatically updated based on config/main.yaml\n")
+            f.write(
+                "# and environment variables (NEXT_PUBLIC_API_BASE, NEXT_PUBLIC_API_BASE_EXTERNAL)\n"
+            )
+            f.write("# \n")
+            f.write("# To configure for remote access, set in your .env file:\n")
+            f.write("#   NEXT_PUBLIC_API_BASE=http://your-server-ip:8001\n")
+            f.write("# ============================================\n\n")
+            f.write(f"NEXT_PUBLIC_API_BASE={api_base_url}\n")
+        print_flush(f"✅ Updated .env.local with API base: {api_base_url}")
+    except Exception as e:
+        print_flush(f"⚠️ Warning: Failed to update .env.local: {e}")
+        print_flush("   Continuing with environment variables only...")
+
+    # Set environment variables for Next.js (as backup)
+    env = os.environ.copy()
+    env["PORT"] = str(frontend_port)
+    env["NEXT_PUBLIC_API_BASE"] = api_base_url
+    # Set encoding environment variables for Windows
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    if os.name == "nt":
+        env["PYTHONLEGACYWINDOWSSTDIO"] = "0"
+
+    npm_cmd = shutil.which("npm") or "npm"
+
+    # Use start_new_session=True on Unix to create a new process group
+    # This allows us to kill all child processes (including Next.js workers) at once
+    popen_kwargs = {
+        "cwd": web_dir,
+        "shell": False,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "bufsize": 1,
+        "env": env,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+
+    # On Unix, create a new session so we can kill the entire process group
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    else:
+        # On Windows, create a new process group so Ctrl+C doesn't propagate to children
+        # This prevents npm from showing "Terminate batch job (Y/N)?" prompt
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    frontend_process = subprocess.Popen(
+        [npm_cmd, "run", "dev", "--", "-p", str(frontend_port)],
+        **popen_kwargs,
+    )
+
+    # Start a thread to output frontend logs in real-time
+    import threading
+
+    def log_frontend_output():
+        try:
+            for line in iter(frontend_process.stdout.readline, ""):
+                if line:
+                    print_flush(f"[Frontend] {line.rstrip()}")
+        except Exception as e:
+            print_flush(f"[Frontend] Log output error: {e}")
+
+    log_thread = threading.Thread(target=log_frontend_output, daemon=True)
+    log_thread.start()
+
+    print_flush(f"✅ Frontend process started (PID: {frontend_process.pid})")
+    if os.name != "nt":
+        print_flush(f"   Process group ID (PGID): {os.getpgid(frontend_process.pid)}")
+    return frontend_process
+
+
+if __name__ == "__main__":
+    # Set up Windows-specific Ctrl+C handler before starting any processes
+    setup_windows_ctrl_handler()
+
+    print_flush("=" * 50)
+    print_flush("DeepTutor Web Platform Launcher")
+    print_flush("=" * 50)
+
+    # Initialize user data directories
+    try:
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+
+        # Create basic directories if they don't exist
+        data_dirs = [
+            os.path.join(project_root, "data"),
+            os.path.join(project_root, "data", "knowledge_bases"),
+            os.path.join(project_root, "data", "notebooks"),
+            os.path.join(project_root, "data", "sessions"),
+            os.path.join(project_root, "logs"),
+        ]
+
+        for dir_path in data_dirs:
+            os.makedirs(dir_path, exist_ok=True)
+
+        print_flush("✅ User data directories initialized")
+    except Exception as e:
+        print_flush(f"⚠️ Warning: Failed to initialize user directories: {e}")
+        print_flush("   Continuing anyway...")
+
+    backend = None
+    frontend = None
+
+    try:
+        backend = start_backend()
+
+        # Get backend port for health check
+        backend_port = get_backend_port()
+
+        print_flush("⏳ Waiting for backend to start...")
+        for i in range(10):
+            time.sleep(1)
+            if backend.poll() is not None:
+                print_flush(f"❌ Backend process exited with code {backend.returncode}")
+                if backend.stdout:
+                    output = backend.stdout.read()
+                    if output:
+                        print_flush(f"Backend output:\n{output}")
+                break
+
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                result = sock.connect_ex(("localhost", backend_port))
+                sock.close()
+                if result == 0:
+                    print_flush(f"✅ Backend is running on port {backend_port}!")
+                    break
+            except Exception as e:
+                print(e)
+
+        if backend.poll() is not None:
+            print_flush(
+                "❌ Backend failed to start. Please check the error messages above."
+            )
+            sys.exit(1)
+
+        frontend = start_frontend()
+
+        # Get ports for display
+        backend_port = get_backend_port()
+        frontend_port = get_frontend_port()
+
+        print_flush("")
+        print_flush("=" * 50)
+        print_flush("✅ Services are running!")
+        print_flush("=" * 50)
+        print_flush(f"   - Backend:  http://localhost:{backend_port}/docs")
+        print_flush(f"   - Frontend: http://localhost:{frontend_port}")
+        print_flush("=" * 50)
+        print_flush("")
+        print_flush("Press Ctrl+C to stop all services.")
+
+        while True:
+            # Check for Ctrl+C via Windows handler or process exit
+            if check_ctrl_c_received():
+                print_flush("\n🛑 Ctrl+C detected, stopping services...")
+                break
+            if backend.poll() is not None:
+                print_flush(
+                    f"\n❌ Backend process exited unexpectedly (code: {backend.returncode})"
+                )
+                break
+            time.sleep(0.5)  # Check more frequently for responsive shutdown
+
+    except KeyboardInterrupt:
+        print_flush("\n🛑 Stopping services...")
+    except Exception as e:
+        print_flush(f"\n❌ Error: {e}")
+        import traceback
+
+        traceback.print_exc()
+    finally:
+        # Use terminate_process_tree to properly kill all child processes
+        # including uvicorn workers and Next.js child processes
+        terminate_process_tree(backend, name="Backend", timeout=5)
+        terminate_process_tree(frontend, name="Frontend", timeout=5)
+
+        print_flush("✅ All services stopped.")
