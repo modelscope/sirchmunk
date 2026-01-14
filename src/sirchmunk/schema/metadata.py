@@ -10,9 +10,9 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from loguru import logger
 
-from sentis.llm.openai_chat import OpenAIChat
-from sentis.schema.snapshot import SnapshotInfo
-from sentis.utils.file_utils import get_fast_hash
+from sirchmunk.llm.openai_chat import OpenAIChat
+from sirchmunk.schema.snapshot import SnapshotInfo
+from sirchmunk.utils.file_utils import get_fast_hash
 
 
 class FileType(enum.Enum):
@@ -408,7 +408,7 @@ def _build_text_schema(
         lines = text.splitlines()
 
         if file_info.do_snapshot:
-            from sentis.schema.snapshot import TextSnapshot
+            from sirchmunk.schema.snapshot import TextSnapshot
 
             snapshot_info: SnapshotInfo = TextSnapshot(
                 llm=llm,

@@ -4,8 +4,8 @@ from typing import Any, Dict, Iterator, List, Tuple, Union
 import msgpack
 from loguru import logger
 
-from sentis.schema.knowledge import KnowledgeCluster
-from sentis.utils.file_utils import StorageStructure
+from sirchmunk.schema.knowledge import KnowledgeCluster
+from sirchmunk.utils.file_utils import StorageStructure
 
 from .base import Storage
 

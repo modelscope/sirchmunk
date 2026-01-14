@@ -1,3 +1,3 @@
-# Sentis
+# Sirchmunk
 
-Sentis: From raw data to self-evolving real-time intelligence.
+Sirchmunk: From raw data to self-evolving real-time intelligence.
