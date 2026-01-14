@@ -1,6 +1,6 @@
 from typing import List, Union
 
-from sentis.scan.base import BaseScanner
+from sirchmunk.scan.base import BaseScanner
 
 
 class WebScanner(BaseScanner):

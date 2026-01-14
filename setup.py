@@ -14,7 +14,7 @@ def readme():
     return content
 
 
-version_file = 'src/sentis/version.py'
+version_file = 'src/sirchmunk/version.py'
 
 
 def get_version():
@@ -148,15 +148,15 @@ if __name__ == '__main__':
     extra_requires['all'] = all_requires
 
     setup(
-        name='sentis',
+        name='sirchmunk',
         version=get_version(),
-        description='Sentis: From raw data to self-evolving real-time intelligence.',
+        description='Sirchmunk: From raw data to self-evolving real-time intelligence.',
         long_description=readme(),
         long_description_content_type='text/markdown',
         author='The ModelScope Team',
         author_email='contact@modelscope.cn',
         keywords='LLM, Agentic, Search, RAG, Indexless, Self-evolving, Real-time Intelligence, Multi-modal',
-        url='https://github.com/modelscope/sentis',
+        url='https://github.com/modelscope/sirchmunk',
         packages=find_packages(exclude=('configs', 'demo')),
         include_package_data=True,
         package_data={
@@ -177,7 +177,7 @@ if __name__ == '__main__':
         install_requires=install_requires,
         extras_require=extra_requires,
         entry_points={
-            'console_scripts': ['sentis=sentis.cli.cli:run_cmd']
+            'console_scripts': ['sirchmunk=sirchmunk.cli.cli:run_cmd']
         },
         dependency_links=deps_link,
         zip_safe=False)

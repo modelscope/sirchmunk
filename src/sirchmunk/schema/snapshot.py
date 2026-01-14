@@ -7,8 +7,8 @@ from typing import Any, List, Optional, Union
 
 from loguru import logger
 
-from sentis.llm.openai_chat import OpenAIChat
-from sentis.utils.tokenizer_util import TokenizerUtil
+from sirchmunk.llm.openai_chat import OpenAIChat
+from sirchmunk.utils.tokenizer_util import TokenizerUtil
 
 
 @dataclass
@@ -77,7 +77,7 @@ class TextSnapshot(Snapshot):
 
     def __init__(self, llm: Optional[OpenAIChat] = None, **kwargs):
 
-        from sentis.insight.text_insights import TextInsights
+        from sirchmunk.insight.text_insights import TextInsights
 
         super().__init__(llm=llm, **kwargs)
 

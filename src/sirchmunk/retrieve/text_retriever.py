@@ -48,7 +48,7 @@ class GrepRetriever(BaseRetriever):
         """
         Ensure ripgrep-all is installed. If not, install it.
         """
-        from sentis.utils.installation_utils import install_rga
+        from sirchmunk.utils.installation_utils import install_rga
 
         install_rga()
 

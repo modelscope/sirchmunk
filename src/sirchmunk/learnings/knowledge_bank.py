@@ -5,23 +5,23 @@ from typing import Any, Dict, List, Optional, Union
 
 from loguru import logger
 
-from sentis.learnings.evidence_processor import (
+from sirchmunk.learnings.evidence_processor import (
     MonteCarloEvidenceSampling,
     RoiResult,
 )
-from sentis.llm.openai_chat import OpenAIChat
-from sentis.llm.prompts import EVIDENCE_SUMMARY
-from sentis.schema.knowledge import (
+from sirchmunk.llm.openai_chat import OpenAIChat
+from sirchmunk.llm.prompts import EVIDENCE_SUMMARY
+from sirchmunk.schema.knowledge import (
     AbstractionLevel,
     EvidenceUnit,
     KnowledgeCluster,
     Lifecycle,
 )
-from sentis.schema.metadata import FileInfo
-from sentis.schema.request import Request
-from sentis.storage.knowledge_storage import KnowledgeStorage
-from sentis.utils.file_utils import StorageStructure, fast_extract
-from sentis.utils.utils import extract_fields
+from sirchmunk.schema.metadata import FileInfo
+from sirchmunk.schema.request import Request
+from sirchmunk.storage.knowledge_storage import KnowledgeStorage
+from sirchmunk.utils.file_utils import StorageStructure, fast_extract
+from sirchmunk.utils.utils import extract_fields
 
 # In-memory knowledge storage, keyed by cluster ID
 _KNOWLEDGE_MAP: Dict[str, KnowledgeCluster] = {}

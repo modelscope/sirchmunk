@@ -6,18 +6,18 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from loguru import logger
 
-from sentis.base import BaseSearch
-from sentis.learnings.knowledge_bank import KnowledgeBank
-from sentis.llm.openai_chat import OpenAIChat
-from sentis.llm.prompts import (
+from sirchmunk.base import BaseSearch
+from sirchmunk.learnings.knowledge_bank import KnowledgeBank
+from sirchmunk.llm.openai_chat import OpenAIChat
+from sirchmunk.llm.prompts import (
     QUERY_KEYWORDS_EXTRACTION,
     SEARCH_RESULT_SUMMARY,
 )
-from sentis.retrieve.text_retriever import GrepRetriever
-from sentis.schema.knowledge import KnowledgeCluster
-from sentis.schema.request import ContentItem, ImageURL, Message, Request
-from sentis.utils.file_utils import get_fast_hash
-from sentis.utils.utils import (
+from sirchmunk.retrieve.text_retriever import GrepRetriever
+from sirchmunk.schema.knowledge import KnowledgeCluster
+from sirchmunk.schema.request import ContentItem, ImageURL, Message, Request
+from sirchmunk.utils.file_utils import get_fast_hash
+from sirchmunk.utils.utils import (
     KeywordValidation,
     extract_fields,
     log_tf_norm_penalty,

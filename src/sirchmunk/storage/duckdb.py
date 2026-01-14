@@ -1,5 +1,5 @@
 """
-DuckDB database manager for Sentis
+DuckDB database manager for Sirchmunk
 Provides a comprehensive interface for DuckDB operations including
 connection management, table operations, data manipulation, and analytics
 """
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class DuckDBManager:
     """
     A comprehensive DuckDB database manager providing common operations
-    for data storage, retrieval, and analytics in the Sentis system.
+    for data storage, retrieval, and analytics in the Sirchmunk system.
     """
     
     def __init__(self, db_path: Optional[str] = None, read_only: bool = False):

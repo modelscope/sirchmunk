@@ -1,7 +1,7 @@
 [project]
-name = "sentis"
+name = "sirchmunk"
 dynamic = ["version", "dependencies", "optional-dependencies"]
-description = "Sentis: From raw data to self-evolving real-time intelligence."
+description = "Sirchmunk: From raw data to self-evolving real-time intelligence."
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {text = "Apache License 2.0"}
 authors = [
@@ -23,10 +23,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/modelscope/sentis"
+Homepage = "https://github.com/modelscope/sirchmunk"
 
 [project.scripts]
-sentis = "sentis.cli.cli:run_cmd"
+sirchmunk = "sirchmunk.cli.cli:run_cmd"
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]
@@ -36,11 +36,11 @@ build-backend = "setuptools.build_meta"
 include-package-data = true
 
 [tool.setuptools.dynamic]
-version = {attr = "sentis.version.__version__"}
+version = {attr = "sirchmunk.version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["sentis*"]
+include = ["sirchmunk*"]
 
 [tool.black]
 line-length = 88
@@ -58,7 +58,7 @@ exclude = '''
   | buck-out
   | build
   | dist
-  | src/sentis/.*/__pycache__
+  | src/sirchmunk/.*/__pycache__
 )/
 '''
 
