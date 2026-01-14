@@ -173,7 +173,7 @@ def get_backend_port():
 
 def get_frontend_port():
     """Get frontend port from environment or use default"""
-    return int(os.environ.get("FRONTEND_PORT", os.environ.get("PORT", "3782")))
+    return int(os.environ.get("FRONTEND_PORT", os.environ.get("PORT", "8585")))
 
 
 def start_backend():
@@ -274,7 +274,7 @@ def start_frontend():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     web_dir = os.path.join(project_root, "web")
 
-    # Get port from environment variable (default: 3782)
+    # Get port from environment variable (default: 8585)
     frontend_port = get_frontend_port()
     print_flush(f"✅ Frontend port: {frontend_port}")
 
