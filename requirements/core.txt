@@ -5,10 +5,13 @@ genson
 pillow
 pypdf
 pandas
+parquet
 numpy
 msgpack
 sentencepiece
 tqdm
 rapidfuzz
+duckdb
 kreuzberg>=4.0.0rc1    # brew install pandoc poppler tesseract
 # ripgrep-all: https://github.com/phiresky/ripgrep-all
+# perplexityai>=0.20.0

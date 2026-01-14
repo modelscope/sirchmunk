@@ -25,7 +25,7 @@ def get_backend_port():
 
 def get_frontend_port():
     """Get frontend port from environment or use default"""
-    return int(os.environ.get("FRONTEND_PORT", os.environ.get("PORT", "3782")))
+    return int(os.environ.get("FRONTEND_PORT", os.environ.get("PORT", "8585")))
 
 
 def find_processes_by_port(port):
@@ -276,7 +276,7 @@ def main():
     # Clean up any remaining Node.js processes that might be related
     print_flush("🧹 Cleaning up related processes...")
     cleanup_patterns = [
-        "node.*3782",  # Frontend port specific
+        "node.*8585",  # Frontend port specific
         f"node.*{frontend_port}",  # Dynamic frontend port
         "webpack",
         "turbopack",

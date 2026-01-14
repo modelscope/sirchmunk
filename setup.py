@@ -136,11 +136,15 @@ if __name__ == '__main__':
     extra_requires['ollama'], _ = parse_requirements('requirements/ollama.txt')
     extra_requires['docs'], _ = parse_requirements('requirements/docs.txt')
     extra_requires['tests'], _ = parse_requirements('requirements/tests.txt')
+    extra_requires['hub'], _ = parse_requirements('requirements/hub.txt')
+    extra_requires['web'], _ = parse_requirements('requirements/web.txt')
 
     all_requires.extend(install_requires)
     all_requires.extend(extra_requires['ollama'])
     all_requires.extend(extra_requires['docs'])
     all_requires.extend(extra_requires['tests'])
+    all_requires.extend(extra_requires['hub'])
+    all_requires.extend(extra_requires['web'])
     extra_requires['all'] = all_requires
 
     setup(
@@ -167,6 +171,7 @@ if __name__ == '__main__':
             'Programming Language :: Python :: 3.11',
             'Programming Language :: Python :: 3.12',
             'Programming Language :: Python :: 3.13',
+            'Programming Language :: Python :: 3.14',
         ],
         license='Apache License 2.0',
         install_requires=install_requires,
