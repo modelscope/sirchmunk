@@ -17,6 +17,8 @@ async def log_with_callback(
     level: str,
     message: str,
     log_callback: LogCallback = None,
+    flush: bool = False,
+    end: str = "\n",
 ) -> None:
     """
     Send log message through callback if available, otherwise use loguru logger.
@@ -29,32 +31,40 @@ async def log_with_callback(
         message: Message content to log
         log_callback: Optional callback function (sync or async) that takes (level, message).
                      If None, uses loguru's default_logger.
+        flush: If True, force immediate output (useful for progress indicators)
+        end: String appended after the message (default: "\n")
     
     Examples:
         # Using default loguru logger
         await log_with_callback("info", "Processing started")
         
+        # Progress indicator without newline
+        await log_with_callback("info", "Processing...", flush=True, end="")
+        await log_with_callback("info", " Done!", flush=True, end="\n")
+        
         # Using custom async callback
         async def my_callback(level: str, msg: str):
             await websocket.send_text(f"[{level}] {msg}")
         await log_with_callback("debug", "Custom log", log_callback=my_callback)
-        
-        # Using custom sync callback
-        def sync_callback(level: str, msg: str):
-            print(f"{level.upper()}: {msg}")
-        await log_with_callback("warning", "Warning message", log_callback=sync_callback)
     """
+    # Append end character to message
+    full_message = message + end if end else message
+    
     if log_callback is not None:
         # Check if callback is async
         if asyncio.iscoroutinefunction(log_callback):
-            await log_callback(level, message)
+            await log_callback(level, full_message)
         else:
             # Call sync callback directly
-            log_callback(level, message)
+            log_callback(level, full_message)
+        
+        # If flush is requested and callback is async, yield control to allow immediate processing
+        if flush and asyncio.iscoroutinefunction(log_callback):
+            await asyncio.sleep(0)
     else:
         # Fallback to loguru logger
-        # Use getattr to call the appropriate log level method
-        getattr(default_logger, level.lower())(message)
+        # For loguru, we just log the message (loguru handles its own output)
+        getattr(default_logger, level.lower())(full_message.rstrip("\n"))
 
 
 def create_logger(log_callback: LogCallback = None) -> "AsyncLogger":
@@ -97,6 +107,8 @@ class AsyncLogger:
     callback configuration. Useful for classes that need persistent
     logging configuration.
     
+    Supports print-like flush and end parameters for advanced output control.
+    
     Example:
         # With custom callback
         async def my_callback(level: str, msg: str):
@@ -105,6 +117,11 @@ class AsyncLogger:
         logger = AsyncLogger(log_callback=my_callback)
         await logger.info("Starting process")
         await logger.error("Failed to connect")
+        
+        # Progress indicator
+        await logger.info("Processing", flush=True, end="")
+        await logger.info("...", flush=True, end="")
+        await logger.info(" Done!", flush=True)
         
         # Without callback (uses loguru)
         logger = AsyncLogger()
@@ -120,30 +137,80 @@ class AsyncLogger:
         """
         self.log_callback = log_callback
     
-    async def log(self, level: str, message: str):
-        """Log a message at the specified level"""
-        await log_with_callback(level, message, log_callback=self.log_callback)
+    async def log(self, level: str, message: str, flush: bool = False, end: str = "\n"):
+        """
+        Log a message at the specified level.
+        
+        Args:
+            level: Log level
+            message: Message to log
+            flush: If True, force immediate output
+            end: String appended after message (default: "\n")
+        """
+        await log_with_callback(level, message, log_callback=self.log_callback, flush=flush, end=end)
     
-    async def debug(self, message: str):
-        """Log a debug message"""
-        await self.log("debug", message)
+    async def debug(self, message: str, flush: bool = False, end: str = "\n"):
+        """
+        Log a debug message.
+        
+        Args:
+            message: Message to log
+            flush: If True, force immediate output
+            end: String appended after message (default: "\n")
+        """
+        await self.log("debug", message, flush=flush, end=end)
     
-    async def info(self, message: str):
-        """Log an info message"""
-        await self.log("info", message)
+    async def info(self, message: str, flush: bool = False, end: str = "\n"):
+        """
+        Log an info message.
+        
+        Args:
+            message: Message to log
+            flush: If True, force immediate output
+            end: String appended after message (default: "\n")
+        """
+        await self.log("info", message, flush=flush, end=end)
     
-    async def warning(self, message: str):
-        """Log a warning message"""
-        await self.log("warning", message)
+    async def warning(self, message: str, flush: bool = False, end: str = "\n"):
+        """
+        Log a warning message.
+        
+        Args:
+            message: Message to log
+            flush: If True, force immediate output
+            end: String appended after message (default: "\n")
+        """
+        await self.log("warning", message, flush=flush, end=end)
     
-    async def error(self, message: str):
-        """Log an error message"""
-        await self.log("error", message)
+    async def error(self, message: str, flush: bool = False, end: str = "\n"):
+        """
+        Log an error message.
+        
+        Args:
+            message: Message to log
+            flush: If True, force immediate output
+            end: String appended after message (default: "\n")
+        """
+        await self.log("error", message, flush=flush, end=end)
     
-    async def success(self, message: str):
-        """Log a success message"""
-        await self.log("success", message)
+    async def success(self, message: str, flush: bool = False, end: str = "\n"):
+        """
+        Log a success message.
+        
+        Args:
+            message: Message to log
+            flush: If True, force immediate output
+            end: String appended after message (default: "\n")
+        """
+        await self.log("success", message, flush=flush, end=end)
     
-    async def critical(self, message: str):
-        """Log a critical message"""
-        await self.log("critical", message)
+    async def critical(self, message: str, flush: bool = False, end: str = "\n"):
+        """
+        Log a critical message.
+        
+        Args:
+            message: Message to log
+            flush: If True, force immediate output
+            end: String appended after message (default: "\n")
+        """
+        await self.log("critical", message, flush=flush, end=end)
