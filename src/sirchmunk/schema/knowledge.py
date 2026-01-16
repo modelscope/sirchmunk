@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum

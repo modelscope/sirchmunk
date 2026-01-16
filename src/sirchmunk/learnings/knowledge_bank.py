@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import json
 from datetime import datetime
 from pathlib import Path

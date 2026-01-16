@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """
 Mock API endpoints for system monitoring functionality
 Provides real-time monitoring of tasks, files, tokens, and system metrics

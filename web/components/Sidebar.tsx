@@ -30,8 +30,12 @@ const SIDEBAR_COLLAPSED_WIDTH = 64;
 
 export default function Sidebar() {
   const pathname = usePathname();
-  const { uiSettings, sidebarCollapsed, toggleSidebar } = useGlobal();
-  const lang = uiSettings.language;
+  const { settings, sidebarCollapsed, setSidebarCollapsed } = useGlobal();
+  const lang = settings?.language || "en";
+
+  const toggleSidebar = () => {
+    setSidebarCollapsed(!sidebarCollapsed);
+  };
 
   const t = (key: string) => getTranslation(lang, key);
 
@@ -45,12 +49,6 @@ export default function Sidebar() {
         { name: t("History"), href: "/history", icon: History },
         { name: t("Knowledge"), href: "/knowledge", icon: BookOpen },
         { name: t("Notebook"), href: "/notebook", icon: Book },
-      ],
-    },
-    {
-      name: t("Research"),
-      items: [
-        { name: t("Deep Research"), href: "/research", icon: Microscope },
       ],
     },
     {
@@ -76,8 +74,8 @@ export default function Sidebar() {
         <div className="px-2 py-3 border-b border-slate-100 dark:border-slate-700 flex justify-center">
           <div className="w-8 h-8 rounded-lg flex items-center justify-center overflow-hidden">
             <Image
-              src="/logo.png"
-              alt="OpenCowork Logo"
+              src="/logo-v1.png"
+                  alt="Sirchmunk Logo"
               width={32}
               height={32}
               className="object-contain"
@@ -183,8 +181,8 @@ export default function Sidebar() {
             <div className="flex items-center gap-2.5">
               <div className="w-8 h-8 rounded-lg flex items-center justify-center overflow-hidden">
                 <Image
-                  src="/logo.png"
-                  alt="OpenCowork Logo"
+                  src="/logo-v1.png"
+                  alt="Sirchmunk Logo"
                   width={32}
                   height={32}
                   className="object-contain"
@@ -192,7 +190,7 @@ export default function Sidebar() {
                 />
               </div>
               <h1 className="font-bold text-slate-900 dark:text-slate-100 tracking-tight text-base truncate">
-                OpenCowork
+                Sirchmunk
               </h1>
             </div>
             <div className="flex items-center gap-0.5">
@@ -205,16 +203,16 @@ export default function Sidebar() {
                 <ChevronsLeft className="w-4 h-4" />
               </button>
               <a
-                href="https://hkuds.github.io/OpenCowork/"
+                href="https://modelscope.github.io/Sirchmunk/"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 p-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 rounded"
-                title="Visit OpenCowork Homepage"
+                title="Visit Sirchmunk Homepage"
               >
                 <Globe className="w-4 h-4" />
               </a>
               <a
-                href="https://github.com/HKUDS/OpenCowork"
+                href="https://github.com/modelscope/sirchmunk"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 p-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 rounded"

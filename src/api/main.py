@@ -1,5 +1,6 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """
-Main FastAPI application for OpenCowork API
+Main FastAPI application for Sirchmunk API
 Combines all API modules and provides centralized configuration
 """
 
@@ -10,7 +11,6 @@ import uvicorn
 
 # Import all API routers
 from .knowledge import router as knowledge_router
-from .search import router as search_router
 from .research import router as research_router
 from .notebook import router as notebook_router
 from .settings import router as settings_router
@@ -20,8 +20,8 @@ from .monitor import router as monitor_router
 
 # Create FastAPI application
 app = FastAPI(
-    title="OpenCowork API",
-    description="Mock API for OpenCowork AI Education System",
+    title="Sirchmunk API",
+    description="Mock API for Sirchmunk AI Education System",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -38,7 +38,6 @@ app.add_middleware(
 
 # Include all API routers
 app.include_router(knowledge_router)
-app.include_router(search_router)
 app.include_router(research_router)
 app.include_router(notebook_router)
 app.include_router(settings_router)
@@ -50,13 +49,12 @@ app.include_router(monitor_router)
 async def root():
     """Root endpoint with API information"""
     return {
-        "name": "OpenCowork API",
+        "name": "Sirchmunk API",
         "version": "1.0.0",
         "description": "Mock API for AI-powered education system",
         "status": "running",
         "endpoints": {
             "knowledge": "/api/v1/knowledge",
-            "search": "/api/v1/search",
             "research": "/api/v1/research",
             "notebook": "/api/v1/notebook",
             "settings": "/api/v1/settings",

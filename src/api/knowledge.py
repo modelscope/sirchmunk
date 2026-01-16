@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """
 Mock API endpoints for knowledge base management
 Provides CRUD operations for knowledge bases and document management

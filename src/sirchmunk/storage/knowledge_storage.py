@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Tuple, Union
 

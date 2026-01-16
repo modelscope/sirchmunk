@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import random
 import re
 from abc import ABC, abstractmethod

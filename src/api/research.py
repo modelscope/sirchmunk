@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """
 Mock API endpoints for research functionality
 Provides WebSocket and REST endpoints for intelligent research and analysis

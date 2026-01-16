@@ -9,9 +9,7 @@ import {
   Search,
   Clock,
   FileText,
-  Calculator,
-  Microscope,
-  PenTool,
+  MessageSquare,
   ChevronRight,
   ChevronLeft,
   ArrowRight,
@@ -37,7 +35,7 @@ import { processLatexContent } from "@/lib/latex";
 
 interface NotebookRecord {
   id: string;
-  type: "solve" | "question" | "research" | "co_writer";
+  type: "chat";
   title: string;
   user_query: string;
   output: string;
@@ -83,14 +81,8 @@ const COLORS = [
 
 const getRecordIcon = (type: string) => {
   switch (type) {
-    case "solve":
-      return <Calculator className="w-4 h-4" />;
-    case "question":
-      return <FileText className="w-4 h-4" />;
-    case "research":
-      return <Microscope className="w-4 h-4" />;
-    case "co_writer":
-      return <PenTool className="w-4 h-4" />;
+    case "chat":
+      return <MessageSquare className="w-4 h-4" />;
     default:
       return <FileText className="w-4 h-4" />;
   }
@@ -98,14 +90,8 @@ const getRecordIcon = (type: string) => {
 
 const getRecordLabel = (type: string) => {
   switch (type) {
-    case "solve":
-      return "Solver";
-    case "question":
-      return "Question";
-    case "research":
-      return "Research";
-    case "co_writer":
-      return "Co-Writer";
+    case "chat":
+      return "Chat";
     default:
       return "Record";
   }
@@ -113,14 +99,8 @@ const getRecordLabel = (type: string) => {
 
 const getRecordColor = (type: string) => {
   switch (type) {
-    case "solve":
+    case "chat":
       return "text-blue-500 bg-blue-50 border-blue-200";
-    case "question":
-      return "text-purple-500 bg-purple-50 border-purple-200";
-    case "research":
-      return "text-emerald-500 bg-emerald-50 border-emerald-200";
-    case "co_writer":
-      return "text-amber-500 bg-amber-50 border-amber-200";
     default:
       return "text-slate-500 bg-slate-50 border-slate-200";
   }
@@ -675,7 +655,7 @@ export default function NotebookPage() {
                     No records yet
                   </p>
                   <p className="text-slate-400 dark:text-slate-500 text-xs mt-1">
-                    Add records from Solver, Question, Research, or Co-Writer
+                    Add records from Chat conversations
                   </p>
                 </div>
               ) : (

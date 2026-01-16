@@ -1,5 +1,6 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """
-Tools API endpoints for OpenCowork
+Tools API endpoints for Sirchmunk
 Handles quick actions like file export, PPT generation, document conversion, etc.
 """
 

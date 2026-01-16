@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """
 Mock API endpoints for notebook management functionality
 Provides CRUD operations for notebooks and records management
