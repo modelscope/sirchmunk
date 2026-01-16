@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """
 DuckDB database manager for Sirchmunk
 Provides a comprehensive interface for DuckDB operations including

@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import TYPE_CHECKING, Any, Dict, List
 
 from openai import AsyncOpenAI, OpenAI

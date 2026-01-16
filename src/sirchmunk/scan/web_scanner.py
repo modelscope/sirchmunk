@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from typing import List, Union
 
 from sirchmunk.scan.base import BaseScanner

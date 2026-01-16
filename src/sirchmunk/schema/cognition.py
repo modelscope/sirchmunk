@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Optional

@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 import math
 import re
 from typing import Dict, List, LiteralString, Optional

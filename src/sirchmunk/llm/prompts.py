@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 # flake8: noqa
 # yapf: disable
 

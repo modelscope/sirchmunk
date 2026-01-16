@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """
 Unified API endpoints for chat and search functionality
 Provides WebSocket endpoint for real-time chat conversations with integrated search

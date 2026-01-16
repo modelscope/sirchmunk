@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """
 Mock API endpoints for history functionality
 Provides unified history tracking across all system activities

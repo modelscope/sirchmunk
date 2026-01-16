@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """
 Main FastAPI application for Sirchmunk API
 Combines all API modules and provides centralized configuration

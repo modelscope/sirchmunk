@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """
 Mock API endpoints for system settings and configuration
 Provides system status, configuration management, and health monitoring

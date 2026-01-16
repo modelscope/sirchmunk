@@ -1,3 +1,4 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
 """
 Hub API endpoints for Sirchmunk
 Handles file management, synchronization, and hub operations

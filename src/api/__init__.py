@@ -1,1 +1,1 @@
-# API module initialization
+# Copyright (c) ModelScope Contributors. All rights reserved.
