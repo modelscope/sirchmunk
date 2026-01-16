@@ -11,7 +11,8 @@ from loguru import logger as default_logger
 
 
 # Type alias for log callback function (can be sync or async)
-LogCallback = Optional[Callable[[str, str], Union[None, Awaitable[None]]]]
+# Signature: (level: str, message: str, end: str, flush: bool) -> None or Awaitable[None]
+LogCallback = Optional[Callable[[str, str, str, bool], Union[None, Awaitable[None]]]]
 
 
 async def log_with_callback_async(
@@ -51,22 +52,21 @@ async def log_with_callback_async(
             await websocket.send_text(f"[{level}] {msg}")
         await log_with_callback("debug", "Custom log", log_callback=my_callback)
     """
-    # Append end character to message
-    full_message = message + end if end else message
-    
     if log_callback is not None:
-        # Check if callback is async
+        # Pass original message, end, and flush to callback
+        # Let the callback handle message formatting
         if asyncio.iscoroutinefunction(log_callback):
-            await log_callback(level, full_message)
+            await log_callback(level, message, end, flush)
         else:
-            # Call sync callback directly
-            log_callback(level, full_message)
+            # Call sync callback directly with all parameters
+            log_callback(level, message, end, flush)
         
         # If flush is requested and callback is async, yield control to allow immediate processing
         if flush and asyncio.iscoroutinefunction(log_callback):
             await asyncio.sleep(0)
     else:
-        # Fallback to loguru logger
+        # Fallback to loguru logger (process message locally)
+        full_message = message + end if end else message
         if flush:
             # Use raw mode (no prefix) for flush=True
             default_logger.opt(raw=True).log(level.upper(), full_message)
@@ -104,18 +104,17 @@ def log_with_callback(
         log_with_callback("info", " Done!", flush=True)
         # Output: Loading... Done!
     """
-    # Append end character to message
-    full_message = message + end if end else message
-    
     if log_callback is not None:
-        # For sync mode, callback must be synchronous
+        # Pass original message, end, and flush to callback
+        # Let the callback handle message formatting
         if not asyncio.iscoroutinefunction(log_callback):
-            log_callback(level, full_message)
+            log_callback(level, message, end, flush)
         else:
             # If async callback provided in sync mode, use asyncio.run
-            asyncio.run(log_callback(level, full_message))
+            asyncio.run(log_callback(level, message, end, flush))
     else:
-        # Fallback to loguru logger
+        # Fallback to loguru logger (process message locally)
+        full_message = message + end if end else message
         if flush:
             # Use raw mode (no prefix) for flush=True
             default_logger.opt(raw=True).log(level.upper(), full_message)

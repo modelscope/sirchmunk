@@ -119,6 +119,9 @@ interface HomeChatMessage {
     level: string;
     message: string;
     timestamp: string;
+    is_streaming?: boolean;  // Flag for streaming output (no timestamp prefix)
+    task_id?: string;        // Task ID for grouping related streaming messages
+    flush?: boolean;         // Flush flag for immediate output
   }>;
 }
 
@@ -701,7 +704,10 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
               searchLogs: [...searchLogs, {
                 level: data.level,
                 message: data.message,
-                timestamp: data.timestamp
+                timestamp: data.timestamp,
+                is_streaming: data.is_streaming,  // Preserve streaming flag
+                task_id: data.task_id,            // Preserve task ID
+                flush: data.flush,                // Preserve flush flag
               }],
             };
             console.log("[DEBUG] Updated searchLogs:", messages[messages.length - 1].searchLogs);

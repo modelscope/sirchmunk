@@ -830,23 +830,60 @@ export default function HomePage() {
                               <span className="text-sm font-medium text-slate-700 dark:text-slate-300">Search Process</span>
                             </div>
                             <div className="space-y-1 max-h-48 overflow-y-auto">
-                              {msg.searchLogs.map((log, logIndex) => (
-                                <div
-                                  key={logIndex}
-                                  className={`text-xs px-2 py-1 rounded font-mono ${
-                                    log.level === 'error'
-                                      ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300'
-                                      : log.level === 'warning'
-                                      ? 'bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300'
-                                      : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
-                                  }`}
-                                >
-                                  <span className="opacity-60 mr-2">
-                                    {new Date(log.timestamp).toLocaleTimeString()}
-                                  </span>
-                                  {log.message}
-                                </div>
-                              ))}
+                              {(() => {
+                                // Group logs by task_id to merge streaming messages
+                                const groupedLogs: Array<{
+                                  level: string;
+                                  message: string;
+                                  timestamp: string;
+                                  is_streaming?: boolean;
+                                  task_id?: string;
+                                }> = [];
+                                
+                                msg.searchLogs.forEach((log) => {
+                                  // If this is a streaming message with a task_id
+                                  if (log.is_streaming && log.task_id) {
+                                    // Find the last log with the same task_id
+                                    const lastMatchingIndex = groupedLogs.findLastIndex(
+                                      (g) => g.task_id === log.task_id && g.is_streaming
+                                    );
+                                    
+                                    if (lastMatchingIndex >= 0) {
+                                      // Merge with existing streaming message (append)
+                                      groupedLogs[lastMatchingIndex].message += log.message;
+                                    } else {
+                                      // Start a new grouped log
+                                      groupedLogs.push({ ...log });
+                                    }
+                                  } else {
+                                    // Non-streaming log, add as is
+                                    groupedLogs.push({ ...log });
+                                  }
+                                });
+
+                                return groupedLogs.map((log, logIndex) => (
+                                  <div
+                                    key={logIndex}
+                                    className={`text-xs px-2 py-1 rounded font-mono ${
+                                      log.level === 'error'
+                                        ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300'
+                                        : log.level === 'warning'
+                                        ? 'bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300'
+                                        : log.level === 'success'
+                                        ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300'
+                                        : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
+                                    }`}
+                                  >
+                                    {/* Only show timestamp for non-streaming messages */}
+                                    {!log.is_streaming && (
+                                      <span className="opacity-60 mr-2">
+                                        {new Date(log.timestamp).toLocaleTimeString()}
+                                      </span>
+                                    )}
+                                    {log.message}
+                                  </div>
+                                ));
+                              })()}
                             </div>
                           </div>
                         )}
