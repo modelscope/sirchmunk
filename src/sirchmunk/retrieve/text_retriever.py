@@ -55,7 +55,7 @@ class GrepRetriever(BaseRetriever):
     async def retrieve(
         self,
         terms: Union[str, List[str]],
-        path: Optional[str] = None,
+        path: Union[str, Path, List[str], List[Path], None] = None,
         logic: Literal["and", "or", "not"] = "or",
         *,
         case_sensitive: bool = False,
@@ -81,7 +81,7 @@ class GrepRetriever(BaseRetriever):
 
         Args:
             terms: Single pattern (str) or list of patterns (List[str]).
-            path: Path to search in (defaults to current directory).
+            path: Single path (str/Path) or multiple paths (List[str]/List[Path]) to search in (defaults to current directory).
             logic:
                 - "or" (default): match any term (A OR B OR C)
                 - "and": match all terms in same file (A AND B AND C)

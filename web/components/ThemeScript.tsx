@@ -8,7 +8,7 @@ export default function ThemeScript() {
   const themeScript = `
     (function() {
       try {
-        const stored = localStorage.getItem('deeptutor-theme');
+        const stored = localStorage.getItem('sirchmunk-theme');
 
         if (stored === 'dark') {
           document.documentElement.classList.add('dark');
@@ -18,9 +18,9 @@ export default function ThemeScript() {
           // Use system preference if not set
           if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
             document.documentElement.classList.add('dark');
-            localStorage.setItem('deeptutor-theme', 'dark');
+            localStorage.setItem('sirchmunk-theme', 'dark');
           } else {
-            localStorage.setItem('deeptutor-theme', 'light');
+            localStorage.setItem('sirchmunk-theme', 'light');
           }
         }
       } catch (e) {

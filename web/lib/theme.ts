@@ -5,7 +5,7 @@
 
 export type Theme = "light" | "dark";
 
-export const THEME_STORAGE_KEY = "deeptutor-theme";
+export const THEME_STORAGE_KEY = "sirchmunk-theme";
 
 type ThemeChangeListener = (theme: Theme) => void;
 const themeListeners = new Set<ThemeChangeListener>();

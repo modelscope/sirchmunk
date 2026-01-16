@@ -598,7 +598,7 @@ export default function SettingsPage() {
         if (!editedUI) {
           const uiData = JSON.parse(JSON.stringify(responseData.ui));
           // localStorage takes priority over backend
-          const storedTheme = localStorage.getItem("deeptutor-theme");
+          const storedTheme = localStorage.getItem("sirchmunk-theme");
           if (storedTheme === "light" || storedTheme === "dark") {
             uiData.theme = storedTheme;
           }

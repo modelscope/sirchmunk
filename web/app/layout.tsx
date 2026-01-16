@@ -13,7 +13,7 @@ const font = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "DeepTutor Platform",
+  title: "Sirchmunk Platform",
   description: "Multi-Agent Teaching & Research Copilot",
 };
 

@@ -23,6 +23,7 @@ import {
   ChevronDown,
 } from "lucide-react";
 import Link from "next/link";
+import Image from "next/image";
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
@@ -30,8 +31,7 @@ import "katex/dist/katex.min.css";
 import { useGlobal } from "@/context/GlobalContext";
 import { apiUrl } from "@/lib/api";
 import { processLatexContent } from "@/lib/latex";
-import { getTranslation } from "@/lib/i18n";
-import RightSidebar from "@/components/RightSidebar";
+import { getTranslation, type Language } from "@/lib/i18n";
 
 interface KnowledgeBase {
   name: string;
@@ -48,28 +48,41 @@ interface SearchSuggestion {
   highlight_end: number;
 }
 
+interface ChatState {
+  sessionId: string | null;
+  messages: any[];
+  isLoading: boolean;
+  selectedKb: string;
+  enableRag: boolean;
+  enableWebSearch: boolean;
+  currentStage: string | null;
+}
+
 export default function HomePage() {
   const {
     chatState,
     setChatState,
     sendChatMessage,
-    clearChatHistory,
     newChatSession,
-    uiSettings,
+    settings,
   } = useGlobal();
-  const t = (key: string) => getTranslation(uiSettings.language, key);
+  const t = (key: string) => getTranslation((settings?.language as Language) || "en", key);
 
-  const [rightSidebarCollapsed, setRightSidebarCollapsed] = useState(false);
-  const [rightSidebarWidth, setRightSidebarWidth] = useState(384); // 默认宽度为原来的0.8倍
 
   const [inputMessage, setInputMessage] = useState("");
   const [kbs, setKbs] = useState<KnowledgeBase[]>([]);
   const [searchSuggestions, setSearchSuggestions] = useState<SearchSuggestion[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(-1);
+  const [showFileSelector, setShowFileSelector] = useState(false);
+  const [selectedPath, setSelectedPath] = useState<string>("");
+  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+  const [showPathDropdown, setShowPathDropdown] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const suggestionsRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const pathDropdownRef = useRef<HTMLDivElement>(null);
 
   // Fetch knowledge bases
   useEffect(() => {
@@ -83,9 +96,9 @@ export default function HomePage() {
         if (!chatState.selectedKb && kbList.length > 0) {
           const defaultKb = kbList.find((kb: KnowledgeBase) => kb.is_default);
           if (defaultKb) {
-            setChatState((prev) => ({ ...prev, selectedKb: defaultKb.name }));
+            setChatState((prev: ChatState) => ({ ...prev, selectedKb: defaultKb.name }));
           } else {
-            setChatState((prev) => ({ ...prev, selectedKb: kbList[0].name }));
+            setChatState((prev: ChatState) => ({ ...prev, selectedKb: kbList[0].name }));
           }
         }
       })
@@ -100,8 +113,33 @@ export default function HomePage() {
     }
   }, [chatState.messages]);
 
-  const handleSend = () => {
+  const handleSend = async () => {
     if (!inputMessage.trim() || chatState.isLoading) return;
+
+    // Check for Google search shortcut
+    const trimmedMessage = inputMessage.trim();
+    if (trimmedMessage.toLowerCase().startsWith('g:') || trimmedMessage.toLowerCase().startsWith('G:')) {
+      const searchQuery = trimmedMessage.slice(2).trim();
+      if (searchQuery) {
+        // Open Google search in new tab
+        window.open(`https://www.google.com/search?q=${encodeURIComponent(searchQuery)}`, '_blank');
+      } else {
+        // Open Google homepage if no query
+        window.open('https://www.google.com', '_blank');
+      }
+      setInputMessage("");
+      return;
+    }
+
+    // Check if File search is enabled and we have selected paths
+    if (chatState.enableRag && selectedPaths.length > 0) {
+      // Use WebSocket chat with search paths instead of direct REST API
+      setChatState((prev) => ({
+        ...prev,
+        selectedKb: selectedPaths.join(","), // Pass paths as comma-separated string
+      }));
+    }
+
     sendChatMessage(inputMessage);
     setInputMessage("");
   };
@@ -139,7 +177,7 @@ export default function HomePage() {
     return () => clearTimeout(timer);
   }, [inputMessage, chatState.enableRag, chatState.selectedKb]);
 
-  // Click outside to close suggestions
+  // Click outside to close suggestions and dropdown
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (
@@ -151,13 +189,21 @@ export default function HomePage() {
         setShowSuggestions(false);
         setSelectedSuggestionIndex(-1);
       }
+
+      if (
+        pathDropdownRef.current &&
+        !pathDropdownRef.current.contains(event.target as Node) &&
+        !(event.target as Element).closest('button')?.textContent?.includes('Select Path')
+      ) {
+        setShowPathDropdown(false);
+      }
     };
 
-    if (showSuggestions) {
+    if (showSuggestions || showPathDropdown) {
       document.addEventListener('mousedown', handleClickOutside);
       return () => document.removeEventListener('mousedown', handleClickOutside);
     }
-  }, [showSuggestions]);
+  }, [showSuggestions, showPathDropdown]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (showSuggestions && searchSuggestions.length > 0) {
@@ -244,9 +290,19 @@ export default function HomePage() {
       {!hasMessages && (
         <div className="flex-1 flex flex-col items-center justify-center px-6">
           <div className="text-center max-w-2xl mx-auto mb-8">
-            <h1 className="text-4xl font-bold text-slate-900 dark:text-slate-100 mb-3 tracking-tight">
-              {t("Welcome to OpenCowork")}
-            </h1>
+            <div className="flex items-center justify-center gap-4 mb-3">
+              <Image
+                src="/logo-v1.png"
+                alt="Sirchmunk Logo"
+                width={56}
+                height={56}
+                className="object-contain"
+                priority
+              />
+              <h1 className="text-4xl font-bold text-slate-900 dark:text-slate-100 tracking-tight">
+                {t("Welcome to Sirchmunk")}
+              </h1>
+            </div>
             <p className="text-lg text-slate-500 dark:text-slate-400">
               {t("How can I help you today?")}
             </p>
@@ -257,14 +313,19 @@ export default function HomePage() {
             {/* Mode Toggles */}
             <div className="flex items-center justify-between mb-3 px-1">
               <div className="flex items-center gap-2">
-                {/* RAG Toggle */}
+                {/* File Toggle */}
                 <button
-                  onClick={() =>
-                    setChatState((prev) => ({
-                      ...prev,
-                      enableRag: !prev.enableRag,
-                    }))
-                  }
+                  onClick={() => {
+                    if (!chatState.enableRag) {
+                      setShowFileSelector(true);
+                    } else {
+                      setChatState((prev) => ({
+                        ...prev,
+                        enableRag: false,
+                      }));
+                      setSelectedPath("");
+                    }
+                  }}
                   className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-all ${
                     chatState.enableRag
                       ? "bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-700"
@@ -294,26 +355,224 @@ export default function HomePage() {
                 </button>
               </div>
 
-              {/* KB Selector */}
-              {chatState.enableRag && (
-                <select
-                  value={chatState.selectedKb}
-                  onChange={(e) =>
-                    setChatState((prev) => ({
-                      ...prev,
-                      selectedKb: e.target.value,
-                    }))
-                  }
-                  className="text-sm bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-1.5 outline-none focus:border-blue-400 dark:text-slate-200"
-                >
-                  {kbs.map((kb) => (
-                    <option key={kb.name} value={kb.name}>
-                      {kb.name}
-                    </option>
-                  ))}
-                </select>
+              {/* Selected Path Display */}
+              {chatState.enableRag && selectedPath && (
+                <div className="flex items-center gap-2 px-3 py-1.5 bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-700 rounded-lg text-sm">
+                  <span className="text-blue-700 dark:text-blue-300 font-medium truncate max-w-[200px]">
+                    {selectedPath.split('/').pop() || selectedPath}
+                  </span>
+                  <button
+                    onClick={() => {
+                      setSelectedPath("");
+                      setChatState((prev) => ({ ...prev, enableRag: false }));
+                    }}
+                    className="text-blue-500 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-200"
+                  >
+                    ×
+                  </button>
+                </div>
               )}
             </div>
+
+            {/* File Selector Modal */}
+            {showFileSelector && (
+              <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+                <div className="bg-white dark:bg-slate-800 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl">
+                  <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100 mb-4">
+                    Select File or Folder
+                  </h3>
+
+                  <div className="space-y-4">
+                    {/* File Input */}
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
+                        Choose Files (Multiple Selection Supported)
+                      </label>
+                      <div className="space-y-2">
+                        <input
+                          ref={fileInputRef}
+                          type="file"
+                          multiple
+                          className="w-full text-sm text-slate-500 dark:text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 dark:file:bg-blue-900/30 dark:file:text-blue-300 dark:hover:file:bg-blue-900/50"
+                          onChange={async (e) => {
+                            const files = e.target.files;
+                            if (files && files.length > 0) {
+                              if (files.length === 1) {
+                                const file = files[0];
+                                // Try to get the full path using File System Access API
+                                try {
+                                  // @ts-ignore - File System Access API may not be in types yet
+                                  if (file.webkitRelativePath) {
+                                    setSelectedPath(file.webkitRelativePath);
+                                  } else if ((file as any).path) {
+                                    // @ts-ignore - Electron or Node.js environment
+                                    setSelectedPath((file as any).path);
+                                  } else {
+                                    // Fallback: show file name with note about path limitation
+                                    setSelectedPath(`${file.name} (browser security limits full path access)`);
+                                  }
+                                } catch (error) {
+                                  setSelectedPath(`${file.name} (path access limited)`);
+                                }
+                              } else {
+                                setSelectedPath(`${files.length} files selected`);
+                              }
+                            }
+                          }}
+                        />
+
+                        {/* Native File Picker using Backend API */}
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            try {
+                              const response = await fetch(apiUrl("/api/v1/file-picker"), {
+                                method: "POST",
+                                headers: {
+                                  "Content-Type": "application/json",
+                                },
+                                body: JSON.stringify({
+                                  type: "files",
+                                  multiple: true
+                                }),
+                              });
+
+                              const result = await response.json();
+
+                              if (result.success && result.data.paths.length > 0) {
+                                if (result.data.paths.length === 1) {
+                                  setSelectedPath(result.data.paths[0]);
+                                } else {
+                                  setSelectedPath(`${result.data.paths.length} files selected (native picker)`);
+                                  // Store all paths for later use
+                                  const newPaths = result.data.paths.filter((path: string) => !selectedPaths.includes(path));
+                                  if (newPaths.length > 0) {
+                                    setSelectedPaths(prev => [...prev, ...newPaths]);
+                                  }
+                                }
+                              } else {
+                                alert(result.error || 'Failed to open native file picker. Please use manual path input below.');
+                              }
+                            } catch (error) {
+                              console.error('Error calling native file picker:', error);
+                              alert('Failed to open native file picker. Please use manual path input below.');
+                            }
+                          }}
+                          className="w-full px-3 py-2 text-sm bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-700 rounded-lg hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition-colors"
+                        >
+                          🖥️ Native File Picker (Real Absolute Paths)
+                        </button>
+
+                        {/* Native Directory Picker using Backend API */}
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            try {
+                              const response = await fetch(apiUrl("/api/v1/file-picker"), {
+                                method: "POST",
+                                headers: {
+                                  "Content-Type": "application/json",
+                                },
+                                body: JSON.stringify({
+                                  type: "directory",
+                                  multiple: false
+                                }),
+                              });
+
+                              const result = await response.json();
+
+                              if (result.success && result.data.paths.length > 0) {
+                                const dirPath = result.data.paths[0];
+                                setSelectedPath(dirPath);
+                              } else {
+                                alert(result.error || 'Failed to open native directory picker. Please use manual path input below.');
+                              }
+                            } catch (error) {
+                              console.error('Error calling native directory picker:', error);
+                              alert('Failed to open native directory picker. Please use manual path input below.');
+                            }
+                          }}
+                          className="w-full px-3 py-2 text-sm bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-purple-700 rounded-lg hover:bg-purple-100 dark:hover:bg-purple-900/50 transition-colors"
+                        >
+                          📂 Native Directory Picker (Real Absolute Paths)
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Manual Path Input */}
+                    <div>
+                      <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
+                        Or Enter Path
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="C:\Users\YourName\Documents\file.txt or /Users/yourname/Documents/file.txt"
+                        value={selectedPath}
+                        onChange={(e) => {
+                          // Accept any path format - Windows, macOS, or Linux
+                          setSelectedPath(e.target.value);
+                        }}
+                        className="w-full px-3 py-2 border border-slate-200 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex gap-3 mt-6">
+                    <button
+                      onClick={() => {
+                        setShowFileSelector(false);
+                        setSelectedPath("");
+                        if (fileInputRef.current) {
+                          fileInputRef.current.value = "";
+                        }
+                      }}
+                      className="flex-1 px-4 py-2 text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 border border-slate-200 dark:border-slate-600 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (selectedPath.trim()) {
+                          const files = fileInputRef.current?.files;
+                          if (files && files.length > 0) {
+                            // Handle multiple files - use real absolute paths
+                            const newPaths = Array.from(files).map(file => {
+                              // Try to get real path, fallback to file name
+                              return file.webkitRelativePath || file.name;
+                            });
+                            const uniquePaths = newPaths.filter(path => !selectedPaths.includes(path));
+                            if (uniquePaths.length > 0) {
+                              setSelectedPaths(prev => [...prev, ...uniquePaths]);
+                              setChatState((prev) => ({
+                                ...prev,
+                                enableRag: true,
+                                selectedKb: uniquePaths[0],
+                              }));
+                            }
+                          } else if (selectedPath.trim() && !selectedPath.includes('files selected')) {
+                            // Handle manual path input - accept any absolute path format
+                            const newPath = selectedPath.trim();
+                            if (!selectedPaths.includes(newPath)) {
+                              setSelectedPaths(prev => [...prev, newPath]);
+                              setChatState((prev) => ({
+                                ...prev,
+                                enableRag: true,
+                                selectedKb: newPath,
+                              }));
+                            }
+                          }
+                          setShowFileSelector(false);
+                        }
+                      }}
+                      disabled={!selectedPath.trim()}
+                      className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      Select
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Input Field */}
             <div className="relative">
@@ -393,35 +652,6 @@ export default function HomePage() {
             </div>
           </div>
 
-          {/* Quick Actions Grid */}
-          <div className="w-full max-w-3xl mx-auto">
-            <h3 className="text-sm font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-4 text-center">
-              {t("Explore Modules")}
-            </h3>
-            <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-              {quickActions.map((action, i) => (
-                <Link
-                  key={i}
-                  href={action.href}
-                  className={`group p-4 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:shadow-lg hover:border-${action.color}-300 dark:hover:border-${action.color}-600 transition-all`}
-                >
-                  <div
-                    className={`w-10 h-10 rounded-xl bg-${action.color}-100 dark:bg-${action.color}-900/30 flex items-center justify-center mb-3 group-hover:scale-110 transition-transform`}
-                  >
-                    <action.icon
-                      className={`w-5 h-5 text-${action.color}-600 dark:text-${action.color}-400`}
-                    />
-                  </div>
-                  <h4 className="font-semibold text-slate-900 dark:text-slate-100 text-sm mb-1">
-                    {action.label}
-                  </h4>
-                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                    {action.description}
-                  </p>
-                </Link>
-              ))}
-            </div>
-          </div>
         </div>
       )}
 
@@ -433,12 +663,24 @@ export default function HomePage() {
             <div className="flex items-center gap-3">
               {/* Mode Toggles */}
               <button
-                onClick={() =>
-                  setChatState((prev) => ({
-                    ...prev,
-                    enableRag: !prev.enableRag,
-                  }))
-                }
+                onClick={() => {
+                  if (!chatState.enableRag) {
+                    if (selectedPaths.length > 0) {
+                      setChatState((prev) => ({
+                        ...prev,
+                        enableRag: true,
+                        selectedKb: selectedPaths[0],
+                      }));
+                    } else {
+                      setShowFileSelector(true);
+                    }
+                  } else {
+                    setChatState((prev) => ({
+                      ...prev,
+                      enableRag: false,
+                    }));
+                  }
+                }}
                 className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-all ${
                   chatState.enableRag
                     ? "bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300"
@@ -467,22 +709,67 @@ export default function HomePage() {
               </button>
 
               {chatState.enableRag && (
-                <select
-                  value={chatState.selectedKb}
-                  onChange={(e) =>
-                    setChatState((prev) => ({
-                      ...prev,
-                      selectedKb: e.target.value,
-                    }))
-                  }
-                  className="text-xs bg-slate-100 dark:bg-slate-800 border-0 rounded-lg px-2 py-1 outline-none dark:text-slate-200"
-                >
-                  {kbs.map((kb) => (
-                    <option key={kb.name} value={kb.name}>
-                      {kb.name}
-                    </option>
-                  ))}
-                </select>
+                <div className="relative">
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => setShowPathDropdown(!showPathDropdown)}
+                      className="flex items-center gap-1 px-2 py-1 text-xs bg-slate-100 dark:bg-slate-800 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors dark:text-slate-200"
+                    >
+                      <span className="max-w-[120px] truncate">
+                        {chatState.selectedKb ? (chatState.selectedKb.split('/').pop() || chatState.selectedKb) : 'Select Path'}
+                      </span>
+                      <ChevronDown className="w-3 h-3" />
+                    </button>
+                    <button
+                      onClick={() => setShowFileSelector(true)}
+                      className="flex items-center justify-center w-6 h-6 text-xs bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400 rounded hover:bg-blue-200 dark:hover:bg-blue-900/70 transition-colors"
+                      title="Add new path"
+                    >
+                      +
+                    </button>
+                  </div>
+
+                  {showPathDropdown && selectedPaths.length > 0 && (
+                    <div
+                      ref={pathDropdownRef}
+                      className="absolute top-full left-0 mt-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-lg z-50 min-w-[200px]"
+                    >
+                      {selectedPaths.map((path, index) => (
+                        <div key={index} className="flex items-center justify-between px-3 py-2 hover:bg-slate-50 dark:hover:bg-slate-700 first:rounded-t-lg last:rounded-b-lg">
+                          <button
+                            onClick={() => {
+                              setChatState((prev) => ({
+                                ...prev,
+                                selectedKb: path,
+                              }));
+                              setShowPathDropdown(false);
+                            }}
+                            className="flex-1 text-left text-xs text-slate-700 dark:text-slate-300 truncate"
+                            title={path}
+                          >
+                            {path.split('/').pop() || path}
+                          </button>
+                          <button
+                            onClick={() => {
+                              const newPaths = selectedPaths.filter((_, i) => i !== index);
+                              setSelectedPaths(newPaths);
+                              if (chatState.selectedKb === path) {
+                                setChatState((prev) => ({
+                                  ...prev,
+                                  selectedKb: newPaths[0] || "",
+                                  enableRag: newPaths.length > 0,
+                                }));
+                              }
+                            }}
+                            className="ml-2 text-slate-400 hover:text-red-500 dark:text-slate-500 dark:hover:text-red-400"
+                          >
+                            ×
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               )}
             </div>
 
@@ -532,6 +819,35 @@ export default function HomePage() {
                           <div className="flex items-center gap-2 mt-3 text-blue-600 dark:text-blue-400 text-sm">
                             <Loader2 className="w-4 h-4 animate-spin" />
                             <span>{t("Generating response...")}</span>
+                          </div>
+                        )}
+
+                        {/* Search Logs */}
+                        {msg.searchLogs && msg.searchLogs.length > 0 && (
+                          <div className="mt-4 p-3 bg-slate-50 dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700">
+                            <div className="flex items-center gap-2 mb-2">
+                              <Search className="w-4 h-4 text-slate-500 dark:text-slate-400" />
+                              <span className="text-sm font-medium text-slate-700 dark:text-slate-300">Search Process</span>
+                            </div>
+                            <div className="space-y-1 max-h-48 overflow-y-auto">
+                              {msg.searchLogs.map((log, logIndex) => (
+                                <div
+                                  key={logIndex}
+                                  className={`text-xs px-2 py-1 rounded font-mono ${
+                                    log.level === 'error'
+                                      ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300'
+                                      : log.level === 'warning'
+                                      ? 'bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300'
+                                      : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
+                                  }`}
+                                >
+                                  <span className="opacity-60 mr-2">
+                                    {new Date(log.timestamp).toLocaleTimeString()}
+                                  </span>
+                                  {log.message}
+                                </div>
+                              ))}
+                            </div>
                           </div>
                         )}
                       </div>
@@ -633,13 +949,6 @@ export default function HomePage() {
       )}
       </div>
 
-      {/* Right Sidebar */}
-      <RightSidebar
-        isCollapsed={rightSidebarCollapsed}
-        onToggle={() => setRightSidebarCollapsed(!rightSidebarCollapsed)}
-        width={rightSidebarWidth}
-        onWidthChange={setRightSidebarWidth}
-      />
     </div>
   );
 }
