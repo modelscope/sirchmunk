@@ -692,25 +692,54 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
           return { ...prev, messages, currentStage: "generating" };
         });
       } else if (data.type === "search_log") {
-        // Handle search log streaming
+        // Handle search log streaming with smart merging
         console.log("[DEBUG] Received search_log:", data);
         setChatState((prev) => {
           const messages = [...prev.messages];
           const lastMessage = messages[messages.length - 1];
           if (lastMessage?.role === "assistant") {
             const searchLogs = lastMessage.searchLogs || [];
-            messages[messages.length - 1] = {
-              ...lastMessage,
-              searchLogs: [...searchLogs, {
+            
+            // Smart merge: if this is a streaming message with same task_id as the last log,
+            // append to the last log instead of creating a new one
+            if (data.is_streaming && data.task_id && searchLogs.length > 0) {
+              const lastLog = searchLogs[searchLogs.length - 1];
+              if (lastLog.is_streaming && lastLog.task_id === data.task_id && lastLog.level === data.level) {
+                // Merge with the last streaming log
+                searchLogs[searchLogs.length - 1] = {
+                  ...lastLog,
+                  message: lastLog.message + data.message,
+                  timestamp: data.timestamp, // Update to latest timestamp
+                };
+                console.log("[DEBUG] Merged streaming log:", searchLogs[searchLogs.length - 1]);
+              } else {
+                // Different task or level, add as new log
+                searchLogs.push({
+                  level: data.level,
+                  message: data.message,
+                  timestamp: data.timestamp,
+                  is_streaming: data.is_streaming,
+                  task_id: data.task_id,
+                  flush: data.flush,
+                });
+              }
+            } else {
+              // Non-streaming or first streaming message, add as new log
+              searchLogs.push({
                 level: data.level,
                 message: data.message,
                 timestamp: data.timestamp,
-                is_streaming: data.is_streaming,  // Preserve streaming flag
-                task_id: data.task_id,            // Preserve task ID
-                flush: data.flush,                // Preserve flush flag
-              }],
+                is_streaming: data.is_streaming,
+                task_id: data.task_id,
+                flush: data.flush,
+              });
+            }
+            
+            messages[messages.length - 1] = {
+              ...lastMessage,
+              searchLogs: [...searchLogs],
             };
-            console.log("[DEBUG] Updated searchLogs:", messages[messages.length - 1].searchLogs);
+            console.log("[DEBUG] Updated searchLogs count:", messages[messages.length - 1].searchLogs?.length);
           } else {
             console.log("[DEBUG] No assistant message found for search log");
           }

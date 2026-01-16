@@ -86,14 +86,14 @@ class AgenticSearch(BaseSearch):
             try:
                 res = ast.literal_eval(keywords_json)
             except Exception as e:
-                logger.warning("Failed to parse keywords: {}", e)
+                logger.warning(f"Failed to parse keywords: {e}")
                 return {}
 
         # Validate using Pydantic model
         try:
             return KeywordValidation(root=res).model_dump()
         except Exception as e:
-            logger.warning("Keyword validation failed: {}", e)
+            logger.warning(f"Keyword validation failed: {e}")
             return {}
 
     @staticmethod
