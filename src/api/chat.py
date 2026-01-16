@@ -46,44 +46,200 @@ class ChatConnectionManager:
         await websocket.send_text(message)
 
 # Unified log callback management
+class WebSocketLogger:
+    """
+    WebSocket-aware logger that wraps websocket communications.
+    
+    Provides logger-style methods (info, warning, etc.) similar to loguru,
+    with support for flush and end parameters for streaming output.
+    Compatible with sirchmunk.utils.log_utils.AsyncLogger interface.
+    """
+    
+    def __init__(self, websocket: WebSocket, manager: Optional[ChatConnectionManager] = None, log_type: str = "log", task_id: Optional[str] = None):
+        """
+        Initialize WebSocket logger.
+        
+        Args:
+            websocket: WebSocket connection to send logs to
+            manager: Optional ConnectionManager for routing messages
+            log_type: Type of log message ("log" or "search_log")
+            task_id: Optional task ID for grouping related log messages
+        """
+        self.websocket = websocket
+        self.manager = manager
+        self.log_type = log_type
+        self.task_id = task_id or str(uuid.uuid4())  # Generate unique task ID
+    
+    async def _send_log(self, level: str, message: str, flush: bool = False, end: str = "\n"):
+        """
+        Send log message through WebSocket.
+        
+        Args:
+            level: Log level (info, warning, error, etc.)
+            message: Message content
+            flush: If True, force immediate output (adds small delay for streaming)
+            end: String appended after message (default: "\n")
+        """
+        # Append end character to message
+        full_message = message + end if end else message
+        
+        # Determine if this is a streaming message (no timestamp prefix should be added on frontend)
+        # Streaming condition: message should be appended to current line (end is not a newline)
+        # This indicates it's part of a multi-chunk streaming output (like LLM responses)
+        is_streaming = end != "\n"
+        
+        # Prepare log message
+        log_data = {
+            "type": self.log_type,
+            "level": level,
+            "message": full_message,
+            "timestamp": datetime.now().isoformat(),
+            "is_streaming": is_streaming,  # Flag for frontend to know if this is streaming output
+            "task_id": self.task_id,  # Task ID for grouping related messages
+            "flush": flush,  # Include flush flag for frontend handling
+        }
+        
+        # Send through WebSocket
+        if self.manager:
+            await self.manager.send_personal_message(json.dumps(log_data), self.websocket)
+        else:
+            await self.websocket.send_text(json.dumps(log_data))
+        
+        # If flush is requested, add small delay for proper streaming
+        if flush:
+            await asyncio.sleep(0.01)  # Very short delay for streaming (reduced from 0.05s)
+        else:
+            await asyncio.sleep(0.05)  # Standard delay (reduced from 0.1s)
+    
+    async def log(self, level: str, message: str, flush: bool = False, end: str = "\n"):
+        """Log a message at the specified level"""
+        await self._send_log(level, message, flush=flush, end=end)
+    
+    async def debug(self, message: str, flush: bool = False, end: str = "\n"):
+        """Log a debug message"""
+        await self._send_log("debug", message, flush=flush, end=end)
+    
+    async def info(self, message: str, flush: bool = False, end: str = "\n"):
+        """Log an info message"""
+        await self._send_log("info", message, flush=flush, end=end)
+    
+    async def warning(self, message: str, flush: bool = False, end: str = "\n"):
+        """Log a warning message"""
+        await self._send_log("warning", message, flush=flush, end=end)
+    
+    async def error(self, message: str, flush: bool = False, end: str = "\n"):
+        """Log an error message"""
+        await self._send_log("error", message, flush=flush, end=end)
+    
+    async def success(self, message: str, flush: bool = False, end: str = "\n"):
+        """Log a success message"""
+        await self._send_log("success", message, flush=flush, end=end)
+    
+    async def critical(self, message: str, flush: bool = False, end: str = "\n"):
+        """Log a critical message"""
+        await self._send_log("critical", message, flush=flush, end=end)
+
+
 class LogCallbackManager:
-    """Centralized management for all log callback functions"""
+    """
+    Centralized management for all log callback functions.
+    
+    Creates callback functions and logger instances that are compatible with
+    sirchmunk.utils.log_utils.AsyncLogger interface, supporting flush and end parameters.
+    """
 
     @staticmethod
-    async def create_search_log_callback(websocket: WebSocket, manager: ChatConnectionManager):
-        """Create search log callback for chat WebSocket"""
-        async def search_log_callback(level: str, log_message: str):
-            await manager.send_personal_message(json.dumps({
-                "type": "search_log",
-                "level": level,
-                "message": log_message,
-                "timestamp": datetime.now().isoformat()
-            }), websocket)
-            await asyncio.sleep(0.1)  # Small delay for proper streaming
+    async def create_search_log_callback(websocket: WebSocket, manager: ChatConnectionManager, task_id: Optional[str] = None):
+        """
+        Create search log callback for chat WebSocket.
+        
+        Returns a callback function compatible with log_utils signature:
+        async def callback(level: str, message: str, end: str = "\n", flush: bool = False)
+        
+        Args:
+            websocket: WebSocket connection
+            manager: Connection manager for routing
+            task_id: Optional task ID for grouping related messages (auto-generated if not provided)
+            
+        Returns:
+            Async callback function
+        """
+        # Generate unique task ID for this search session
+        if task_id is None:
+            task_id = f"search_{uuid.uuid4().hex[:8]}"
+        
+        logger = WebSocketLogger(websocket, manager, log_type="search_log", task_id=task_id)
+        
+        async def search_log_callback(level: str, message: str, end: str = "\n", flush: bool = False):
+            await logger._send_log(level, message, flush=flush, end=end)
+        
         return search_log_callback
 
-    @staticmethod
-    async def create_websocket_log_callback(websocket: WebSocket):
-        """Create log callback for search WebSocket"""
-        async def log_callback(level: str, message: str):
-            await websocket.send_text(json.dumps({
-                "type": "log",
-                "level": level,
-                "message": message,
-                "timestamp": asyncio.get_event_loop().time()
-            }))
-            # Small delay to ensure proper streaming
-            await asyncio.sleep(0.1)
-        return log_callback
+    # @staticmethod
+    # async def create_websocket_log_callback(websocket: WebSocket):
+    #     """
+    #     Create log callback for search WebSocket.
+    #
+    #     Returns a callback function compatible with log_utils signature:
+    #     async def callback(level: str, message: str, end: str = "\n", flush: bool = False)
+    #
+    #     Args:
+    #         websocket: WebSocket connection
+    #
+    #     Returns:
+    #         Async callback function
+    #     """
+    #     logger = WebSocketLogger(websocket, manager=None, log_type="log")
+    #
+    #     async def log_callback(level: str, message: str, end: str = "\n", flush: bool = False):
+    #         await logger._send_log(level, message, flush=flush, end=end)
+    #
+    #     return log_callback
 
+    # @staticmethod
+    # async def create_rest_log_callback():
+    #     """
+    #     Create log callback for REST API (silent operation).
+    #
+    #     Returns a callback function compatible with log_utils signature:
+    #     async def callback(level: str, message: str, end: str = "\n", flush: bool = False)
+    #
+    #     Returns:
+    #         Async callback function (no-op)
+    #     """
+    #     async def rest_log_callback(level: str, message: str, end: str = "\n", flush: bool = False):
+    #         # For REST API, we use silent operation
+    #         # This ensures consistency with other search instances
+    #         pass
+    #
+    #     return rest_log_callback
+    
     @staticmethod
-    async def create_rest_log_callback():
-        """Create log callback for REST API (silent operation)"""
-        async def rest_log_callback(level: str, message: str):
-            # For REST API, we use silent operation
-            # This ensures consistency with other search instances
-            pass
-        return rest_log_callback
+    def create_logger(websocket: WebSocket, manager: Optional[ChatConnectionManager] = None, log_type: str = "log", task_id: Optional[str] = None) -> WebSocketLogger:
+        """
+        Create a WebSocketLogger instance with logger-style methods.
+        
+        This provides a logger interface similar to create_logger from log_utils,
+        allowing usage like: await logger.info("message", flush=True, end="")
+        
+        Args:
+            websocket: WebSocket connection
+            manager: Optional ConnectionManager for routing messages
+            log_type: Type of log message ("log" or "search_log")
+            task_id: Optional task ID for grouping related messages (auto-generated if not provided)
+            
+        Returns:
+            WebSocketLogger instance
+            
+        Example:
+            logger = LogCallbackManager.create_logger(websocket, manager, "search_log")
+            await logger.info("Processing started")
+            await logger.info("Loading", flush=True, end=" -> ")
+            await logger.success("Done!", flush=True)
+        """
+        if task_id is None:
+            task_id = f"logger_{uuid.uuid4().hex[:8]}"
+        return WebSocketLogger(websocket, manager, log_type, task_id)
 
 manager = ChatConnectionManager()
 
@@ -97,9 +253,7 @@ class SearchRequest(BaseModel):
 
 def get_search_instance(log_callback=None):
     """Get configured search instance with optional log callback"""
-    if log_callback:
-        return AgenticSearch(log_callback=log_callback)
-    return AgenticSearch()
+    return AgenticSearch(log_callback=log_callback)
 
 def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[str]:
     """

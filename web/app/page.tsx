@@ -376,7 +376,7 @@ export default function HomePage() {
 
             {/* File Selector Modal */}
             {showFileSelector && (
-              <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+              <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[9999]">
                 <div className="bg-white dark:bg-slate-800 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl">
                   <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100 mb-4">
                     Select File or Folder
@@ -829,7 +829,15 @@ export default function HomePage() {
                               <Search className="w-4 h-4 text-slate-500 dark:text-slate-400" />
                               <span className="text-sm font-medium text-slate-700 dark:text-slate-300">Search Process</span>
                             </div>
-                            <div className="space-y-1 max-h-48 overflow-y-auto">
+                            <div 
+                              className="space-y-1 max-h-48 overflow-y-auto"
+                              ref={(el) => {
+                                // Auto-scroll to bottom when new logs arrive
+                                if (el && msg.isStreaming) {
+                                  el.scrollTop = el.scrollHeight;
+                                }
+                              }}
+                            >
                               {msg.searchLogs.map((log, logIndex) => (
                                 <div
                                   key={logIndex}
@@ -838,13 +846,20 @@ export default function HomePage() {
                                       ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300'
                                       : log.level === 'warning'
                                       ? 'bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300'
+                                      : log.level === 'success'
+                                      ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300'
                                       : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
                                   }`}
                                 >
-                                  <span className="opacity-60 mr-2">
-                                    {new Date(log.timestamp).toLocaleTimeString()}
+                                  {/* Only show timestamp for non-streaming messages */}
+                                  {!log.is_streaming && (
+                                    <span className="opacity-60 mr-2">
+                                      {new Date(log.timestamp).toLocaleTimeString()}
+                                    </span>
+                                  )}
+                                  <span style={{ whiteSpace: log.is_streaming ? 'pre' : 'pre-wrap' }}>
+                                    {log.message}
                                   </span>
-                                  {log.message}
                                 </div>
                               ))}
                             </div>
