@@ -645,7 +645,7 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
           // Use ref to get the latest sessionId (avoids closure capturing stale state)
           session_id: sessionIdRef.current,
           history,
-          kb_name: chatState.selectedKb || "/home/project/src,/home/project/web",
+          kb_name: chatState.selectedKb,
           enable_rag: true, // Always enable to trigger search
           enable_web_search: chatState.enableWebSearch,
         }),

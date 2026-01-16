@@ -14,7 +14,7 @@ from datetime import datetime
 import random
 import os
 import threading
-from pathlib import Path
+from sirchmunk.search import AgenticSearch
 
 # Try to import tkinter for file dialogs
 try:
@@ -23,14 +23,6 @@ try:
     TKINTER_AVAILABLE = True
 except ImportError:
     TKINTER_AVAILABLE = False
-
-# Import search functionality
-try:
-    from sirchmunk.search import AgenticSearch
-    SEARCH_AVAILABLE = True
-except ImportError as e:
-    print(f"[ERROR] Failed to import sirchmunk.search: {e}")
-    raise
 
 router = APIRouter(prefix="/api/v1", tags=["chat", "search"])
 
@@ -183,6 +175,65 @@ def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[
         return []
     
     return selected_paths
+
+async def _perform_web_search(query: str, websocket: WebSocket, manager: ChatConnectionManager) -> Dict[str, Any]:
+    """
+    Mock web search functionality
+    TODO: Replace with actual web search implementation
+    """
+    await manager.send_personal_message(json.dumps({
+        "type": "search_log",
+        "level": "info",
+        "message": "🌐 Starting web search...",
+        "timestamp": datetime.now().isoformat()
+    }), websocket)
+    
+    # Simulate web search delay
+    await asyncio.sleep(random.uniform(0.5, 1.0))
+    
+    await manager.send_personal_message(json.dumps({
+        "type": "search_log",
+        "level": "info",
+        "message": f"🔎 Searching web for: {query}",
+        "timestamp": datetime.now().isoformat()
+    }), websocket)
+    
+    await asyncio.sleep(random.uniform(0.5, 1.0))
+    
+    # Mock web search results
+    web_results = {
+        "sources": [
+            {
+                "url": "https://example.com/article1",
+                "title": "Comprehensive Guide to " + query[:30],
+                "snippet": "This article provides detailed information about the subject matter...",
+                "relevance_score": 0.95
+            },
+            {
+                "url": "https://example.com/article2", 
+                "title": "Advanced Concepts and Applications",
+                "snippet": "Exploring advanced techniques and real-world applications...",
+                "relevance_score": 0.87
+            },
+            {
+                "url": "https://example.com/article3",
+                "title": "Latest Research and Findings",
+                "snippet": "Recent discoveries and innovations in this field...",
+                "relevance_score": 0.82
+            }
+        ],
+        "summary": f"Found 3 relevant web sources for '{query}'. The sources cover comprehensive guides, advanced concepts, and latest research."
+    }
+    
+    await manager.send_personal_message(json.dumps({
+        "type": "search_log",
+        "level": "success",
+        "message": f"✅ Web search completed: found {len(web_results['sources'])} sources",
+        "timestamp": datetime.now().isoformat()
+    }), websocket)
+    
+    return web_results
+
 
 def generate_mock_response(message: str, enable_rag: bool = False, enable_web_search: bool = False, kb_name: str = "") -> str:
     """Generate mock chat response based on message content"""
@@ -347,10 +398,239 @@ To dive deeper into this topic, I recommend:
 
 Would you like me to elaborate on any particular aspect, or do you have more specific questions about this topic?"""
 
+async def _chat_only(
+    message: str,
+    websocket: WebSocket,
+    manager: ChatConnectionManager
+) -> tuple[str, Dict[str, Any]]:
+    """
+    Mode 1: Pure chat mode (no RAG, no web search)
+    Direct LLM chat without any retrieval augmentation
+    """
+    await manager.send_personal_message(json.dumps({
+        "type": "status",
+        "stage": "generating",
+        "message": "💬 Generating response..."
+    }), websocket)
+    
+    await asyncio.sleep(random.uniform(0.3, 0.8))
+    
+    # Generate pure chat response
+    response = generate_mock_response(message, enable_rag=False, enable_web_search=False)
+    sources = {}
+    
+    return response, sources
+
+
+async def _chat_rag(
+    message: str,
+    kb_name: str,
+    websocket: WebSocket,
+    manager: ChatConnectionManager
+) -> tuple[str, Dict[str, Any]]:
+    """
+    Mode 2: Chat + RAG (enable_rag=True, enable_web_search=False)
+    LLM chat with knowledge base retrieval
+    """
+    sources = {}
+    if not kb_name:
+        await manager.send_personal_message(json.dumps({
+            "type": "error",
+            "message": "No search paths specified for RAG search."
+        }), websocket)
+        response = "Please specify search paths for RAG search."
+        return response, sources
+    
+    try:
+        # Create log callback for streaming search logs
+        search_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
+
+        # Send RAG start signal
+        await manager.send_personal_message(json.dumps({
+            "type": "status",
+            "stage": "rag",
+            "message": f"🔍 Searching knowledge base: {kb_name}"
+        }), websocket)
+
+        # Create search instance with log callback
+        search_engine = get_search_instance(log_callback=search_log_callback)
+        
+        search_paths = [path.strip() for path in kb_name.split(",")]
+        await search_log_callback("info", f"📂 Parsed search paths: {search_paths}")
+
+        # Execute RAG search
+        print(f"[MODE 2] RAG search with query: {message}, paths: {search_paths}")
+        
+        search_result = await search_engine.search(
+            query=message,
+            search_paths=search_paths,
+            max_depth=5,
+            top_k_files=3,
+            verbose=True
+        )
+        
+        # Send search completion
+        await manager.send_personal_message(json.dumps({
+            "type": "search_complete",
+            "message": "✅ Knowledge base search completed"
+        }), websocket)
+        
+        # Use search result as response
+        response = search_result
+        
+        # Add RAG sources
+        sources["rag"] = [
+            {
+                "kb_name": kb_name,
+                "content": f"Retrieved content from {kb_name}",
+                "relevance_score": 0.92
+            }
+        ]
+        
+    except Exception as e:
+        # Send search error
+        await manager.send_personal_message(json.dumps({
+            "type": "search_error",
+            "message": f"❌ RAG search failed: {str(e)}"
+        }), websocket)
+        
+        # Fallback to mock response
+        response = generate_mock_response(message, enable_rag=True, enable_web_search=False, kb_name=kb_name)
+        sources["rag"] = [{"kb_name": kb_name, "content": "Fallback content", "error": str(e)}]
+    
+    return response, sources
+
+
+async def _chat_web_search(
+    message: str,
+    websocket: WebSocket,
+    manager: ChatConnectionManager
+) -> tuple[str, Dict[str, Any]]:
+    """
+    Mode 3: Chat + Web Search (enable_rag=False, enable_web_search=True)
+    LLM chat with web search augmentation (currently mock)
+    """
+    await manager.send_personal_message(json.dumps({
+        "type": "status",
+        "stage": "web_search",
+        "message": "🌐 Searching the web..."
+    }), websocket)
+    
+    # Perform mock web search
+    web_results = await _perform_web_search(message, websocket, manager)
+    
+    # Generate response enhanced with web search results
+    web_context = "\n\nBased on web search results:\n"
+    for source in web_results["sources"]:
+        web_context += f"- {source['title']}: {source['snippet']}\n"
+    
+    response = generate_mock_response(message, enable_rag=False, enable_web_search=True) + web_context
+    
+    sources = {"web": web_results["sources"]}
+    
+    return response, sources
+
+
+async def _chat_rag_web_search(
+    message: str,
+    kb_name: str,
+    websocket: WebSocket,
+    manager: ChatConnectionManager
+) -> tuple[str, Dict[str, Any]]:
+    """
+    Mode 4: Chat + RAG + Web Search (enable_rag=True, enable_web_search=True)
+    LLM chat with both knowledge base retrieval and web search
+    """
+    sources = {}
+    if not kb_name:
+        await manager.send_personal_message(json.dumps({
+            "type": "error",
+            "message": "No search paths specified for RAG search."
+        }), websocket)
+        response = "Please specify search paths for RAG search."
+        return response, sources
+
+    # Step 1: Perform RAG search
+    try:
+        search_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
+
+        await manager.send_personal_message(json.dumps({
+            "type": "status",
+            "stage": "rag",
+            "message": f"🔍 Step 1/2: Searching knowledge base: {kb_name}"
+        }), websocket)
+
+        search_engine = get_search_instance(log_callback=search_log_callback)
+        search_paths = [path.strip() for path in kb_name.split(",")]
+        await search_log_callback("info", f"📂 RAG search paths: {search_paths}")
+
+        print(f"[MODE 4] RAG search with query: {message}, paths: {search_paths}")
+        
+        rag_result = await search_engine.search(
+            query=message,
+            search_paths=search_paths,
+            max_depth=5,
+            top_k_files=3,
+            verbose=True
+        )
+        
+        await manager.send_personal_message(json.dumps({
+            "type": "search_complete",
+            "message": "✅ Knowledge base search completed"
+        }), websocket)
+        
+        sources["rag"] = [
+            {
+                "kb_name": kb_name,
+                "content": f"Retrieved from {kb_name}",
+                "relevance_score": 0.92
+            }
+        ]
+        
+    except Exception as e:
+        await manager.send_personal_message(json.dumps({
+            "type": "search_error",
+            "message": f"⚠️ RAG search failed: {str(e)}, continuing with web search..."
+        }), websocket)
+        rag_result = f"[RAG search unavailable: {str(e)}]"
+        sources["rag"] = [{"error": str(e)}]
+    
+    # Step 2: Perform web search
+    await manager.send_personal_message(json.dumps({
+        "type": "status",
+        "stage": "web_search",
+        "message": "🌐 Step 2/2: Searching the web..."
+    }), websocket)
+    
+    web_results = await _perform_web_search(message, websocket, manager)
+    sources["web"] = web_results["sources"]
+    
+    # Combine results
+    web_context = "\n\n## Additional Web Sources:\n"
+    for source in web_results["sources"]:
+        web_context += f"- [{source['title']}]({source['url']})\n"
+    
+    # If RAG succeeded, use it as primary response; otherwise use mock
+    if rag_result and "[RAG search unavailable" not in rag_result:
+        response = rag_result + web_context
+    else:
+        response = generate_mock_response(message, enable_rag=True, enable_web_search=True, kb_name=kb_name) + web_context
+    
+    return response, sources
+
+
 # WebSocket endpoint for chat with integrated search
 @router.websocket("/chat")
 async def chat_websocket(websocket: WebSocket):
-    """WebSocket endpoint for real-time chat conversations with integrated search"""
+    """
+    WebSocket endpoint for real-time chat conversations with integrated search
+    
+    Supports 4 modes:
+    1. Pure chat: enable_rag=False, enable_web_search=False
+    2. Chat + RAG: enable_rag=True, enable_web_search=False
+    3. Chat + Web Search: enable_rag=False, enable_web_search=True (mock)
+    4. Chat + RAG + Web Search: enable_rag=True, enable_web_search=True (RAG real, web mock)
+    """
     await manager.connect(websocket)
     
     try:
@@ -365,6 +645,11 @@ async def chat_websocket(websocket: WebSocket):
             kb_name = request_data.get("kb_name", "")
             enable_rag = request_data.get("enable_rag", False)
             enable_web_search = request_data.get("enable_web_search", False)
+
+            print(f"\n{'='*60}")
+            print(f"[CHAT REQUEST] Message: {message[:50]}...")
+            print(f"[CHAT REQUEST] KB: {kb_name}, RAG: {enable_rag}, Web: {enable_web_search}")
+            print(f"{'='*60}\n")
             
             # Generate or use existing session ID
             if not session_id:
@@ -400,96 +685,46 @@ async def chat_websocket(websocket: WebSocket):
             })
             session["updated_at"] = datetime.now().isoformat()
             
-            # Handle real search if enabled and search available
-            # if enable_rag and kb_name and SEARCH_AVAILABLE:
-            if SEARCH_AVAILABLE:
-                try:
-                    # Create log callback for streaming search logs
-                    search_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
-
-                    # Send search start signal
-                    await manager.send_personal_message(json.dumps({
-                        "type": "status",
-                        "stage": "search",
-                        "message": f"🔍 Starting real-time search in: {kb_name}"
-                    }), websocket)
-
-                    # Create search instance with log callback
-                    search_engine = get_search_instance(log_callback=search_log_callback)
-                    
-                    # Perform real search with streaming logs
-                    # Parse comma-separated paths from kb_name or use default paths
-                    if kb_name and isinstance(kb_name, str) and "," in kb_name:
-                        search_paths = [path.strip() for path in kb_name.split(",")]
-                    elif kb_name and isinstance(kb_name, str):
-                        search_paths = [kb_name]
-                    else:
-                        # Default search paths if no kb_name provided
-                        search_paths = ["/home/project/src", "/home/project/web"]
-                        await search_log_callback("info", "🔧 Using default search paths: src and web directories")
-
-                    # Add debug log
-                    await search_log_callback("info", f"🔧 Debug: Parsed search paths: {search_paths}")
-
-                    # Debug log before executing search
-                    print(f"[DEBUG] About to execute search_engine.search() with query: {message}")
-                    print(f"[DEBUG] Search paths: {search_paths}")
-
-                    search_result = await search_engine.search(
-                        query=message,
-                        search_paths=search_paths,
-                        max_depth=5,
-                        top_k_files=3,
-                        verbose=True
-                    )
-                    
-                    # Send search completion
-                    await manager.send_personal_message(json.dumps({
-                        "type": "search_complete",
-                        "message": "✅ Search completed successfully"
-                    }), websocket)
-                    
-                    # Use search result as response
-                    response = search_result
-                    
-                except Exception as e:
-                    # Send search error
-                    await manager.send_personal_message(json.dumps({
-                        "type": "search_error",
-                        "message": f"❌ Search failed: {str(e)}"
-                    }), websocket)
-                    
-                    # Fallback to mock response
-                    response = generate_mock_response(message, enable_rag, enable_web_search, kb_name)
-            else:
-                # Simulate processing stages for mock responses
-                stages = []
-                
-                if enable_rag:
-                    stages.append({"stage": "rag", "message": f"Searching knowledge base: {kb_name}"})
-                
-                if enable_web_search:
-                    stages.append({"stage": "web", "message": "Searching the web for relevant information"})
-                
-                stages.append({"stage": "generating", "message": "Generating response"})
-                
-                # Send status updates
-                for stage_info in stages:
-                    await manager.send_personal_message(json.dumps({
-                        "type": "status",
-                        **stage_info
-                    }), websocket)
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
-                
-                # Generate mock response
-                response = generate_mock_response(message, enable_rag, enable_web_search, kb_name)
+            # ============================================================
+            # Route to appropriate chat mode based on feature flags
+            # ============================================================
+            response = ""
+            sources = {}
             
-            # Simulate streaming response
+            if enable_rag and enable_web_search:
+                # Mode 4: Chat + RAG + Web Search
+                print(f"[MODE 4] Chat + RAG + Web Search")
+                response, sources = await _chat_rag_web_search(
+                    message, kb_name, websocket, manager
+                )
+                
+            elif enable_rag and not enable_web_search:
+                # Mode 2: Chat + RAG only
+                print(f"[MODE 2] Chat + RAG only")
+                response, sources = await _chat_rag(
+                    message, kb_name, websocket, manager
+                )
+                    
+            elif not enable_rag and enable_web_search:
+                # Mode 3: Chat + Web Search only
+                print(f"[MODE 3] Chat + Web Search only")
+                response, sources = await _chat_web_search(
+                    message, websocket, manager
+                )
+                
+            else:
+                # Mode 1: Pure chat (no RAG, no web search)
+                print(f"[MODE 1] Pure chat mode")
+                response, sources = await _chat_only(
+                    message, websocket, manager
+                )
+            
+            # ============================================================
+            # Stream response to client
+            # ============================================================
             words = response.split()
-            streamed_content = ""
             
             for i, word in enumerate(words):
-                streamed_content += word + " "
                 await manager.send_personal_message(json.dumps({
                     "type": "stream",
                     "content": word + " "
@@ -497,31 +732,7 @@ async def chat_websocket(websocket: WebSocket):
                 
                 # Add small delay for realistic streaming
                 if i % 3 == 0:  # Every 3 words
-                    await asyncio.sleep(0.1)
-            
-            # Generate mock sources if RAG or web search enabled
-            sources = {}
-            if enable_rag and kb_name:
-                sources["rag"] = [
-                    {
-                        "kb_name": kb_name,
-                        "content": f"Relevant content from {kb_name} knowledge base"
-                    }
-                ]
-            
-            if enable_web_search:
-                sources["web"] = [
-                    {
-                        "url": "https://example.com/article1",
-                        "title": "Comprehensive Guide to the Topic",
-                        "snippet": "This article provides detailed information about the subject matter..."
-                    },
-                    {
-                        "url": "https://example.com/article2", 
-                        "title": "Advanced Concepts and Applications",
-                        "snippet": "Exploring advanced techniques and real-world applications..."
-                    }
-                ]
+                    await asyncio.sleep(0.05)
             
             # Send sources if available
             if sources:
@@ -548,6 +759,9 @@ async def chat_websocket(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
     except Exception as e:
+        print(f"[ERROR] WebSocket error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         try:
             await manager.send_personal_message(json.dumps({
                 "type": "error",
@@ -558,115 +772,115 @@ async def chat_websocket(websocket: WebSocket):
         manager.disconnect(websocket)
 
 # REST API endpoints for search functionality
-@router.post("/search")
-async def search_files(request: SearchRequest):
-    """Search files using Sirchmunk search engine"""
-    try:
-        # Create log callback using LogCallbackManager
-        rest_log_callback = await LogCallbackManager.create_rest_log_callback()
-
-        # Get search instance with log callback
-        search_engine = get_search_instance(log_callback=rest_log_callback)
-
-        # Convert search_paths to appropriate format
-        if isinstance(request.search_paths, str):
-            search_paths = request.search_paths
-        else:
-            search_paths = request.search_paths
-
-        # Perform search
-        result = await search_engine.search(
-            query=request.query,
-            search_paths=search_paths,
-            max_depth=request.max_depth,
-            top_k_files=request.top_k_files
-        )
-
-        return {
-            "success": True,
-            "data": {
-                "query": request.query,
-                "search_paths": request.search_paths,
-                "result": result
-            }
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
-
-@router.websocket("/search/ws")
-async def search_websocket(websocket: WebSocket):
-    """WebSocket endpoint for real-time search with streaming logs"""
-    await websocket.accept()
-    
-    try:
-        while True:
-            # Receive search request from client
-            data = await websocket.receive_text()
-            request_data = json.loads(data)
-            
-            query = request_data.get("query", "")
-            search_paths = request_data.get("search_paths", [])
-            max_depth = request_data.get("max_depth", 5)
-            top_k_files = request_data.get("top_k_files", 3)
-            
-            if not query or not search_paths:
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": "Query and search_paths are required"
-                }))
-                continue
-            
-            # Create log callback for streaming
-            log_callback = await LogCallbackManager.create_websocket_log_callback(websocket)
-
-            try:
-                # Create search instance with log callback
-                search_engine = get_search_instance(log_callback=log_callback)
-                
-                # Send start signal
-                await websocket.send_text(json.dumps({
-                    "type": "start",
-                    "query": query,
-                    "search_paths": search_paths
-                }))
-                
-                # Perform search with streaming logs
-                result = await search_engine.search(
-                    query=query,
-                    search_paths=search_paths,
-                    max_depth=max_depth,
-                    top_k_files=top_k_files,
-                    verbose=True
-                )
-                
-                # Send final result
-                await websocket.send_text(json.dumps({
-                    "type": "result",
-                    "success": True,
-                    "data": {
-                        "query": query,
-                        "search_paths": search_paths,
-                        "result": result
-                    }
-                }))
-                
-            except Exception as e:
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": f"Search failed: {str(e)}"
-                }))
-                
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        try:
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": f"WebSocket error: {str(e)}"
-            }))
-        except:
-            pass
+# @router.post("/search")
+# async def search_files(request: SearchRequest):
+#     """Search files using Sirchmunk search engine"""
+#     try:
+#         # Create log callback using LogCallbackManager
+#         rest_log_callback = await LogCallbackManager.create_rest_log_callback()
+#
+#         # Get search instance with log callback
+#         search_engine = get_search_instance(log_callback=rest_log_callback)
+#
+#         # Convert search_paths to appropriate format
+#         if isinstance(request.search_paths, str):
+#             search_paths = request.search_paths
+#         else:
+#             search_paths = request.search_paths
+#
+#         # Perform search
+#         result = await search_engine.search(
+#             query=request.query,
+#             search_paths=search_paths,
+#             max_depth=request.max_depth,
+#             top_k_files=request.top_k_files
+#         )
+#
+#         return {
+#             "success": True,
+#             "data": {
+#                 "query": request.query,
+#                 "search_paths": request.search_paths,
+#                 "result": result
+#             }
+#         }
+#
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+#
+# @router.websocket("/search/ws")
+# async def search_websocket(websocket: WebSocket):
+#     """WebSocket endpoint for real-time search with streaming logs"""
+#     await websocket.accept()
+#
+#     try:
+#         while True:
+#             # Receive search request from client
+#             data = await websocket.receive_text()
+#             request_data = json.loads(data)
+#
+#             query = request_data.get("query", "")
+#             search_paths = request_data.get("search_paths", [])
+#             max_depth = request_data.get("max_depth", 5)
+#             top_k_files = request_data.get("top_k_files", 3)
+#
+#             if not query or not search_paths:
+#                 await websocket.send_text(json.dumps({
+#                     "type": "error",
+#                     "message": "Query and search_paths are required"
+#                 }))
+#                 continue
+#
+#             # Create log callback for streaming
+#             log_callback = await LogCallbackManager.create_websocket_log_callback(websocket)
+#
+#             try:
+#                 # Create search instance with log callback
+#                 search_engine = get_search_instance(log_callback=log_callback)
+#
+#                 # Send start signal
+#                 await websocket.send_text(json.dumps({
+#                     "type": "start",
+#                     "query": query,
+#                     "search_paths": search_paths
+#                 }))
+#
+#                 # Perform search with streaming logs
+#                 result = await search_engine.search(
+#                     query=query,
+#                     search_paths=search_paths,
+#                     max_depth=max_depth,
+#                     top_k_files=top_k_files,
+#                     verbose=True
+#                 )
+#
+#                 # Send final result
+#                 await websocket.send_text(json.dumps({
+#                     "type": "result",
+#                     "success": True,
+#                     "data": {
+#                         "query": query,
+#                         "search_paths": search_paths,
+#                         "result": result
+#                     }
+#                 }))
+#
+#             except Exception as e:
+#                 await websocket.send_text(json.dumps({
+#                     "type": "error",
+#                     "message": f"Search failed: {str(e)}"
+#                 }))
+#
+#     except WebSocketDisconnect:
+#         pass
+#     except Exception as e:
+#         try:
+#             await websocket.send_text(json.dumps({
+#                 "type": "error",
+#                 "message": f"WebSocket error: {str(e)}"
+#             }))
+#         except:
+#             pass
 
 # File picker endpoints
 @router.post("/file-picker")
