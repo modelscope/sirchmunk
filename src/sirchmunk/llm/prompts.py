@@ -50,6 +50,41 @@ Output the result strictly in the following JSON-like dict format within tags: <
 """
 
 
+QUERY_KEYWORDS_EXTRACTION_RETRY = """
+### Role: Search Optimization Expert & Information Retrieval Specialist
+
+### Context:
+Previous keyword extraction attempt(s) yielded no search results. We need to re-extract keywords with a **different granularity and perspective**.
+
+### Previous Keywords That Failed:
+{previous_keywords}
+
+### Task:
+1. Re-analyze the user query with a **different approach** than previous attempts:
+   - If previous keywords were too specific/technical, try more **general/common** terms
+   - If previous keywords were too general, try more **specific/technical/domain-specific** terms
+   - Consider synonyms, related concepts, or alternative phrasings
+   - Try different levels of abstraction (broader or narrower)
+2. Extract keywords that are **DIFFERENT** from previous attempts
+3. Estimate the **IDF (Inverse Document Frequency)** value for each keyword
+4. Normalize the IDF values to a scale of **[1, 10]**
+
+### Critical Requirements:
+- **MUST** generate keywords different from previous attempts
+- Balance between specificity and generality
+- Include variations and alternative expressions
+- ONLY extract from the user query context
+
+### Output Format:
+Output the result strictly in the following JSON-like dict format within tags: <KEYWORDS></KEYWORDS>
+
+### User Query:
+{user_input}
+
+### Re-optimized Keywords with IDF (Attempt #{retry_count}):
+"""
+
+
 EVIDENCE_SUMMARY = """
 ## Role: High-Precision Information Synthesis Expert
 

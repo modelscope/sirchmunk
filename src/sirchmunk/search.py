@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import ast
 import json
-import os
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union, Callable
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Union
 import asyncio
 
 from loguru import logger
@@ -20,6 +19,7 @@ from sirchmunk.schema.knowledge import KnowledgeCluster
 from sirchmunk.schema.request import ContentItem, ImageURL, Message, Request
 from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME, WORK_PATH
 from sirchmunk.utils.file_utils import get_fast_hash
+from sirchmunk.utils.log_utils import create_logger, LogCallback
 from sirchmunk.utils.utils import (
     KeywordValidation,
     extract_fields,
@@ -34,7 +34,7 @@ class AgenticSearch(BaseSearch):
         llm: Optional[OpenAIChat] = None,
         work_path: Optional[Union[str, Path]] = None,
         verbose: bool = False,
-        log_callback: Optional[Callable[[str, str], None]] = None,
+        log_callback: LogCallback = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -53,20 +53,17 @@ class AgenticSearch(BaseSearch):
 
         self.grep_retriever: GrepRetriever = GrepRetriever(work_path=self.work_path)
 
-        self.knowledge_bank = KnowledgeBank(llm=self.llm, work_path=self.work_path)
+        # Create bound logger with callback - returns async function(level, message)
+        self._log: Callable[[str, str], Awaitable[None]] = create_logger(log_callback=log_callback)
+        
+        # Pass log_callback to KnowledgeBank so it can also log through the same callback
+        self.knowledge_bank = KnowledgeBank(
+            llm=self.llm, 
+            work_path=self.work_path,
+            log_callback=log_callback
+        )
 
         self.verbose: bool = verbose
-        self.log_callback: Optional[Callable[[str, str], None]] = log_callback
-
-    async def _log(self, level: str, message: str):
-        """Send log message through callback if available, otherwise use logger"""
-        if self.log_callback:
-            if asyncio.iscoroutinefunction(self.log_callback):
-                await self.log_callback(level, message)
-            else:
-                self.log_callback(level, message)
-        else:
-            getattr(logger, level.lower())(message)
 
     @staticmethod
     def _extract_and_validate_keywords(llm_resp: str) -> dict:
@@ -232,7 +229,7 @@ class AgenticSearch(BaseSearch):
         )
 
         # Get enhanced query keywords with IDF scores
-        await self._log("info", "🔍 Extracting query keywords...")
+        await self._log("info", "Extracting query keywords...")
         resp_keywords: str = await self.llm.achat(
             messages=request.to_payload(prompt_template=QUERY_KEYWORDS_EXTRACTION),
             stream=False,
@@ -240,10 +237,10 @@ class AgenticSearch(BaseSearch):
         query_keywords: Dict[str, float] = self._extract_and_validate_keywords(
             resp_keywords
         )
-        await self._log("info", f"✅ Enhanced query keywords: {query_keywords}")
+        await self._log("info", f"Enhanced query keywords: {query_keywords}")
 
         # Get grep results
-        await self._log("info", f"🔎 Searching files in paths: {search_paths}")
+        await self._log("info", f"Searching files in paths: {search_paths}")
         grep_results: List[Dict[str, Any]] = await self.grep_retriever.retrieve(
             terms=list(query_keywords.keys()),
             path=search_paths,
@@ -274,14 +271,18 @@ class AgenticSearch(BaseSearch):
         grep_results = self.process_grep_results(
             results=grep_results, keywords_with_idf=query_keywords
         )
+
         if verbose:
             tmp_sep = "\n"
             file_list = [str(r['path']) for r in grep_results[:top_k_files]]
-            await self._log("info", f"📁 Found {len(grep_results)} files, top {len(file_list)}:\n{tmp_sep.join(file_list)}")
+            await self._log("info", f"Found {len(grep_results)} files, top {len(file_list)}:\n{tmp_sep.join(file_list)}")
+
+        if len(grep_results) == 0:
+            return f"No relevant information found for the query: {query}"
 
         # Build knowledge cluster
         if verbose:
-            await self._log("info", "🧠 Building knowledge cluster...")
+            await self._log("info", "Building knowledge cluster...")
         cluster: KnowledgeCluster = await self.knowledge_bank.build(
             request=request,
             retrieved_infos=grep_results,
@@ -314,11 +315,11 @@ class AgenticSearch(BaseSearch):
             text_content=cluster_text_content,
         )
 
-        await self._log("info", "📝 Generating search result summary...")
+        await self._log("info", "Generating search result summary...")
         search_result: str = await self.llm.achat(
             messages=[{"role": "user", "content": result_sum_prompt}],
             stream=True,
         )
-        await self._log("info", "✅ Search completed successfully!")
+        await self._log("info", "Search completed successfully!")
 
         return search_result

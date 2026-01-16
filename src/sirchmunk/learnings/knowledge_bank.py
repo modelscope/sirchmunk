@@ -2,9 +2,8 @@
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
-from loguru import logger
 
 from sirchmunk.learnings.evidence_processor import (
     MonteCarloEvidenceSampling,
@@ -22,6 +21,7 @@ from sirchmunk.schema.metadata import FileInfo
 from sirchmunk.schema.request import Request
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
 from sirchmunk.utils.file_utils import StorageStructure, fast_extract
+from sirchmunk.utils.log_utils import create_logger, LogCallback
 from sirchmunk.utils.utils import extract_fields
 
 # In-memory knowledge storage, keyed by cluster ID
@@ -40,6 +40,7 @@ class KnowledgeBank:
         llm: OpenAIChat,
         metadata_map: Dict[str, Any] = None,
         work_path: Union[str, Path] = None,
+        log_callback: LogCallback = None,
     ):
         """
         Initialize the KnowledgeBank with an LLM and metadata mapping.
@@ -49,6 +50,8 @@ class KnowledgeBank:
             metadata_map (Dict[str, Any]): A mapping of all metadata information.
                 k: metadata cache key, refers to `FileInfo.cache_key`
                 v: metadata path or content
+            work_path: Working directory path
+            log_callback: Optional log callback function for custom logging
         """
         self.llm = llm
         self.metadata_map = metadata_map
@@ -62,6 +65,9 @@ class KnowledgeBank:
         self.knowledge_storage = KnowledgeStorage(
             work_path=self.work_path, readonly=False
         )
+        
+        # Create bound logger with callback - returns async function(level, message)
+        self._log: Callable[[str, str], Awaitable[None]] = create_logger(log_callback=log_callback)
 
     @staticmethod
     def _get_file_info(
@@ -92,7 +98,8 @@ class KnowledgeBank:
         """Build a knowledge cluster from retrieved information and metadata dynamically."""
 
         if len(retrieved_infos) == 0:
-            logger.warning(
+            await self._log(
+                "warning",
                 "No retrieved information available to build knowledge cluster."
             )
             return None
@@ -134,7 +141,7 @@ class KnowledgeBank:
             evidences.append(evidence_unit)
 
         if len(evidences) == 0:
-            logger.warning("No evidence units extracted from retrieved information.")
+            await self._log("warning", "No evidence units extracted from retrieved information.")
             return None
 
         # Get `name`, `description` and `content` from user request and evidences using LLM
@@ -155,7 +162,8 @@ class KnowledgeBank:
             content=evidence_summary_response
         )
         if len(cluster_infos) == 0:
-            logger.warning(
+            await self._log(
+                "warning",
                 "Failed to extract knowledge cluster information from LLM response."
             )
             return None
@@ -222,8 +230,9 @@ class KnowledgeBank:
         if cluster_id in _KNOWLEDGE_MAP:
             del _KNOWLEDGE_MAP[cluster_id]
         else:
-            logger.warning(
-                "Knowledge cluster with ID {} not found for removal.", cluster_id
+            await self._log(
+                "warning",
+                f"Knowledge cluster with ID {cluster_id} not found for removal."
             )
 
     async def clear(self) -> None:
