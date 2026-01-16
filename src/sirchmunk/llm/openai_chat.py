@@ -2,6 +2,7 @@
 from typing import TYPE_CHECKING, Any, Dict, List
 
 from openai import AsyncOpenAI, OpenAI
+from sirchmunk.utils import create_logger, LogCallback
 
 if TYPE_CHECKING:
     pass
@@ -17,6 +18,7 @@ class OpenAIChat:
         api_key: str = None,
         base_url: str = None,
         model: str = None,
+        log_callback: LogCallback = None,
         **kwargs,
     ):
         """
@@ -40,6 +42,9 @@ class OpenAIChat:
 
         self._model = model
         self._kwargs = kwargs
+
+        self._logger = create_logger(log_callback=log_callback, enable_async=False)
+        self._logger_async = create_logger(log_callback=log_callback, enable_async=True)
 
     def chat(
         self,
@@ -66,9 +71,11 @@ class OpenAIChat:
             for chunk in resp:
                 delta = chunk.choices[0].delta
                 if delta.role:
-                    print(f"[role={delta.role}] ", end="", flush=True)
+                    # print(f"[role={delta.role}] ", end="", flush=True)
+                    self._logger.info(f"[role={delta.role}] ", end="", flush=True)
                 if delta.content:
-                    print(delta.content, end="", flush=True)
+                    # print(delta.content, end="", flush=True)
+                    self._logger.info(delta.content, end="", flush=True)
                     res_content += delta.content
         else:
             res_content = resp.choices[0].message.content
@@ -100,9 +107,9 @@ class OpenAIChat:
             async for chunk in resp:
                 delta = chunk.choices[0].delta
                 if delta.role:
-                    print(f"[role={delta.role}] ", end="", flush=True)
+                    await self._logger_async.info(f"[role={delta.role}] ", end="", flush=True)
                 if delta.content:
-                    print(delta.content, end="", flush=True)
+                    await self._logger_async.info(delta.content, end="", flush=True)
                     res_content += delta.content
         else:
             res_content = resp.choices[0].message.content

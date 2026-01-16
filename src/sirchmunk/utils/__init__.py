@@ -2,14 +2,14 @@
 
 from sirchmunk.utils.log_utils import (
     AsyncLogger,
+    SyncLogger,
     LogCallback,
     create_logger,
-    log_with_callback,
 )
 
 __all__ = [
-    "log_with_callback",
     "create_logger",
     "AsyncLogger",
+    "SyncLogger",
     "LogCallback",
 ]
