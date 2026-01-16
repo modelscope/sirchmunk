@@ -35,54 +35,96 @@ QUERY_KEYWORDS_EXTRACTION = """
 ### Role: Search Optimization Expert & Information Retrieval Specialist
 
 ### Task:
-1. Analyze the provided user query to extract core keywords, including both **fine-grained** and **coarse-grained** terms.
-2. Estimate the **IDF (Inverse Document Frequency)** value for each keyword based on its rarity in the latest general-purpose technical and web corpus.
-3. Normalize the IDF values to a scale of **[1, 10]**, where 10 is the most rare/specific, and 1 is the most common.
-4. ONLY extract keywords from the user query; do NOT add external information.
+Extract **{num_levels} sets** of keywords from the user query with **different granularities** to maximize search hit rate.
+
+### Multi-Level Keyword Granularity Strategy:
+
+Extract {num_levels} levels of keywords with progressively finer granularity:
+
+{level_descriptions}
+
+### IDF Value Guidelines:
+- Estimate the **IDF (Inverse Document Frequency)** for each keyword based on its rarity in general corpus
+- IDF range: **[0-10]** where:
+  - 0-3: Very common terms (e.g., "the", "is", "data")
+  - 4-6: Moderately common terms (e.g., "algorithm", "network")
+  - 7-9: Rare/specific terms (e.g., "backpropagation", "xgboost")
+  - 10: Extremely rare/specialized terms
+- IDF values are **independent** of keyword level - focus on term rarity, not granularity
+
+### Requirements:
+- Each level should have 3-5 keywords
+- Keywords must become progressively **finer-grained** from Level 1 to Level {num_levels}
+- **Level 1**: Coarse-grained phrases/multi-word expressions
+- **Level {num_levels}**: Fine-grained single words or precise technical terms
+- ONLY extract from the user query context; do NOT add external information
+- Ensure keywords at different levels are complementary, not redundant
 
 ### Output Format:
-Output the result strictly in the following JSON-like dict format within tags: <KEYWORDS></KEYWORDS>
+Output {num_levels} separate JSON-like dicts within their respective tags:
+
+{output_format_example}
 
 ### User Query:
-{user_input}
+{{user_input}}
 
-### Optimized Keywords with IDF:
+### {num_levels}-Level Keywords (Coarse to Fine):
 """
 
 
-QUERY_KEYWORDS_EXTRACTION_RETRY = """
-### Role: Search Optimization Expert & Information Retrieval Specialist
-
-### Context:
-Previous keyword extraction attempt(s) yielded no search results. We need to re-extract keywords with a **different granularity and perspective**.
-
-### Previous Keywords That Failed:
-{previous_keywords}
-
-### Task:
-1. Re-analyze the user query with a **different approach** than previous attempts:
-   - If previous keywords were too specific/technical, try more **general/common** terms
-   - If previous keywords were too general, try more **specific/technical/domain-specific** terms
-   - Consider synonyms, related concepts, or alternative phrasings
-   - Try different levels of abstraction (broader or narrower)
-2. Extract keywords that are **DIFFERENT** from previous attempts
-3. Estimate the **IDF (Inverse Document Frequency)** value for each keyword
-4. Normalize the IDF values to a scale of **[1, 10]**
-
-### Critical Requirements:
-- **MUST** generate keywords different from previous attempts
-- Balance between specificity and generality
-- Include variations and alternative expressions
-- ONLY extract from the user query context
-
-### Output Format:
-Output the result strictly in the following JSON-like dict format within tags: <KEYWORDS></KEYWORDS>
-
-### User Query:
-{user_input}
-
-### Re-optimized Keywords with IDF (Attempt #{retry_count}):
-"""
+def generate_keyword_extraction_prompt(num_levels: int = 3) -> str:
+    """
+    Generate a dynamic keyword extraction prompt template based on the number of levels.
+    
+    The returned template still contains {{user_input}} placeholder that needs to be
+    filled in by the caller.
+    
+    Args:
+        num_levels: Number of granularity levels (default: 3)
+    
+    Returns:
+        Prompt template string with {{user_input}} placeholder
+    """
+    # Generate level descriptions with granularity focus
+    level_descriptions = []
+    for i in range(1, num_levels + 1):
+        # Define granularity characteristics
+        if i == 1:
+            granularity = "Coarse-grained"
+            desc_text = "Multi-word phrases, compound expressions, broader concepts"
+            examples = '"machine learning algorithms", "data processing pipeline", "neural network training"'
+        elif i == num_levels:
+            granularity = "Fine-grained"
+            desc_text = "Single words, precise terms, atomic concepts"
+            examples = '"optimization", "gradient", "tensor", "epoch"'
+        else:
+            granularity = f"Medium-grained (Level {i})"
+            desc_text = "2-3 word phrases or compound terms transitioning to single words"
+            examples = '"deep learning", "batch normalization", "learning rate"'
+        
+        level_descriptions.append(
+            f"**Level {i}** ({granularity}):\n"
+            f"   - Granularity: {desc_text}\n"
+            f"   - Example keywords: {examples}\n"
+            f"   - Note: IDF values should reflect term rarity, not granularity level"
+        )
+    
+    # Generate output format examples (avoiding f-string interpolation issues)
+    output_examples = []
+    for i in range(1, num_levels + 1):
+        # Use double braces to escape them in the format string
+        example_dict = '{{"keyword1": idf_value, "keyword2": idf_value, ...}}'
+        output_examples.append(
+            f"<KEYWORDS_LEVEL_{i}>\n{example_dict}\n</KEYWORDS_LEVEL_{i}>"
+        )
+    
+    # Format the template with num_levels, descriptions, and examples
+    # Note: {{user_input}} becomes {user_input} after this format call
+    return QUERY_KEYWORDS_EXTRACTION.format(
+        num_levels=num_levels,
+        level_descriptions="\n\n".join(level_descriptions),
+        output_format_example="\n\n".join(output_examples)
+    )
 
 
 EVIDENCE_SUMMARY = """

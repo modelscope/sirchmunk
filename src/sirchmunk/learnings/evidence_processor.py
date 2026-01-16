@@ -4,13 +4,13 @@ import json
 import math
 import random
 from dataclasses import dataclass
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Set, Tuple
 
-from loguru import logger
 from rapidfuzz import fuzz, process
 
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import EVALUATE_EVIDENCE_SAMPLE, ROI_RESULT_SUMMARY
+from sirchmunk.utils import create_logger, LogCallback
 
 
 @dataclass
@@ -74,6 +74,7 @@ class MonteCarloEvidenceSampling:
         llm: OpenAIChat,
         doc_content: str,
         verbose: bool = True,
+        log_callback: LogCallback = None,
     ):
         self.llm = llm
         self.doc = doc_content
@@ -97,6 +98,9 @@ class MonteCarloEvidenceSampling:
         self.top_k_seeds = 2
 
         self.visited_starts: Set[int] = set()
+        
+        # Create bound logger with callback - returns AsyncLogger instance
+        self._log = create_logger(log_callback=log_callback)
 
     def _get_content(self, start: int) -> Tuple[int, int, str]:
         """
@@ -106,7 +110,7 @@ class MonteCarloEvidenceSampling:
         end = min(start + self.probe_window, self.doc_len)
         return start, end, self.doc[start:end]
 
-    def _get_fuzzy_anchors(
+    async def _get_fuzzy_anchors(
         self, query: str, keywords: List[str] = None, threshold: float = 10.0
     ) -> List[SampleWindow]:
         """
@@ -121,7 +125,7 @@ class MonteCarloEvidenceSampling:
             List[SampleWindow]: List of sampled windows based on fuzzy matching.
         """
         if self.verbose:
-            logger.info(">> Executing RapidFuzz heuristic pre-filtering...")
+            await self._log.info(">> Executing RapidFuzz heuristic pre-filtering...")
 
         keywords = keywords or []
 
@@ -175,7 +179,7 @@ class MonteCarloEvidenceSampling:
 
         top_score = anchors[0].fuzz_score if anchors else 0.0
         if self.verbose:
-            logger.info(
+            await self._log.info(
                 f"   Anchors hit: {len(anchors)} (Top Fuzz Score: {top_score:.1f})"
             )
 
@@ -302,7 +306,7 @@ class MonteCarloEvidenceSampling:
             sample.score = float(data.get("score", 0))
             sample.reasoning = data.get("reasoning", "")
         except Exception as e:
-            logger.warning(f"Error evaluating sample at {sample.start_idx}: {e}")
+            await self._log.warning(f"Error evaluating sample at {sample.start_idx}: {e}")
             sample.score = 0.0
 
         return sample
@@ -314,7 +318,7 @@ class MonteCarloEvidenceSampling:
         Evaluates a batch of samples concurrently.
         """
         if self.verbose:
-            logger.info(f"   Evaluating {len(samples)} samples with LLM...")
+            await self._log.info(f"   Evaluating {len(samples)} samples with LLM...")
 
         # Create async tasks
         tasks = [self._evaluate_sample_async(s, query) for s in samples]
@@ -371,10 +375,10 @@ class MonteCarloEvidenceSampling:
             RoiResult: The final ROI result with metadata.
         """
         if self.verbose:
-            logger.info(
+            await self._log.info(
                 f"=== Starting Hybrid Adaptive Retrieval (Doc Len: {self.doc_len}) ==="
             )
-            logger.info(f"Query: {query}, optional keywords: {keywords}")
+            await self._log.info(f"Query: {query}, optional keywords: {keywords}")
 
         keywords = keywords or {}
 
@@ -383,14 +387,14 @@ class MonteCarloEvidenceSampling:
 
         for r in range(1, self.max_rounds + 1):
             if self.verbose:
-                logger.info(f"--- Round {r}/{self.max_rounds} ---")
+                await self._log.info(f"--- Round {r}/{self.max_rounds} ---")
             current_samples = []
 
             if r == 1:
                 # === Strategy: Fuzz Anchors + Random Supplement ===
                 # 1. Get Fuzz Anchors (Exploitation)
-                # Note: Fuzz is CPU bound, so we keep it sync
-                fuzz_samples = self._get_fuzzy_anchors(
+                # Note: Now async to support log callback
+                fuzz_samples = await self._get_fuzzy_anchors(
                     query=query,
                     keywords=list(keywords.keys()),
                     threshold=10.0,
@@ -406,7 +410,7 @@ class MonteCarloEvidenceSampling:
                 current_samples.extend(random_samples)
 
                 if self.verbose:
-                    logger.info(
+                    await self._log.info(
                         f"Sampling Distribution: Fuzz Anchors={len(fuzz_samples)}, Random Exploration={len(random_samples)}"
                     )
 
@@ -416,7 +420,7 @@ class MonteCarloEvidenceSampling:
                 valid_seeds = [s for s in top_seeds if s.score >= 4.0]
 
                 if not valid_seeds:
-                    logger.warning(
+                    await self._log.warning(
                         "No high-value regions found, attempting global random sampling again..."
                     )
                     current_samples = self._sample_stratified_supplement(
@@ -425,19 +429,19 @@ class MonteCarloEvidenceSampling:
                 else:
                     max_score = valid_seeds[0].score
                     if self.verbose:
-                        logger.info(
+                        await self._log.info(
                             f"Focusing: Based on {len(valid_seeds)} seeds (Max Score: {max_score})"
                         )
                     current_samples = self._sample_gaussian(valid_seeds, r)
 
             if not current_samples and self.verbose:
-                logger.info("No new samples generated this round, skipping.")
+                await self._log.info("No new samples generated this round, skipping.")
             else:
                 evaluated = await self._evaluate_batch(current_samples, query)
                 all_candidates.extend(evaluated)
 
                 for s in evaluated:
-                    logger.info(
+                    await self._log.info(
                         f"  [Pos {s.start_idx:6d} | Src: {s.source:8s}] Score: {s.score} | {s.reasoning[:30]}..."
                     )
 
@@ -448,14 +452,14 @@ class MonteCarloEvidenceSampling:
             # Early stopping check
             if top_seeds and top_seeds[0].score >= confidence_threshold:
                 if self.verbose:
-                    logger.info(
+                    await self._log.info(
                         f">> High confidence target found (Score >= {confidence_threshold}), stopping early."
                     )
                 break
 
         # --- Final Result Processing ---
         if not all_candidates:
-            logger.warning("Failed to retrieve any content.")
+            await self._log.warning("Failed to retrieve any content.")
             return RoiResult(
                 summary="Could not retrieve relevant content.",
                 is_found=False,
@@ -488,7 +492,7 @@ class MonteCarloEvidenceSampling:
         best_score = final_candidates[0].score
 
         if self.verbose:
-            logger.info(
+            await self._log.info(
                 f"=== Final Lock: {len(final_candidates)} snippets, Top Score {best_score} ==="
             )
 

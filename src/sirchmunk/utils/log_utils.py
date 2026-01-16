@@ -57,18 +57,18 @@ async def log_with_callback(
         getattr(default_logger, level.lower())(message)
 
 
-def create_logger(log_callback: LogCallback = None):
+def create_logger(log_callback: LogCallback = None) -> "AsyncLogger":
     """
-    Create a logger function with a bound log_callback.
+    Create an AsyncLogger instance with a bound log_callback.
     
-    This factory function creates a logging function with a specific callback
-    pre-configured, useful for dependency injection or class initialization.
+    This factory function creates a logger with logger-style methods (info, warning, etc.)
+    pre-configured with a specific callback, compatible with loguru logger usage.
     
     Args:
         log_callback: Optional callback function to bind
         
     Returns:
-        An async function that logs with the bound callback
+        An AsyncLogger instance that can be used like: await logger.info("message")
         
     Example:
         # Create a custom logger
@@ -77,14 +77,16 @@ def create_logger(log_callback: LogCallback = None):
         
         logger = create_logger(log_callback=my_callback)
         
-        # Use the logger
-        await logger("info", "Starting process")
-        await logger("error", "Failed to load file")
+        # Use the logger (same style as loguru)
+        await logger.info("Starting process")
+        await logger.error("Failed to load file")
+        await logger.warning("Low memory")
+        
+        # Without callback (uses default loguru)
+        logger = create_logger()
+        await logger.info("Using default logger")
     """
-    async def bound_logger(level: str, message: str):
-        await log_with_callback(level, message, log_callback=log_callback)
-    
-    return bound_logger
+    return AsyncLogger(log_callback=log_callback)
 
 
 class AsyncLogger:

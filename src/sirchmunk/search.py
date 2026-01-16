@@ -11,7 +11,7 @@ from sirchmunk.base import BaseSearch
 from sirchmunk.learnings.knowledge_bank import KnowledgeBank
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import (
-    QUERY_KEYWORDS_EXTRACTION,
+    generate_keyword_extraction_prompt,
     SEARCH_RESULT_SUMMARY,
 )
 from sirchmunk.retrieve.text_retriever import GrepRetriever
@@ -19,7 +19,7 @@ from sirchmunk.schema.knowledge import KnowledgeCluster
 from sirchmunk.schema.request import ContentItem, ImageURL, Message, Request
 from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME, WORK_PATH
 from sirchmunk.utils.file_utils import get_fast_hash
-from sirchmunk.utils.log_utils import create_logger, LogCallback
+from sirchmunk.utils import create_logger, LogCallback
 from sirchmunk.utils.utils import (
     KeywordValidation,
     extract_fields,
@@ -53,8 +53,8 @@ class AgenticSearch(BaseSearch):
 
         self.grep_retriever: GrepRetriever = GrepRetriever(work_path=self.work_path)
 
-        # Create bound logger with callback - returns async function(level, message)
-        self._log: Callable[[str, str], Awaitable[None]] = create_logger(log_callback=log_callback)
+        # Create bound logger with callback - returns AsyncLogger instance
+        self._log = create_logger(log_callback=log_callback)
         
         # Pass log_callback to KnowledgeBank so it can also log through the same callback
         self.knowledge_bank = KnowledgeBank(
@@ -98,6 +98,59 @@ class AgenticSearch(BaseSearch):
         except Exception as e:
             logger.warning("Keyword validation failed: {}", e)
             return {}
+
+    @staticmethod
+    def _extract_and_validate_multi_level_keywords(
+        llm_resp: str, 
+        num_levels: int = 3
+    ) -> List[Dict[str, float]]:
+        """
+        Extract and validate multiple sets of keywords from LLM response.
+        
+        Args:
+            llm_resp: LLM response containing keyword sets
+            num_levels: Number of keyword granularity levels to extract
+        
+        Returns:
+            List of keyword dicts, one for each level: [level1_keywords, level2_keywords, ...]
+        """
+        keyword_sets: List[Dict[str, float]] = []
+        
+        # Generate tags dynamically based on num_levels
+        tags = [f"KEYWORDS_LEVEL_{i+1}" for i in range(num_levels)]
+        
+        # Extract all fields at once
+        extracted_fields = extract_fields(content=llm_resp, tags=tags)
+        
+        for level_idx, tag in enumerate(tags, start=1):
+            keywords_dict: Dict[str, float] = {}
+            keywords_json: Optional[str] = extracted_fields.get(tag.lower(), None)
+            
+            if not keywords_json:
+                logger.warning(f"No {tag} found in LLM response")
+                keyword_sets.append({})
+                continue
+            
+            # Try to parse as dict format
+            try:
+                keywords_dict = json.loads(keywords_json)
+            except json.JSONDecodeError:
+                try:
+                    keywords_dict = ast.literal_eval(keywords_json)
+                except Exception as e:
+                    logger.warning(f"Failed to parse {tag}: {e}")
+                    keyword_sets.append({})
+                    continue
+            
+            # Validate using Pydantic model
+            try:
+                validated = KeywordValidation(root=keywords_dict).model_dump()
+                keyword_sets.append(validated)
+            except Exception as e:
+                logger.warning(f"{tag} validation failed: {e}")
+                keyword_sets.append({})
+        
+        return keyword_sets
 
     @staticmethod
     def fast_deduplicate_by_content(data: List[dict]):
@@ -199,11 +252,33 @@ class AgenticSearch(BaseSearch):
         images: Optional[list] = None,
         max_depth: Optional[int] = 5,
         top_k_files: Optional[int] = 3,
+        keyword_levels: Optional[int] = 3,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         verbose: Optional[bool] = True,
         grep_timeout: Optional[float] = 60.0,
     ) -> str:
+        """
+        Perform intelligent search with multi-level keyword extraction.
+        
+        Args:
+            query: Search query string
+            search_paths: Paths to search in
+            mode: Search mode (FAST/DEEP/FILENAME_ONLY)
+            images: Optional image inputs
+            max_depth: Maximum directory depth to search
+            top_k_files: Number of top files to return
+            keyword_levels: Number of keyword granularity levels (default: 3)
+                          - Higher values provide more fallback options
+                          - Recommended: 3-5 levels
+            include: File patterns to include
+            exclude: File patterns to exclude
+            verbose: Enable verbose logging
+            grep_timeout: Timeout for grep operations
+            
+        Returns:
+            Search result summary string
+        """
 
         # Build request
         text_items: List[ContentItem] = [ContentItem(type="text", text=query)]
@@ -228,61 +303,101 @@ class AgenticSearch(BaseSearch):
             ],
         )
 
-        # Get enhanced query keywords with IDF scores
-        await self._log("info", "Extracting query keywords...")
+        # Extract multi-level keywords in one LLM call
+        await self._log.info(f"Extracting {keyword_levels}-level query keywords...")
+        
+        # Generate dynamic prompt based on keyword_levels
+        dynamic_prompt = generate_keyword_extraction_prompt(num_levels=keyword_levels)
+        keyword_extraction_prompt = dynamic_prompt.format(user_input=request.get_user_input())
+        
         resp_keywords: str = await self.llm.achat(
-            messages=request.to_payload(prompt_template=QUERY_KEYWORDS_EXTRACTION),
+            messages=[{"role": "user", "content": keyword_extraction_prompt}],
             stream=False,
         )
-        query_keywords: Dict[str, float] = self._extract_and_validate_keywords(
-            resp_keywords
+        
+        # Parse N sets of keywords
+        keyword_sets: List[Dict[str, float]] = self._extract_and_validate_multi_level_keywords(
+            resp_keywords,
+            num_levels=keyword_levels
         )
-        await self._log("info", f"Enhanced query keywords: {query_keywords}")
-
-        # Get grep results
-        await self._log("info", f"Searching files in paths: {search_paths}")
-        grep_results: List[Dict[str, Any]] = await self.grep_retriever.retrieve(
-            terms=list(query_keywords.keys()),
-            path=search_paths,
-            logic="or",
-            case_sensitive=False,
-            whole_word=False,
-            literal=False,
-            regex=True,
-            max_depth=max_depth,
-            include=None,
-            exclude=["*.pyc", "*.log"],
-            file_type=None,
-            invert_match=False,
-            count_only=False,
-            line_number=True,
-            with_filename=True,
-            rank=True,
-            rga_no_cache=False,
-            rga_cache_max_blob_len=10000000,
-            rga_cache_path=None,
-            timeout=grep_timeout,
-        )
-
-        # Example: [{"path": "", "matches": [], "lines": [], "total_matches": 20, "total_score": 39.70}, ...]
-        grep_results: List[Dict[str, Any]] = self.grep_retriever.merge_results(
-            grep_results
-        )
-        grep_results = self.process_grep_results(
-            results=grep_results, keywords_with_idf=query_keywords
-        )
+        
+        # Ensure we have keyword_levels sets (even if some are empty)
+        while len(keyword_sets) < keyword_levels:
+            keyword_sets.append({})
+        
+        # Log all extracted keyword sets
+        for level_idx, keywords in enumerate(keyword_sets, start=1):
+            specificity = "General" if level_idx == 1 else "Specific" if level_idx == keyword_levels else f"Level {level_idx}"
+            await self._log.info(f"Level {level_idx} ({specificity}) keywords: {keywords}")
+        
+        # Try each keyword set in order (from general to specific) until we get results
+        # Using priority hit principle: stop as soon as we find results
+        grep_results: List[Dict[str, Any]] = []
+        query_keywords: Dict[str, float] = {}
+        
+        for level_idx, keywords in enumerate(keyword_sets, start=1):
+            if not keywords:
+                await self._log.warning(f"Level {level_idx} keywords set is empty, skipping...")
+                continue
+            
+            specificity = "General" if level_idx == 1 else "Specific" if level_idx == keyword_levels else f"Level {level_idx}"
+            await self._log.info(f"Attempting search with Level {level_idx} ({specificity}) keywords: {list(keywords.keys())}")
+            
+            # Perform grep search with current keyword set
+            temp_grep_results: List[Dict[str, Any]] = await self.grep_retriever.retrieve(
+                terms=list(keywords.keys()),
+                path=search_paths,
+                logic="or",
+                case_sensitive=False,
+                whole_word=False,
+                literal=False,
+                regex=True,
+                max_depth=max_depth,
+                include=None,
+                exclude=["*.pyc", "*.log"],
+                file_type=None,
+                invert_match=False,
+                count_only=False,
+                line_number=True,
+                with_filename=True,
+                rank=True,
+                rga_no_cache=False,
+                rga_cache_max_blob_len=10000000,
+                rga_cache_path=None,
+                timeout=grep_timeout,
+            )
+            
+            # Merge and process results
+            temp_grep_results = self.grep_retriever.merge_results(temp_grep_results)
+            temp_grep_results = self.process_grep_results(
+                results=temp_grep_results, keywords_with_idf=keywords
+            )
+            
+            # Check if we found results
+            if len(temp_grep_results) > 0:
+                specificity = "General" if level_idx == 1 else "Specific" if level_idx == keyword_levels else f"Level {level_idx}"
+                await self._log.info(f"Success with Level {level_idx} ({specificity}) keywords: found {len(temp_grep_results)} files")
+                grep_results = temp_grep_results
+                query_keywords = keywords
+                break
+            else:
+                await self._log.warning(f"No results with Level {level_idx} keywords, trying next level...")
+        
+        # If still no results after all attempts
+        if len(grep_results) == 0:
+            await self._log.error(f"All {keyword_levels} keyword granularity levels failed to find results")
 
         if verbose:
             tmp_sep = "\n"
             file_list = [str(r['path']) for r in grep_results[:top_k_files]]
-            await self._log("info", f"Found {len(grep_results)} files, top {len(file_list)}:\n{tmp_sep.join(file_list)}")
+            await self._log.info(f"Found {len(grep_results)} files, top {len(file_list)}:\n{tmp_sep.join(file_list)}")
 
         if len(grep_results) == 0:
             return f"No relevant information found for the query: {query}"
 
         # Build knowledge cluster
         if verbose:
-            await self._log("info", "Building knowledge cluster...")
+            await self._log.info("Building knowledge cluster...")
         cluster: KnowledgeCluster = await self.knowledge_bank.build(
             request=request,
             retrieved_infos=grep_results,
@@ -315,11 +430,11 @@ class AgenticSearch(BaseSearch):
             text_content=cluster_text_content,
         )
 
-        await self._log("info", "Generating search result summary...")
+        await self._log.info("Generating search result summary...")
         search_result: str = await self.llm.achat(
             messages=[{"role": "user", "content": result_sum_prompt}],
             stream=True,
         )
-        await self._log("info", "Search completed successfully!")
+        await self._log.info("Search completed successfully!")
 
         return search_result
