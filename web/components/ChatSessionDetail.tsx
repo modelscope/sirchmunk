@@ -19,7 +19,7 @@ import "katex/dist/katex.min.css";
 import { apiUrl } from "@/lib/api";
 import { processLatexContent } from "@/lib/latex";
 import { useGlobal } from "@/context/GlobalContext";
-import { getTranslation } from "@/lib/i18n";
+import { getTranslation, type Language } from "@/lib/i18n";
 
 interface ChatMessage {
   role: "user" | "assistant";
@@ -56,7 +56,7 @@ export default function ChatSessionDetail({
   onContinue,
 }: ChatSessionDetailProps) {
   const { uiSettings } = useGlobal();
-  const t = (key: string) => getTranslation(uiSettings.language, key);
+  const t = (key: string) => getTranslation((uiSettings?.language || "en") as Language, key);
 
   const [session, setSession] = useState<ChatSession | null>(null);
   const [loading, setLoading] = useState(true);
@@ -81,7 +81,11 @@ export default function ChatSessionDetail({
           throw new Error("Failed to load session");
         }
         const data = await response.json();
-        setSession(data);
+        if (data.success && data.data) {
+          setSession(data.data);
+        } else {
+          throw new Error("Invalid response format");
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Unknown error");
       } finally {
@@ -132,8 +136,12 @@ export default function ChatSessionDetail({
               {session && (
                 <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-2">
                   <Clock className="w-3 h-3" />
-                  {new Date(session.created_at * 1000).toLocaleString(
-                    uiSettings.language === "zh" ? "zh-CN" : "en-US",
+                  {new Date(
+                    typeof session.created_at === 'number' 
+                      ? session.created_at * 1000 
+                      : session.created_at
+                  ).toLocaleString(
+                    uiSettings?.language === "zh" ? "zh-CN" : "en-US",
                   )}
                   <span className="mx-1">•</span>
                   {session.messages.length} {t("messages")}
@@ -257,8 +265,12 @@ export default function ChatSessionDetail({
                             : "text-slate-400 dark:text-slate-500"
                         }`}
                       >
-                        {new Date(msg.timestamp * 1000).toLocaleTimeString(
-                          uiSettings.language === "zh" ? "zh-CN" : "en-US",
+                        {new Date(
+                          typeof msg.timestamp === 'number'
+                            ? msg.timestamp * 1000
+                            : msg.timestamp
+                        ).toLocaleTimeString(
+                          uiSettings?.language === "zh" ? "zh-CN" : "en-US",
                           { hour: "2-digit", minute: "2-digit" },
                         )}
                       </p>

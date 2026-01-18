@@ -10,7 +10,7 @@ import msgpack
 from loguru import logger
 
 
-class Storage:
+class BaseStorage:
     """
     Base class for storage systems based on mmap.
     """

@@ -8,7 +8,7 @@ from loguru import logger
 from sirchmunk.schema.knowledge import KnowledgeCluster
 from sirchmunk.utils.file_utils import StorageStructure
 
-from .base import Storage
+from .base import BaseStorage
 
 """
 High-performance Knowledge Cluster Store for large-scale graphs.
@@ -19,7 +19,7 @@ High-performance Knowledge Cluster Store for large-scale graphs.
 """
 
 
-class KnowledgeStorage(Storage):
+class KnowledgeStorage(BaseStorage):
     """
     Thread-safe store for KnowledgeCluster objects.
 

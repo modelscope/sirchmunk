@@ -19,7 +19,7 @@ import {
   Eye,
 } from "lucide-react";
 import { apiUrl } from "@/lib/api";
-import { getTranslation } from "@/lib/i18n";
+import { getTranslation, type Language } from "@/lib/i18n";
 import { useGlobal } from "@/context/GlobalContext";
 import ActivityDetail from "@/components/ActivityDetail";
 import ChatSessionDetail from "@/components/ChatSessionDetail";
@@ -72,7 +72,7 @@ interface ChatSession {
 
 export default function HistoryPage() {
   const { uiSettings, loadChatSession } = useGlobal();
-  const t = (key: string) => getTranslation(uiSettings.language, key);
+  const t = (key: string) => getTranslation((uiSettings?.language || "en") as Language, key);
   const router = useRouter();
 
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
@@ -177,7 +177,7 @@ export default function HistoryPage() {
         dateKey = "Yesterday";
       } else {
         dateKey = date.toLocaleDateString(
-          uiSettings.language === "zh" ? "zh-CN" : "en-US",
+          uiSettings?.language === "zh" ? "zh-CN" : "en-US",
           {
             month: "long",
             day: "numeric",
@@ -245,9 +245,6 @@ export default function HistoryPage() {
               {[
                 { value: "all", label: t("All") },
                 { value: "chat", label: t("Chat") },
-                { value: "solve", label: t("Solve") },
-                { value: "question", label: t("Question") },
-                { value: "research", label: t("Research") },
               ].map((option) => (
                 <button
                   key={option.value}
@@ -332,7 +329,7 @@ export default function HistoryPage() {
                                 {new Date(
                                   entry.timestamp * 1000,
                                 ).toLocaleTimeString(
-                                  uiSettings.language === "zh"
+                                  uiSettings?.language === "zh"
                                     ? "zh-CN"
                                     : "en-US",
                                   { hour: "2-digit", minute: "2-digit" },
@@ -407,7 +404,7 @@ export default function HistoryPage() {
                               {new Date(
                                 session.updated_at * 1000,
                               ).toLocaleDateString(
-                                uiSettings.language === "zh"
+                                uiSettings?.language === "zh"
                                   ? "zh-CN"
                                   : "en-US",
                               )}

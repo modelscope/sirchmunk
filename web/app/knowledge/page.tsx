@@ -276,6 +276,12 @@ export default function KnowledgePage() {
       ) {
         return;
       }
+      
+      // Temporarily disable WebSocket connections for progress tracking
+      // TODO: Implement backend WebSocket endpoints for progress tracking
+      console.log(`[Progress WS] Skipping WebSocket connection for KB: ${kb.name} (endpoint not implemented)`);
+      return;
+      
       // Connect to all KBs (not just uninitialized ones)
       // This allows receiving progress updates when adding documents
       const ws = new WebSocket(
@@ -345,7 +351,7 @@ export default function KnowledgePage() {
       };
 
       ws.onerror = (error) => {
-        console.error(`[Progress WS] Error for ${kb.name}:`, error);
+        console.warn(`[Progress WS] Connection failed for ${kb.name} (endpoint may not be implemented)`);
       };
 
       ws.onclose = () => {

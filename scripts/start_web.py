@@ -448,29 +448,6 @@ if __name__ == "__main__":
     print_flush("DeepTutor Web Platform Launcher")
     print_flush("=" * 50)
 
-    # Initialize user data directories
-    try:
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
-
-        # Create basic directories if they don't exist
-        data_dirs = [
-            os.path.join(project_root, "data"),
-            os.path.join(project_root, "data", "knowledge_bases"),
-            os.path.join(project_root, "data", "notebooks"),
-            os.path.join(project_root, "data", "sessions"),
-            os.path.join(project_root, "logs"),
-        ]
-
-        for dir_path in data_dirs:
-            os.makedirs(dir_path, exist_ok=True)
-
-        print_flush("✅ User data directories initialized")
-    except Exception as e:
-        print_flush(f"⚠️ Warning: Failed to initialize user directories: {e}")
-        print_flush("   Continuing anyway...")
-
     backend = None
     frontend = None
 

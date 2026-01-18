@@ -4,7 +4,6 @@ export const translations = {
     Start: "Start",
     Dashboard: "Dashboard",
     "Knowledge Bases": "Knowledge Bases",
-    Notebooks: "Notebooks",
     Settings: "Settings",
 
     // Common
@@ -34,7 +33,6 @@ export const translations = {
     "System Language": "System Language",
     "Default language for system operations":
       "Default language for system operations",
-    "Research Tools": "Research Tools",
     WebSearch: "Web",
     "Max Results": "Max Results",
     "Knowledge Base": "Knowledge Base",
@@ -77,10 +75,7 @@ export const translations = {
     "Start exploring knowledge bases!":
       "Start exploring knowledge bases!",
     Activity: "Activity",
-    "My Notebooks": "My Notebooks",
     records: "records",
-    "No notebooks yet": "No notebooks yet",
-    "Create your first notebook": "Create your first notebook",
     "System Status": "System Status",
     "Quick Actions": "Quick Actions",
     "Ask a Question": "Ask a Question",
@@ -119,7 +114,6 @@ export const translations = {
     Start: "开始",
     Dashboard: "仪表盘",
     "Knowledge Bases": "知识库",
-    Notebooks: "笔记本",
     Settings: "设置",
 
     // Common
@@ -147,7 +141,6 @@ export const translations = {
     "System Configuration": "系统配置",
     "System Language": "系统语言",
     "Default language for system operations": "系统操作的默认语言",
-    "Research Tools": "研究工具",
     WebSearch: "网络",
     "Max Results": "最大结果数",
     "Knowledge Base": "知识库",
@@ -186,10 +179,7 @@ export const translations = {
     "No recent activity found": "未找到最近活动",
     "Start exploring knowledge bases!": "开始探索知识库吧！",
     Activity: "活动",
-    "My Notebooks": "我的笔记本",
     records: "条记录",
-    "No notebooks yet": "暂无笔记本",
-    "Create your first notebook": "创建您的第一个笔记本",
     "System Status": "系统状态",
     "Quick Actions": "快捷操作",
     "Ask a Question": "提问问题",

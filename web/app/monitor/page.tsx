@@ -27,7 +27,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { apiUrl } from "@/lib/api";
-import { getTranslation } from "@/lib/i18n";
+import { getTranslation, type Language } from "@/lib/i18n";
 import { useGlobal } from "@/context/GlobalContext";
 
 interface TaskStatus {
@@ -77,7 +77,7 @@ interface SystemMetrics {
 
 export default function MonitorPage() {
   const { uiSettings } = useGlobal();
-  const t = (key: string) => getTranslation(uiSettings.language, key);
+  const t = (key: string) => getTranslation((uiSettings?.language || "en") as Language, key);
 
   const [tasks, setTasks] = useState<TaskStatus[]>([]);
   const [files, setFiles] = useState<FileInfo[]>([]);
