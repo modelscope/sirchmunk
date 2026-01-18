@@ -1,10 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Storage package initialization"""
 
-from .base import BaseStorage
-from .knowledge_storage import KnowledgeStorage
-from .history_storage import HistoryStorage
-from .settings_storage import SettingsStorage
+from .knowledge_manager import KnowledgeManager
 from .duckdb import DuckDBManager
 
-__all__ = ["BaseStorage", "KnowledgeStorage", "HistoryStorage", "SettingsStorage", "DuckDBManager"]
+__all__ = ["KnowledgeManager", "DuckDBManager"]

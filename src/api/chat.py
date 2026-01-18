@@ -15,9 +15,10 @@ import random
 import os
 import threading
 from sirchmunk.search import AgenticSearch
-from sirchmunk.storage import HistoryStorage
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME
+from api.components.history_storage import HistoryStorage
+
 
 # Try to import tkinter for file dialogs
 try:

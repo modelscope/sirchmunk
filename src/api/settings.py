@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional
 from pydantic import BaseModel
 import os
 
-from sirchmunk.storage import SettingsStorage
+from api.components.settings_storage import SettingsStorage
 from sirchmunk.utils.constants import (
     GREP_CONCURRENT_LIMIT,
     LLM_BASE_URL,
