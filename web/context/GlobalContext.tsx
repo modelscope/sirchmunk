@@ -219,11 +219,23 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
 
   const refreshSettings = async () => {
     try {
-      const response = await fetch(apiUrl("/api/v1/settings"));
+      const response = await fetch(apiUrl("/api/v1/settings/ui"));
       if (response.ok) {
-        const data = await response.json();
-        if (data.success) {
-          setSettings(data.data);
+        const result = await response.json();
+        if (result.success && result.data) {
+          const newSettings = {
+            theme: result.data.theme || "light",
+            language: result.data.language || "en",
+          };
+          setSettings(newSettings);
+          
+          // Apply theme immediately
+          setThemeLib(newSettings.theme);
+          
+          // Store in localStorage for persistence
+          localStorage.setItem("sirchmunk_settings", JSON.stringify(newSettings));
+          
+          console.log("Settings refreshed:", newSettings);
         }
       }
     } catch (error) {
@@ -649,7 +661,7 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
           session_id: sessionIdRef.current,
           history,
           kb_name: chatState.selectedKb,
-          enable_rag: true, // Always enable to trigger search
+          enable_rag: chatState.enableRag,  // Use actual RAG state from chatState
           enable_web_search: chatState.enableWebSearch,
         }),
       );

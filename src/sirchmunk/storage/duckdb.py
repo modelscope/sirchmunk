@@ -67,7 +67,7 @@ class DuckDBManager:
             logger.error(f"Transaction rolled back: {e}")
             raise
     
-    def execute(self, query: str, parameters: Optional[List] = None) -> duckdb.DuckDBPyResult:
+    def execute(self, query: str, parameters: Optional[List] = None):
         """
         Execute SQL query
         

@@ -8,22 +8,15 @@ import {
   Home,
   History,
   BookOpen,
-  PenTool,
-  Calculator,
-  Microscope,
-  Edit3,
   Settings,
-  Book,
-  GraduationCap,
-  Lightbulb,
-  Github,
-  Globe,
   ChevronsLeft,
   ChevronsRight,
   Monitor,
+  Globe,
+  Github,
 } from "lucide-react";
 import { useGlobal } from "@/context/GlobalContext";
-import { getTranslation } from "@/lib/i18n";
+import { getTranslation, type Language } from "@/lib/i18n";
 
 const SIDEBAR_EXPANDED_WIDTH = 256;
 const SIDEBAR_COLLAPSED_WIDTH = 64;
@@ -31,7 +24,7 @@ const SIDEBAR_COLLAPSED_WIDTH = 64;
 export default function Sidebar() {
   const pathname = usePathname();
   const { settings, sidebarCollapsed, setSidebarCollapsed } = useGlobal();
-  const lang = settings?.language || "en";
+  const lang = (settings?.language || "en") as Language;
 
   const toggleSidebar = () => {
     setSidebarCollapsed(!sidebarCollapsed);
@@ -48,7 +41,6 @@ export default function Sidebar() {
         { name: t("Home"), href: "/", icon: Home },
         { name: t("History"), href: "/history", icon: History },
         { name: t("Knowledge"), href: "/knowledge", icon: BookOpen },
-        { name: t("Notebook"), href: "/notebook", icon: Book },
       ],
     },
     {

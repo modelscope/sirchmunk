@@ -665,16 +665,10 @@ export default function HomePage() {
               <button
                 onClick={() => {
                   if (!chatState.enableRag) {
-                    if (selectedPaths.length > 0) {
-                      setChatState((prev) => ({
-                        ...prev,
-                        enableRag: true,
-                        selectedKb: selectedPaths[0],
-                      }));
-                    } else {
-                      setShowFileSelector(true);
-                    }
+                    // Always show file selector when enabling RAG
+                    setShowFileSelector(true);
                   } else {
+                    // Disable RAG
                     setChatState((prev) => ({
                       ...prev,
                       enableRag: false,

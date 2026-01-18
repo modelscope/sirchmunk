@@ -15,6 +15,9 @@ import random
 import os
 import threading
 from sirchmunk.search import AgenticSearch
+from sirchmunk.storage import HistoryStorage
+from sirchmunk.llm.openai_chat import OpenAIChat
+from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME
 
 # Try to import tkinter for file dialogs
 try:
@@ -26,7 +29,10 @@ except ImportError:
 
 router = APIRouter(prefix="/api/v1", tags=["chat", "search"])
 
-# Mock chat sessions storage
+# Initialize persistent history storage
+history_storage = HistoryStorage()
+
+# In-memory cache for active sessions (for backward compatibility)
 chat_sessions = {}
 
 # Active WebSocket connections
@@ -388,170 +394,6 @@ async def _perform_web_search(query: str, websocket: WebSocket, manager: ChatCon
     
     return web_results
 
-
-def generate_mock_response(message: str, enable_rag: bool = False, enable_web_search: bool = False, kb_name: str = "") -> str:
-    """Generate mock chat response based on message content"""
-    message_lower = message.lower()
-    
-    # Context-aware responses based on keywords
-    if any(keyword in message_lower for keyword in ["hello", "hi", "hey", "greetings"]):
-        return "Hello! I'm Sirchmunk, your AI learning assistant. How can I help you today?"
-    
-    elif any(keyword in message_lower for keyword in ["machine learning", "ml", "ai", "artificial intelligence"]):
-        return """# Machine Learning Overview
-
-Machine learning is a powerful subset of artificial intelligence that enables computers to learn and improve from experience without being explicitly programmed.
-
-## Key Concepts
-
-### Types of Learning
-- **Supervised Learning**: Learning with labeled examples
-- **Unsupervised Learning**: Finding patterns in unlabeled data
-- **Reinforcement Learning**: Learning through trial and error with rewards
-
-### Popular Algorithms
-- Linear Regression for prediction
-- Decision Trees for classification
-- Neural Networks for complex patterns
-- K-Means for clustering
-
-## Mathematical Foundation
-
-The core optimization problem in ML:
-
-$$\\min_{\\theta} \\frac{1}{m} \\sum_{i=1}^{m} L(h_{\\theta}(x^{(i)}), y^{(i)})$$
-
-Where:
-- $\\theta$ represents model parameters
-- $L$ is the loss function
-- $h_{\\theta}$ is the hypothesis function
-
-## Practical Applications
-- Image recognition and computer vision
-- Natural language processing
-- Recommendation systems
-- Autonomous vehicles
-- Medical diagnosis
-
-Would you like me to dive deeper into any specific aspect of machine learning?"""
-
-    elif any(keyword in message_lower for keyword in ["python", "programming", "code"]):
-        return """# Python Programming Guide
-
-Python is an excellent language for beginners and experts alike, known for its readability and versatility.
-
-## Basic Syntax
-
-```python
-# Variables and data types
-name = "Alice"
-age = 25
-scores = [85, 92, 78, 96]
-
-# Control structures
-if age >= 18:
-    print("Adult")
-else:
-    print("Minor")
-
-# Functions
-def greet(name):
-    return f"Hello, {name}!"
-
-# Classes
-class Student:
-    def __init__(self, name, age):
-        self.name = name
-        self.age = age
-    
-    def study(self, subject):
-        return f"{self.name} is studying {subject}"
-```
-
-## Popular Libraries
-- **NumPy**: Numerical computing
-- **Pandas**: Data manipulation
-- **Matplotlib**: Data visualization
-- **Scikit-learn**: Machine learning
-- **Django/Flask**: Web development
-
-## Best Practices
-1. Follow PEP 8 style guidelines
-2. Write clear, descriptive variable names
-3. Use docstrings for documentation
-4. Handle exceptions properly
-5. Write unit tests
-
-What specific Python topic would you like to explore further?"""
-
-    elif any(keyword in message_lower for keyword in ["help", "assist", "support"]):
-        return """# How I Can Help You
-
-I'm Sirchmunk, your AI learning companion! Here's what I can do:
-
-## 🎓 Learning Support
-- Explain complex concepts in simple terms
-- Provide step-by-step solutions
-- Generate practice questions
-- Create study guides
-
-## 💻 Programming Help
-- Debug code issues
-- Explain algorithms
-- Suggest best practices
-- Review code structure
-
-## 📊 Research Assistance
-- Summarize academic papers
-- Find relevant resources
-- Generate research ideas
-- Create comprehensive reports
-
-## 🧮 Problem Solving
-- Mathematical problem solving
-- Logical reasoning
-- Critical thinking exercises
-- Real-world applications
-
-## 🔧 Available Tools
-- **Smart Solver**: Multi-step problem solving
-- **Question Generator**: Create practice questions
-- **Research Assistant**: Deep research reports
-- **Co-Writer**: Collaborative writing
-- **Guided Learning**: Structured tutorials
-
-What would you like to work on today?"""
-
-    else:
-        # Generic helpful response
-        return f"""Thank you for your question about "{message}". 
-
-I understand you're looking for information on this topic. Let me provide a comprehensive response:
-
-## Analysis
-
-Your question touches on important concepts that are worth exploring in detail. Based on the context, I can help you understand the key principles and practical applications.
-
-## Key Points
-
-1. **Fundamental Concepts**: Understanding the basic principles is crucial for building a solid foundation.
-
-2. **Practical Applications**: Real-world examples help connect theory to practice.
-
-3. **Best Practices**: Following established guidelines ensures optimal results.
-
-4. **Common Challenges**: Being aware of potential pitfalls helps avoid mistakes.
-
-## Next Steps
-
-To dive deeper into this topic, I recommend:
-- Exploring related concepts
-- Practicing with examples
-- Asking specific follow-up questions
-- Applying the knowledge to real projects
-
-Would you like me to elaborate on any particular aspect, or do you have more specific questions about this topic?"""
-
 async def _chat_only(
     message: str,
     websocket: WebSocket,
@@ -567,10 +409,26 @@ async def _chat_only(
         "message": "💬 Generating response..."
     }), websocket)
     
-    await asyncio.sleep(random.uniform(0.3, 0.8))
+    # Create log callback for streaming LLM output
+    llm_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
     
-    # Generate pure chat response
-    response = generate_mock_response(message, enable_rag=False, enable_web_search=False)
+    # Initialize OpenAI client with log callback for streaming
+    llm = OpenAIChat(
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        model=LLM_MODEL_NAME,
+        log_callback=llm_log_callback
+    )
+    
+    # Prepare messages for LLM
+    messages = [
+        {"role": "system", "content": "You are a helpful AI assistant. Provide clear, accurate, and helpful responses."},
+        {"role": "user", "content": message}
+    ]
+    
+    # Generate response with streaming
+    response = await llm.achat(messages=messages, stream=True)
+    
     sources = {}
     
     return response, sources
@@ -648,9 +506,15 @@ async def _chat_rag(
             "message": f"❌ RAG search failed: {str(e)}"
         }), websocket)
         
-        # Fallback to mock response
-        response = generate_mock_response(message, enable_rag=True, enable_web_search=False, kb_name=kb_name)
-        sources["rag"] = [{"kb_name": kb_name, "content": "Fallback content", "error": str(e)}]
+        # Fallback to chat only
+        await manager.send_personal_message(json.dumps({
+            "type": "status",
+            "stage": "fallback",
+            "message": "⚠️ RAG mode did not find relevant results, falling back to pure chat mode..."
+        }), websocket)
+        
+        print(f"[MODE 2] RAG search failed, falling back to chat only: {str(e)}")
+        response, sources = await _chat_only(message, websocket, manager)
     
     return response, sources
 
@@ -673,13 +537,45 @@ async def _chat_web_search(
     # Perform mock web search
     web_results = await _perform_web_search(message, websocket, manager)
     
+    # Check if web search returned valid results
+    if not web_results or not web_results.get("sources"):
+        # Fallback to chat only
+        await manager.send_personal_message(json.dumps({
+            "type": "status",
+            "stage": "fallback",
+            "message": "⚠️ Web search did not return results, falling back to pure chat mode..."
+        }), websocket)
+        
+        print(f"[MODE 3] Web search failed, falling back to chat only")
+        response, sources = await _chat_only(message, websocket, manager)
+        return response, sources
+    
     # Generate response enhanced with web search results
     web_context = "\n\nBased on web search results:\n"
     for source in web_results["sources"]:
         web_context += f"- {source['title']}: {source['snippet']}\n"
     
-    response = generate_mock_response(message, enable_rag=False, enable_web_search=True) + web_context
+    # Use LLM to generate response with web context
+    await manager.send_personal_message(json.dumps({
+        "type": "status",
+        "stage": "generating",
+        "message": "💬 Generating response with web context..."
+    }), websocket)
     
+    llm_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
+    llm = OpenAIChat(
+        api_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        model=LLM_MODEL_NAME,
+        log_callback=llm_log_callback
+    )
+    
+    messages = [
+        {"role": "system", "content": "You are a helpful AI assistant. Use the provided web search results to answer the user's question accurately."},
+        {"role": "user", "content": f"{message}\n\nWeb search context:\n{web_context}"}
+    ]
+    
+    response = await llm.achat(messages=messages, stream=True)
     sources = {"web": web_results["sources"]}
     
     return response, sources
@@ -764,11 +660,11 @@ async def _chat_rag_web_search(
     for source in web_results["sources"]:
         web_context += f"- [{source['title']}]({source['url']})\n"
     
-    # If RAG succeeded, use it as primary response; otherwise use mock
+    # If RAG succeeded, use it as primary response; otherwise use web search only
     if rag_result and "[RAG search unavailable" not in rag_result:
         response = rag_result + web_context
     else:
-        response = generate_mock_response(message, enable_rag=True, enable_web_search=True, kb_name=kb_name) + web_context
+        response = f"Based on web search results:\n{web_context}"
     
     return response, sources
 
@@ -815,7 +711,7 @@ async def chat_websocket(websocket: WebSocket):
                 "session_id": session_id
             }), websocket)
             
-            # Store session data
+            # Store session data (in-memory + persistent)
             if session_id not in chat_sessions:
                 chat_sessions[session_id] = {
                     "session_id": session_id,
@@ -829,15 +725,21 @@ async def chat_websocket(websocket: WebSocket):
                         "enable_web_search": enable_web_search
                     }
                 }
+                # Save new session to persistent storage
+                history_storage.save_session(chat_sessions[session_id])
             
             # Update session with new message
             session = chat_sessions[session_id]
-            session["messages"].append({
+            user_message = {
                 "role": "user",
                 "content": message,
                 "timestamp": datetime.now().isoformat()
-            })
+            }
+            session["messages"].append(user_message)
             session["updated_at"] = datetime.now().isoformat()
+            
+            # Save user message to persistent storage
+            history_storage.save_message(session_id, user_message)
             
             # ============================================================
             # Route to appropriate chat mode based on feature flags
@@ -903,12 +805,19 @@ async def chat_websocket(websocket: WebSocket):
             }), websocket)
             
             # Store assistant response in session
-            session["messages"].append({
+            assistant_message = {
                 "role": "assistant",
                 "content": response.strip(),
                 "sources": sources if sources else None,
                 "timestamp": datetime.now().isoformat()
-            })
+            }
+            session["messages"].append(assistant_message)
+            
+            # Save assistant message to persistent storage
+            history_storage.save_message(session_id, assistant_message)
+            
+            # Update session in persistent storage
+            history_storage.save_session(session)
             
     except WebSocketDisconnect:
         manager.disconnect(websocket)

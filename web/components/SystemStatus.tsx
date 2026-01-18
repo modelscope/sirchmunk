@@ -72,10 +72,23 @@ export default function SystemStatus() {
   useEffect(() => {
     const checkBackendConnection = async () => {
       try {
+        // Temporarily disabled - use monitor endpoint instead
+        // const controller = new AbortController();
+        // const timeoutId = setTimeout(() => controller.abort(), 3000);
+
+        // const response = await fetch(apiUrl("/api/v1/knowledge/health"), {
+        //   method: "GET",
+        //   signal: controller.signal,
+        // });
+
+        // clearTimeout(timeoutId);
+        // setBackendConnected(response.ok);
+
+        // Use monitor endpoint as fallback
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 3000);
 
-        const response = await fetch(apiUrl("/api/v1/knowledge/health"), {
+        const response = await fetch(apiUrl("/api/v1/monitor/status"), {
           method: "GET",
           signal: controller.signal,
         });

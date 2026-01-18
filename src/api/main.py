@@ -11,8 +11,6 @@ import uvicorn
 
 # Import all API routers
 from .knowledge import router as knowledge_router
-from .research import router as research_router
-from .notebook import router as notebook_router
 from .settings import router as settings_router
 from .history import router as history_router
 from .chat import router as chat_router
@@ -38,8 +36,6 @@ app.add_middleware(
 
 # Include all API routers
 app.include_router(knowledge_router)
-app.include_router(research_router)
-app.include_router(notebook_router)
 app.include_router(settings_router)
 app.include_router(history_router)
 app.include_router(chat_router)
@@ -55,8 +51,6 @@ async def root():
         "status": "running",
         "endpoints": {
             "knowledge": "/api/v1/knowledge",
-            "research": "/api/v1/research",
-            "notebook": "/api/v1/notebook",
             "settings": "/api/v1/settings",
             "history": "/api/v1/history",
             "chat": "/api/v1/chat",
