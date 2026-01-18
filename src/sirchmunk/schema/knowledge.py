@@ -226,9 +226,16 @@ class KnowledgeCluster:
     # Related knowledge clusters for estimated weak semantic connections
     related_clusters: List[WeakSemanticEdge] = None
 
+    # Search results: list of file paths or URLs that were retrieved
+    # Used to track which sources contributed to this knowledge cluster
+    search_results: List[str] = None
+
     def __post_init__(self):
         if self.related_clusters is None:
             self.related_clusters = []
+
+        if self.search_results is None:
+            self.search_results = []
 
         if self.create_time is None:
             self.create_time = datetime.now(timezone.utc)
@@ -263,14 +270,15 @@ class KnowledgeCluster:
             "constraints": [c.to_dict() for c in self.constraints],
             "evidences": [er.to_dict() for er in self.evidences],
             "confidence": self.confidence,
-            "abstraction_level": self.abstraction_level.name,
+            "abstraction_level": self.abstraction_level.name if self.abstraction_level else None,
             "landmark_potential": self.landmark_potential,
             "hotness": self.hotness,
             "lifecycle": self.lifecycle.name,
-            "create_time": self.create_time.isoformat(),
-            "last_modified": self.last_modified.isoformat(),
+            "create_time": self.create_time.isoformat() if self.create_time else None,
+            "last_modified": self.last_modified.isoformat() if self.last_modified else None,
             "version": self.version,
             "related_clusters": [rc.to_dict() for rc in self.related_clusters],
+            "search_results": self.search_results,
         }
 
 

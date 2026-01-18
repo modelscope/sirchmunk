@@ -14,6 +14,7 @@ from sirchmunk.llm.prompts import (
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.schema.knowledge import KnowledgeCluster
 from sirchmunk.schema.request import ContentItem, ImageURL, Message, Request
+from sirchmunk.storage.knowledge_manager import KnowledgeManager
 from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME, WORK_PATH
 from sirchmunk.utils.file_utils import get_fast_hash
 from sirchmunk.utils import create_logger, LogCallback
@@ -60,7 +61,22 @@ class AgenticSearch(BaseSearch):
             log_callback=log_callback
         )
 
+        # Initialize KnowledgeManager for persistent storage
+        self.knowledge_manager = KnowledgeManager(work_path=str(self.work_path))
+        
+        # Load historical knowledge clusters from cache
+        self._load_historical_knowledge()
+
         self.verbose: bool = verbose
+    
+    def _load_historical_knowledge(self):
+        """Load historical knowledge clusters from local cache"""
+        try:
+            stats = self.knowledge_manager.get_stats()
+            cluster_count = stats.get('custom_stats', {}).get('total_clusters', 0)
+            logger.info(f"Loaded {cluster_count} historical knowledge clusters from cache")
+        except Exception as e:
+            logger.warning(f"Failed to load historical knowledge: {e}")
 
     @staticmethod
     def _extract_and_validate_keywords(llm_resp: str) -> dict:
@@ -409,9 +425,6 @@ class AgenticSearch(BaseSearch):
         if cluster is None:
             return f"No relevant information found for the query: {query}"
 
-        # self.knowledge_bank.update(cluster=cluster)
-        # self.knowledge_bank.save(cluster=cluster)
-
         if self.verbose:
             await self._logger_async.info(json.dumps(cluster.to_dict(), ensure_ascii=False, indent=2))
 
@@ -436,5 +449,21 @@ class AgenticSearch(BaseSearch):
         )
         await self._logger_async.success(" ✓", flush=True)
         await self._logger_async.success("Search completed successfully!")
+
+        # Add search results (file paths) to the cluster
+        if grep_results:
+            cluster.search_results.append(search_result)
+
+        # Save knowledge cluster to persistent storage
+        try:
+            await self.knowledge_manager.insert(cluster)
+            await self._logger_async.info(f"Saved knowledge cluster {cluster.id} to cache")
+        except Exception as e:
+            # If cluster exists, update it instead
+            try:
+                await self.knowledge_manager.update(cluster)
+                await self._logger_async.info(f"Updated knowledge cluster {cluster.id} in cache")
+            except Exception as update_error:
+                await self._logger_async.warning(f"Failed to save knowledge cluster: {update_error}")
 
         return search_result

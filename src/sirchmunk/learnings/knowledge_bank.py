@@ -19,7 +19,6 @@ from sirchmunk.schema.knowledge import (
 )
 from sirchmunk.schema.metadata import FileInfo
 from sirchmunk.schema.request import Request
-from sirchmunk.storage.knowledge_storage import KnowledgeStorage
 from sirchmunk.utils.file_utils import StorageStructure, fast_extract
 from sirchmunk.utils import create_logger, LogCallback
 from sirchmunk.utils.utils import extract_fields
@@ -60,10 +59,6 @@ class KnowledgeBank:
         )
         self.metadata_path: Path = (
             self.work_path / StorageStructure.CACHE_DIR / StorageStructure.METADATA_DIR
-        )
-
-        self.knowledge_storage = KnowledgeStorage(
-            work_path=self.work_path, readonly=False
         )
         
         # Store log_callback for passing to child components
@@ -192,58 +187,3 @@ class KnowledgeBank:
         )
 
         return cluster
-
-    async def get(self, cluster_id: str) -> Optional[KnowledgeCluster]:
-        """
-        Get knowledge cluster by ID.
-        """
-        return _KNOWLEDGE_MAP.get(cluster_id, None)
-
-    async def update(self, cluster: KnowledgeCluster):
-        """
-        Update or add a knowledge cluster in the in-memory storage.
-        """
-
-        if cluster is not None:
-            _KNOWLEDGE_MAP[cluster.id] = cluster
-
-    async def save(self, cluster: KnowledgeCluster):
-        """
-        Save a knowledge cluster to persistent storage.
-        """
-        self.knowledge_storage.insert_cluster(cluster=cluster)
-
-    async def merge(self, clusters: List[KnowledgeCluster]) -> KnowledgeCluster:
-        """
-        Merge multiple similar knowledge clusters into a single cluster.
-        """
-        ...
-
-    async def split(self, cluster: KnowledgeCluster) -> List[KnowledgeCluster]:
-        """
-        Split a knowledge cluster into more focused clusters.
-        """
-        ...
-
-    async def remove(self, cluster_id: str) -> None:
-        """
-        Remove a knowledge cluster by ID from the in-memory storage.
-        """
-        if cluster_id in _KNOWLEDGE_MAP:
-            del _KNOWLEDGE_MAP[cluster_id]
-        else:
-            await self._log.warning(
-                f"Knowledge cluster with ID {cluster_id} not found for removal."
-            )
-
-    async def clear(self) -> None:
-        """
-        Clear all knowledge clusters from the in-memory storage.
-        """
-        _KNOWLEDGE_MAP.clear()
-
-    async def find(self, query: str) -> List[KnowledgeCluster]:
-        """
-        Find knowledge clusters relevant to the query.  TODO ...
-        """
-        ...
