@@ -12,7 +12,7 @@ import uvicorn
 # Import all API routers
 from .knowledge import router as knowledge_router
 from .settings import router as settings_router
-from .history import router as history_router
+from .history import router as history_router, dashboard_router
 from .chat import router as chat_router
 from .monitor import router as monitor_router
 
@@ -38,6 +38,7 @@ app.add_middleware(
 app.include_router(knowledge_router)
 app.include_router(settings_router)
 app.include_router(history_router)
+app.include_router(dashboard_router)
 app.include_router(chat_router)
 app.include_router(monitor_router)
 

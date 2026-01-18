@@ -24,7 +24,8 @@ from sirchmunk.utils.utils import (
     log_tf_norm_penalty,
 )
 
-logger = create_logger(log_callback=None, enable_async=False)
+# Note: Do not create a global logger here as it will duplicate logs
+# Each instance creates its own logger in __init__ with the provided log_callback
 
 
 class AgenticSearch(BaseSearch):
@@ -74,9 +75,12 @@ class AgenticSearch(BaseSearch):
         try:
             stats = self.knowledge_manager.get_stats()
             cluster_count = stats.get('custom_stats', {}).get('total_clusters', 0)
-            logger.info(f"Loaded {cluster_count} historical knowledge clusters from cache")
+            # Use sync logger for initialization
+            from loguru import logger as default_logger
+            default_logger.info(f"Loaded {cluster_count} historical knowledge clusters from cache")
         except Exception as e:
-            logger.warning(f"Failed to load historical knowledge: {e}")
+            from loguru import logger as default_logger
+            default_logger.warning(f"Failed to load historical knowledge: {e}")
 
     @staticmethod
     def _extract_and_validate_keywords(llm_resp: str) -> dict:
@@ -102,14 +106,16 @@ class AgenticSearch(BaseSearch):
             try:
                 res = ast.literal_eval(keywords_json)
             except Exception as e:
-                logger.warning(f"Failed to parse keywords: {e}")
+                from loguru import logger as default_logger
+                default_logger.warning(f"Failed to parse keywords: {e}")
                 return {}
 
         # Validate using Pydantic model
         try:
             return KeywordValidation(root=res).model_dump()
         except Exception as e:
-            logger.warning(f"Keyword validation failed: {e}")
+            from loguru import logger as default_logger
+            default_logger.warning(f"Keyword validation failed: {e}")
             return {}
 
     @staticmethod
@@ -140,7 +146,8 @@ class AgenticSearch(BaseSearch):
             keywords_json: Optional[str] = extracted_fields.get(tag.lower(), None)
 
             if not keywords_json:
-                logger.warning(f"No {tag} found in LLM response")
+                from loguru import logger as default_logger
+                default_logger.warning(f"No {tag} found in LLM response")
                 keyword_sets.append({})
                 continue
 
@@ -151,7 +158,8 @@ class AgenticSearch(BaseSearch):
                 try:
                     keywords_dict = ast.literal_eval(keywords_json)
                 except Exception as e:
-                    logger.warning(f"Failed to parse {tag}: {e}")
+                    from loguru import logger as default_logger
+                    default_logger.warning(f"Failed to parse {tag}: {e}")
                     keyword_sets.append({})
                     continue
 
@@ -160,7 +168,8 @@ class AgenticSearch(BaseSearch):
                 validated = KeywordValidation(root=keywords_dict).model_dump()
                 keyword_sets.append(validated)
             except Exception as e:
-                logger.warning(f"{tag} validation failed: {e}")
+                from loguru import logger as default_logger
+                default_logger.warning(f"{tag} validation failed: {e}")
                 keyword_sets.append({})
 
         return keyword_sets
