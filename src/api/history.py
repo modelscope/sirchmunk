@@ -14,6 +14,10 @@ from .chat import chat_sessions, history_storage
 
 router = APIRouter(prefix="/api/v1", tags=["history"])
 
+# Create a second router for dashboard endpoints
+from fastapi import APIRouter as FastAPIRouter
+dashboard_router = FastAPIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
+
 
 @router.get("/chat/sessions")
 async def get_chat_sessions(limit: int = 20, offset: int = 0):
@@ -200,3 +204,51 @@ async def get_history_statistics():
             }
         }
     }
+
+
+@dashboard_router.get("/recent")
+async def get_recent_activity(limit: int = 50, type: Optional[str] = None):
+    """
+    Get recent activity (chat sessions)
+    
+    Query params:
+        limit: Maximum number of items to return
+        type: Filter by type (currently only "chat" is supported)
+    """
+    try:
+        # Get recent sessions
+        sessions_list = history_storage.get_all_sessions(limit=limit, offset=0)
+        
+        # Format as activity items
+        activities = []
+        for session in sessions_list:
+            # Get full session data
+            full_session = history_storage.get_session(session["session_id"])
+            
+            title = session.get("title", "Chat Session")
+            if full_session and full_session.get("messages"):
+                first_user_message = next((m for m in full_session["messages"] if m["role"] == "user"), None)
+                if first_user_message:
+                    title = first_user_message["content"][:50] + "..." if len(first_user_message["content"]) > 50 else first_user_message["content"]
+            
+            # Convert timestamps
+            created_at = session["created_at"]
+            if isinstance(created_at, str):
+                created_at = int(datetime.fromisoformat(created_at).timestamp())
+            
+            activities.append({
+                "id": session["session_id"],
+                "type": "chat",
+                "title": title,
+                "timestamp": created_at,
+                "message_count": session.get("message_count", 0),
+            })
+    
+    return {
+        "success": True,
+            "data": activities,
+            "count": len(activities),
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

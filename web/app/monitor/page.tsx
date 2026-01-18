@@ -4,631 +4,578 @@ import { useState, useEffect } from "react";
 import {
   Monitor,
   Activity,
-  FileText,
-  Zap,
-  Clock,
-  CheckCircle,
-  AlertCircle,
-  XCircle,
-  Play,
-  Pause,
-  RotateCcw,
-  TrendingUp,
   Database,
+  MessageSquare,
+  Brain,
   Server,
   Cpu,
   HardDrive,
-  BarChart3,
-  PieChart,
-  LineChart,
-  Calendar,
-  Filter,
-  Download,
+  Wifi,
+  Clock,
+  TrendingUp,
+  AlertCircle,
+  CheckCircle,
   RefreshCw,
+  Loader2,
+  HelpCircle,
 } from "lucide-react";
 import { apiUrl } from "@/lib/api";
 import { getTranslation, type Language } from "@/lib/i18n";
 import { useGlobal } from "@/context/GlobalContext";
 
-interface TaskStatus {
-  id: string;
-  type: "solve" | "research" | "chat" | "upload";
-  name: string;
-  status: "running" | "completed" | "failed" | "pending";
-  progress: number;
-  startTime: string;
-  endTime?: string;
-  duration?: number;
-  tokensUsed: number;
-  filesProcessed: number;
-  error?: string;
-}
-
-interface FileInfo {
-  id: string;
-  name: string;
-  type: string;
-  size: number;
-  uploadTime: string;
-  processedTime?: string;
-  status: "uploaded" | "processing" | "processed" | "failed";
-  tokensGenerated: number;
-  associatedTasks: string[];
-}
-
-interface TokenUsage {
-  model: string;
-  totalTokens: number;
-  inputTokens: number;
-  outputTokens: number;
-  cost: number;
-  requests: number;
-  lastUsed: string;
-}
+// === Types ===
 
 interface SystemMetrics {
-  cpuUsage: number;
-  memoryUsage: number;
-  diskUsage: number;
-  activeConnections: number;
+  cpu: {
+    usage_percent: number;
+    count: number;
+    process_percent: number;
+  };
+  memory: {
+    usage_percent: number;
+    total_gb: number;
+    used_gb: number;
+    available_gb: number;
+    process_mb: number;
+  };
+  disk: {
+    usage_percent: number;
+    total_gb: number;
+    used_gb: number;
+    free_gb: number;
+  };
+  network: {
+    active_connections: number;
+  };
   uptime: string;
-  lastUpdated: string;
+  timestamp: string;
+}
+
+interface ChatActivity {
+  total_sessions: number;
+  total_messages: number;
+  active_sessions: number;
+  recent_sessions: Array<{
+    session_id: string;
+    title: string;
+    message_count: number;
+    created_at: number;
+    updated_at: number;
+  }>;
+  time_window_hours: number;
+}
+
+interface KnowledgeActivity {
+  total_clusters: number;
+  average_confidence: number;
+  recent_clusters: Array<{
+    id: string;
+    name: string;
+    lifecycle: string;
+    last_modified: string;
+    confidence: number;
+  }>;
+  lifecycle_distribution: Record<string, number>;
+}
+
+interface StorageInfo {
+  work_path: string;
+  cache_path: string;
+  databases: Record<string, {
+    path: string;
+    size_mb: number;
+    exists: boolean;
+  }>;
+  total_cache_size_mb: number;
+}
+
+interface HealthStatus {
+  overall_status: string;
+  status_color: string;
+  health_score: number;
+  issues: string[];
+  services: Record<string, {
+    status: string;
+    healthy: boolean;
+  }>;
+  timestamp: string;
+}
+
+interface MonitorOverview {
+  system: SystemMetrics;
+  chat: ChatActivity;
+  knowledge: KnowledgeActivity;
+  storage: StorageInfo;
+  health: HealthStatus;
+  timestamp: string;
 }
 
 export default function MonitorPage() {
   const { uiSettings } = useGlobal();
   const t = (key: string) => getTranslation((uiSettings?.language || "en") as Language, key);
 
-  const [tasks, setTasks] = useState<TaskStatus[]>([]);
-  const [files, setFiles] = useState<FileInfo[]>([]);
-  const [tokenUsage, setTokenUsage] = useState<TokenUsage[]>([]);
-  const [systemMetrics, setSystemMetrics] = useState<SystemMetrics | null>(null);
+  const [overview, setOverview] = useState<MonitorOverview | null>(null);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<"tasks" | "files" | "tokens" | "system">("tasks");
+  const [error, setError] = useState("");
   const [autoRefresh, setAutoRefresh] = useState(true);
-  const [filterStatus, setFilterStatus] = useState<string>("all");
+  const [refreshing, setRefreshing] = useState(false);
 
-  // Mock data generation
-  const generateMockData = () => {
-    const mockTasks: TaskStatus[] = [
-      {
-        id: "task_001",
-        type: "solve",
-        name: "Machine Learning Problem Analysis",
-        status: "running",
-        progress: 65,
-        startTime: new Date(Date.now() - 300000).toISOString(),
-        tokensUsed: 1250,
-        filesProcessed: 3,
-      },
-      {
-        id: "task_002",
-        type: "research",
-        name: "Climate Change Research Report",
-        status: "completed",
-        progress: 100,
-        startTime: new Date(Date.now() - 1800000).toISOString(),
-        endTime: new Date(Date.now() - 300000).toISOString(),
-        duration: 1500,
-        tokensUsed: 3420,
-        filesProcessed: 8,
-      },
-      {
-        id: "task_003",
-        type: "chat",
-        name: "AI Assistant Conversation",
-        status: "completed",
-        progress: 100,
-        startTime: new Date(Date.now() - 600000).toISOString(),
-        endTime: new Date(Date.now() - 120000).toISOString(),
-        duration: 480,
-        tokensUsed: 890,
-        filesProcessed: 0,
-      },
-      {
-        id: "task_004",
-        type: "upload",
-        name: "Document Processing",
-        status: "failed",
-        progress: 45,
-        startTime: new Date(Date.now() - 900000).toISOString(),
-        tokensUsed: 156,
-        filesProcessed: 1,
-        error: "File format not supported",
-      },
-    ];
+  // Fetch overview data
+  const fetchOverview = async () => {
+    try {
+      setRefreshing(true);
+      setError("");
 
-    const mockFiles: FileInfo[] = [
-      {
-        id: "file_001",
-        name: "research_paper.pdf",
-        type: "PDF",
-        size: 2048576,
-        uploadTime: new Date(Date.now() - 3600000).toISOString(),
-        processedTime: new Date(Date.now() - 3300000).toISOString(),
-        status: "processed",
-        tokensGenerated: 1250,
-        associatedTasks: ["task_002"],
-      },
-      {
-        id: "file_002",
-        name: "dataset.csv",
-        type: "CSV",
-        size: 1024000,
-        uploadTime: new Date(Date.now() - 1800000).toISOString(),
-        processedTime: new Date(Date.now() - 1500000).toISOString(),
-        status: "processed",
-        tokensGenerated: 890,
-        associatedTasks: ["task_001"],
-      },
-      {
-        id: "file_003",
-        name: "presentation.pptx",
-        type: "PPTX",
-        size: 5120000,
-        uploadTime: new Date(Date.now() - 600000).toISOString(),
-        status: "processing",
-        tokensGenerated: 0,
-        associatedTasks: [],
-      },
-    ];
+      const response = await fetch(apiUrl("/api/v1/monitor/overview"));
+      if (!response.ok) throw new Error("Failed to fetch monitoring data");
 
-    const mockTokenUsage: TokenUsage[] = [
-      {
-        model: "gpt-4",
-        totalTokens: 15420,
-        inputTokens: 8230,
-        outputTokens: 7190,
-        cost: 0.462,
-        requests: 23,
-        lastUsed: new Date(Date.now() - 120000).toISOString(),
-      },
-      {
-        model: "gpt-3.5-turbo",
-        totalTokens: 8950,
-        inputTokens: 4200,
-        outputTokens: 4750,
-        cost: 0.0179,
-        requests: 45,
-        lastUsed: new Date(Date.now() - 300000).toISOString(),
-      },
-      {
-        model: "text-embedding-ada-002",
-        totalTokens: 25600,
-        inputTokens: 25600,
-        outputTokens: 0,
-        cost: 0.0026,
-        requests: 128,
-        lastUsed: new Date(Date.now() - 180000).toISOString(),
-      },
-    ];
-
-    const mockSystemMetrics: SystemMetrics = {
-      cpuUsage: 45.2,
-      memoryUsage: 68.7,
-      diskUsage: 34.1,
-      activeConnections: 12,
-      uptime: "2d 14h 32m",
-      lastUpdated: new Date().toISOString(),
-    };
-
-    setTasks(mockTasks);
-    setFiles(mockFiles);
-    setTokenUsage(mockTokenUsage);
-    setSystemMetrics(mockSystemMetrics);
-    setLoading(false);
+      const result = await response.json();
+      if (result.success && result.data) {
+        setOverview(result.data);
+      }
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
   };
 
+  // Initial fetch
   useEffect(() => {
-    generateMockData();
-    
-    if (autoRefresh) {
-      const interval = setInterval(generateMockData, 5000);
-      return () => clearInterval(interval);
-    }
+    fetchOverview();
+  }, []);
+
+  // Auto-refresh every 5 seconds
+  useEffect(() => {
+    if (!autoRefresh) return;
+
+    const interval = setInterval(() => {
+      fetchOverview();
+    }, 5000);
+
+    return () => clearInterval(interval);
   }, [autoRefresh]);
 
-  const getStatusIcon = (status: string) => {
-    switch (status) {
-      case "running":
-      case "processing":
-        return <Play className="w-4 h-4 text-blue-500 animate-pulse" />;
-      case "completed":
-      case "processed":
-        return <CheckCircle className="w-4 h-4 text-green-500" />;
-      case "failed":
-        return <XCircle className="w-4 h-4 text-red-500" />;
-      case "pending":
-      case "uploaded":
-        return <Clock className="w-4 h-4 text-yellow-500" />;
-      default:
-        return <AlertCircle className="w-4 h-4 text-gray-500" />;
-    }
-  };
-
+  // Get status color
   const getStatusColor = (status: string) => {
     switch (status) {
-      case "running":
-      case "processing":
-        return "text-blue-600 bg-blue-100 dark:text-blue-400 dark:bg-blue-900/30";
-      case "completed":
-      case "processed":
-        return "text-green-600 bg-green-100 dark:text-green-400 dark:bg-green-900/30";
-      case "failed":
-        return "text-red-600 bg-red-100 dark:text-red-400 dark:bg-red-900/30";
-      case "pending":
-      case "uploaded":
-        return "text-yellow-600 bg-yellow-100 dark:text-yellow-400 dark:bg-yellow-900/30";
+      case "excellent":
+        return "text-green-600 dark:text-green-400 bg-green-100 dark:bg-green-900/30";
+      case "good":
+        return "text-blue-600 dark:text-blue-400 bg-blue-100 dark:bg-blue-900/30";
+      case "warning":
+        return "text-yellow-600 dark:text-yellow-400 bg-yellow-100 dark:bg-yellow-900/30";
+      case "critical":
+        return "text-red-600 dark:text-red-400 bg-red-100 dark:bg-red-900/30";
       default:
-        return "text-gray-600 bg-gray-100 dark:text-gray-400 dark:bg-gray-900/30";
+        return "text-slate-600 dark:text-slate-400 bg-slate-100 dark:bg-slate-700";
     }
   };
 
-  const formatFileSize = (bytes: number) => {
-    if (bytes === 0) return "0 Bytes";
-    const k = 1024;
-    const sizes = ["Bytes", "KB", "MB", "GB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+  // Get progress bar color
+  const getProgressColor = (percent: number) => {
+    if (percent >= 90) return "bg-red-500";
+    if (percent >= 75) return "bg-yellow-500";
+    if (percent >= 50) return "bg-blue-500";
+    return "bg-green-500";
   };
-
-  const formatDuration = (seconds: number) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}m ${secs}s`;
-  };
-
-  const filteredTasks = tasks.filter(task => 
-    filterStatus === "all" || task.status === filterStatus
-  );
-
-  const totalTokensUsed = tokenUsage.reduce((sum, usage) => sum + usage.totalTokens, 0);
-  const totalCost = tokenUsage.reduce((sum, usage) => sum + usage.cost, 0);
-  const activeTasks = tasks.filter(task => task.status === "running").length;
-  const completedTasks = tasks.filter(task => task.status === "completed").length;
 
   if (loading) {
     return (
-      <div className="h-screen flex items-center justify-center">
+      <div className="h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 to-blue-50/30 dark:from-slate-900 dark:to-blue-950/20">
         <div className="text-center">
-          <RefreshCw className="w-8 h-8 animate-spin text-blue-500 mx-auto mb-4" />
-          <p className="text-slate-500 dark:text-slate-400">{t("Loading monitor data...")}</p>
+          <Loader2 className="w-12 h-12 animate-spin text-blue-500 mx-auto mb-4" />
+          <p className="text-slate-600 dark:text-slate-400">{t("Loading monitoring data...")}</p>
         </div>
       </div>
     );
   }
 
+  if (error) {
+    return (
+      <div className="h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 to-blue-50/30 dark:from-slate-900 dark:to-blue-950/20">
+        <div className="text-center max-w-md">
+          <AlertCircle className="w-16 h-16 text-red-500 mx-auto mb-4" />
+          <h2 className="text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">{t("Error")}</h2>
+          <p className="text-slate-600 dark:text-slate-400">{error}</p>
+          <button
+            onClick={() => { setLoading(true); fetchOverview(); }}
+            className="mt-4 px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg"
+          >
+            {t("Retry")}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!overview) return null;
+
+  const { system, chat, knowledge, storage, health } = overview;
+
   return (
-    <div className="h-screen flex flex-col animate-fade-in p-6">
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-blue-50/30 dark:from-slate-900 dark:to-blue-950/20">
       {/* Header */}
-      <div className="shrink-0 pb-6">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-3xl font-bold text-slate-900 dark:text-slate-100 tracking-tight flex items-center gap-3">
-              <Monitor className="w-8 h-8 text-blue-600 dark:text-blue-400" />
-              {t("System Monitor")}
-            </h1>
-            <p className="text-slate-500 dark:text-slate-400 mt-2">
-              {t("Real-time monitoring of tasks, files, and system resources")}
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => setAutoRefresh(!autoRefresh)}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-                autoRefresh
-                  ? "bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300"
-                  : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400"
-              }`}
-            >
-              {autoRefresh ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
-              {autoRefresh ? t("Auto Refresh On") : t("Auto Refresh Off")}
-            </button>
-            <button
-              onClick={generateMockData}
-              className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors"
-            >
-              <RefreshCw className="w-4 h-4" />
-              {t("Refresh")}
-            </button>
-          </div>
-        </div>
+      <div className="border-b border-slate-200 dark:border-slate-700 bg-white/80 dark:bg-slate-800/80 backdrop-blur-sm sticky top-0 z-10">
+        <div className="px-6 py-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <Monitor className="w-7 h-7 text-blue-500 dark:text-blue-400" />
+              <div>
+                <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">
+                  {t("System Monitor")}
+                </h1>
+                <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
+                  {t("Real-time system monitoring and metrics")}
+                </p>
+              </div>
+            </div>
 
-        {/* Stats Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mt-6">
-          <div className="bg-white dark:bg-slate-800 rounded-xl p-4 border border-slate-200 dark:border-slate-700">
             <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-blue-100 dark:bg-blue-900/30 rounded-lg flex items-center justify-center">
-                <Activity className="w-5 h-5 text-blue-600 dark:text-blue-400" />
-              </div>
-              <div>
-                <p className="text-sm text-slate-500 dark:text-slate-400">{t("Active Tasks")}</p>
-                <p className="text-2xl font-bold text-slate-900 dark:text-slate-100">{activeTasks}</p>
-              </div>
-            </div>
-          </div>
-          <div className="bg-white dark:bg-slate-800 rounded-xl p-4 border border-slate-200 dark:border-slate-700">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-green-100 dark:bg-green-900/30 rounded-lg flex items-center justify-center">
-                <CheckCircle className="w-5 h-5 text-green-600 dark:text-green-400" />
-              </div>
-              <div>
-                <p className="text-sm text-slate-500 dark:text-slate-400">{t("Completed")}</p>
-                <p className="text-2xl font-bold text-slate-900 dark:text-slate-100">{completedTasks}</p>
-              </div>
-            </div>
-          </div>
-          <div className="bg-white dark:bg-slate-800 rounded-xl p-4 border border-slate-200 dark:border-slate-700">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-purple-100 dark:bg-purple-900/30 rounded-lg flex items-center justify-center">
-                <Zap className="w-5 h-5 text-purple-600 dark:text-purple-400" />
-              </div>
-              <div>
-                <p className="text-sm text-slate-500 dark:text-slate-400">{t("Total Tokens")}</p>
-                <p className="text-2xl font-bold text-slate-900 dark:text-slate-100">{totalTokensUsed.toLocaleString()}</p>
-              </div>
-            </div>
-          </div>
-          <div className="bg-white dark:bg-slate-800 rounded-xl p-4 border border-slate-200 dark:border-slate-700">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-amber-100 dark:bg-amber-900/30 rounded-lg flex items-center justify-center">
-                <TrendingUp className="w-5 h-5 text-amber-600 dark:text-amber-400" />
-              </div>
-              <div>
-                <p className="text-sm text-slate-500 dark:text-slate-400">{t("Total Cost")}</p>
-                <p className="text-2xl font-bold text-slate-900 dark:text-slate-100">${totalCost.toFixed(3)}</p>
-              </div>
-            </div>
-          </div>
-        </div>
+              {/* Auto-refresh toggle */}
+              <button
+                onClick={() => setAutoRefresh(!autoRefresh)}
+                className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${
+                  autoRefresh
+                    ? "bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300"
+                    : "bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400"
+                }`}
+              >
+                <Activity className="w-4 h-4" />
+                <span className="text-sm font-medium">
+                  {autoRefresh ? t("Auto-refresh ON") : t("Auto-refresh OFF")}
+                </span>
+              </button>
 
-        {/* Tab Navigation */}
-        <div className="flex items-center gap-1 mt-6 bg-slate-100 dark:bg-slate-800 rounded-lg p-1">
-          {[
-            { id: "tasks", label: t("Tasks"), icon: Activity },
-            { id: "files", label: t("Files"), icon: FileText },
-            { id: "tokens", label: t("Tokens"), icon: Zap },
-            { id: "system", label: t("System"), icon: Server },
-          ].map((tab) => (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id as any)}
-              className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-all ${
-                activeTab === tab.id
-                  ? "bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 shadow-sm"
-                  : "text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
-              }`}
-            >
-              <tab.icon className="w-4 h-4" />
-              {tab.label}
-            </button>
-          ))}
+              {/* Manual refresh button */}
+              <button
+                onClick={fetchOverview}
+                disabled={refreshing}
+                className="flex items-center gap-2 px-3 py-2 bg-blue-500 hover:bg-blue-600 disabled:bg-slate-300 dark:disabled:bg-slate-700 text-white rounded-lg transition-colors"
+              >
+                <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
+                <span className="text-sm font-medium">{t("Refresh")}</span>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
-      {/* Content Area */}
-      <div className="flex-1 min-h-0 overflow-y-auto">
-        {activeTab === "tasks" && (
-          <div className="space-y-4">
-            {/* Filter */}
-            <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2">
-                <Filter className="w-4 h-4 text-slate-400" />
-                <select
-                  value={filterStatus}
-                  onChange={(e) => setFilterStatus(e.target.value)}
-                  className="text-sm bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 outline-none focus:border-blue-400 dark:text-slate-200"
-                >
-                  <option value="all">{t("All Status")}</option>
-                  <option value="running">{t("Running")}</option>
-                  <option value="completed">{t("Completed")}</option>
-                  <option value="failed">{t("Failed")}</option>
-                  <option value="pending">{t("Pending")}</option>
-                </select>
+      {/* Content */}
+      <div className="px-6 py-6 space-y-6">
+        {/* Health Status Banner */}
+        <div className={`rounded-xl border-2 p-6 ${getStatusColor(health.overall_status)}`}>
+          <div className="flex items-start justify-between">
+            <div className="flex items-start gap-4">
+              {health.overall_status === "excellent" || health.overall_status === "good" ? (
+                <CheckCircle className="w-10 h-10 flex-shrink-0" />
+              ) : (
+                <AlertCircle className="w-10 h-10 flex-shrink-0" />
+              )}
+              <div>
+                <h2 className="text-xl font-bold capitalize mb-1">
+                  {health.overall_status} Health
+                </h2>
+                <p className="text-sm opacity-90 mb-2">
+                  System is operating at {health.health_score}% capacity
+                </p>
+                {health.issues.length > 0 && (
+                  <ul className="text-sm space-y-1">
+                    {health.issues.map((issue, i) => (
+                      <li key={i}>• {issue}</li>
+                    ))}
+                  </ul>
+                )}
               </div>
             </div>
-
-            {/* Tasks List */}
-            <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
-              <div className="divide-y divide-slate-100 dark:divide-slate-700">
-                {filteredTasks.map((task) => (
-                  <div key={task.id} className="p-4 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-4">
-                        {getStatusIcon(task.status)}
-                        <div>
-                          <h3 className="font-semibold text-slate-900 dark:text-slate-100">{task.name}</h3>
-                          <div className="flex items-center gap-4 mt-1 text-sm text-slate-500 dark:text-slate-400">
-                            <span className="capitalize">{task.type}</span>
-                            <span>{new Date(task.startTime).toLocaleString()}</span>
-                            {task.duration && <span>{formatDuration(task.duration)}</span>}
-                          </div>
-                        </div>
-                      </div>
-                      <div className="text-right">
-                        <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(task.status)}`}>
-                          {task.status}
-                        </span>
-                        <div className="flex items-center gap-4 mt-2 text-sm text-slate-500 dark:text-slate-400">
-                          <span>{task.tokensUsed} tokens</span>
-                          <span>{task.filesProcessed} files</span>
-                        </div>
-                      </div>
-                    </div>
-                    {task.status === "running" && (
-                      <div className="mt-3">
-                        <div className="flex justify-between text-sm text-slate-500 dark:text-slate-400 mb-1">
-                          <span>{t("Progress")}</span>
-                          <span>{task.progress}%</span>
-                        </div>
-                        <div className="w-full bg-slate-200 dark:bg-slate-700 rounded-full h-2">
-                          <div
-                            className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-                            style={{ width: `${task.progress}%` }}
-                          ></div>
-                        </div>
-                      </div>
-                    )}
-                    {task.error && (
-                      <div className="mt-2 p-2 bg-red-50 dark:bg-red-900/30 rounded-lg">
-                        <p className="text-sm text-red-600 dark:text-red-400">{task.error}</p>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
+            <div className="text-right">
+              <div className="text-3xl font-bold">{health.health_score}</div>
+              <div className="text-xs opacity-75">Health Score</div>
             </div>
           </div>
-        )}
+        </div>
 
-        {activeTab === "files" && (
-          <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
-            <div className="divide-y divide-slate-100 dark:divide-slate-700">
-              {files.map((file) => (
-                <div key={file.id} className="p-4 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors">
+        {/* System Metrics */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          {/* CPU Usage */}
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-5">
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <p className="text-sm font-medium text-slate-500 dark:text-slate-400 mb-1">
+                  {t("CPU Usage")}
+                </p>
+                <p className="text-2xl font-bold text-slate-900 dark:text-slate-100">
+                  {system.cpu.usage_percent}%
+                </p>
+              </div>
+              <div className="w-12 h-12 bg-purple-100 dark:bg-purple-900/30 rounded-lg flex items-center justify-center">
+                <Cpu className="w-6 h-6 text-purple-600 dark:text-purple-400" />
+              </div>
+            </div>
+            <div className="w-full bg-slate-100 dark:bg-slate-700 rounded-full h-2">
+              <div
+                className={`h-2 rounded-full ${getProgressColor(system.cpu.usage_percent)}`}
+                style={{ width: `${Math.min(system.cpu.usage_percent, 100)}%` }}
+              />
+            </div>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
+              {system.cpu.count} cores • Process: {system.cpu.process_percent}%
+            </p>
+          </div>
+
+          {/* Memory Usage */}
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-5">
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <p className="text-sm font-medium text-slate-500 dark:text-slate-400 mb-1">
+                  {t("Memory")}
+                </p>
+                <p className="text-2xl font-bold text-slate-900 dark:text-slate-100">
+                  {system.memory.usage_percent}%
+                </p>
+              </div>
+              <div className="w-12 h-12 bg-blue-100 dark:bg-blue-900/30 rounded-lg flex items-center justify-center">
+                <Activity className="w-6 h-6 text-blue-600 dark:text-blue-400" />
+              </div>
+            </div>
+            <div className="w-full bg-slate-100 dark:bg-slate-700 rounded-full h-2">
+              <div
+                className={`h-2 rounded-full ${getProgressColor(system.memory.usage_percent)}`}
+                style={{ width: `${Math.min(system.memory.usage_percent, 100)}%` }}
+              />
+            </div>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
+              {system.memory.used_gb.toFixed(1)} / {system.memory.total_gb.toFixed(1)} GB
+            </p>
+          </div>
+
+          {/* Disk Usage */}
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-5">
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <p className="text-sm font-medium text-slate-500 dark:text-slate-400 mb-1">
+                  {t("Disk")}
+                </p>
+                <p className="text-2xl font-bold text-slate-900 dark:text-slate-100">
+                  {system.disk.usage_percent}%
+                </p>
+              </div>
+              <div className="w-12 h-12 bg-green-100 dark:bg-green-900/30 rounded-lg flex items-center justify-center">
+                <HardDrive className="w-6 h-6 text-green-600 dark:text-green-400" />
+              </div>
+            </div>
+            <div className="w-full bg-slate-100 dark:bg-slate-700 rounded-full h-2">
+              <div
+                className={`h-2 rounded-full ${getProgressColor(system.disk.usage_percent)}`}
+                style={{ width: `${Math.min(system.disk.usage_percent, 100)}%` }}
+              />
+            </div>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
+              {system.disk.free_gb.toFixed(1)} GB free of {system.disk.total_gb.toFixed(1)} GB
+            </p>
+          </div>
+
+          {/* Uptime */}
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-5">
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <p className="text-sm font-medium text-slate-500 dark:text-slate-400 mb-1">
+                  {t("Uptime")}
+                </p>
+                <p className="text-lg font-bold text-slate-900 dark:text-slate-100">
+                  {system.uptime}
+                </p>
+              </div>
+              <div className="w-12 h-12 bg-orange-100 dark:bg-orange-900/30 rounded-lg flex items-center justify-center">
+                <Clock className="w-6 h-6 text-orange-600 dark:text-orange-400" />
+              </div>
+            </div>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">
+              {system.network.active_connections} active connections
+            </p>
+          </div>
+        </div>
+
+        {/* Activity Cards */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Chat Activity */}
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-6">
+            <div className="flex items-center gap-2 mb-4">
+              <MessageSquare className="w-5 h-5 text-blue-500" />
+              <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
+                {t("Chat Activity")}
+              </h3>
+            </div>
+
+            <div className="grid grid-cols-3 gap-4 mb-6">
+              <div className="text-center">
+                <div className="text-2xl font-bold text-slate-900 dark:text-slate-100">
+                  {chat.total_sessions}
+                </div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">Total Sessions</div>
+              </div>
+              <div className="text-center">
+                <div className="text-2xl font-bold text-blue-600 dark:text-blue-400">
+                  {chat.active_sessions}
+                </div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">Active (24h)</div>
+              </div>
+              <div className="text-center">
+                <div className="text-2xl font-bold text-slate-900 dark:text-slate-100">
+                  {chat.total_messages}
+                </div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">Messages</div>
+              </div>
+            </div>
+
+            <div className="space-y-2 max-h-64 overflow-y-auto">
+              {chat.recent_sessions.length > 0 ? (
+                chat.recent_sessions.map((session) => (
+                  <div
+                    key={session.session_id}
+                    className="p-3 rounded-lg bg-slate-50 dark:bg-slate-700/50"
+                  >
+                    <div className="flex items-start justify-between">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-slate-900 dark:text-slate-100 truncate">
+                          {session.title}
+                        </p>
+                        <p className="text-xs text-slate-500 dark:text-slate-400">
+                          {session.message_count} messages •{" "}
+                          {new Date(session.updated_at * 1000).toLocaleString()}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <p className="text-sm text-slate-500 dark:text-slate-400 text-center py-4">
+                  No recent sessions
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Knowledge Activity */}
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-6">
+            <div className="flex items-center gap-2 mb-4">
+              <Brain className="w-5 h-5 text-purple-500" />
+              <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
+                {t("Knowledge Clusters")}
+              </h3>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4 mb-6">
+              <div className="text-center">
+                <div className="text-2xl font-bold text-slate-900 dark:text-slate-100">
+                  {knowledge.total_clusters}
+                </div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">Total Clusters</div>
+              </div>
+              <div className="text-center">
+                <div className="text-2xl font-bold text-purple-600 dark:text-purple-400">
+                  {(knowledge.average_confidence * 100).toFixed(0)}%
+                </div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">Avg Confidence</div>
+              </div>
+            </div>
+
+            <div className="space-y-2 max-h-64 overflow-y-auto">
+              {knowledge.recent_clusters.length > 0 ? (
+                knowledge.recent_clusters.map((cluster) => (
+                  <div
+                    key={cluster.id}
+                    className="p-3 rounded-lg bg-slate-50 dark:bg-slate-700/50"
+                  >
+                    <div className="flex items-start justify-between">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-slate-900 dark:text-slate-100 truncate">
+                          {cluster.name}
+                        </p>
+                        <p className="text-xs text-slate-500 dark:text-slate-400">
+                          {cluster.lifecycle} •{" "}
+                          {cluster.confidence ? `${(cluster.confidence * 100).toFixed(0)}%` : "N/A"}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <p className="text-sm text-slate-500 dark:text-slate-400 text-center py-4">
+                  No clusters created yet
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Storage and Services */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Storage Info */}
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-6">
+            <div className="flex items-center gap-2 mb-4">
+              <Database className="w-5 h-5 text-green-500" />
+              <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
+                {t("Storage")}
+              </h3>
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-sm text-slate-600 dark:text-slate-400">Total Cache</span>
+                  <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                    {storage.total_cache_size_mb.toFixed(2)} MB
+                  </span>
+                </div>
+              </div>
+
+              {Object.entries(storage.databases).map(([name, db]) => (
+                <div key={name}>
                   <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-4">
-                      {getStatusIcon(file.status)}
-                      <div>
-                        <h3 className="font-semibold text-slate-900 dark:text-slate-100">{file.name}</h3>
-                        <div className="flex items-center gap-4 mt-1 text-sm text-slate-500 dark:text-slate-400">
-                          <span>{file.type}</span>
-                          <span>{formatFileSize(file.size)}</span>
-                          <span>{new Date(file.uploadTime).toLocaleString()}</span>
-                        </div>
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(file.status)}`}>
-                        {file.status}
-                      </span>
-                      <div className="mt-2 text-sm text-slate-500 dark:text-slate-400">
-                        {file.tokensGenerated > 0 && <span>{file.tokensGenerated} tokens generated</span>}
-                      </div>
-                    </div>
+                    <span className="text-sm text-slate-600 dark:text-slate-400 capitalize">
+                      {name}
+                    </span>
+                    <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                      {db.size_mb.toFixed(2)} MB
+                    </span>
                   </div>
                 </div>
               ))}
             </div>
           </div>
-        )}
 
-        {activeTab === "tokens" && (
-          <div className="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden">
-            <div className="divide-y divide-slate-100 dark:divide-slate-700">
-              {tokenUsage.map((usage, index) => (
-                <div key={index} className="p-4 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <h3 className="font-semibold text-slate-900 dark:text-slate-100">{usage.model}</h3>
-                      <div className="flex items-center gap-4 mt-1 text-sm text-slate-500 dark:text-slate-400">
-                        <span>{usage.requests} requests</span>
-                        <span>Last used: {new Date(usage.lastUsed).toLocaleString()}</span>
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <div className="text-lg font-bold text-slate-900 dark:text-slate-100">
-                        {usage.totalTokens.toLocaleString()}
-                      </div>
-                      <div className="text-sm text-slate-500 dark:text-slate-400">
-                        ${usage.cost.toFixed(4)}
-                      </div>
-                    </div>
-                  </div>
-                  <div className="mt-3 grid grid-cols-2 gap-4 text-sm">
-                    <div>
-                      <span className="text-slate-500 dark:text-slate-400">Input: </span>
-                      <span className="text-slate-900 dark:text-slate-100">{usage.inputTokens.toLocaleString()}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-500 dark:text-slate-400">Output: </span>
-                      <span className="text-slate-900 dark:text-slate-100">{usage.outputTokens.toLocaleString()}</span>
-                    </div>
+          {/* Services Status */}
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-6">
+            <div className="flex items-center gap-2 mb-4">
+              <Server className="w-5 h-5 text-blue-500" />
+              <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
+                {t("Services")}
+              </h3>
+            </div>
+
+            <div className="space-y-3">
+              {Object.entries(health.services).map(([name, service]) => (
+                <div key={name} className="flex items-center justify-between">
+                  <span className="text-sm text-slate-600 dark:text-slate-400 capitalize">
+                    {name.replace(/_/g, " ")}
+                  </span>
+                  <div className="flex items-center gap-2">
+                    {service.healthy ? (
+                      <CheckCircle className="w-4 h-4 text-green-500" />
+                    ) : (
+                      <AlertCircle className="w-4 h-4 text-red-500" />
+                    )}
+                    <span className="text-sm font-medium text-slate-900 dark:text-slate-100">
+                      {service.status}
+                    </span>
                   </div>
                 </div>
               ))}
             </div>
           </div>
-        )}
-
-        {activeTab === "system" && systemMetrics && (
-          <div className="space-y-6">
-            {/* System Overview */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-              <div className="bg-white dark:bg-slate-800 rounded-xl p-4 border border-slate-200 dark:border-slate-700">
-                <div className="flex items-center gap-3">
-                  <Cpu className="w-8 h-8 text-blue-500" />
-                  <div>
-                    <p className="text-sm text-slate-500 dark:text-slate-400">CPU Usage</p>
-                    <p className="text-2xl font-bold text-slate-900 dark:text-slate-100">{systemMetrics.cpuUsage}%</p>
-                  </div>
-                </div>
-                <div className="mt-3 w-full bg-slate-200 dark:bg-slate-700 rounded-full h-2">
-                  <div
-                    className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-                    style={{ width: `${systemMetrics.cpuUsage}%` }}
-                  ></div>
-                </div>
-              </div>
-              <div className="bg-white dark:bg-slate-800 rounded-xl p-4 border border-slate-200 dark:border-slate-700">
-                <div className="flex items-center gap-3">
-                  <Database className="w-8 h-8 text-green-500" />
-                  <div>
-                    <p className="text-sm text-slate-500 dark:text-slate-400">Memory Usage</p>
-                    <p className="text-2xl font-bold text-slate-900 dark:text-slate-100">{systemMetrics.memoryUsage}%</p>
-                  </div>
-                </div>
-                <div className="mt-3 w-full bg-slate-200 dark:bg-slate-700 rounded-full h-2">
-                  <div
-                    className="bg-green-600 h-2 rounded-full transition-all duration-300"
-                    style={{ width: `${systemMetrics.memoryUsage}%` }}
-                  ></div>
-                </div>
-              </div>
-              <div className="bg-white dark:bg-slate-800 rounded-xl p-4 border border-slate-200 dark:border-slate-700">
-                <div className="flex items-center gap-3">
-                  <HardDrive className="w-8 h-8 text-purple-500" />
-                  <div>
-                    <p className="text-sm text-slate-500 dark:text-slate-400">Disk Usage</p>
-                    <p className="text-2xl font-bold text-slate-900 dark:text-slate-100">{systemMetrics.diskUsage}%</p>
-                  </div>
-                </div>
-                <div className="mt-3 w-full bg-slate-200 dark:bg-slate-700 rounded-full h-2">
-                  <div
-                    className="bg-purple-600 h-2 rounded-full transition-all duration-300"
-                    style={{ width: `${systemMetrics.diskUsage}%` }}
-                  ></div>
-                </div>
-              </div>
-              <div className="bg-white dark:bg-slate-800 rounded-xl p-4 border border-slate-200 dark:border-slate-700">
-                <div className="flex items-center gap-3">
-                  <Activity className="w-8 h-8 text-amber-500" />
-                  <div>
-                    <p className="text-sm text-slate-500 dark:text-slate-400">Connections</p>
-                    <p className="text-2xl font-bold text-slate-900 dark:text-slate-100">{systemMetrics.activeConnections}</p>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* System Info */}
-            <div className="bg-white dark:bg-slate-800 rounded-xl p-6 border border-slate-200 dark:border-slate-700">
-              <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100 mb-4">System Information</h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                <div>
-                  <p className="text-sm text-slate-500 dark:text-slate-400">System Uptime</p>
-                  <p className="text-xl font-semibold text-slate-900 dark:text-slate-100">{systemMetrics.uptime}</p>
-                </div>
-                <div>
-                  <p className="text-sm text-slate-500 dark:text-slate-400">Last Updated</p>
-                  <p className="text-xl font-semibold text-slate-900 dark:text-slate-100">
-                    {new Date(systemMetrics.lastUpdated).toLocaleTimeString()}
-                  </p>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
+        </div>
       </div>
     </div>
   );

@@ -5,14 +5,19 @@ Provides CRUD and analytics for KnowledgeCluster objects
 """
 
 from fastapi import APIRouter, HTTPException
-from typing import List, Dict, Any, Optional
-from datetime import datetime
+from typing import Optional
 from pydantic import BaseModel
 
 from sirchmunk.storage.knowledge_manager import KnowledgeManager
-from sirchmunk.schema.knowledge import Lifecycle, AbstractionLevel
+from sirchmunk.schema.knowledge import AbstractionLevel
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge"])
+
+# Alias endpoint for backward compatibility
+@router.get("/list")
+async def list_knowledge_bases_alias():
+    """Alias for /clusters endpoint (backward compatibility)"""
+    return await get_all_clusters(limit=100)
 
 # Initialize Knowledge Manager
 km = KnowledgeManager()
@@ -68,10 +73,10 @@ async def get_all_clusters(
         
         return {
             "success": True,
-            "count": len(clusters),
-            "total": stats.get('custom_stats', {}).get('total_clusters', 0),
-            "data": [c.to_dict() for c in clusters]
-        }
+                "count": len(clusters),
+                "total": stats.get('custom_stats', {}).get('total_clusters', 0),
+                "data": [c.to_dict() for c in clusters]
+            }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -82,11 +87,11 @@ async def get_cluster(cluster_id: str):
         cluster = await km.get(cluster_id)
         if not cluster:
             raise HTTPException(status_code=404, detail="Cluster not found")
-        
+    
         return {
             "success": True,
-            "data": cluster.to_dict()
-        }
+                "data": cluster.to_dict()
+            }
     except HTTPException:
         raise
     except Exception as e:
@@ -101,13 +106,13 @@ async def search_clusters(request: SearchRequest):
     """
     try:
         results = await km.find(request.query, limit=request.limit)
-        
+    
         return {
             "success": True,
-            "query": request.query,
-            "count": len(results),
-            "data": [c.to_dict() for c in results]
-        }
+                "query": request.query,
+                "count": len(results),
+                "data": [c.to_dict() for c in results]
+            }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -256,24 +261,24 @@ async def get_knowledge_stats():
             }
             for row in timeline_rows
         ]
-        
+    
         return {
             "success": True,
             "data": {
-                "overview": {
-                    "total_clusters": custom_stats.get('total_clusters', 0),
-                    "avg_confidence": custom_stats.get('average_confidence', 0),
-                },
-                "lifecycle_distribution": lifecycle_dist,
-                "abstraction_level_distribution": abstraction_dist,
-                "confidence_stats": confidence_stats,
-                "hotness_stats": hotness_stats,
-                "recent_clusters": recent_clusters,
-                "top_confidence_clusters": top_confidence,
-                "top_hotness_clusters": top_hotness,
-                "timeline": timeline,
+                    "overview": {
+                        "total_clusters": custom_stats.get('total_clusters', 0),
+                        "avg_confidence": custom_stats.get('average_confidence', 0),
+                    },
+                    "lifecycle_distribution": lifecycle_dist,
+                    "abstraction_level_distribution": abstraction_dist,
+                    "confidence_stats": confidence_stats,
+                    "hotness_stats": hotness_stats,
+                    "recent_clusters": recent_clusters,
+                    "top_confidence_clusters": top_confidence,
+                    "top_hotness_clusters": top_hotness,
+                    "timeline": timeline,
+                }
             }
-        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -303,12 +308,12 @@ async def get_top_patterns(limit: int = 20):
             {"pattern": pattern, "count": count}
             for pattern, count in pattern_counter.most_common(limit)
         ]
-        
+    
         return {
             "success": True,
-            "count": len(top_patterns),
-            "data": top_patterns
-        }
+                "count": len(top_patterns),
+                "data": top_patterns
+            }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -353,14 +358,14 @@ async def get_knowledge_graph():
                         "weight": rc["weight"],
                         "type": rc["source"]
                     })
-        
+    
         return {
             "success": True,
-            "data": {
-                "nodes": nodes,
-                "edges": edges
+                "data": {
+                    "nodes": nodes,
+                    "edges": edges
+                }
             }
-        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -371,11 +376,11 @@ async def delete_cluster(cluster_id: str):
         success = await km.remove(cluster_id)
         if not success:
             raise HTTPException(status_code=404, detail="Cluster not found")
-        
+    
         return {
             "success": True,
-            "message": f"Cluster {cluster_id} deleted successfully"
-        }
+                "message": f"Cluster {cluster_id} deleted successfully"
+            }
     except HTTPException:
         raise
     except Exception as e:
