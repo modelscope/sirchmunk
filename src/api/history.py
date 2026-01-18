@@ -244,11 +244,11 @@ async def get_recent_activity(limit: int = 50, type: Optional[str] = None):
                 "message_count": session.get("message_count", 0),
             })
     
-    return {
-        "success": True,
-            "data": activities,
-            "count": len(activities),
-        }
-    
+        return {
+            "success": True,
+                "data": activities,
+                "count": len(activities),
+            }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
