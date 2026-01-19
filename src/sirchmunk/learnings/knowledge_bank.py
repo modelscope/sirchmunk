@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import json
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
@@ -22,12 +23,6 @@ from sirchmunk.schema.request import Request
 from sirchmunk.utils.file_utils import StorageStructure, fast_extract
 from sirchmunk.utils import create_logger, LogCallback
 from sirchmunk.utils.utils import extract_fields
-
-# In-memory knowledge storage, keyed by cluster ID
-_KNOWLEDGE_MAP: Dict[str, KnowledgeCluster] = {}
-
-# _LATEST_KNOWLEDGE_NUMERIC_IDX: int = 0
-
 
 class KnowledgeBank:
     """
@@ -82,6 +77,34 @@ class KnowledgeBank:
             metadata_content = json.load(f)
 
         return FileInfo.from_dict(info=metadata_content)
+
+    @staticmethod
+    def _compose_cluster_text(
+        name: Optional[str],
+        description: Union[List[str], str, None],
+        content: Union[List[str], str, None],
+    ) -> str:
+        """
+        Compose a stable text representation of a cluster from name, description, and content.
+        This is used for deterministic cluster ID generation.
+        """
+        parts: List[str] = []
+        if name:
+            parts.append(str(name).strip())
+
+        if description:
+            if isinstance(description, list):
+                parts.extend([str(item).strip() for item in description if item])
+            else:
+                parts.append(str(description).strip())
+
+        if content:
+            if isinstance(content, list):
+                parts.extend([str(item).strip() for item in content if item])
+            else:
+                parts.append(str(content).strip())
+
+        return "\n\n".join([part for part in parts if part])
 
     async def build(
         self,
@@ -165,11 +188,25 @@ class KnowledgeBank:
             )
             return None
 
+        cluster_name = cluster_infos.get("name")
+        cluster_description = cluster_infos.get("description")
+        cluster_content = cluster_infos.get("content")
+
+        cluster_text = self._compose_cluster_text(
+            name=cluster_name,
+            description=cluster_description,
+            content=cluster_content,
+        )
+        if not cluster_text:
+            cluster_text = request.get_user_input() or "unknown"
+
+        cluster_id = f"C{hashlib.sha256(cluster_text.encode('utf-8')).hexdigest()[:10]}"
+
         cluster = KnowledgeCluster(
-            id=f"C{len(_KNOWLEDGE_MAP) + 1}",
-            name=cluster_infos.get("name"),
-            description=[cluster_infos.get("description")],
-            content=cluster_infos.get("content"),
+            id=cluster_id,
+            name=cluster_name,
+            description=[cluster_description] if cluster_description else [],
+            content=cluster_content,
             scripts=[],
             resources=[],
             patterns=[],
