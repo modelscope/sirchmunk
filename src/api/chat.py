@@ -239,71 +239,91 @@ def get_search_instance(log_callback=None):
     return AgenticSearch(log_callback=log_callback)
 
 
+_DIALOG_LOCK = threading.Lock()
+_ROOT_INSTANCE = None
+
+def _get_bg_root():
+    """
+    Retrieves or creates the global, hidden Tk root window.
+    """
+    global _ROOT_INSTANCE
+
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("Tkinter must be executed on the Main Thread.")
+
+    if _ROOT_INSTANCE is None or not _ROOT_INSTANCE.winfo_exists():
+        _ROOT_INSTANCE = tk.Tk()
+        _ROOT_INSTANCE.withdraw()  # Completely hide the main window
+
+        _ROOT_INSTANCE.attributes("-alpha", 0.0)
+        _ROOT_INSTANCE.attributes("-topmost", True)
+
+        if platform.system() == "Darwin":
+            _ROOT_INSTANCE.update_idletasks()
+
+    return _ROOT_INSTANCE
+
+
 def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[str]:
     """
     Open native file dialog (Win/Mac/Linux).
-    Fixes the 'ghost window' issue on macOS when clicking Cancel.
+    Robust version using a singleton root window with extended file type support.
     """
+    if not _DIALOG_LOCK.acquire(blocking=False):
+        return []
+
     selected_paths = []
 
-    def run_dialog():
-        nonlocal selected_paths
-        root = tk.Tk()
+    try:
+        # Get singleton root
+        root = _get_bg_root()
 
-        try:
-            root.overrideredirect(True)
+        # Lift window to ensure the dialog appears on top
+        root.lift()
+        root.attributes("-topmost", True)
+        # Force update to ensure focus is correct in the Python process
+        root.update()
 
-            root.withdraw()
-            root.attributes("-alpha", 0.0)
-            root.attributes("-topmost", True)
+        kwargs = {"parent": root, "title": "Select File(s)"}
 
-            current_os = platform.system()
-            if current_os == "Darwin":  # macOS
-                root.lift()
-                root.update()
+        # Handle file dialog types
+        if dialog_type == "files":
+            filetypes = [
+                ("All Files", "*.*"),
+                ("PDF Documents", "*.pdf"),
+                ("Word Documents", "*.docx *.doc"),
+                ("PowerPoint Presentations", "*.pptx *.ppt"),
+                ("Excel Spreadsheets", "*.xlsx *.xls *.csv"),
+                ("Markdown & Text", "*.md *.markdown *.txt"),
+                ("JSON & Data", "*.json *.xml *.yaml *.yml"),
+                ("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.svg *.webp"),
+                ("Python Files", "*.py *.pyw"),
+                ("Web Files", "*.html *.htm *.css *.js"),
+                ("Archives", "*.zip *.tar *.gz *.rar *.7z")
+            ]
 
-            elif current_os == "Windows":
-                root.lift()
-
-            kwargs = {"parent": root, "title": "Select"}
-
-            root.focus_force()
-
-            if dialog_type == "files":
-                filetypes = [
-                    ("All files", "*.*"),
-                    ("Text files", "*.txt"),
-                    ("Python files", "*.py")
-                ]
-                if multiple:
-                    res = filedialog.askopenfilenames(filetypes=filetypes, **kwargs)
-                    selected_paths = list(res) if res else []
-                else:
-                    res = filedialog.askopenfilename(filetypes=filetypes, **kwargs)
-                    selected_paths = [res] if res else []
-
-            elif dialog_type == "directory":
-                res = filedialog.askdirectory(**kwargs)
+            if multiple:
+                res = filedialog.askopenfilenames(filetypes=filetypes, **kwargs)
+                selected_paths = list(res) if res else []
+            else:
+                res = filedialog.askopenfilename(filetypes=filetypes, **kwargs)
                 selected_paths = [res] if res else []
 
-            root.update()
+        elif dialog_type == "directory":
+            kwargs["title"] = "Select Directory"
+            res = filedialog.askdirectory(**kwargs)
+            selected_paths = [res] if res else []
 
-        except Exception as e:
-            print(f"Dialog Error: {e}")
-            selected_paths = []
+        root.attributes("-topmost", False)
+        root.update()
 
-        finally:
-            try:
-                root.destroy()
-            except Exception:
-                pass
+    except Exception as e:
+        print(f"Dialog Error: {e}")
+        selected_paths = []
 
-    # Ensure this runs on the Main Thread
-    if threading.current_thread() is threading.main_thread():
-        run_dialog()
-    else:
-        print("Error: Dialog must be called from the Main Thread.")
-        return []
+    finally:
+        # Release the lock
+        _DIALOG_LOCK.release()
 
     return selected_paths
 
