@@ -13,12 +13,6 @@ from sirchmunk.schema.knowledge import AbstractionLevel
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge"])
 
-# Alias endpoint for backward compatibility
-@router.get("/list")
-async def list_knowledge_bases_alias():
-    """Alias for /clusters endpoint (backward compatibility)"""
-    return await get_all_clusters(limit=100)
-
 # Initialize Knowledge Manager
 km = KnowledgeManager()
 
@@ -29,6 +23,12 @@ class SearchRequest(BaseModel):
     limit: int = 10
 
 # === API Endpoints ===
+
+@router.get("/list")
+async def list_knowledge_bases_alias():
+    """Alias for /clusters endpoint (backward compatibility)"""
+    return await get_all_clusters(limit=100)
+
 
 @router.get("/clusters")
 async def get_all_clusters(

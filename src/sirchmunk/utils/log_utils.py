@@ -110,8 +110,14 @@ def log_with_callback(
         if not asyncio.iscoroutinefunction(log_callback):
             log_callback(level, message, end, flush)
         else:
-            # If async callback provided in sync mode, use asyncio.run
-            asyncio.run(log_callback(level, message, end, flush))
+            # If async callback provided in sync mode, schedule safely.
+            # Avoid asyncio.run() when already inside a running event loop.
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(log_callback(level, message, end, flush))
+            else:
+                running_loop.create_task(log_callback(level, message, end, flush))
     else:
         # Fallback to loguru logger (process message locally)
         full_message = message + end if end else message

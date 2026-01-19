@@ -54,6 +54,7 @@ class AgenticSearch(BaseSearch):
 
         # Create bound logger with callback - returns AsyncLogger instance
         self._logger_async = create_logger(log_callback=log_callback, enable_async=True)
+        self._logger = create_logger(log_callback=log_callback, enable_async=False)
 
         # Pass log_callback to KnowledgeBank so it can also log through the same callback
         self.knowledge_bank = KnowledgeBank(
@@ -76,11 +77,9 @@ class AgenticSearch(BaseSearch):
             stats = self.knowledge_manager.get_stats()
             cluster_count = stats.get('custom_stats', {}).get('total_clusters', 0)
             # Use sync logger for initialization
-            from loguru import logger as default_logger
-            default_logger.info(f"Loaded {cluster_count} historical knowledge clusters from cache")
+            self._logger.info(f"Loaded {cluster_count} historical knowledge clusters from cache")
         except Exception as e:
-            from loguru import logger as default_logger
-            default_logger.warning(f"Failed to load historical knowledge: {e}")
+            self._logger.warning(f"Failed to load historical knowledge: {e}")
 
     @staticmethod
     def _extract_and_validate_keywords(llm_resp: str) -> dict:

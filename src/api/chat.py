@@ -3,6 +3,7 @@
 Unified API endpoints for chat and search functionality
 Provides WebSocket endpoint for real-time chat conversations with integrated search
 """
+import platform
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
 from typing import Dict, Any, List, Optional, Union
@@ -161,7 +162,10 @@ class LogCallbackManager:
         Create search log callback for chat WebSocket.
         
         Returns a callback function compatible with log_utils signature:
-        async def callback(level: str, message: str, end: str = "\n", flush: bool = False)
+        async def callback(level: str, message: str, end: str, flush: bool)
+        
+        NOTE: The signature MUST match log_utils.LogCallback exactly:
+              (level: str, message: str, end: str, flush: bool) -> None
         
         Args:
             websocket: WebSocket connection
@@ -177,50 +181,22 @@ class LogCallbackManager:
         
         logger = WebSocketLogger(websocket, manager, log_type="search_log", task_id=task_id)
         
-        async def search_log_callback(level: str, message: str, end: str = "\n", flush: bool = False):
+        # CRITICAL: This callback signature MUST match log_utils.LogCallback
+        # Signature: (level: str, message: str, end: str, flush: bool) -> None
+        async def search_log_callback(level: str, message: str, end: str, flush: bool):
+            """
+            Log callback compatible with log_utils.LogCallback type.
+            
+            Args:
+                level: Log level (info, warning, error, etc.)
+                message: Message content (WITHOUT end character appended)
+                end: String to append after message
+                flush: Whether to flush immediately
+            """
             await logger._send_log(level, message, flush=flush, end=end)
         
         return search_log_callback
 
-    # @staticmethod
-    # async def create_websocket_log_callback(websocket: WebSocket):
-    #     """
-    #     Create log callback for search WebSocket.
-    #
-    #     Returns a callback function compatible with log_utils signature:
-    #     async def callback(level: str, message: str, end: str = "\n", flush: bool = False)
-    #
-    #     Args:
-    #         websocket: WebSocket connection
-    #
-    #     Returns:
-    #         Async callback function
-    #     """
-    #     logger = WebSocketLogger(websocket, manager=None, log_type="log")
-    #
-    #     async def log_callback(level: str, message: str, end: str = "\n", flush: bool = False):
-    #         await logger._send_log(level, message, flush=flush, end=end)
-    #
-    #     return log_callback
-
-    # @staticmethod
-    # async def create_rest_log_callback():
-    #     """
-    #     Create log callback for REST API (silent operation).
-    #
-    #     Returns a callback function compatible with log_utils signature:
-    #     async def callback(level: str, message: str, end: str = "\n", flush: bool = False)
-    #
-    #     Returns:
-    #         Async callback function (no-op)
-    #     """
-    #     async def rest_log_callback(level: str, message: str, end: str = "\n", flush: bool = False):
-    #         # For REST API, we use silent operation
-    #         # This ensures consistency with other search instances
-    #         pass
-    #
-    #     return rest_log_callback
-    
     @staticmethod
     def create_logger(websocket: WebSocket, manager: Optional[ChatConnectionManager] = None, log_type: str = "log", task_id: Optional[str] = None) -> WebSocketLogger:
         """
@@ -262,80 +238,75 @@ def get_search_instance(log_callback=None):
     """Get configured search instance with optional log callback"""
     return AgenticSearch(log_callback=log_callback)
 
+
 def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[str]:
     """
-    Open native file dialog using tkinter
-    Returns list of absolute file paths from user's local filesystem
+    Open native file dialog (Win/Mac/Linux).
+    Fixes the 'ghost window' issue on macOS when clicking Cancel.
     """
-    if not TKINTER_AVAILABLE:
-        return []
-    
     selected_paths = []
-    
+
     def run_dialog():
         nonlocal selected_paths
+        root = tk.Tk()
+
         try:
-            # Create root window but hide it
-            root = tk.Tk()
+            root.overrideredirect(True)
+
             root.withdraw()
-            root.attributes('-topmost', True)
-            
+            root.attributes("-alpha", 0.0)
+            root.attributes("-topmost", True)
+
+            current_os = platform.system()
+            if current_os == "Darwin":  # macOS
+                root.lift()
+                root.update()
+
+            elif current_os == "Windows":
+                root.lift()
+
+            kwargs = {"parent": root, "title": "Select"}
+
+            root.focus_force()
+
             if dialog_type == "files":
+                filetypes = [
+                    ("All files", "*.*"),
+                    ("Text files", "*.txt"),
+                    ("Python files", "*.py")
+                ]
                 if multiple:
-                    # Multiple file selection
-                    files = filedialog.askopenfilenames(
-                        title="Select Files",
-                        filetypes=[
-                            ("All files", "*.*"),
-                            ("Text files", "*.txt"),
-                            ("Python files", "*.py"),
-                            ("JSON files", "*.json"),
-                            ("CSV files", "*.csv"),
-                            ("PDF files", "*.pdf"),
-                            ("Word documents", "*.docx"),
-                            ("Excel files", "*.xlsx")
-                        ]
-                    )
-                    selected_paths = list(files) if files else []
+                    res = filedialog.askopenfilenames(filetypes=filetypes, **kwargs)
+                    selected_paths = list(res) if res else []
                 else:
-                    # Single file selection
-                    file_path = filedialog.askopenfilename(
-                        title="Select File",
-                        filetypes=[
-                            ("All files", "*.*"),
-                            ("Text files", "*.txt"),
-                            ("Python files", "*.py"),
-                            ("JSON files", "*.json"),
-                            ("CSV files", "*.csv"),
-                            ("PDF files", "*.pdf"),
-                            ("Word documents", "*.docx"),
-                            ("Excel files", "*.xlsx")
-                        ]
-                    )
-                    selected_paths = [file_path] if file_path else []
-            
+                    res = filedialog.askopenfilename(filetypes=filetypes, **kwargs)
+                    selected_paths = [res] if res else []
+
             elif dialog_type == "directory":
-                # Directory selection
-                dir_path = filedialog.askdirectory(
-                    title="Select Directory"
-                )
-                selected_paths = [dir_path] if dir_path else []
-            
-            root.destroy()
-            
+                res = filedialog.askdirectory(**kwargs)
+                selected_paths = [res] if res else []
+
+            root.update()
+
         except Exception as e:
-            print(f"Error in file dialog: {e}")
+            print(f"Dialog Error: {e}")
             selected_paths = []
-    
-    # Run dialog in main thread
+
+        finally:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+    # Ensure this runs on the Main Thread
     if threading.current_thread() is threading.main_thread():
         run_dialog()
     else:
-        # If not in main thread, we need to handle this differently
-        # For now, return empty list as tkinter requires main thread
+        print("Error: Dialog must be called from the Main Thread.")
         return []
-    
+
     return selected_paths
+
 
 async def _perform_web_search(query: str, websocket: WebSocket, manager: ChatConnectionManager) -> Dict[str, Any]:
     """
@@ -469,7 +440,7 @@ async def _chat_rag(
         search_engine = get_search_instance(log_callback=search_log_callback)
         
         search_paths = [path.strip() for path in kb_name.split(",")]
-        await search_log_callback("info", f"📂 Parsed search paths: {search_paths}")
+        await search_log_callback("info", f"📂 Parsed search paths: {search_paths}", "\n", False)
 
         # Execute RAG search
         print(f"[MODE 2] RAG search with query: {message}, paths: {search_paths}")
@@ -613,7 +584,7 @@ async def _chat_rag_web_search(
 
         search_engine = get_search_instance(log_callback=search_log_callback)
         search_paths = [path.strip() for path in kb_name.split(",")]
-        await search_log_callback("info", f"📂 RAG search paths: {search_paths}")
+        await search_log_callback("info", f"📂 RAG search paths: {search_paths}", "\n", False)
 
         print(f"[MODE 4] RAG search with query: {message}, paths: {search_paths}")
         
