@@ -238,12 +238,17 @@ def get_search_instance(log_callback=None):
     """Get configured search instance with optional log callback"""
     return AgenticSearch(log_callback=log_callback)
 
+_DIALOG_LOCK = threading.Lock()
 
 def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[str]:
     """
     Open native file dialog (Win/Mac/Linux).
     Fixes the 'ghost window' issue on macOS when clicking Cancel.
     """
+    if not _DIALOG_LOCK.acquire(blocking=False):
+        print("Dialog is already open. Ignoring request.")
+        return []
+
     selected_paths = []
 
     def run_dialog():
@@ -299,11 +304,14 @@ def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[
                 pass
 
     # Ensure this runs on the Main Thread
-    if threading.current_thread() is threading.main_thread():
-        run_dialog()
-    else:
-        print("Error: Dialog must be called from the Main Thread.")
-        return []
+    try:
+        if threading.current_thread() is threading.main_thread():
+            run_dialog()
+        else:
+            print("Error: Dialog must be called from the Main Thread.")
+            return []
+    finally:
+        _DIALOG_LOCK.release()
 
     return selected_paths
 
