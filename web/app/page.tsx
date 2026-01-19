@@ -330,7 +330,7 @@ export default function HomePage() {
                         selectedKb: filePath,
                       }));
                       setShowFileSelector(false);
-                    } else {
+                    } else if (!result.success) {
                       alert(result.error || t("Failed to open file picker"));
                     }
                   } catch (error) {
@@ -374,7 +374,7 @@ export default function HomePage() {
                         selectedKb: dirPath,
                       }));
                       setShowFileSelector(false);
-                    } else {
+                    } else if (!result.success) {
                       alert(result.error || t("Failed to open folder picker"));
                     }
                   } catch (error) {
@@ -457,7 +457,7 @@ export default function HomePage() {
           <div className="text-center max-w-2xl mx-auto mb-8">
             <div className="flex items-center justify-center gap-4 mb-3">
               <Image
-                src="/logo-v1.png"
+                src="/logo-v2.png"
                 alt="Sirchmunk Logo"
                 width={56}
                 height={56}
@@ -469,7 +469,7 @@ export default function HomePage() {
               </h1>
             </div>
             <p className="text-lg text-slate-500 dark:text-slate-400">
-              {t("How can I help you today?")}
+              {t("Search to Learn, Evolve to Find.")}
             </p>
           </div>
 

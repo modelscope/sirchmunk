@@ -68,7 +68,12 @@ async def get_all_clusters(
         
         sql += f" ORDER BY last_modified DESC LIMIT {limit}"
         
-        rows = km.db.fetch_all(sql, params if params else None)
+        try:
+            rows = km.db.fetch_all(sql, params if params else None)
+        except Exception as fetch_error:
+            # If table is missing or schema is out of date, recreate and return empty list.
+            km._create_table()
+            rows = []
         clusters = [km._row_to_cluster(row) for row in rows]
         
         return {
