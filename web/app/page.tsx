@@ -501,23 +501,25 @@ export default function HomePage() {
                   {t("FileSystem")}
                 </button>
 
-                {/* Web Search Toggle */}
-                <button
-                  onClick={() =>
-                    setChatState((prev) => ({
-                      ...prev,
-                      enableWebSearch: !prev.enableWebSearch,
-                    }))
-                  }
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-all ${
-                    chatState.enableWebSearch
-                      ? "bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-700"
-                      : "bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700"
-                  }`}
-                >
-                  <Globe className="w-3.5 h-3.5" />
-                  {t("WebSearch")}
-                </button>
+                {/* Web Search Toggle (hidden for now) */}
+                {false && (
+                  <button
+                    onClick={() =>
+                      setChatState((prev) => ({
+                        ...prev,
+                        enableWebSearch: !prev.enableWebSearch,
+                      }))
+                    }
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-all ${
+                      chatState.enableWebSearch
+                        ? "bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-700"
+                        : "bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700"
+                    }`}
+                  >
+                    <Globe className="w-3.5 h-3.5" />
+                    {t("WebSearch")}
+                  </button>
+                )}
               </div>
 
               {/* Selected Path Display */}

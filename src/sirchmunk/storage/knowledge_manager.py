@@ -168,6 +168,14 @@ class KnowledgeManager:
                 lifecycle, create_time, last_modified, version, related_clusters
             ) = row
             search_results = None
+        elif len(row) == 17:
+            (
+                id, name, description, content, scripts, resources, evidences, patterns,
+                constraints, confidence, abstraction_level, landmark_potential, hotness,
+                lifecycle, create_time, last_modified, version
+            ) = row
+            related_clusters = None
+            search_results = None
         else:
             raise ValueError(f"Unexpected knowledge_clusters row length: {len(row)}")
         

@@ -74,7 +74,13 @@ async def get_all_clusters(
             # If table is missing or schema is out of date, recreate and return empty list.
             km._create_table()
             rows = []
-        clusters = [km._row_to_cluster(row) for row in rows]
+        clusters = []
+        for row in rows:
+            try:
+                clusters.append(km._row_to_cluster(row))
+            except Exception:
+                # Skip malformed rows to avoid failing the whole request
+                continue
         
         return {
             "success": True,
