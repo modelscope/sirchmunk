@@ -161,7 +161,10 @@ class LogCallbackManager:
         Create search log callback for chat WebSocket.
         
         Returns a callback function compatible with log_utils signature:
-        async def callback(level: str, message: str, end: str = "\n", flush: bool = False)
+        async def callback(level: str, message: str, end: str, flush: bool)
+        
+        NOTE: The signature MUST match log_utils.LogCallback exactly:
+              (level: str, message: str, end: str, flush: bool) -> None
         
         Args:
             websocket: WebSocket connection
@@ -177,7 +180,18 @@ class LogCallbackManager:
         
         logger = WebSocketLogger(websocket, manager, log_type="search_log", task_id=task_id)
         
-        async def search_log_callback(level: str, message: str, end: str = "\n", flush: bool = False):
+        # CRITICAL: This callback signature MUST match log_utils.LogCallback
+        # Signature: (level: str, message: str, end: str, flush: bool) -> None
+        async def search_log_callback(level: str, message: str, end: str, flush: bool):
+            """
+            Log callback compatible with log_utils.LogCallback type.
+            
+            Args:
+                level: Log level (info, warning, error, etc.)
+                message: Message content (WITHOUT end character appended)
+                end: String to append after message
+                flush: Whether to flush immediately
+            """
             await logger._send_log(level, message, flush=flush, end=end)
         
         return search_log_callback
@@ -278,7 +292,10 @@ def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[
             # Create root window but hide it
             root = tk.Tk()
             root.withdraw()
-            root.attributes('-topmost', True)
+            # Ensure dialog stays on top
+            root.attributes("-topmost", True)
+            root.lift()
+            root.update()
             
             if dialog_type == "files":
                 if multiple:
@@ -469,7 +486,7 @@ async def _chat_rag(
         search_engine = get_search_instance(log_callback=search_log_callback)
         
         search_paths = [path.strip() for path in kb_name.split(",")]
-        await search_log_callback("info", f"📂 Parsed search paths: {search_paths}")
+        await search_log_callback("info", f"📂 Parsed search paths: {search_paths}", "\n", False)
 
         # Execute RAG search
         print(f"[MODE 2] RAG search with query: {message}, paths: {search_paths}")
@@ -613,7 +630,7 @@ async def _chat_rag_web_search(
 
         search_engine = get_search_instance(log_callback=search_log_callback)
         search_paths = [path.strip() for path in kb_name.split(",")]
-        await search_log_callback("info", f"📂 RAG search paths: {search_paths}")
+        await search_log_callback("info", f"📂 RAG search paths: {search_paths}", "\n", False)
 
         print(f"[MODE 4] RAG search with query: {message}, paths: {search_paths}")
         

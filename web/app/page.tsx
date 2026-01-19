@@ -21,6 +21,8 @@ import {
   PenTool,
   Search,
   ChevronDown,
+  Folder,
+  Plus,
 } from "lucide-react";
 import Link from "next/link";
 import Image from "next/image";
@@ -286,6 +288,169 @@ export default function HomePage() {
     <div className="h-screen flex animate-fade-in">
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0">
+      {/* File Selector Modal (available in both empty and chat views) */}
+      {showFileSelector && (
+        <div 
+          className="fixed inset-0 bg-black/50 flex items-center justify-center z-[99999]"
+          style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0 }}
+        >
+          <div className="bg-white dark:bg-slate-800 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl relative z-[100000]">
+            <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100 mb-4">
+              {t("Select File or Folder")} / 选择文件或文件夹
+            </h3>
+
+            <div className="space-y-3">
+              {/* Single File Button */}
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    const response = await fetch(apiUrl("/api/v1/file-picker"), {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                      },
+                      body: JSON.stringify({
+                        type: "files",
+                        multiple: false
+                      }),
+                    });
+
+                    const result = await response.json();
+
+                    if (result.success && result.data.paths.length > 0) {
+                      const filePath = result.data.paths[0];
+                      setSelectedPath(filePath);
+                      if (!selectedPaths.includes(filePath)) {
+                        setSelectedPaths(prev => [...prev, filePath]);
+                      }
+                      setChatState((prev) => ({
+                        ...prev,
+                        enableRag: true,
+                        selectedKb: filePath,
+                      }));
+                      setShowFileSelector(false);
+                    } else {
+                      alert(result.error || t("Failed to open file picker"));
+                    }
+                  } catch (error) {
+                    console.error('Error calling file picker:', error);
+                    alert(t("Failed to open file picker"));
+                  }
+                }}
+                className="w-full px-4 py-3 text-sm font-medium bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 border-2 border-blue-200 dark:border-blue-700 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/50 transition-colors flex items-center justify-center gap-2"
+              >
+                <FileText className="w-4 h-4" />
+                <span>{t("Single File")} / 单文件</span>
+              </button>
+
+              {/* Folder Button */}
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    const response = await fetch(apiUrl("/api/v1/file-picker"), {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                      },
+                      body: JSON.stringify({
+                        type: "directory",
+                        multiple: false
+                      }),
+                    });
+
+                    const result = await response.json();
+
+                    if (result.success && result.data.paths.length > 0) {
+                      const dirPath = result.data.paths[0];
+                      setSelectedPath(dirPath);
+                      if (!selectedPaths.includes(dirPath)) {
+                        setSelectedPaths(prev => [...prev, dirPath]);
+                      }
+                      setChatState((prev) => ({
+                        ...prev,
+                        enableRag: true,
+                        selectedKb: dirPath,
+                      }));
+                      setShowFileSelector(false);
+                    } else {
+                      alert(result.error || t("Failed to open folder picker"));
+                    }
+                  } catch (error) {
+                    console.error('Error calling folder picker:', error);
+                    alert(t("Failed to open folder picker"));
+                  }
+                }}
+                className="w-full px-4 py-3 text-sm font-medium bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 border-2 border-purple-200 dark:border-purple-700 rounded-lg hover:bg-purple-100 dark:hover:bg-purple-900/50 transition-colors flex items-center justify-center gap-2"
+              >
+                <Folder className="w-4 h-4" />
+                <span>{t("Folder")} / 文件夹</span>
+              </button>
+
+              {/* Custom Path Input */}
+              <div className="pt-2 border-t border-slate-200 dark:border-slate-700">
+                <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
+                  {t("Custom Path")} / 自定义路径
+                </label>
+                <input
+                  type="text"
+                  placeholder="C:\\Users\\...\\file.txt or /Users/.../file.txt"
+                  value={selectedPath}
+                  onChange={(e) => setSelectedPath(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && selectedPath.trim()) {
+                      const newPath = selectedPath.trim();
+                      if (!selectedPaths.includes(newPath)) {
+                        setSelectedPaths(prev => [...prev, newPath]);
+                      }
+                      setChatState((prev) => ({
+                        ...prev,
+                        enableRag: true,
+                        selectedKb: newPath,
+                      }));
+                      setShowFileSelector(false);
+                    }
+                  }}
+                  className="w-full px-3 py-2 border border-slate-200 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 text-sm"
+                />
+              </div>
+            </div>
+
+            <div className="flex gap-3 mt-6">
+              <button
+                onClick={() => {
+                  setShowFileSelector(false);
+                  setSelectedPath("");
+                }}
+                className="flex-1 px-4 py-2 text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 border border-slate-200 dark:border-slate-600 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
+              >
+                {t("Cancel")} / 取消
+              </button>
+              <button
+                onClick={() => {
+                  if (selectedPath.trim()) {
+                    const newPath = selectedPath.trim();
+                    if (!selectedPaths.includes(newPath)) {
+                      setSelectedPaths(prev => [...prev, newPath]);
+                    }
+                    setChatState((prev) => ({
+                      ...prev,
+                      enableRag: true,
+                      selectedKb: newPath,
+                    }));
+                    setShowFileSelector(false);
+                  }
+                }}
+                disabled={!selectedPath.trim()}
+                className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {t("Confirm")} / 确认
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {/* Empty State / Welcome Screen */}
       {!hasMessages && (
         <div className="flex-1 flex flex-col items-center justify-center px-6">
@@ -374,205 +539,6 @@ export default function HomePage() {
               )}
             </div>
 
-            {/* File Selector Modal */}
-            {showFileSelector && (
-              <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[9999]">
-                <div className="bg-white dark:bg-slate-800 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl">
-                  <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100 mb-4">
-                    Select File or Folder
-                  </h3>
-
-                  <div className="space-y-4">
-                    {/* File Input */}
-                    <div>
-                      <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
-                        Choose Files (Multiple Selection Supported)
-                      </label>
-                      <div className="space-y-2">
-                        <input
-                          ref={fileInputRef}
-                          type="file"
-                          multiple
-                          className="w-full text-sm text-slate-500 dark:text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 dark:file:bg-blue-900/30 dark:file:text-blue-300 dark:hover:file:bg-blue-900/50"
-                          onChange={async (e) => {
-                            const files = e.target.files;
-                            if (files && files.length > 0) {
-                              if (files.length === 1) {
-                                const file = files[0];
-                                // Try to get the full path using File System Access API
-                                try {
-                                  // @ts-ignore - File System Access API may not be in types yet
-                                  if (file.webkitRelativePath) {
-                                    setSelectedPath(file.webkitRelativePath);
-                                  } else if ((file as any).path) {
-                                    // @ts-ignore - Electron or Node.js environment
-                                    setSelectedPath((file as any).path);
-                                  } else {
-                                    // Fallback: show file name with note about path limitation
-                                    setSelectedPath(`${file.name} (browser security limits full path access)`);
-                                  }
-                                } catch (error) {
-                                  setSelectedPath(`${file.name} (path access limited)`);
-                                }
-                              } else {
-                                setSelectedPath(`${files.length} files selected`);
-                              }
-                            }
-                          }}
-                        />
-
-                        {/* Native File Picker using Backend API */}
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            try {
-                              const response = await fetch(apiUrl("/api/v1/file-picker"), {
-                                method: "POST",
-                                headers: {
-                                  "Content-Type": "application/json",
-                                },
-                                body: JSON.stringify({
-                                  type: "files",
-                                  multiple: true
-                                }),
-                              });
-
-                              const result = await response.json();
-
-                              if (result.success && result.data.paths.length > 0) {
-                                if (result.data.paths.length === 1) {
-                                  setSelectedPath(result.data.paths[0]);
-                                } else {
-                                  setSelectedPath(`${result.data.paths.length} files selected (native picker)`);
-                                  // Store all paths for later use
-                                  const newPaths = result.data.paths.filter((path: string) => !selectedPaths.includes(path));
-                                  if (newPaths.length > 0) {
-                                    setSelectedPaths(prev => [...prev, ...newPaths]);
-                                  }
-                                }
-                              } else {
-                                alert(result.error || 'Failed to open native file picker. Please use manual path input below.');
-                              }
-                            } catch (error) {
-                              console.error('Error calling native file picker:', error);
-                              alert('Failed to open native file picker. Please use manual path input below.');
-                            }
-                          }}
-                          className="w-full px-3 py-2 text-sm bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-700 rounded-lg hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition-colors"
-                        >
-                          🖥️ Native File Picker (Real Absolute Paths)
-                        </button>
-
-                        {/* Native Directory Picker using Backend API */}
-                        <button
-                          type="button"
-                          onClick={async () => {
-                            try {
-                              const response = await fetch(apiUrl("/api/v1/file-picker"), {
-                                method: "POST",
-                                headers: {
-                                  "Content-Type": "application/json",
-                                },
-                                body: JSON.stringify({
-                                  type: "directory",
-                                  multiple: false
-                                }),
-                              });
-
-                              const result = await response.json();
-
-                              if (result.success && result.data.paths.length > 0) {
-                                const dirPath = result.data.paths[0];
-                                setSelectedPath(dirPath);
-                              } else {
-                                alert(result.error || 'Failed to open native directory picker. Please use manual path input below.');
-                              }
-                            } catch (error) {
-                              console.error('Error calling native directory picker:', error);
-                              alert('Failed to open native directory picker. Please use manual path input below.');
-                            }
-                          }}
-                          className="w-full px-3 py-2 text-sm bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-purple-700 rounded-lg hover:bg-purple-100 dark:hover:bg-purple-900/50 transition-colors"
-                        >
-                          📂 Native Directory Picker (Real Absolute Paths)
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Manual Path Input */}
-                    <div>
-                      <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
-                        Or Enter Path
-                      </label>
-                      <input
-                        type="text"
-                        placeholder="C:\Users\YourName\Documents\file.txt or /Users/yourname/Documents/file.txt"
-                        value={selectedPath}
-                        onChange={(e) => {
-                          // Accept any path format - Windows, macOS, or Linux
-                          setSelectedPath(e.target.value);
-                        }}
-                        className="w-full px-3 py-2 border border-slate-200 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="flex gap-3 mt-6">
-                    <button
-                      onClick={() => {
-                        setShowFileSelector(false);
-                        setSelectedPath("");
-                        if (fileInputRef.current) {
-                          fileInputRef.current.value = "";
-                        }
-                      }}
-                      className="flex-1 px-4 py-2 text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 border border-slate-200 dark:border-slate-600 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      onClick={() => {
-                        if (selectedPath.trim()) {
-                          const files = fileInputRef.current?.files;
-                          if (files && files.length > 0) {
-                            // Handle multiple files - use real absolute paths
-                            const newPaths = Array.from(files).map(file => {
-                              // Try to get real path, fallback to file name
-                              return file.webkitRelativePath || file.name;
-                            });
-                            const uniquePaths = newPaths.filter(path => !selectedPaths.includes(path));
-                            if (uniquePaths.length > 0) {
-                              setSelectedPaths(prev => [...prev, ...uniquePaths]);
-                              setChatState((prev) => ({
-                                ...prev,
-                                enableRag: true,
-                                selectedKb: uniquePaths[0],
-                              }));
-                            }
-                          } else if (selectedPath.trim() && !selectedPath.includes('files selected')) {
-                            // Handle manual path input - accept any absolute path format
-                            const newPath = selectedPath.trim();
-                            if (!selectedPaths.includes(newPath)) {
-                              setSelectedPaths(prev => [...prev, newPath]);
-                              setChatState((prev) => ({
-                                ...prev,
-                                enableRag: true,
-                                selectedKb: newPath,
-                              }));
-                            }
-                          }
-                          setShowFileSelector(false);
-                        }
-                      }}
-                      disabled={!selectedPath.trim()}
-                      className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                      Select
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
 
             {/* Input Field */}
             <div className="relative">
@@ -664,9 +630,19 @@ export default function HomePage() {
               {/* Mode Toggles */}
               <button
                 onClick={() => {
+                  // Toggle RAG mode
                   if (!chatState.enableRag) {
-                    // Always show file selector when enabling RAG
-                    setShowFileSelector(true);
+                    // If there are already selected paths, just enable RAG
+                    if (selectedPaths.length > 0) {
+                      setChatState((prev) => ({
+                        ...prev,
+                        enableRag: true,
+                        selectedKb: selectedPaths[0],
+                      }));
+                    } else {
+                      // No paths yet, show file selector
+                      setShowFileSelector(true);
+                    }
                   } else {
                     // Disable RAG
                     setChatState((prev) => ({
@@ -682,25 +658,28 @@ export default function HomePage() {
                 }`}
               >
                 <Database className="w-3 h-3" />
-                {t("FileSystem")}
+                File
               </button>
 
-              <button
-                onClick={() =>
-                  setChatState((prev) => ({
-                    ...prev,
-                    enableWebSearch: !prev.enableWebSearch,
-                  }))
-                }
-                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-all ${
-                  chatState.enableWebSearch
-                    ? "bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300"
-                    : "bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400"
-                }`}
-              >
-                <Globe className="w-3 h-3" />
-                {t("WebSearch")}
-              </button>
+              {/* Web Search Button - Temporarily hidden but functionality preserved */}
+              {false && (
+                <button
+                  onClick={() =>
+                    setChatState((prev) => ({
+                      ...prev,
+                      enableWebSearch: !prev.enableWebSearch,
+                    }))
+                  }
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-all ${
+                    chatState.enableWebSearch
+                      ? "bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300"
+                      : "bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400"
+                  }`}
+                >
+                  <Globe className="w-3 h-3" />
+                  {t("WebSearch")}
+                </button>
+              )}
 
               {chatState.enableRag && (
                 <div className="relative">
@@ -769,9 +748,9 @@ export default function HomePage() {
 
             <button
               onClick={newChatSession}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-500 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition-colors"
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded-lg transition-colors"
             >
-              <Trash2 className="w-3.5 h-3.5" />
+              <Plus className="w-3.5 h-3.5" />
               {t("New Chat")}
             </button>
           </div>

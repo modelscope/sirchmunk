@@ -187,16 +187,16 @@ export default function KnowledgePage() {
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-3">
               <Database className="w-7 h-7 text-blue-500 dark:text-blue-400" />
-              <div>
+        <div>
                 <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">
                   {t("Knowledge Base Analytics")}
-                </h1>
+          </h1>
                 <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
                   {t("Real-time insights and statistics")}
-                </p>
-              </div>
-            </div>
-          </div>
+          </p>
+        </div>
+        </div>
+      </div>
 
           {/* Search Bar */}
           <div className="relative">
@@ -211,7 +211,7 @@ export default function KnowledgePage() {
             />
           </div>
         </div>
-      </div>
+                  </div>
 
       {/* Content */}
       <div className="px-6 py-6 space-y-6">
@@ -220,7 +220,7 @@ export default function KnowledgePage() {
           {/* Total Clusters */}
           <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-5">
             <div className="flex items-start justify-between">
-              <div>
+                  <div>
                 <p className="text-sm font-medium text-slate-500 dark:text-slate-400 mb-1">
                   {t("Total Clusters")}
                 </p>
@@ -231,8 +231,8 @@ export default function KnowledgePage() {
               <div className="w-12 h-12 bg-blue-100 dark:bg-blue-900/30 rounded-lg flex items-center justify-center">
                 <Database className="w-6 h-6 text-blue-600 dark:text-blue-400" />
               </div>
-            </div>
-          </div>
+                  </div>
+                </div>
 
           {/* Average Confidence */}
           <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-5">
@@ -248,8 +248,8 @@ export default function KnowledgePage() {
               <div className="w-12 h-12 bg-green-100 dark:bg-green-900/30 rounded-lg flex items-center justify-center">
                 <TrendingUp className="w-6 h-6 text-green-600 dark:text-green-400" />
               </div>
-            </div>
-          </div>
+                </div>
+              </div>
 
           {/* Max Hotness */}
           <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-5">
@@ -260,8 +260,8 @@ export default function KnowledgePage() {
                 </p>
                 <p className="text-3xl font-bold text-slate-900 dark:text-slate-100">
                   {(stats.hotness_stats.max * 100).toFixed(1)}%
-                </p>
-              </div>
+                    </p>
+                  </div>
               <div className="w-12 h-12 bg-orange-100 dark:bg-orange-900/30 rounded-lg flex items-center justify-center">
                 <Zap className="w-6 h-6 text-orange-600 dark:text-orange-400" />
               </div>
@@ -277,8 +277,8 @@ export default function KnowledgePage() {
                 </p>
                 <p className="text-3xl font-bold text-slate-900 dark:text-slate-100">
                   {lifecycleData.STABLE}
-                </p>
-              </div>
+                    </p>
+                  </div>
               <div className="w-12 h-12 bg-emerald-100 dark:bg-emerald-900/30 rounded-lg flex items-center justify-center">
                 <Check className="w-6 h-6 text-emerald-600 dark:text-emerald-400" />
               </div>
@@ -295,20 +295,20 @@ export default function KnowledgePage() {
               <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
                 {t("Lifecycle Distribution")}
               </h3>
-            </div>
-            
+                </div>
+
             <div className="space-y-4">
               {Object.entries(lifecycleData).map(([lifecycle, count]) => {
                 const percentage = total > 0 ? (count / total) * 100 : 0;
-                return (
+                          return (
                   <div key={lifecycle}>
                     <div className="flex items-center justify-between mb-2">
                       <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
                         {lifecycle}
-                      </span>
+                            </span>
                       <span className="text-sm text-slate-500 dark:text-slate-400">
                         {count} ({percentage.toFixed(1)}%)
-                      </span>
+                            </span>
                     </div>
                     <div className="w-full bg-slate-100 dark:bg-slate-700 rounded-full h-2.5">
                       <div
@@ -335,7 +335,7 @@ export default function KnowledgePage() {
               {Object.entries(abstractionData).map(([level, count]) => {
                 const maxCount = Math.max(...Object.values(abstractionData));
                 const percentage = maxCount > 0 ? (count / maxCount) * 100 : 0;
-                return (
+                      return (
                   <div key={level}>
                     <div className="flex items-center justify-between mb-2">
                       <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
@@ -354,9 +354,9 @@ export default function KnowledgePage() {
                   </div>
                 );
               })}
-            </div>
-          </div>
-        </div>
+                          </div>
+                            </div>
+                            </div>
 
         {/* Stats Row */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -367,7 +367,7 @@ export default function KnowledgePage() {
               <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
                 {t("Confidence Statistics")}
               </h3>
-            </div>
+                            </div>
             
             <div className="grid grid-cols-3 gap-4">
               <div className="text-center">
@@ -375,13 +375,13 @@ export default function KnowledgePage() {
                 <p className="text-2xl font-bold text-slate-900 dark:text-slate-100">
                   {(stats.confidence_stats.min * 100).toFixed(0)}%
                 </p>
-              </div>
+                        </div>
               <div className="text-center">
                 <p className="text-sm text-slate-500 dark:text-slate-400 mb-1">{t("Avg")}</p>
                 <p className="text-2xl font-bold text-green-600 dark:text-green-400">
                   {(stats.confidence_stats.avg * 100).toFixed(0)}%
                 </p>
-              </div>
+                        </div>
               <div className="text-center">
                 <p className="text-sm text-slate-500 dark:text-slate-400 mb-1">{t("Max")}</p>
                 <p className="text-2xl font-bold text-slate-900 dark:text-slate-100">
@@ -433,11 +433,11 @@ export default function KnowledgePage() {
                 {t("Recent Activity")}
               </h3>
             </div>
-            
+
             <div className="space-y-2">
-              {stats.recent_clusters.slice(0, 10).map((cluster) => (
+              {stats.recent_clusters.slice(0, 10).map((cluster, index) => (
                 <div
-                  key={cluster.id}
+                  key={`recent-${cluster.id}-${index}`}
                   className="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors cursor-pointer"
                 >
                   <ChevronRight className="w-4 h-4 text-slate-400 mt-0.5 flex-shrink-0" />
@@ -461,12 +461,12 @@ export default function KnowledgePage() {
               <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
                 {t("Top Confidence")}
               </h3>
-            </div>
-            
+              </div>
+
             <div className="space-y-2">
-              {stats.top_confidence_clusters.slice(0, 10).map((cluster) => (
+              {stats.top_confidence_clusters.slice(0, 10).map((cluster, index) => (
                 <div
-                  key={cluster.id}
+                  key={`confidence-${cluster.id}-${index}`}
                   className="flex items-center justify-between p-2 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors cursor-pointer"
                 >
                   <p className="text-sm font-medium text-slate-900 dark:text-slate-100 truncate flex-1">
@@ -477,7 +477,7 @@ export default function KnowledgePage() {
                   </span>
                 </div>
               ))}
-            </div>
+              </div>
           </div>
 
           {/* Top Hotness */}
@@ -490,9 +490,9 @@ export default function KnowledgePage() {
             </div>
             
             <div className="space-y-2">
-              {stats.top_hotness_clusters.slice(0, 10).map((cluster) => (
+              {stats.top_hotness_clusters.slice(0, 10).map((cluster, index) => (
                 <div
-                  key={cluster.id}
+                  key={`hotness-${cluster.id}-${index}`}
                   className="flex items-center justify-between p-2 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors cursor-pointer"
                 >
                   <p className="text-sm font-medium text-slate-900 dark:text-slate-100 truncate flex-1">
@@ -515,8 +515,8 @@ export default function KnowledgePage() {
               <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
                 {t("Common Patterns")}
               </h3>
-            </div>
-            
+              </div>
+
             <div className="flex flex-wrap gap-2">
               {patterns.map((pattern) => (
                 <div
@@ -526,10 +526,10 @@ export default function KnowledgePage() {
                   {pattern.pattern} ({pattern.count})
                 </div>
               ))}
-            </div>
+              </div>
           </div>
         )}
-      </div>
+        </div>
     </div>
   );
 }
