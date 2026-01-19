@@ -154,12 +154,30 @@ class KnowledgeManager:
     
     def _row_to_cluster(self, row: tuple) -> KnowledgeCluster:
         """Convert database row to KnowledgeCluster"""
-        # Unpack row (order matches schema)
-        (
-            id, name, description, content, scripts, resources, evidences, patterns,
-            constraints, confidence, abstraction_level, landmark_potential, hotness,
-            lifecycle, create_time, last_modified, version, related_clusters, search_results
-        ) = row
+        # Unpack row (order matches schema). Older tables may not include search_results.
+        if len(row) == 19:
+            (
+                id, name, description, content, scripts, resources, evidences, patterns,
+                constraints, confidence, abstraction_level, landmark_potential, hotness,
+                lifecycle, create_time, last_modified, version, related_clusters, search_results
+            ) = row
+        elif len(row) == 18:
+            (
+                id, name, description, content, scripts, resources, evidences, patterns,
+                constraints, confidence, abstraction_level, landmark_potential, hotness,
+                lifecycle, create_time, last_modified, version, related_clusters
+            ) = row
+            search_results = None
+        elif len(row) == 17:
+            (
+                id, name, description, content, scripts, resources, evidences, patterns,
+                constraints, confidence, abstraction_level, landmark_potential, hotness,
+                lifecycle, create_time, last_modified, version
+            ) = row
+            related_clusters = None
+            search_results = None
+        else:
+            raise ValueError(f"Unexpected knowledge_clusters row length: {len(row)}")
         
         # Parse JSON fields
         try:

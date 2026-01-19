@@ -436,8 +436,6 @@ class AgenticSearch(BaseSearch):
         if self.verbose:
             await self._logger_async.info(json.dumps(cluster.to_dict(), ensure_ascii=False, indent=2))
 
-        # return f"{cluster.name}\n{cluster.description}"
-
         sep: str = "\n"
         cluster_text_content: str = (
             f"{cluster.name}\n\n"

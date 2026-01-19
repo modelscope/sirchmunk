@@ -66,7 +66,7 @@ export default function Sidebar() {
         <div className="px-2 py-3 border-b border-slate-100 dark:border-slate-700 flex justify-center">
           <div className="w-8 h-8 rounded-lg flex items-center justify-center overflow-hidden">
             <Image
-              src="/logo-v1.png"
+              src="/logo-v2.png"
                   alt="Sirchmunk Logo"
               width={32}
               height={32}
@@ -173,7 +173,7 @@ export default function Sidebar() {
             <div className="flex items-center gap-2.5">
               <div className="w-8 h-8 rounded-lg flex items-center justify-center overflow-hidden">
                 <Image
-                  src="/logo-v1.png"
+                  src="/logo-v2.png"
                   alt="Sirchmunk Logo"
                   width={32}
                   height={32}
