@@ -704,13 +704,28 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
           return { ...prev, messages, currentStage: "generating" };
         });
       } else if (data.type === "search_log") {
-        // Handle search log streaming with smart merging
+        // Handle search log streaming with smart merging and deduplication
         console.log("[DEBUG] Received search_log:", data);
         setChatState((prev) => {
           const messages = [...prev.messages];
           const lastMessage = messages[messages.length - 1];
           if (lastMessage?.role === "assistant") {
-            const searchLogs = lastMessage.searchLogs || [];
+            const searchLogs = [...(lastMessage.searchLogs || [])];
+            
+            // Deduplication: Check if an identical non-streaming message already exists
+            // (prevents duplicate logs from being added)
+            if (!data.is_streaming && searchLogs.length > 0) {
+              const isDuplicate = searchLogs.some(
+                (log) => 
+                  !log.is_streaming && 
+                  log.level === data.level && 
+                  log.message === data.message
+              );
+              if (isDuplicate) {
+                console.log("[DEBUG] Skipping duplicate log:", data.message);
+                return prev; // No state change
+              }
+            }
             
             // Smart merge: if this is a streaming message with same task_id as the last log,
             // append to the last log instead of creating a new one
@@ -749,7 +764,7 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
             
             messages[messages.length - 1] = {
               ...lastMessage,
-              searchLogs: [...searchLogs],
+              searchLogs,
             };
             console.log("[DEBUG] Updated searchLogs count:", messages[messages.length - 1].searchLogs?.length);
           } else {
