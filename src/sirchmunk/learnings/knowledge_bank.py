@@ -63,6 +63,8 @@ class KnowledgeBank:
         # Create bound logger with callback - returns AsyncLogger instance
         self._log = create_logger(log_callback=log_callback)
 
+        self.llm_usages: List[Dict[str, Any]] = []
+
     @staticmethod
     def _get_file_info(
         file_or_url: str, metadata_path: Union[str, Path]
@@ -160,6 +162,7 @@ class KnowledgeBank:
                 extracted_at=datetime.now(),
                 conflict_group=[],
             )
+            self.llm_usages.extend(sampler.llm_usages)
             evidences.append(evidence_unit)
 
         if len(evidences) == 0:
@@ -180,6 +183,7 @@ class KnowledgeBank:
             stream=True,
         )
         evidence_summary_response: str = evidence_summary_llm_response.content
+        self.llm_usages.append(evidence_summary_llm_response.usage)
 
         cluster_infos: Dict[str, Any] = extract_fields(
             content=evidence_summary_response

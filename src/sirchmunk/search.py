@@ -66,6 +66,8 @@ class AgenticSearch(BaseSearch):
         self._load_historical_knowledge()
 
         self.verbose: bool = verbose
+
+        self.llm_usages: List[Dict[str, Any]] = []
     
     def _load_historical_knowledge(self):
         """Load historical knowledge clusters from local cache"""
@@ -322,6 +324,7 @@ class AgenticSearch(BaseSearch):
             stream=False,
         )
         resp_keywords: str = resp_keywords_response.content
+        self.llm_usages.append(resp_keywords_response.usage)
         
         await self._logger.success(" ✓", flush=True)
 
@@ -414,6 +417,8 @@ class AgenticSearch(BaseSearch):
             top_k_snippets=5,
             verbose=verbose,
         )
+
+        self.llm_usages.extend(self.knowledge_bank.llm_usages)
         
         await self._logger.success(" ✓", flush=True)
 
@@ -441,6 +446,7 @@ class AgenticSearch(BaseSearch):
             stream=True,
         )
         search_result: str = search_result_response.content
+        self.llm_usages.append(search_result_response.usage)
         await self._logger.success(" ✓", flush=True)
         await self._logger.success("Search completed successfully!")
 
