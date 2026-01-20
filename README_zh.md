@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="web/public/logo-v2.png" alt="Sirchmunk Logo" width="150" style="border-radius: 15px;">
+<img src="web/public/logo-v2.png" alt="Sirchmunk Logo" width="250" style="border-radius: 15px;">
 
 # Sirchmunk: 从原始数据到自进化的实时智能
 
