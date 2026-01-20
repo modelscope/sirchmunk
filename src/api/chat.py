@@ -565,7 +565,7 @@ async def _chat_rag(
 
         # Create search instance with log callback
         search_engine = get_search_instance(log_callback=search_log_callback)
-        
+
         search_paths = [path.strip() for path in kb_name.split(",")]
         await search_log_callback("info", f"📂 Parsed search paths: {search_paths}", "\n", False)
 
@@ -579,7 +579,14 @@ async def _chat_rag(
             top_k_files=3,
             verbose=True
         )
-        
+
+        # Calculate the llm usage
+        for usage in search_engine.llm_usages:
+            llm_usage_tracker.record_usage(
+                model=search_engine.llm._model,
+                usage=usage,
+            )
+
         # Send search completion
         await manager.send_personal_message(json.dumps({
             "type": "search_complete",
@@ -725,6 +732,12 @@ async def _chat_rag_web_search(
             top_k_files=3,
             verbose=True
         )
+
+        for rag_usage in search_engine.llm_usages:
+            llm_usage_tracker.record_usage(
+                model=search_engine.llm._model,
+                usage=rag_usage,
+            )
         
         await manager.send_personal_message(json.dumps({
             "type": "search_complete",
@@ -753,7 +766,8 @@ async def _chat_rag_web_search(
         "stage": "web_search",
         "message": "🌐 Step 2/2: Searching the web..."
     }), websocket)
-    
+
+    # TODO: add llm usage
     web_results = await _perform_web_search(message, websocket, manager)
     sources["web"] = web_results["sources"]
     

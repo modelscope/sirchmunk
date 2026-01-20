@@ -165,7 +165,6 @@ async def get_llm_usage():
     """
     try:
         stats = llm_usage_tracker.get_stats()
-        
         return {
             "success": True,
             "data": stats

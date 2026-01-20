@@ -102,6 +102,8 @@ class MonteCarloEvidenceSampling:
         # Create bound logger with callback - returns AsyncLogger instance
         self._log = create_logger(log_callback=log_callback)
 
+        self.llm_usages: List[Dict[str, Any]] = []
+
     def _get_content(self, start: int) -> Tuple[int, int, str]:
         """
         Safely retrieves a document slice with boundary checks.
@@ -301,6 +303,7 @@ class MonteCarloEvidenceSampling:
         try:
             resp_obj = await self.llm.achat([{"role": "user", "content": prompt}])
             resp: str = resp_obj.content
+            self.llm_usages.append(resp_obj.usage)
 
             clean_resp = resp.replace("```json", "").replace("```", "").strip()
             data = json.loads(clean_resp)
@@ -355,6 +358,7 @@ class MonteCarloEvidenceSampling:
         )
 
         summary_response = await self.llm.achat([{"role": "user", "content": prompt}])
+        self.llm_usages.append(summary_response.usage)
         return summary_response.content
 
     async def get_roi(

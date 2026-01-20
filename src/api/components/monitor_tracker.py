@@ -58,7 +58,7 @@ class LLMUsageTracker:
             input_tokens = usage.get('prompt_tokens', 0)
             output_tokens = usage.get('completion_tokens', 0)
             total = usage.get('total_tokens', input_tokens + output_tokens)
-            
+
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
             self.total_tokens += total
