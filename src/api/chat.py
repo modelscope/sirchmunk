@@ -181,6 +181,10 @@ class LogCallbackManager:
         
         logger = WebSocketLogger(websocket, manager, log_type="search_log", task_id=task_id)
         
+        # Track recent messages for deduplication (message -> timestamp)
+        recent_messages: Dict[str, float] = {}
+        DEDUP_WINDOW_SEC = 0.5  # Messages within this window are considered duplicates
+
         # CRITICAL: This callback signature MUST match log_utils.LogCallback
         # Signature: (level: str, message: str, end: str, flush: bool) -> None
         async def search_log_callback(level: str, message: str, end: str, flush: bool):
@@ -193,6 +197,27 @@ class LogCallbackManager:
                 end: String to append after message
                 flush: Whether to flush immediately
             """
+            import time
+            nonlocal recent_messages
+            
+            # Create unique key for this message (include level and message content)
+            msg_key = f"{level}:{message}"
+            current_time = time.time()
+            
+            # Check for duplicate within time window
+            if msg_key in recent_messages:
+                last_time = recent_messages[msg_key]
+                if current_time - last_time < DEDUP_WINDOW_SEC:
+                    # Skip duplicate message within dedup window
+                    return
+            
+            # Clean up old entries (older than 2x window)
+            cutoff = current_time - (DEDUP_WINDOW_SEC * 2)
+            recent_messages = {k: v for k, v in recent_messages.items() if v > cutoff}
+            
+            # Record this message
+            recent_messages[msg_key] = current_time
+            
             await logger._send_log(level, message, flush=flush, end=end)
         
         return search_log_callback

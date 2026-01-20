@@ -53,8 +53,7 @@ class AgenticSearch(BaseSearch):
         self.grep_retriever: GrepRetriever = GrepRetriever(work_path=self.work_path)
 
         # Create bound logger with callback - returns AsyncLogger instance
-        self._logger_async = create_logger(log_callback=log_callback, enable_async=True)
-        self._logger = create_logger(log_callback=log_callback, enable_async=False)
+        self._logger = create_logger(log_callback=log_callback, enable_async=True)
 
         # Pass log_callback to KnowledgeBank so it can also log through the same callback
         self.knowledge_bank = KnowledgeBank(
@@ -105,16 +104,12 @@ class AgenticSearch(BaseSearch):
             try:
                 res = ast.literal_eval(keywords_json)
             except Exception as e:
-                from loguru import logger as default_logger
-                default_logger.warning(f"Failed to parse keywords: {e}")
                 return {}
 
         # Validate using Pydantic model
         try:
             return KeywordValidation(root=res).model_dump()
         except Exception as e:
-            from loguru import logger as default_logger
-            default_logger.warning(f"Keyword validation failed: {e}")
             return {}
 
     @staticmethod
@@ -145,8 +140,6 @@ class AgenticSearch(BaseSearch):
             keywords_json: Optional[str] = extracted_fields.get(tag.lower(), None)
 
             if not keywords_json:
-                from loguru import logger as default_logger
-                default_logger.warning(f"No {tag} found in LLM response")
                 keyword_sets.append({})
                 continue
 
@@ -157,8 +150,6 @@ class AgenticSearch(BaseSearch):
                 try:
                     keywords_dict = ast.literal_eval(keywords_json)
                 except Exception as e:
-                    from loguru import logger as default_logger
-                    default_logger.warning(f"Failed to parse {tag}: {e}")
                     keyword_sets.append({})
                     continue
 
@@ -167,8 +158,6 @@ class AgenticSearch(BaseSearch):
                 validated = KeywordValidation(root=keywords_dict).model_dump()
                 keyword_sets.append(validated)
             except Exception as e:
-                from loguru import logger as default_logger
-                default_logger.warning(f"{tag} validation failed: {e}")
                 keyword_sets.append({})
 
         return keyword_sets
@@ -306,7 +295,7 @@ class AgenticSearch(BaseSearch):
         image_items: List[ContentItem] = []
         if images is not None and len(images) > 0:
             # TODO: to be implemented
-            await self._logger_async.warning("Image search is not yet implemented.")
+            await self._logger.warning("Image search is not yet implemented.")
             image_items = [
                 ContentItem(
                     type="image_url",
@@ -325,7 +314,7 @@ class AgenticSearch(BaseSearch):
         )
 
         # Extract multi-level keywords in one LLM call
-        await self._logger_async.info(f"Extracting {keyword_levels}-level query keywords", flush=True, end="")
+        await self._logger.info(f"Extracting {keyword_levels}-level query keywords", flush=True, end="")
 
         # Generate dynamic prompt based on keyword_levels
         dynamic_prompt = generate_keyword_extraction_prompt(num_levels=keyword_levels)
@@ -336,7 +325,7 @@ class AgenticSearch(BaseSearch):
             stream=False,
         )
         
-        await self._logger_async.success(" ✓", flush=True)
+        await self._logger.success(" ✓", flush=True)
 
         # Parse N sets of keywords
         keyword_sets: List[Dict[str, float]] = self._extract_and_validate_multi_level_keywords(
@@ -351,7 +340,7 @@ class AgenticSearch(BaseSearch):
         # Log all extracted keyword sets
         for level_idx, keywords in enumerate(keyword_sets, start=1):
             specificity = "General" if level_idx == 1 else "Specific" if level_idx == keyword_levels else f"Level {level_idx}"
-            await self._logger_async.info(f"Level {level_idx} ({specificity}) keywords: {keywords}")
+            await self._logger.info(f"Level {level_idx} ({specificity}) keywords: {keywords}")
 
         # Try each keyword set in order (from general to specific) until we get results
         # Using priority hit principle: stop as soon as we find results
@@ -360,11 +349,11 @@ class AgenticSearch(BaseSearch):
 
         for level_idx, keywords in enumerate(keyword_sets, start=1):
             if not keywords:
-                await self._logger_async.warning(f"Level {level_idx} keywords set is empty, skipping...")
+                await self._logger.warning(f"Level {level_idx} keywords set is empty, skipping...")
                 continue
 
             specificity = "General" if level_idx == 1 else "Specific" if level_idx == keyword_levels else f"Level {level_idx}"
-            await self._logger_async.info(f"Searching with Level {level_idx} ({specificity}) keywords", flush=True, end="")
+            await self._logger.info(f"Searching with Level {level_idx} ({specificity}) keywords", flush=True, end="")
 
             # Perform grep search with current keyword set
             temp_grep_results: List[Dict[str, Any]] = await self.grep_retriever.retrieve(
@@ -398,27 +387,27 @@ class AgenticSearch(BaseSearch):
 
             # Check if we found results
             if len(temp_grep_results) > 0:
-                await self._logger_async.success(f" ✓ (found {len(temp_grep_results)} files)", flush=True)
+                await self._logger.success(f" ✓ (found {len(temp_grep_results)} files)", flush=True)
                 grep_results = temp_grep_results
                 query_keywords = keywords
                 break
             else:
-                await self._logger_async.warning(" ✗ (no results, trying next level)", flush=True)
+                await self._logger.warning(" ✗ (no results, trying next level)", flush=True)
 
         # If still no results after all attempts
         if len(grep_results) == 0:
-            await self._logger_async.error(f"All {keyword_levels} keyword granularity levels failed to find results")
+            await self._logger.error(f"All {keyword_levels} keyword granularity levels failed to find results")
 
         if verbose:
             tmp_sep = "\n"
             file_list = [str(r['path']) for r in grep_results[:top_k_files]]
-            await self._logger_async.info(f"Found {len(grep_results)} files, top {len(file_list)}:\n{tmp_sep.join(file_list)}")
+            await self._logger.info(f"Found {len(grep_results)} files, top {len(file_list)}:\n{tmp_sep.join(file_list)}")
 
         if len(grep_results) == 0:
             return f"No relevant information found for the query: {query}"
 
         # Build knowledge cluster
-        await self._logger_async.info("Building knowledge cluster", flush=True, end="")
+        await self._logger.info("Building knowledge cluster", flush=True, end="")
         cluster: KnowledgeCluster = await self.knowledge_bank.build(
             request=request,
             retrieved_infos=grep_results,
@@ -428,13 +417,13 @@ class AgenticSearch(BaseSearch):
             verbose=verbose,
         )
         
-        await self._logger_async.success(" ✓", flush=True)
+        await self._logger.success(" ✓", flush=True)
 
         if cluster is None:
             return f"No relevant information found for the query: {query}"
 
         if self.verbose:
-            await self._logger_async.info(json.dumps(cluster.to_dict(), ensure_ascii=False, indent=2))
+            await self._logger.info(json.dumps(cluster.to_dict(), ensure_ascii=False, indent=2))
 
         sep: str = "\n"
         cluster_text_content: str = (
@@ -448,13 +437,13 @@ class AgenticSearch(BaseSearch):
             text_content=cluster_text_content,
         )
 
-        await self._logger_async.info("Generating search result summary", flush=True, end="")
+        await self._logger.info("Generating search result summary", flush=True, end="")
         search_result: str = await self.llm.achat(
             messages=[{"role": "user", "content": result_sum_prompt}],
             stream=True,
         )
-        await self._logger_async.success(" ✓", flush=True)
-        await self._logger_async.success("Search completed successfully!")
+        await self._logger.success(" ✓", flush=True)
+        await self._logger.success("Search completed successfully!")
 
         # Add search results (file paths) to the cluster
         if grep_results:
@@ -463,13 +452,13 @@ class AgenticSearch(BaseSearch):
         # Save knowledge cluster to persistent storage
         try:
             await self.knowledge_manager.insert(cluster)
-            await self._logger_async.info(f"Saved knowledge cluster {cluster.id} to cache")
+            await self._logger.info(f"Saved knowledge cluster {cluster.id} to cache")
         except Exception as e:
             # If cluster exists, update it instead
             try:
                 await self.knowledge_manager.update(cluster)
-                await self._logger_async.info(f"Updated knowledge cluster {cluster.id} in cache")
+                await self._logger.info(f"Updated knowledge cluster {cluster.id} in cache")
             except Exception as update_error:
-                await self._logger_async.warning(f"Failed to save knowledge cluster: {update_error}")
+                await self._logger.warning(f"Failed to save knowledge cluster: {update_error}")
 
         return search_result
