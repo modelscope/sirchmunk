@@ -916,7 +916,7 @@ export default function HomePage() {
                 ref={inputRef}
                 type="text"
                 className="w-full px-5 py-3.5 pr-14 bg-slate-50 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all placeholder:text-slate-400 dark:placeholder:text-slate-500 text-slate-700 dark:text-slate-200"
-                placeholder={t("Type your message...")}
+                placeholder={t("Input message or search the web via g: xx or G: xx ...")}
                 value={inputMessage}
                 onChange={(e) => setInputMessage(e.target.value)}
                 onKeyDown={handleKeyDown}

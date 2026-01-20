@@ -9,12 +9,8 @@ import {
   Save,
   Loader2,
   Check,
-  Server,
   AlertCircle,
-  CheckCircle,
-  XCircle,
   Key,
-  RefreshCw,
 } from "lucide-react";
 import { apiUrl } from "@/lib/api";
 import { getTranslation, type Language } from "@/lib/i18n";
@@ -53,9 +49,7 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [error, setError] = useState("");
-  const [testingLLM, setTestingLLM] = useState(false);
-  const [llmTestResult, setLLMTestResult] = useState<any>(null);
-  
+
   // Edit states
   const [editedUI, setEditedUI] = useState<UISettings | null>(null);
   const [editedEnv, setEditedEnv] = useState<Record<string, string>>({});
@@ -81,6 +75,7 @@ export default function SettingsPage() {
         // Initialize edited env with current values
         const envValues: Record<string, string> = {};
         Object.entries(result.data.environment || {}).forEach(([key, info]: [string, any]) => {
+          if (key === "WORK_PATH") return;
           envValues[key] = info.value || "";
         });
         setEditedEnv(envValues);
@@ -94,8 +89,8 @@ export default function SettingsPage() {
 
   const handleSaveSettings = async () => {
     try {
-      setSaving(true);
-      setError("");
+    setSaving(true);
+    setError("");
       setSaveSuccess(false);
 
       const payload: any = {};
@@ -107,7 +102,9 @@ export default function SettingsPage() {
       
       // Include environment variables if edited
       if (Object.keys(editedEnv).length > 0) {
-        payload.environment = editedEnv;
+        const envPayload = { ...editedEnv };
+        delete envPayload.WORK_PATH;
+        payload.environment = envPayload;
       }
 
       const response = await fetch(apiUrl("/api/v1/settings"), {
@@ -124,12 +121,12 @@ export default function SettingsPage() {
         
         // Update theme immediately if changed
         if (editedUI?.theme && editedUI.theme !== data?.ui?.theme) {
-          setTheme(editedUI.theme);
-        }
-        
+        setTheme(editedUI.theme);
+      }
+
         // Refresh settings in global context
-        await refreshSettings();
-        
+      await refreshSettings();
+
         // Reload settings to get updated values
         await fetchSettings();
         
@@ -139,26 +136,6 @@ export default function SettingsPage() {
       setError(err.message);
     } finally {
       setSaving(false);
-    }
-  };
-
-  const handleTestLLM = async () => {
-    try {
-      setTestingLLM(true);
-      setLLMTestResult(null);
-      
-      const response = await fetch(apiUrl("/api/v1/settings/test/llm"));
-      const result = await response.json();
-      
-      setLLMTestResult(result);
-    } catch (err: any) {
-      setLLMTestResult({
-        success: false,
-        status: "error",
-        message: err.message
-      });
-    } finally {
-      setTestingLLM(false);
     }
   };
 
@@ -173,7 +150,7 @@ export default function SettingsPage() {
     );
   }
 
-  return (
+    return (
     <div className="h-screen flex flex-col bg-gradient-to-br from-slate-50 to-blue-50/30 dark:from-slate-900 dark:to-blue-950/20">
       {/* Header */}
       <div className="flex-none border-b border-slate-200 dark:border-slate-700 bg-white/80 dark:bg-slate-800/80 backdrop-blur-sm">
@@ -181,40 +158,40 @@ export default function SettingsPage() {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
               <SettingsIcon className="w-6 h-6 text-blue-500 dark:text-blue-400" />
-              <div>
-                <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">
+          <div>
+            <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">
                   {t("System Settings")}
-                </h1>
+            </h1>
                 <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
                   {t("Manage system configuration and preferences")}
                 </p>
-              </div>
+          </div>
             </div>
             
-            <button
+          <button
               onClick={handleSaveSettings}
-              disabled={saving}
+            disabled={saving}
               className="flex items-center gap-2 px-4 py-2 bg-blue-500 hover:bg-blue-600 disabled:bg-slate-300 dark:disabled:bg-slate-700 text-white rounded-lg font-medium transition-colors"
-            >
-              {saving ? (
+          >
+            {saving ? (
                 <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
+              <Loader2 className="w-4 h-4 animate-spin" />
                   {t("Saving...")}
                 </>
-              ) : saveSuccess ? (
+            ) : saveSuccess ? (
                 <>
-                  <Check className="w-4 h-4" />
+              <Check className="w-4 h-4" />
                   {t("Saved!")}
                 </>
-              ) : (
+            ) : (
                 <>
-                  <Save className="w-4 h-4" />
+              <Save className="w-4 h-4" />
                   {t("Save All Changes")}
                 </>
-              )}
-            </button>
-          </div>
+            )}
+          </button>
         </div>
+      </div>
 
         {/* Tabs */}
         <div className="px-6 flex gap-1">
@@ -241,12 +218,12 @@ export default function SettingsPage() {
             }`}
           >
             <div className="flex items-center gap-2">
-              <Key className="w-4 h-4" />
-              {t("Environment Variables")}
-            </div>
-          </button>
+            <Key className="w-4 h-4" />
+            {t("Environment Variables")}
         </div>
-      </div>
+                </button>
+              </div>
+              </div>
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto px-6 py-6">
@@ -258,97 +235,30 @@ export default function SettingsPage() {
               <div>
                 <p className="font-medium text-red-900 dark:text-red-200">{t("Error")}</p>
                 <p className="text-sm text-red-700 dark:text-red-300 mt-1">{error}</p>
-              </div>
-            </div>
+                  </div>
+                  </div>
           )}
-
-          {/* LLM Configuration Status */}
-          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 overflow-hidden">
-            <div className="px-4 py-3 border-b border-slate-100 dark:border-slate-700 bg-gradient-to-r from-slate-50 to-blue-50/30 dark:from-slate-800/50 dark:to-blue-900/20">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Server className="w-4 h-4 text-blue-500 dark:text-blue-400" />
-                  <h2 className="font-semibold text-sm text-slate-900 dark:text-slate-100">
-                    {t("Configuration Status")}
-                  </h2>
-                </div>
-              </div>
-            </div>
-            
-            <div className="p-4">
-              <button
-                onClick={handleTestLLM}
-                disabled={testingLLM}
-                className="w-full p-4 rounded-lg border-2 border-slate-200 dark:border-slate-700 hover:border-blue-300 dark:hover:border-blue-700 hover:bg-blue-50/50 dark:hover:bg-blue-900/20 transition-all group"
-              >
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${
-                      llmTestResult?.success 
-                        ? "bg-green-100 dark:bg-green-900/30" 
-                        : llmTestResult && !llmTestResult.success
-                        ? "bg-red-100 dark:bg-red-900/30"
-                        : "bg-blue-100 dark:bg-blue-900/30"
-                    }`}>
-                      <Server className={`w-5 h-5 ${
-                        llmTestResult?.success 
-                          ? "text-green-600 dark:text-green-400" 
-                          : llmTestResult && !llmTestResult.success
-                          ? "text-red-600 dark:text-red-400"
-                          : "text-blue-600 dark:text-blue-400"
-                      }`} />
-                    </div>
-                    <div className="text-left">
-                      <div className="font-medium text-slate-900 dark:text-slate-100">
-                        {t("LLM Service")}
-                      </div>
-                      <div className="text-sm text-slate-500 dark:text-slate-400">
-                        {llmTestResult?.message || t("Click to test connection")}
-                      </div>
-                      {llmTestResult?.model && (
-                        <div className="text-xs text-blue-600 dark:text-blue-400 mt-1">
-                          Model: {llmTestResult.model}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                  
-                  <div className="flex items-center gap-2">
-                    {testingLLM ? (
-                      <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
-                    ) : llmTestResult?.success ? (
-                      <CheckCircle className="w-5 h-5 text-green-500" />
-                    ) : llmTestResult && !llmTestResult.success ? (
-                      <XCircle className="w-5 h-5 text-red-500" />
-                    ) : (
-                      <RefreshCw className="w-5 h-5 text-slate-400 group-hover:text-blue-500 transition-colors" />
-                    )}
-                  </div>
-                </div>
-              </button>
-            </div>
-          </div>
 
           {/* Interface Preferences */}
           {activeTab === "interface" && editedUI && (
             <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700">
               <div className="px-4 py-3 border-b border-slate-100 dark:border-slate-700">
                 <h3 className="font-semibold text-slate-900 dark:text-slate-100">
-                  {t("Interface Preferences")}
+                    {t("Interface Preferences")}
                 </h3>
                 <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
                   {t("Customize your interface appearance and language")}
                 </p>
-              </div>
+                </div>
               
               <div className="p-6 space-y-6">
                 {/* Theme */}
-                <div>
+                  <div>
                   <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-3">
-                    {t("Theme")}
-                  </label>
+                      {t("Theme")}
+                    </label>
                   <div className="grid grid-cols-2 gap-3">
-                    <button
+                        <button
                       onClick={() => setEditedUI({ ...editedUI, theme: "light" })}
                       className={`flex items-center gap-3 p-4 rounded-lg border-2 transition-all ${
                         editedUI.theme === "light"
@@ -367,10 +277,10 @@ export default function SettingsPage() {
                           : "text-slate-600 dark:text-slate-400"
                       }`}>
                         {t("Light Mode")}
-                      </span>
-                    </button>
+                          </span>
+                        </button>
                     
-                    <button
+                              <button
                       onClick={() => setEditedUI({ ...editedUI, theme: "dark" })}
                       className={`flex items-center gap-3 p-4 rounded-lg border-2 transition-all ${
                         editedUI.theme === "dark"
@@ -380,7 +290,7 @@ export default function SettingsPage() {
                     >
                       <Moon className={`w-5 h-5 ${
                         editedUI.theme === "dark" 
-                          ? "text-blue-600 dark:text-blue-400" 
+                              ? "text-blue-600 dark:text-blue-400"
                           : "text-slate-400"
                       }`} />
                       <span className={`font-medium ${
@@ -389,18 +299,18 @@ export default function SettingsPage() {
                           : "text-slate-600 dark:text-slate-400"
                       }`}>
                         {t("Dark Mode")}
-                      </span>
+                        </span>
                     </button>
-                  </div>
-                </div>
+                      </div>
+                    </div>
 
                 {/* Language */}
-                <div>
+              <div>
                   <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-3">
                     {t("Language")}
                   </label>
                   <div className="grid grid-cols-2 gap-3">
-                    <button
+              <button
                       onClick={() => setEditedUI({ ...editedUI, language: "en" })}
                       className={`flex items-center gap-3 p-4 rounded-lg border-2 transition-all ${
                         editedUI.language === "en"
@@ -418,9 +328,9 @@ export default function SettingsPage() {
                       }`}>
                         English
                       </span>
-                    </button>
+              </button>
                     
-                    <button
+                  <button
                       onClick={() => setEditedUI({ ...editedUI, language: "zh" })}
                       className={`flex items-center gap-3 p-4 rounded-lg border-2 transition-all ${
                         editedUI.language === "zh"
@@ -437,13 +347,13 @@ export default function SettingsPage() {
                           : "text-slate-600 dark:text-slate-400"
                       }`}>
                         中文
-                      </span>
-                    </button>
-                  </div>
-                </div>
+                                </span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
               </div>
-            </div>
-          )}
+            )}
 
           {/* Environment Variables */}
           {activeTab === "environment" && data?.environment && (
@@ -451,42 +361,44 @@ export default function SettingsPage() {
               <div className="px-4 py-3 border-b border-slate-100 dark:border-slate-700">
                 <h3 className="font-semibold text-slate-900 dark:text-slate-100">
                   {t("Environment Variables")}
-                </h3>
+                    </h3>
                 <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
                   {t("Configure system and LLM environment variables")}
-                </p>
-              </div>
-              
+                      </p>
+                    </div>
+
               <div className="p-6 space-y-4">
-                {Object.entries(data.environment).map(([key, info]) => (
+                {Object.entries(data.environment)
+                  .filter(([key]) => key !== "WORK_PATH")
+                  .map(([key, info]) => (
                   <div key={key} className="space-y-2">
                     <div className="flex items-start justify-between">
                       <div className="flex-1">
                         <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
                           {key}
-                        </label>
+                      </label>
                         <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
                           {info.description}
                         </p>
-                      </div>
+                    </div>
                       <span className="text-xs px-2 py-1 rounded bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400">
                         {info.category}
                       </span>
                     </div>
-                    
-                    <input
+
+                      <input
                       type={info.sensitive ? "password" : "text"}
                       value={editedEnv[key] || ""}
                       onChange={(e) => setEditedEnv({ ...editedEnv, [key]: e.target.value })}
                       placeholder={`Default: ${info.default}`}
                       className="w-full px-3 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
                     />
-                  </div>
+                        </div>
                 ))}
-              </div>
-            </div>
+                            </div>
+                          </div>
           )}
-        </div>
+                      </div>
       </div>
     </div>
   );

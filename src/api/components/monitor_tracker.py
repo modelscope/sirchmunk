@@ -12,6 +12,7 @@ from pathlib import Path
 
 from sirchmunk.storage.knowledge_manager import KnowledgeManager
 from api.components.history_storage import HistoryStorage
+from sirchmunk.utils.constants import DEFAULT_WORK_PATH
 
 
 class MonitorTracker:
@@ -249,7 +250,7 @@ class MonitorTracker:
             Storage information
         """
         try:
-            work_path = Path(os.getenv("WORK_PATH", os.path.expanduser("~/sirchmunk")))
+            work_path = Path(os.getenv("WORK_PATH", DEFAULT_WORK_PATH))
             cache_path = work_path / ".cache"
             
             storage_info = {

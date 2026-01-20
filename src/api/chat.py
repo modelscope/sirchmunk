@@ -290,6 +290,8 @@ def get_envs() -> Dict[str, Any]:
     if not model_name:
         model_name = LLM_MODEL_NAME
 
+    print(f"[ENV CONFIG] base_url={base_url}, model_name={model_name}, api_key={'***' if api_key else '(not set)'}")
+
     return dict(
         base_url=base_url,
         api_key=api_key,
