@@ -137,9 +137,7 @@ interface ChatState {
 
 // Settings
 interface Settings {
-  kb_name: string;
-  enable_rag: boolean;
-  enable_web_search: boolean;
+  theme: string;
   language: string;
 }
 
@@ -211,9 +209,7 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
 
   // --- Settings Logic ---
   const [settings, setSettings] = useState<Settings>({
-    kb_name: "",
-    enable_rag: false,
-    enable_web_search: false,
+    theme: "light",
     language: "en",
   });
 
@@ -857,6 +853,18 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
       if (chatWs.current === ws) {
         chatWs.current = null;
       }
+      // Ensure loading state is reset when connection closes
+      setChatState((prev) => {
+        // Only reset if still loading (don't override a successful completion)
+        if (prev.isLoading) {
+          return {
+            ...prev,
+            isLoading: false,
+            currentStage: null,
+          };
+        }
+        return prev;
+      });
     };
   };
 

@@ -19,6 +19,7 @@ from sirchmunk.search import AgenticSearch
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME
 from api.components.history_storage import HistoryStorage
+from api.components.settings_storage import SettingsStorage
 
 
 # Try to import tkinter for file dialogs
@@ -33,6 +34,13 @@ router = APIRouter(prefix="/api/v1", tags=["chat", "search"])
 
 # Initialize persistent history storage
 history_storage = HistoryStorage()
+
+# Initialize settings storage for LLM configuration (with error handling)
+try:
+    settings_storage = SettingsStorage()
+except Exception as e:
+    print(f"[WARNING] Failed to initialize SettingsStorage: {e}")
+    settings_storage = None
 
 # In-memory cache for active sessions (for backward compatibility)
 chat_sessions = {}
@@ -259,9 +267,67 @@ class SearchRequest(BaseModel):
     max_depth: Optional[int] = 5
     top_k_files: Optional[int] = 3
 
+
+def get_envs() -> Dict[str, Any]:
+    """
+    Get LLM configuration from settings storage or environment variables.
+    """
+    # Try to get from settings storage first (if available)
+    if settings_storage is not None:
+        base_url = settings_storage.get_env_variable("LLM_BASE_URL", "")
+        api_key = settings_storage.get_env_variable("LLM_API_KEY", "")
+        model_name = settings_storage.get_env_variable("LLM_MODEL_NAME", "")
+    else:
+        base_url = ""
+        api_key = ""
+        model_name = ""
+
+    # Fallback to environment variables if not in settings
+    if not base_url:
+        base_url = LLM_BASE_URL
+    if not api_key:
+        api_key = LLM_API_KEY
+    if not model_name:
+        model_name = LLM_MODEL_NAME
+
+    return dict(
+        base_url=base_url,
+        api_key=api_key,
+        model_name=model_name,
+    )
+
+
 def get_search_instance(log_callback=None):
-    """Get configured search instance with optional log callback"""
-    return AgenticSearch(log_callback=log_callback)
+    """
+    Get configured search instance with optional log callback.
+    
+    Creates OpenAIChat instance with settings from DuckDB (priority) or environment variables (fallback).
+    
+    Args:
+        log_callback: Optional callback for logging
+        
+    Returns:
+        Configured AgenticSearch instance
+    """
+    # Get LLM configuration from settings storage (priority) or env variables (fallback)
+    try:
+        envs = get_envs()
+        
+        # Create OpenAI LLM instance with retrieved configuration
+        llm = OpenAIChat(
+            base_url=envs["base_url"],
+            api_key=envs["api_key"],
+            model=envs["model_name"],
+            log_callback=log_callback,
+        )
+        
+        # Create and return AgenticSearch instance with configured LLM
+        return AgenticSearch(llm=llm, log_callback=log_callback)
+    
+    except Exception as e:
+        # If settings retrieval fails, fall back to default AgenticSearch initialization
+        print(f"[WARNING] Please config ENVs: LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME. Error: {e}")
+        return AgenticSearch(log_callback=log_callback)
 
 
 _DIALOG_LOCK = threading.Lock()
@@ -296,9 +362,9 @@ def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[
     """
     if not _DIALOG_LOCK.acquire(blocking=False):
         return []
-
+    
     selected_paths = []
-
+    
     try:
         # Get singleton root
         root = _get_bg_root()
@@ -333,7 +399,7 @@ def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[
             else:
                 res = filedialog.askopenfilename(filetypes=filetypes, **kwargs)
                 selected_paths = [res] if res else []
-
+            
         elif dialog_type == "directory":
             kwargs["title"] = "Select Directory"
             res = filedialog.askdirectory(**kwargs)
@@ -341,15 +407,15 @@ def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[
 
         root.attributes("-topmost", False)
         root.update()
-
+            
     except Exception as e:
         print(f"Dialog Error: {e}")
         selected_paths = []
-
+    
     finally:
         # Release the lock
         _DIALOG_LOCK.release()
-
+    
     return selected_paths
 
 
@@ -420,35 +486,47 @@ async def _chat_only(
     Mode 1: Pure chat mode (no RAG, no web search)
     Direct LLM chat without any retrieval augmentation
     """
-    await manager.send_personal_message(json.dumps({
-        "type": "status",
-        "stage": "generating",
-        "message": "💬 Generating response..."
-    }), websocket)
+    try:
+        await manager.send_personal_message(json.dumps({
+            "type": "status",
+            "stage": "generating",
+            "message": "💬 Generating response..."
+        }), websocket)
+        
+        # Create log callback for streaming LLM output
+        llm_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
+        
+        # Initialize OpenAI client with log callback for streaming
+        envs: Dict[str, Any] = get_envs()
+        llm = OpenAIChat(
+            api_key=envs["api_key"],
+            base_url=envs["base_url"],
+            model=envs["model_name"],
+            log_callback=llm_log_callback
+        )
+        
+        # Prepare messages for LLM
+        messages = [
+            {"role": "system", "content": "You are a helpful AI assistant. Provide clear, accurate, and helpful responses."},
+            {"role": "user", "content": message}
+        ]
+        
+        # Generate response with streaming
+        response = await llm.achat(messages=messages, stream=True)
+        
+        sources = {}
+        
+        return response, sources
     
-    # Create log callback for streaming LLM output
-    llm_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
-    
-    # Initialize OpenAI client with log callback for streaming
-    llm = OpenAIChat(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
-        model=LLM_MODEL_NAME,
-        log_callback=llm_log_callback
-    )
-    
-    # Prepare messages for LLM
-    messages = [
-        {"role": "system", "content": "You are a helpful AI assistant. Provide clear, accurate, and helpful responses."},
-        {"role": "user", "content": message}
-    ]
-    
-    # Generate response with streaming
-    response = await llm.achat(messages=messages, stream=True)
-    
-    sources = {}
-    
-    return response, sources
+    except Exception as e:
+        # Send error message to frontend
+        await manager.send_personal_message(json.dumps({
+            "type": "error",
+            "message": f"LLM chat failed: {str(e)}"
+        }), websocket)
+        
+        # Re-raise to be caught by outer handler
+        raise
 
 
 async def _chat_rag(
@@ -578,12 +656,13 @@ async def _chat_web_search(
         "stage": "generating",
         "message": "💬 Generating response with web context..."
     }), websocket)
-    
+
+    envs: Dict[str, Any] = get_envs()
     llm_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
     llm = OpenAIChat(
-        api_key=LLM_API_KEY,
-        base_url=LLM_BASE_URL,
-        model=LLM_MODEL_NAME,
+        api_key=envs["api_key"],
+        base_url=envs["base_url"],
+        model=envs["model_name"],
         log_callback=llm_log_callback
     )
     
@@ -772,8 +851,8 @@ async def chat_websocket(websocket: WebSocket):
                 )
                 
             elif enable_rag and not enable_web_search:
-                # Mode 2: Chat + RAG only
-                print(f"[MODE 2] Chat + RAG only")
+                # Mode 2: Chat + RAG
+                print(f"[MODE 2] Chat + RAG")
                 response, sources = await _chat_rag(
                     message, kb_name, websocket, manager
                 )

@@ -11,4 +11,5 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "qwen3-max")
 
 # Search Configuration
-WORK_PATH = os.getenv("WORK_PATH", Path.cwd() / "sirchmunk_work")
+DEFAULT_WORK_PATH = os.path.expanduser("~/sirchmunk")
+WORK_PATH = os.getenv("WORK_PATH", DEFAULT_WORK_PATH)
