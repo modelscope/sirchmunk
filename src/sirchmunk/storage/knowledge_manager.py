@@ -20,6 +20,7 @@ from sirchmunk.schema.knowledge import (
     Lifecycle,
     AbstractionLevel
 )
+from ..utils.constants import DEFAULT_WORK_PATH
 
 
 class KnowledgeManager:
@@ -44,7 +45,7 @@ class KnowledgeManager:
         """
         # Get work path from env if not provided
         if work_path is None:
-            work_path = os.getenv("WORK_PATH", os.path.expanduser("~/sirchmunk"))
+            work_path = os.getenv("WORK_PATH", DEFAULT_WORK_PATH)
         
         # Create knowledge storage path
         self.knowledge_path = Path(work_path) / ".cache" / "knowledge"
@@ -68,6 +69,8 @@ class KnowledgeManager:
         """Load knowledge clusters from parquet file into DuckDB"""
         try:
             if Path(self.parquet_file).exists():
+                # Drop existing table first to avoid conflicts
+                self.db.drop_table(self.table_name, if_exists=True)
                 # Load parquet file into DuckDB table
                 self.db.import_from_parquet(self.table_name, self.parquet_file, create_table=True)
                 count = self.db.get_table_count(self.table_name)
@@ -78,6 +81,8 @@ class KnowledgeManager:
                 logger.info("Created new knowledge clusters table")
         except Exception as e:
             logger.error(f"Failed to load from parquet: {e}")
+            # Try to recreate table
+            self.db.drop_table(self.table_name, if_exists=True)
             self._create_table()
     
     def _create_table(self):

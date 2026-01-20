@@ -24,9 +24,6 @@ from sirchmunk.utils.utils import (
     log_tf_norm_penalty,
 )
 
-# Note: Do not create a global logger here as it will duplicate logs
-# Each instance creates its own logger in __init__ with the provided log_callback
-
 
 class AgenticSearch(BaseSearch):
 
@@ -320,10 +317,11 @@ class AgenticSearch(BaseSearch):
         dynamic_prompt = generate_keyword_extraction_prompt(num_levels=keyword_levels)
         keyword_extraction_prompt = dynamic_prompt.format(user_input=request.get_user_input())
 
-        resp_keywords: str = await self.llm.achat(
+        resp_keywords_response = await self.llm.achat(
             messages=[{"role": "user", "content": keyword_extraction_prompt}],
             stream=False,
         )
+        resp_keywords: str = resp_keywords_response.content
         
         await self._logger.success(" ✓", flush=True)
 
@@ -438,10 +436,11 @@ class AgenticSearch(BaseSearch):
         )
 
         await self._logger.info("Generating search result summary", flush=True, end="")
-        search_result: str = await self.llm.achat(
+        search_result_response = await self.llm.achat(
             messages=[{"role": "user", "content": result_sum_prompt}],
             stream=True,
         )
+        search_result: str = search_result_response.content
         await self._logger.success(" ✓", flush=True)
         await self._logger.success("Search completed successfully!")
 

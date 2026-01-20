@@ -175,10 +175,11 @@ class KnowledgeBank:
             evidences="\n\n".join(evidence_contents),
         )
 
-        evidence_summary_response: str = await self.llm.achat(
+        evidence_summary_llm_response = await self.llm.achat(
             messages=[{"role": "user", "content": evidence_summary_prompt}],
             stream=True,
         )
+        evidence_summary_response: str = evidence_summary_llm_response.content
 
         cluster_infos: Dict[str, Any] = extract_fields(
             content=evidence_summary_response

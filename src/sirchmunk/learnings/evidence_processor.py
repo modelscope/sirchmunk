@@ -299,7 +299,8 @@ class MonteCarloEvidenceSampling:
             sample_content=sample.content,
         )
         try:
-            resp: str = await self.llm.achat([{"role": "user", "content": prompt}])
+            resp_obj = await self.llm.achat([{"role": "user", "content": prompt}])
+            resp: str = resp_obj.content
 
             clean_resp = resp.replace("```json", "").replace("```", "").strip()
             data = json.loads(clean_resp)
@@ -353,7 +354,8 @@ class MonteCarloEvidenceSampling:
             text_content=combined_context,
         )
 
-        return await self.llm.achat([{"role": "user", "content": prompt}])
+        summary_response = await self.llm.achat([{"role": "user", "content": prompt}])
+        return summary_response.content
 
     async def get_roi(
         self,

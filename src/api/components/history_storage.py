@@ -12,6 +12,7 @@ from datetime import datetime
 from loguru import logger
 
 from sirchmunk.storage.duckdb import DuckDBManager
+from sirchmunk.utils.constants import DEFAULT_WORK_PATH
 
 
 class HistoryStorage:
@@ -34,7 +35,7 @@ class HistoryStorage:
         """
         # Get work path from env if not provided
         if work_path is None:
-            work_path = os.getenv("WORK_PATH", os.path.expanduser("~/sirchmunk"))
+            work_path = os.getenv("WORK_PATH", DEFAULT_WORK_PATH)
         
         # Create history storage path
         self.history_path = Path(work_path) / ".cache" / "history"

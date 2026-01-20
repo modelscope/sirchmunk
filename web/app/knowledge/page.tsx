@@ -15,6 +15,7 @@ import {
   AlertCircle,
   Check,
   ChevronRight,
+  RefreshCw,
 } from "lucide-react";
 import { apiUrl } from "@/lib/api";
 import { getTranslation, type Language } from "@/lib/i18n";
@@ -83,18 +84,23 @@ export default function KnowledgePage() {
   const [stats, setStats] = useState<KnowledgeStats | null>(null);
   const [patterns, setPatterns] = useState<Pattern[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
 
   // Fetch stats
   useEffect(() => {
-    fetchStats();
+    fetchStats(true);
     fetchPatterns();
   }, []);
 
-  const fetchStats = async () => {
+  const fetchStats = async (showLoading: boolean = true) => {
     try {
+      if (showLoading) {
       setLoading(true);
+      } else {
+        setRefreshing(true);
+      }
       setError("");
 
       const response = await fetch(apiUrl("/api/v1/knowledge/stats"));
@@ -107,7 +113,10 @@ export default function KnowledgePage() {
     } catch (err: any) {
       setError(err.message);
     } finally {
+      if (showLoading) {
       setLoading(false);
+      }
+      setRefreshing(false);
     }
   };
 
@@ -129,6 +138,10 @@ export default function KnowledgePage() {
     if (!searchQuery.trim()) return;
     // TODO: Navigate to search results or show modal
     console.log("Search:", searchQuery);
+  };
+
+  const handleRefresh = async () => {
+    await Promise.all([fetchStats(false), fetchPatterns()]);
   };
 
   // Lifecycle colors
@@ -189,12 +202,22 @@ export default function KnowledgePage() {
               <Database className="w-7 h-7 text-blue-500 dark:text-blue-400" />
         <div>
                 <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">
-                  {t("Knowledge Base Analytics")}
+                  {t("Knowledge Analytics")}
           </h1>
                 <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
                   {t("Real-time insights and statistics")}
           </p>
         </div>
+            </div>
+            <div className="flex items-center gap-3">
+          <button
+                onClick={handleRefresh}
+                disabled={refreshing}
+                className="flex items-center gap-2 px-3 py-2 bg-blue-500 hover:bg-blue-600 disabled:bg-slate-300 dark:disabled:bg-slate-700 text-white rounded-lg transition-colors"
+              >
+                <RefreshCw className={`w-4 h-4 ${refreshing ? "animate-spin" : ""}`} />
+                <span className="text-sm font-medium">{t("Refresh")}</span>
+          </button>
         </div>
       </div>
 
@@ -210,8 +233,8 @@ export default function KnowledgePage() {
                 placeholder={t("Search knowledge clusters...")}
                 className="w-full pl-10 pr-4 py-2.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
-            </div>
-          )}
+        </div>
+      )}
         </div>
                   </div>
 

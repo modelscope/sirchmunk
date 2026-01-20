@@ -219,11 +219,15 @@ async def update_ui_settings(ui: UISettings):
 @router.get("/test/llm")
 async def test_llm_connection():
     """Test LLM connection"""
+    from sirchmunk.llm import OpenAIChat
+
     try:
         # Get current LLM settings
         base_url = settings_storage.get_env_variable("LLM_BASE_URL") or LLM_BASE_URL
         api_key = settings_storage.get_env_variable("LLM_API_KEY") or LLM_API_KEY
         model = settings_storage.get_env_variable("LLM_MODEL_NAME") or LLM_MODEL_NAME
+
+        print(f"[DEBUG] Testing LLM connection with base_url={base_url}, model={model}, api_key={'***' if api_key else '(not set)'}")
         
         # Simple validation
         if not api_key:
@@ -242,12 +246,28 @@ async def test_llm_connection():
                         "model": None
                     }
         
-        # TODO: Implement actual connection test
-        # For now, just return configured status
+
+        llm = OpenAIChat(
+            base_url=base_url,
+            api_key=api_key,
+            model=model
+        )
+
+        messages = [
+            {"role": "system",
+             "content": "You are a helpful AI assistant."},
+            {"role": "user", "content": "Output the word: 'test'."}
+        ]
+        resp = await llm.achat(
+            messages=messages,
+            stream=False
+        )
+        print(f"[DEBUG] LLM response: {resp.content}")
+
         return {
             "success": True,
                 "status": "configured",
-                "message": "LLM is configured (connection test not implemented)",
+                "message": "LLM connection successful",
                 "model": model,
                 "base_url": base_url
             }
