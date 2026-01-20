@@ -262,7 +262,7 @@ async def test_llm_connection():
             messages=messages,
             stream=False
         )
-        print(f"[DEBUG] LLM response: {resp}")
+        print(f"[DEBUG] LLM response: {resp.content}")
 
         return {
             "success": True,

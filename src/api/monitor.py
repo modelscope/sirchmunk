@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 from typing import Dict, Any, Optional
 from datetime import datetime
 
-from api.components.monitor_tracker import get_monitor_tracker
+from api.components.monitor_tracker import get_monitor_tracker, llm_usage_tracker
 
 router = APIRouter(prefix="/api/v1/monitor", tags=["monitor"])
 
@@ -148,6 +148,27 @@ async def get_storage_info():
         return {
             "success": True,
             "data": storage
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/llm")
+async def get_llm_usage():
+    """
+    Get LLM usage statistics
+    
+    Returns:
+        - Total calls
+        - Total input/output/total tokens
+        - Calls per minute
+        - Models usage breakdown
+    """
+    try:
+        stats = llm_usage_tracker.get_stats()
+        
+        return {
+            "success": True,
+            "data": stats
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

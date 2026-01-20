@@ -9,10 +9,98 @@ import os
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from pathlib import Path
+import threading
 
 from sirchmunk.storage.knowledge_manager import KnowledgeManager
 from api.components.history_storage import HistoryStorage
 from sirchmunk.utils.constants import DEFAULT_WORK_PATH
+
+
+class LLMUsageTracker:
+    """
+    Global tracker for LLM token usage and call statistics.
+    Thread-safe singleton for tracking across the application.
+    """
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialize()
+        return cls._instance
+    
+    def _initialize(self):
+        """Initialize tracking data"""
+        self.total_calls = 0
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_tokens = 0
+        self.calls_by_model = {}
+        self.last_call_time = None
+        self.session_start = datetime.now()
+        self._data_lock = threading.Lock()
+    
+    def record_usage(self, model: str, usage: Dict[str, int]):
+        """
+        Record token usage from an LLM call
+        
+        Args:
+            model: Model name
+            usage: Dictionary with prompt_tokens, completion_tokens, total_tokens
+        """
+        with self._data_lock:
+            self.total_calls += 1
+            self.last_call_time = datetime.now()
+            
+            input_tokens = usage.get('prompt_tokens', 0)
+            output_tokens = usage.get('completion_tokens', 0)
+            total = usage.get('total_tokens', input_tokens + output_tokens)
+            
+            self.total_input_tokens += input_tokens
+            self.total_output_tokens += output_tokens
+            self.total_tokens += total
+            
+            # Track by model
+            if model not in self.calls_by_model:
+                self.calls_by_model[model] = {
+                    "calls": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0
+                }
+            self.calls_by_model[model]["calls"] += 1
+            self.calls_by_model[model]["input_tokens"] += input_tokens
+            self.calls_by_model[model]["output_tokens"] += output_tokens
+            self.calls_by_model[model]["total_tokens"] += total
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current usage statistics"""
+        with self._data_lock:
+            uptime_seconds = (datetime.now() - self.session_start).total_seconds()
+            calls_per_minute = (self.total_calls / uptime_seconds * 60) if uptime_seconds > 0 else 0
+            
+            return {
+                "total_calls": self.total_calls,
+                "total_input_tokens": self.total_input_tokens,
+                "total_output_tokens": self.total_output_tokens,
+                "total_tokens": self.total_tokens,
+                "calls_per_minute": round(calls_per_minute, 2),
+                "last_call_time": self.last_call_time.isoformat() if self.last_call_time else None,
+                "session_start": self.session_start.isoformat(),
+                "session_duration_minutes": round(uptime_seconds / 60, 1),
+                "models": self.calls_by_model.copy(),
+            }
+    
+    def reset(self):
+        """Reset all statistics"""
+        self._initialize()
+
+
+# Global LLM usage tracker instance
+llm_usage_tracker = LLMUsageTracker()
 
 
 class MonitorTracker:
@@ -140,51 +228,66 @@ class MonitorTracker:
         try:
             # Get all sessions
             all_sessions = self.history_storage.get_all_sessions()
-            
+
             # Calculate time threshold
             threshold = datetime.now() - timedelta(hours=hours)
             threshold_ts = threshold.timestamp()
-            
+
             # Filter recent sessions
             recent_sessions = []
             total_messages = 0
             active_count = 0
-            
+
             for session in all_sessions:
                 session_time = session.get('updated_at', 0)
-                
-                # Count messages
-                messages = session.get('messages', [])
-                total_messages += len(messages)
-                
+
+                if isinstance(session_time, datetime):
+                    session_time = session_time.timestamp()
+                elif isinstance(session_time, str):
+                    try:
+                        session_time = datetime.fromisoformat(session_time.replace('Z', '+00:00')).timestamp()
+                    except (ValueError, TypeError):
+                        session_time = 0
+
+                # Count messages using message_count field (messages are not included in get_all_sessions)
+                message_count = session.get('message_count', 0)
+                total_messages += message_count
+
                 # Check if recent
                 if session_time >= threshold_ts:
                     recent_sessions.append({
                         "session_id": session.get('session_id'),
                         "title": session.get('title', 'Untitled'),
-                        "message_count": len(messages),
+                        "message_count": message_count,
                         "created_at": session.get('created_at'),
-                        "updated_at": session.get('updated_at'),
+                        "updated_at": session_time,  # Store as timestamp
                     })
                     active_count += 1
-            
+
             # Sort by update time
-            recent_sessions.sort(key=lambda x: x['updated_at'], reverse=True)
-            
+            recent_sessions.sort(key=lambda x: x['updated_at'] if isinstance(x['updated_at'], (int, float)) else 0, reverse=True)
+
+            # Get LLM usage stats
+            llm_stats = llm_usage_tracker.get_stats()
+
             return {
                 "total_sessions": len(all_sessions),
                 "total_messages": total_messages,
                 "recent_sessions": recent_sessions[:10],  # Top 10 most recent
                 "active_sessions": active_count,
                 "time_window_hours": hours,
+                "llm_usage": llm_stats,
             }
         
         except Exception as e:
+            print(f"[ERROR] Error getting chat activity in monitor: {e}")
+
             return {
                 "total_sessions": 0,
                 "total_messages": 0,
                 "recent_sessions": [],
                 "active_sessions": 0,
+                "llm_usage": llm_usage_tracker.get_stats(),
                 "error": str(e)
             }
     

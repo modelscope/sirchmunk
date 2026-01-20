@@ -51,6 +51,23 @@ interface SystemMetrics {
   timestamp: string;
 }
 
+interface LLMUsage {
+  total_calls: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_tokens: number;
+  calls_per_minute: number;
+  last_call_time: string | null;
+  session_start: string;
+  session_duration_minutes: number;
+  models: Record<string, {
+    calls: number;
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+  }>;
+}
+
 interface ChatActivity {
   total_sessions: number;
   total_messages: number;
@@ -63,6 +80,7 @@ interface ChatActivity {
     updated_at: number;
   }>;
   time_window_hours: number;
+  llm_usage?: LLMUsage;
 }
 
 interface KnowledgeActivity {
@@ -115,10 +133,26 @@ export default function MonitorPage() {
   const t = (key: string) => getTranslation((uiSettings?.language || "en") as Language, key);
 
   const [overview, setOverview] = useState<MonitorOverview | null>(null);
+  const [llmUsage, setLlmUsage] = useState<LLMUsage | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+
+  // Fetch LLM usage data
+  const fetchLlmUsage = async () => {
+    try {
+      const response = await fetch(apiUrl("/api/v1/monitor/llm"));
+      if (!response.ok) return;
+
+      const result = await response.json();
+      if (result.success && result.data) {
+        setLlmUsage(result.data);
+      }
+    } catch (err) {
+      console.warn("Failed to fetch LLM usage:", err);
+    }
+  };
 
   // Fetch overview data
   const fetchOverview = async () => {
@@ -126,10 +160,14 @@ export default function MonitorPage() {
       setRefreshing(true);
       setError("");
 
-      const response = await fetch(apiUrl("/api/v1/monitor/overview"));
-      if (!response.ok) throw new Error("Failed to fetch monitoring data");
+      const [overviewRes] = await Promise.all([
+        fetch(apiUrl("/api/v1/monitor/overview")),
+        fetchLlmUsage(),
+      ]);
+      
+      if (!overviewRes.ok) throw new Error("Failed to fetch monitoring data");
 
-      const result = await response.json();
+      const result = await overviewRes.json();
       if (result.success && result.data) {
         setOverview(result.data);
       }
@@ -398,7 +436,7 @@ export default function MonitorPage() {
         </div>
 
         {/* Activity Cards */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           {/* Chat Activity */}
           <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-6">
             <div className="flex items-center gap-2 mb-4">
@@ -408,7 +446,7 @@ export default function MonitorPage() {
               </h3>
             </div>
 
-            <div className="grid grid-cols-3 gap-4 mb-6">
+            <div className="grid grid-cols-3 gap-4">
               <div className="text-center">
                 <div className="text-2xl font-bold text-slate-900 dark:text-slate-100">
                   {chat.total_sessions}
@@ -428,33 +466,78 @@ export default function MonitorPage() {
                 <div className="text-xs text-slate-500 dark:text-slate-400">Messages</div>
               </div>
             </div>
+          </div>
 
-            <div className="space-y-2 max-h-64 overflow-y-auto">
-              {chat.recent_sessions.length > 0 ? (
-                chat.recent_sessions.map((session) => (
-                  <div
-                    key={session.session_id}
-                    className="p-3 rounded-lg bg-slate-50 dark:bg-slate-700/50"
-                  >
-                    <div className="flex items-start justify-between">
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium text-slate-900 dark:text-slate-100 truncate">
-                          {session.title}
-                        </p>
-                        <p className="text-xs text-slate-500 dark:text-slate-400">
-                          {session.message_count} messages •{" "}
-                          {new Date(session.updated_at * 1000).toLocaleString()}
-                        </p>
-                      </div>
+          {/* LLM Usage - Independent Card */}
+          <div className="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 p-6">
+            <div className="flex items-center gap-2 mb-4">
+              <Cpu className="w-5 h-5 text-indigo-500" />
+              <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
+                LLM Usage
+              </h3>
+            </div>
+
+            {llmUsage ? (
+              <>
+                <div className="grid grid-cols-2 gap-4 mb-4">
+                  <div className="text-center p-3 bg-indigo-50 dark:bg-indigo-900/20 rounded-lg">
+                    <div className="text-2xl font-bold text-indigo-600 dark:text-indigo-400">
+                      {llmUsage.total_calls}
+                    </div>
+                    <div className="text-xs text-slate-600 dark:text-slate-400">Total Calls</div>
+                  </div>
+                  <div className="text-center p-3 bg-purple-50 dark:bg-purple-900/20 rounded-lg">
+                    <div className="text-2xl font-bold text-purple-600 dark:text-purple-400">
+                      {llmUsage.total_tokens.toLocaleString()}
+                    </div>
+                    <div className="text-xs text-slate-600 dark:text-slate-400">Total Tokens</div>
+                  </div>
+                </div>
+                
+                <div className="grid grid-cols-2 gap-3 mb-4">
+                  <div className="text-center p-2 bg-slate-50 dark:bg-slate-700/50 rounded">
+                    <div className="text-lg font-semibold text-green-600 dark:text-green-400">
+                      {llmUsage.total_input_tokens.toLocaleString()}
+                    </div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400">Input</div>
+                  </div>
+                  <div className="text-center p-2 bg-slate-50 dark:bg-slate-700/50 rounded">
+                    <div className="text-lg font-semibold text-blue-600 dark:text-blue-400">
+                      {llmUsage.total_output_tokens.toLocaleString()}
+                    </div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400">Output</div>
+                  </div>
+                </div>
+
+                {/* Session info */}
+                <div className="text-xs text-slate-500 dark:text-slate-400 space-y-1 pt-3 border-t border-slate-200 dark:border-slate-700">
+                  <p>Calls/min: {llmUsage.calls_per_minute}</p>
+                  <p>Duration: {llmUsage.session_duration_minutes} min</p>
+                </div>
+
+                {/* Models Used */}
+                {Object.keys(llmUsage.models).length > 0 && (
+                  <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-700">
+                    <div className="text-xs text-slate-600 dark:text-slate-400 mb-2">Models:</div>
+                    <div className="flex flex-wrap gap-1">
+                      {Object.entries(llmUsage.models).map(([model, stats]) => (
+                        <span
+                          key={model}
+                          className="text-xs px-2 py-1 bg-slate-100 dark:bg-slate-700 rounded"
+                          title={`${stats.total_tokens.toLocaleString()} tokens`}
+                        >
+                          {model.split('/').pop()}: {stats.calls}
+                        </span>
+                      ))}
                     </div>
                   </div>
-                ))
-              ) : (
-                <p className="text-sm text-slate-500 dark:text-slate-400 text-center py-4">
-                  No recent sessions
-                </p>
-              )}
-            </div>
+                )}
+              </>
+            ) : (
+              <p className="text-sm text-slate-500 dark:text-slate-400 text-center py-4">
+                No LLM usage data yet
+              </p>
+            )}
           </div>
 
           {/* Knowledge Activity */}

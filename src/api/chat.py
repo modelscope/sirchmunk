@@ -20,6 +20,7 @@ from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME
 from api.components.history_storage import HistoryStorage
 from api.components.settings_storage import SettingsStorage
+from api.components.monitor_tracker import llm_usage_tracker
 
 
 # Try to import tkinter for file dialogs
@@ -514,11 +515,19 @@ async def _chat_only(
         ]
         
         # Generate response with streaming
-        response = await llm.achat(messages=messages, stream=True)
+        llm_response = await llm.achat(messages=messages, stream=True)
+        
+        # Record LLM usage for monitoring (always record call, even if usage is empty)
+        # Some LLM APIs don't return usage in streaming mode
+        usage_data = llm_response.usage if llm_response.usage else {}
+        llm_usage_tracker.record_usage(
+            model=llm_response.model or envs["model_name"],
+            usage=usage_data
+        )
         
         sources = {}
         
-        return response, sources
+        return llm_response.content, sources
     
     except Exception as e:
         # Send error message to frontend
@@ -666,10 +675,18 @@ async def _chat_web_search(
         {"role": "user", "content": f"{message}\n\nWeb search context:\n{web_context}"}
     ]
     
-    response = await llm.achat(messages=messages, stream=True)
+    llm_response = await llm.achat(messages=messages, stream=True)
+    
+    # Record LLM usage for monitoring (always record call, even if usage is empty)
+    usage_data = llm_response.usage if llm_response.usage else {}
+    llm_usage_tracker.record_usage(
+        model=llm_response.model or envs["model_name"],
+        usage=usage_data
+    )
+    
     sources = {"web": web_results["sources"]}
     
-    return response, sources
+    return llm_response.content, sources
 
 
 async def _chat_rag_web_search(
