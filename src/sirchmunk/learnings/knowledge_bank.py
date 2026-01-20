@@ -20,6 +20,7 @@ from sirchmunk.schema.knowledge import (
 )
 from sirchmunk.schema.metadata import FileInfo
 from sirchmunk.schema.request import Request
+from sirchmunk.utils.constants import DEFAULT_WORK_PATH
 from sirchmunk.utils.file_utils import StorageStructure, fast_extract
 from sirchmunk.utils import create_logger, LogCallback
 from sirchmunk.utils.utils import extract_fields
@@ -50,7 +51,7 @@ class KnowledgeBank:
         self.llm = llm
         self.metadata_map = metadata_map
         self.work_path: Path = (
-            Path.cwd() if work_path is None else Path(work_path).resolve()
+            DEFAULT_WORK_PATH if work_path is None else Path(work_path).resolve()
         )
         self.metadata_path: Path = (
             self.work_path / StorageStructure.CACHE_DIR / StorageStructure.METADATA_DIR

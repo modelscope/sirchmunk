@@ -20,8 +20,12 @@ from sirchmunk.utils.constants import (
 
 router = APIRouter(prefix="/api/v1/settings", tags=["settings"])
 
-# Initialize settings storage
-settings_storage = SettingsStorage()
+# Initialize settings storage (with error handling)
+try:
+    settings_storage = SettingsStorage()
+except Exception as e:
+    print(f"[ERROR] Failed to initialize SettingsStorage: {e}")
+    settings_storage = None
 
 # === Request/Response Models ===
 
@@ -76,8 +80,8 @@ def get_current_env_variables() -> Dict[str, Any]:
             "default": "***" if LLM_API_KEY else "",
             "description": "API key for LLM service",
             "category": "llm",
-            "sensitive": True
-        },
+                "sensitive": True
+            },
         "LLM_MODEL_NAME": {
             "value": saved_llm_model or LLM_MODEL_NAME,
             "default": LLM_MODEL_NAME,
@@ -97,47 +101,66 @@ def get_current_env_variables() -> Dict[str, Any]:
 @router.get("")
 async def get_all_settings():
     """Get all settings including UI and environment variables"""
+    if settings_storage is None:
+        raise HTTPException(status_code=503, detail="Settings storage not available")
+    
     try:
         ui_settings = get_default_ui_settings()
         env_variables = get_current_env_variables()
-        
+    
         return {
             "success": True,
             "data": {
-                "ui": ui_settings,
-                "environment": env_variables
+                    "ui": ui_settings,
+                    "environment": env_variables
+                }
             }
-        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/ui")
 async def get_ui_settings():
     """Get UI settings"""
+    if settings_storage is None:
+        # Return default settings if storage not available
+        return {
+            "success": True,
+            "data": {
+                    "theme": "light",
+                    "language": "en"
+                }
+            }
+    
     try:
         ui_settings = get_default_ui_settings()
         return {
             "success": True,
-            "data": ui_settings
-        }
+                "data": ui_settings
+            }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/environment")
 async def get_environment_variables():
     """Get environment variables"""
+    if settings_storage is None:
+        raise HTTPException(status_code=503, detail="Settings storage not available")
+    
     try:
         env_variables = get_current_env_variables()
         return {
             "success": True,
-            "data": env_variables
-        }
+                "data": env_variables
+            }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("")
 async def save_settings(request: SaveSettingsRequest):
     """Save settings (UI and/or environment variables)"""
+    if settings_storage is None:
+        raise HTTPException(status_code=503, detail="Settings storage not available")
+    
     try:
         saved_items = []
         
@@ -163,18 +186,21 @@ async def save_settings(request: SaveSettingsRequest):
                         category="llm" if "LLM" in key else "system"
                     )
                     saved_items.append(key)
-        
+    
         return {
             "success": True,
-            "message": f"Settings saved successfully: {', '.join(saved_items)}",
-            "saved_items": saved_items
-        }
+                "message": f"Settings saved successfully: {', '.join(saved_items)}",
+                "saved_items": saved_items
+            }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {str(e)}")
 
 @router.post("/ui")
 async def update_ui_settings(ui: UISettings):
     """Update UI settings"""
+    if settings_storage is None:
+        raise HTTPException(status_code=503, detail="Settings storage not available")
+    
     try:
         settings_storage.save_setting("ui.theme", ui.theme, "ui")
         settings_storage.save_setting("ui.language", ui.language, "ui")
@@ -203,34 +229,34 @@ async def test_llm_connection():
         if not api_key:
             return {
                 "success": False,
-                "status": "error",
-                "message": "LLM API key is not configured",
-                "model": None
-            }
+                    "status": "error",
+                    "message": "LLM API key is not configured",
+                    "model": None
+                }
         
         if not base_url:
             return {
-                "success": False,
-                "status": "error",
-                "message": "LLM base URL is not configured",
-                "model": None
-            }
+                        "success": False,
+                        "status": "error",
+                        "message": "LLM base URL is not configured",
+                        "model": None
+                    }
         
         # TODO: Implement actual connection test
         # For now, just return configured status
         return {
             "success": True,
-            "status": "configured",
-            "message": "LLM is configured (connection test not implemented)",
-            "model": model,
-            "base_url": base_url
-        }
+                "status": "configured",
+                "message": "LLM is configured (connection test not implemented)",
+                "model": model,
+                "base_url": base_url
+            }
     except Exception as e:
         return {
-            "success": False,
-            "status": "error",
-            "message": str(e),
-            "model": None
+                "success": False,
+                "status": "error",
+                "message": str(e),
+                "model": None
         }
 
 @router.get("/status")
@@ -245,20 +271,20 @@ async def get_settings_status():
         llm_model = settings_storage.get_env_variable("LLM_MODEL_NAME") or LLM_MODEL_NAME
         
         llm_configured = bool(llm_api_key and llm_base_url and llm_model)
-        
+    
         return {
             "success": True,
             "data": {
-                "ui": {
-                    "theme": ui_settings.get("theme", "light"),
-                    "language": ui_settings.get("language", "en")
-                },
-                "llm": {
-                    "configured": llm_configured,
-                    "model": llm_model if llm_configured else None,
-                    "status": "ready" if llm_configured else "not_configured"
+                    "ui": {
+                        "theme": ui_settings.get("theme", "light"),
+                        "language": ui_settings.get("language", "en")
+                    },
+                    "llm": {
+                        "configured": llm_configured,
+                        "model": llm_model if llm_configured else None,
+                        "status": "ready" if llm_configured else "not_configured"
+                    }
                 }
             }
-        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
