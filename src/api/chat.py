@@ -392,7 +392,7 @@ def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[
                 ("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.svg *.webp"),
                 ("Python Files", "*.py *.pyw"),
                 ("Web Files", "*.html *.htm *.css *.js"),
-                ("Archives", "*.zip *.tar *.gz *.rar *.7z")
+                ("Archives", "*.zip *.tar *.gz *.rar *.7z"),
             ]
 
             if multiple:
@@ -401,7 +401,7 @@ def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[
             else:
                 res = filedialog.askopenfilename(filetypes=filetypes, **kwargs)
                 selected_paths = [res] if res else []
-            
+
         elif dialog_type == "directory":
             kwargs["title"] = "Select Directory"
             res = filedialog.askdirectory(**kwargs)
@@ -409,7 +409,7 @@ def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[
 
         root.attributes("-topmost", False)
         root.update()
-            
+
     except Exception as e:
         print(f"Dialog Error: {e}")
         selected_paths = []
@@ -554,13 +554,6 @@ async def _chat_rag(
         # Create log callback for streaming search logs
         search_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
 
-        # Send RAG start signal
-        await manager.send_personal_message(json.dumps({
-            "type": "status",
-            "stage": "rag",
-            "message": f"🔍 Searching knowledge base: {kb_name}"
-        }), websocket)
-
         # Create search instance with log callback
         search_engine = get_search_instance(log_callback=search_log_callback)
         
@@ -701,12 +694,6 @@ async def _chat_rag_web_search(
     # Step 1: Perform RAG search
     try:
         search_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
-
-        await manager.send_personal_message(json.dumps({
-            "type": "status",
-            "stage": "rag",
-            "message": f"🔍 Step 1/2: Searching knowledge base: {kb_name}"
-        }), websocket)
 
         search_engine = get_search_instance(log_callback=search_log_callback)
         search_paths = [path.strip() for path in kb_name.split(",")]
@@ -932,116 +919,6 @@ async def chat_websocket(websocket: WebSocket):
             pass
         manager.disconnect(websocket)
 
-# REST API endpoints for search functionality
-# @router.post("/search")
-# async def search_files(request: SearchRequest):
-#     """Search files using Sirchmunk search engine"""
-#     try:
-#         # Create log callback using LogCallbackManager
-#         rest_log_callback = await LogCallbackManager.create_rest_log_callback()
-#
-#         # Get search instance with log callback
-#         search_engine = get_search_instance(log_callback=rest_log_callback)
-#
-#         # Convert search_paths to appropriate format
-#         if isinstance(request.search_paths, str):
-#             search_paths = request.search_paths
-#         else:
-#             search_paths = request.search_paths
-#
-#         # Perform search
-#         result = await search_engine.search(
-#             query=request.query,
-#             search_paths=search_paths,
-#             max_depth=request.max_depth,
-#             top_k_files=request.top_k_files
-#         )
-#
-#         return {
-#             "success": True,
-#             "data": {
-#                 "query": request.query,
-#                 "search_paths": request.search_paths,
-#                 "result": result
-#             }
-#         }
-#
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
-#
-# @router.websocket("/search/ws")
-# async def search_websocket(websocket: WebSocket):
-#     """WebSocket endpoint for real-time search with streaming logs"""
-#     await websocket.accept()
-#
-#     try:
-#         while True:
-#             # Receive search request from client
-#             data = await websocket.receive_text()
-#             request_data = json.loads(data)
-#
-#             query = request_data.get("query", "")
-#             search_paths = request_data.get("search_paths", [])
-#             max_depth = request_data.get("max_depth", 5)
-#             top_k_files = request_data.get("top_k_files", 3)
-#
-#             if not query or not search_paths:
-#                 await websocket.send_text(json.dumps({
-#                     "type": "error",
-#                     "message": "Query and search_paths are required"
-#                 }))
-#                 continue
-#
-#             # Create log callback for streaming
-#             log_callback = await LogCallbackManager.create_websocket_log_callback(websocket)
-#
-#             try:
-#                 # Create search instance with log callback
-#                 search_engine = get_search_instance(log_callback=log_callback)
-#
-#                 # Send start signal
-#                 await websocket.send_text(json.dumps({
-#                     "type": "start",
-#                     "query": query,
-#                     "search_paths": search_paths
-#                 }))
-#
-#                 # Perform search with streaming logs
-#                 result = await search_engine.search(
-#                     query=query,
-#                     search_paths=search_paths,
-#                     max_depth=max_depth,
-#                     top_k_files=top_k_files,
-#                     verbose=True
-#                 )
-#
-#                 # Send final result
-#                 await websocket.send_text(json.dumps({
-#                     "type": "result",
-#                     "success": True,
-#                     "data": {
-#                         "query": query,
-#                         "search_paths": search_paths,
-#                         "result": result
-#                     }
-#                 }))
-#
-#             except Exception as e:
-#                 await websocket.send_text(json.dumps({
-#                     "type": "error",
-#                     "message": f"Search failed: {str(e)}"
-#                 }))
-#
-#     except WebSocketDisconnect:
-#         pass
-#     except Exception as e:
-#         try:
-#             await websocket.send_text(json.dumps({
-#                 "type": "error",
-#                 "message": f"WebSocket error: {str(e)}"
-#             }))
-#         except:
-#             pass
 
 # File picker endpoints
 @router.post("/file-picker")

@@ -160,10 +160,10 @@ export default function SettingsPage() {
               <SettingsIcon className="w-6 h-6 text-blue-500 dark:text-blue-400" />
           <div>
             <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">
-                  {t("System Settings")}
+                  {t("Preferences")}
             </h1>
                 <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
-                  {t("Manage system configuration and preferences")}
+                  {t("Manage interface and environment preferences")}
                 </p>
           </div>
             </div>
@@ -363,7 +363,7 @@ export default function SettingsPage() {
                   {t("Environment Variables")}
                     </h3>
                 <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
-                  {t("Configure system and LLM environment variables")}
+                  {t("Configure LLM environment variables")}
                       </p>
                     </div>
 
