@@ -25,9 +25,9 @@ from sirchmunk.utils.file_utils import StorageStructure, fast_extract
 from sirchmunk.utils import create_logger, LogCallback
 from sirchmunk.utils.utils import extract_fields
 
-class KnowledgeBank:
+class KnowledgeBase:
     """
-    A knowledge bank that manages knowledge clusters built from retrieved information and metadata dynamically.
+    A knowledge base that manages knowledge clusters built from retrieved information and metadata dynamically.
     """
 
     def __init__(
@@ -38,7 +38,7 @@ class KnowledgeBank:
         log_callback: LogCallback = None,
     ):
         """
-        Initialize the KnowledgeBank with an LLM and metadata mapping.
+        Initialize the KnowledgeBase with an LLM and metadata mapping.
 
         Args:
             llm (OpenAIChat): An instance of the OpenAIChat LLM for processing text.

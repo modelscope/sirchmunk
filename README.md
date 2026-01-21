@@ -2,7 +2,7 @@
 
 <img src="web/public/logo-v2.png" alt="Sirchmunk Logo" width="250" style="border-radius: 15px;">
 
-# Sirchmunk: From raw data to self-evolving real-time intelligence
+# Sirchmunk: Raw data to self-evolving intelligence, real-time. 
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
@@ -15,9 +15,6 @@
 [![Ollama](https://img.shields.io/badge/Ollama-Local_LLM-000000?style=flat-square&logo=ollama&logoColor=white)](https://ollama.com/)
 [![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square)](https://github.com/kreuzberg-dev/kreuzberg)
 
-<p align="center">
-  <b>Search, reason, and evolve knowledge in real time.</b>
-</p>
 
 [**Quick Start**](#-quick-start) · [**Architecture**](#-architecture) · [**Core Modules**](#-core-modules) · [**API Reference**](#-api-reference) · [**FAQ**](#-faq)
 
@@ -34,16 +31,9 @@
 
 ---
 
-## 🌰 What “Sirchmunk” Means
+## 🌰 Why “Sirchmunk”？
 
-**Sirchmunk** blends **Search** + **Chipmunk**: fast, adaptive, and always digging for relevant signals in large, messy data.
-
-The **chipmunk** stands for:
-
-- **Swift Action**: no vector database and no heavy indexing; just fast, direct retrieval  
-- **Not Picky**: handles complex, multi-format documents (PDF, code, markdown, logs)  
-- **Lightweight Design**: minimal dependencies, easy deployment  
-- **Adaptive Habitat**: self-evolving knowledge that grows with usage  
+Intelligence pipelines built upon vector-based retrieval can be _rigid and brittle_. They rely on static vector embeddings that are **expensive to compute, blind to real-time changes, and detached from the raw context**. We introduce **Sirchmunk** to usher in a more agile paradigm, where data is no longer treated as a snapshot, and insights can evolve together with the data.
 
 ---
 
@@ -71,7 +61,7 @@ The **chipmunk** stands for:
 
 ### ⚡ Indexless Real-Time Retrieval
 
-- **No Pre-indexing Required**: Direct `grep`-based retrieval on raw files
+- **No Pre-indexing Required**: Direct retrieval on raw files
 - **Multi-Format Support**: PDF, DOCX, TXT, Markdown, code files, and more
 - **Blazing Fast**: Parallel file scanning with configurable concurrency
 
@@ -79,15 +69,15 @@ The **chipmunk** stands for:
 
 - **WebSocket Streaming**: Real-time response streaming with search log visualization
 - **RAG Integration**: Seamless knowledge base augmented generation
-- **Session Management**: Persistent chat history with DuckDB storage
-- **LLM Usage Tracking**: Real-time token consumption monitoring
+- **Session Management**: Persistent history storage with DuckDB
+- **Token Usage Tracking**: Real-time token consumption monitoring
 
 ### 📊 Comprehensive Monitoring Dashboard
 
 - **System Metrics**: CPU, memory, disk usage tracking
 - **Chat Analytics**: Session statistics and activity monitoring
 - **Knowledge Analytics**: BI-style visualization for knowledge clusters
-- **LLM Usage Statistics**: Token consumption tracking by model
+- **Token Usage Statistics**: Token consumption tracking by model
 
 ---
 
@@ -102,9 +92,9 @@ The **chipmunk** stands for:
 | Component | Description |
 |:---|:---|
 | **AgenticSearch** | Main search orchestrator with LLM-powered keyword extraction and retrieval |
-| **KnowledgeBank** | Transforms raw results into structured knowledge clusters with evidence sampling |
-| **KnowledgeManager** | Persistent storage layer using DuckDB and Parquet format |
-| **GrepRetriever** | High-performance indexless file search with parallel processing |
+| **KnowledgeBase** | Transforms raw results into structured knowledge clusters with evidence sampling |
+| **KnowledgeManager** | Persistent storage layer, by default in Parquet format and stored in DuckDB |
+| **GrepRetriever** | High-performance _indexless_ file search with parallel processing |
 | **OpenAIChat** | Unified LLM interface supporting streaming and usage tracking |
 | **MonitorTracker** | Real-time system and application metrics collection |
 
@@ -236,7 +226,7 @@ asyncio.run(main())
 ---
 
 <details>
-<summary><b>🧠 KnowledgeBank</b></summary>
+<summary><b>🧠 KnowledgeBase</b></summary>
 
 > **Evidence processor** that transforms raw search results into structured knowledge clusters using Monte Carlo sampling and LLM evaluation.
 
@@ -539,18 +529,11 @@ This project is licensed under the [Apache License 2.0](LICENSE).
 
 ---
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/sirchmunk&type=Date)](https://star-history.com/#modelscope/sirchmunk&Date)
-
-
----
-
 <div align="center">
 
 **[ModelScope](https://github.com/modelscope)** · [⭐ Star us](https://github.com/modelscope/sirchmunk/stargazers) · [🐛 Report a bug](https://github.com/modelscope/sirchmunk/issues) · [💬 Discussions](https://github.com/modelscope/sirchmunk/discussions)
 
-*✨ Sirchmunk: From raw data to self-evolving real-time intelligence.*
+*✨ Sirchmunk: Raw data to self-evolving intelligence, real-time.*
 
 </div>
 
