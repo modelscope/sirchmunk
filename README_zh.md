@@ -551,6 +551,13 @@ pytest tests/
 
 ---
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/sirchmunk&type=Date)](https://star-history.com/#modelscope/sirchmunk&Date)
+
+
+---
+
 <div align="center">
 
 **[ModelScope](https://github.com/modelscope)** · [⭐ Star 我们](https://github.com/modelscope/sirchmunk/stargazers) · [🐛 报告问题](https://github.com/modelscope/sirchmunk/issues) · [💬 讨论](https://github.com/modelscope/sirchmunk/discussions)
@@ -558,15 +565,6 @@ pytest tests/
 *✨ Sirchmunk：从原始数据到自进化的实时智能。*
 
 </div>
-
----
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/sirchmunk&type=Date)](https://star-history.com/#modelscope/sirchmunk&Date)
-
-
----
 
 <p align="center">
   <em> ❤️ Thanks for Visiting ✨ Sirchmunk !</em><br><br>

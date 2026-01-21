@@ -551,6 +551,13 @@ This project is licensed under the [Apache License 2.0](LICENSE).
 
 ---
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/sirchmunk&type=Date)](https://star-history.com/#modelscope/sirchmunk&Date)
+
+
+---
+
 <div align="center">
 
 **[ModelScope](https://github.com/modelscope)** · [⭐ Star us](https://github.com/modelscope/sirchmunk/stargazers) · [🐛 Report a bug](https://github.com/modelscope/sirchmunk/issues) · [💬 Discussions](https://github.com/modelscope/sirchmunk/discussions)
@@ -558,15 +565,6 @@ This project is licensed under the [Apache License 2.0](LICENSE).
 *✨ Sirchmunk: From raw data to self-evolving real-time intelligence.*
 
 </div>
-
----
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/sirchmunk&type=Date)](https://star-history.com/#modelscope/sirchmunk&Date)
-
-
----
 
 <p align="center">
   <em> ❤️ Thanks for Visiting ✨ Sirchmunk !</em><br><br>
