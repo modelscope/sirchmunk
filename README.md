@@ -53,7 +53,8 @@ Data is a stream, not a snapshot.  **Sirchmunk** is **dynamic by design**, while
 * **LLM-Powered Autonomy:** Designed for Agents that perceive data as it lives, utilizing **token-efficient** reasoning that triggers LLM inference only when necessary to maximize intelligence while minimizing cost.
 
 ### 3. Intelligence at Scale: Real-Time & Massive
-**Sirchmunk** bridges massive local repositories and the web with **high-scale throughput** and **real-time awareness**. 
+
+**Sirchmunk** bridges massive local repositories and the web with **high-scale throughput** and **real-time awareness**. <br/>
 It serves as a unified intelligent hub for AI agents, delivering deep insights across vast datasets at the speed of thought.
 
 ---
