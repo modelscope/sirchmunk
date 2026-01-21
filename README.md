@@ -40,22 +40,22 @@ Intelligence pipelines built upon vector-based retrieval can be _rigid and britt
 
 ### 1. Embedding-Free: Data in its Purest Form
 
-&emsp;&emsp;&emsp;&emsp;**Sirchmunk** works directly with **raw data** -- bypassing the heavy overhead of squeezing your rich files into fixed-dimensional vectors.
+**Sirchmunk** works directly with **raw data** -- bypassing the heavy overhead of squeezing your rich files into fixed-dimensional vectors.
 
 * **Instant Search:** Eliminating complex pre-processing pipelines in hours long indexing; just drop your files and search immediately.
 * **Full Fidelity:** Zero information loss —- stay true to your data without vector approximation.
 
 ### 2. Self-Evolving: A Living Index
 
-&emsp;&emsp;&emsp;&emsp;Data is a stream, not a snapshot.  **Sirchmunk** is **dynamic by design**, while vector DB can become obsolete the moment your data changes.
+Data is a stream, not a snapshot.  **Sirchmunk** is **dynamic by design**, while vector DB can become obsolete the moment your data changes.
 
 * **Context-Aware:** Evolves in real-time with your data context.
 * **LLM-Powered Autonomy:** Designed for Agents that perceive data as it lives, utilizing **token-efficient** reasoning that triggers LLM inference only when necessary to maximize intelligence while minimizing cost.
 
 ### 3. Intelligence at Scale: Real-Time & Massive
 
-&emsp;&emsp;&emsp;&emsp;**Sirchmunk** bridges massive local repositories and the web with **high-scale throughput** and **real-time awareness**. <br/>
-&emsp;&emsp;&emsp;&emsp;It serves as a unified intelligent hub for AI agents, delivering deep insights across vast datasets at the speed of thought.
+**Sirchmunk** bridges massive local repositories and the web with **high-scale throughput** and **real-time awareness**. <br/>
+It serves as a unified intelligent hub for AI agents, delivering deep insights across vast datasets at the speed of thought.
 
 ---
 
