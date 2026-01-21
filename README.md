@@ -39,131 +39,96 @@ Intelligence pipelines built upon vector-based retrieval can be _rigid and britt
 
 ## ✨ Key Features
 
-### 🔍 Agentic Search with Multi-Level Keyword Extraction
+### 1. Embedding-Free: Data in its Purest Form
 
-- **Intelligent Query Understanding**: LLM-powered keyword extraction with configurable granularity levels (coarse → fine)
-- **Priority-Hit Retrieval**: Sequential search across keyword levels, stopping at first successful match for optimal efficiency
-- **TF-IDF Scoring**: Advanced document ranking with customizable weighting algorithms
+Traditional RAG (Retrieval-Augmented Generation) forces nuanced files into fixed-dimensional vectors. **Sirchmunk** retrieves directly from **raw data**.
 
-### 🧠 Self-Evolving Knowledge Clusters
+* **Instant Search:** No complex pre-processing pipelines or multi-hour indexing; drop files and search immediately.
+* **Full Fidelity:** Zero information loss—no vector approximation, just raw precision.
 
-- **Automatic Knowledge Structuring**: Raw search results transformed into structured `KnowledgeCluster` objects
-- **Evidence-Based Learning**: Monte Carlo sampling for relevant region identification with LLM evaluation
-- **Lifecycle Management**: Track knowledge states (`STABLE`, `EMERGING`, `CONTESTED`, `DEPRECATED`)
-- **Persistent Storage**: DuckDB + Parquet for efficient knowledge persistence and retrieval
-- **Dynamic Knowledge Generation**: New clusters are built and updated continuously as search patterns evolve
+### 2. Self-Evolving: A Living Index
 
-### 📚 Large-Scale Document Understanding
+Data is a stream, not a snapshot. While vector databases become stale the moment data changes, **Sirchmunk** is **dynamic by design**.
 
-- **High-Volume Coverage**: Handle large repositories without pre-indexing
-- **Granular Evidence Tracing**: Extracts and scores precise spans from massive documents
-- **Fast Multi-Level Recall**: Coarse-to-fine keyword tiers improve hit rate on long or noisy corpora
+* **Context-Aware:** The index evolves in real-time as your files grow and change.
+* **LLM-Powered Autonomy:** Designed for Agents that perceive data as it lives, utilizing **token-efficient** reasoning that triggers LLM inference only when necessary to maximize intelligence while minimizing cost.
 
-### ⚡ Indexless Real-Time Retrieval
+### 3. Intelligence at Scale: Real-Time & Massive
 
-- **No Pre-indexing Required**: Direct retrieval on raw files
-- **Multi-Format Support**: PDF, DOCX, TXT, Markdown, code files, and more
-- **Blazing Fast**: Parallel file scanning with configurable concurrency
-
-### 💬 Interactive Chat Interface
-
-- **WebSocket Streaming**: Real-time response streaming with search log visualization
-- **RAG Integration**: Seamless knowledge base augmented generation
-- **Session Management**: Persistent history storage with DuckDB
-- **Token Usage Tracking**: Real-time token consumption monitoring
-
-### 📊 Comprehensive Monitoring Dashboard
-
-- **System Metrics**: CPU, memory, disk usage tracking
-- **Chat Analytics**: Session statistics and activity monitoring
-- **Knowledge Analytics**: BI-style visualization for knowledge clusters
-- **Token Usage Statistics**: Token consumption tracking by model
+**Sirchmunk** bridges massive local repositories and the web with **Large-Scale** throughput and **Real-Time** perception. </br>
+It provides a unified, intelligent pulse for AI Agents, delivering deep insights across vast datasets with the speed of thought.
 
 ---
 
-## 🏗️ Architecture
+### How it compares
 
-<div align="center">
-  <img src="assets/pic/Sirchmunk_Architecture.png" alt="Sirchmunk Architecture" width="80%">
-</div>
-
-### Core Components
-
-| Component | Description |
-|:---|:---|
-| **AgenticSearch** | Main search orchestrator with LLM-powered keyword extraction and retrieval |
-| **KnowledgeBase** | Transforms raw results into structured knowledge clusters with evidence sampling |
-| **KnowledgeManager** | Persistent storage layer, by default in Parquet format and stored in DuckDB |
-| **GrepRetriever** | High-performance _indexless_ file search with parallel processing |
-| **OpenAIChat** | Unified LLM interface supporting streaming and usage tracking |
-| **MonitorTracker** | Real-time system and application metrics collection |
+| Feature | RAG (Chunking+VectorDB)                       | **Sirchmunk** |
+| --- |------------------------------| --- |
+| **Setup Cost** | High (Models + Infra)        | **Zero (Direct Retrieval)** |
+| **Data Freshness** | Stale (Requires re-indexing) | **Instant (Self-evolving)** |
+| **Scalability** | Costly/Complex at Scale      | **Native Large-Scale Support** |
+| **Accuracy** | Approximate (Probabilistic)  | **Exact & Contextual** |
+| **Workflow** | Complex ETL Pipelines        | **Drop-and-Search** |
 
 ---
+
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 
 - **Python** 3.10+
-- **Node.js** 18+ (for web interface)
-- **LLM API Key** (OpenAI-compatible endpoint)
+- **LLM API Key** (OpenAI-compatible endpoint, or Ollama for local models)
+- **Node.js** 18+ (Optional, for web interface)
 
-### Step 1: Clone & Configure
-
-```bash
-# Clone the repository
-git clone https://github.com/modelscope/sirchmunk.git
-cd sirchmunk
-
-# Create environment file
-cp .env.example .env
-# Edit .env with your LLM API credentials
-```
-
-<details>
-<summary>📋 <b>Environment Variables Reference</b></summary>
-
-| Variable | Required | Description |
-|:---|:---:|:---|
-| `LLM_BASE_URL` | **Yes** | LLM API endpoint (e.g., `https://api.openai.com/v1`) |
-| `LLM_API_KEY` | **Yes** | Your LLM API key |
-| `LLM_MODEL_NAME` | **Yes** | Model name (e.g., `gpt-4o`, `gpt-4o-mini`) |
-| `WORK_PATH` | No | Working directory for data storage (default: current directory) |
-| `GREP_CONCURRENT_LIMIT` | No | Parallel grep workers (default: `10`) |
-
-</details>
-
-### Step 2: Install Dependencies
+### Installation
 
 ```bash
 # Create virtual environment (recommended)
-conda create -n sirchmunk python=3.10 && conda activate sirchmunk
-# Or: python -m venv venv && source venv/bin/activate
+conda create -n sirchmunk python=3.13 -y && conda activate sirchmunk 
 
-# Install Python dependencies
-pip install -r requirements.txt
+pip install sirchmunk
 
-# Install web dependencies
-npm install --prefix web
+# Or via UV:
+uv pip install sirchmunk
+
+# Alternatively, install from source:
+git clone https://github.com/modelscope/sirchmunk.git && cd sirchmunk
+pip install -e .
 ```
 
-### Step 3: Launch
+### Python SDK Usage
 
-```bash
-# Start both backend and frontend
-python scripts/start_web.py
+```python
+import asyncio
 
-# Or start separately:
-# Backend: python src/api/run_server.py
-# Frontend: cd web && npm run dev
+from sirchmunk import AgenticSearch
+from sirchmunk.llm import OpenAIChat
+
+llm = OpenAIChat(
+        api_key="your-api-key",
+        base_url="your-base-url",   # e.g., https://api.openai.com/v1
+        model="your-model-name"     # e.g., gpt-4o
+    )
+
+async def main():
+    
+    agent_search = AgenticSearch(llm=llm)
+    
+    result: str = await agent_search.search(
+        query="How does transformer attention work?",
+        search_paths=["/path/to/documents"],
+    )
+    
+    print(result)
+
+asyncio.run(main())
 ```
 
-### Access URLs
 
-| Service | URL | Description |
-|:---:|:---|:---|
-| **Web Interface** | http://localhost:3000 | Main chat and dashboard |
-| **API Documentation** | http://localhost:8000/docs | Interactive Swagger UI |
+
+
+
 
 ---
 
@@ -183,7 +148,26 @@ The web UI is built for fast, transparent workflows: chat, knowledge analytics, 
 
 ---
 
-## 📦 Core Modules
+## 🏗️ How it Works
+
+### Architecture
+
+<div align="center">
+  <img src="assets/pic/Sirchmunk_Architecture.png" alt="Sirchmunk Architecture" width="85%">
+</div>
+
+### Core Components
+
+| Component | Description |
+|:---|:---|
+| **AgenticSearch** | Main search orchestrator with LLM-powered keyword extraction and retrieval |
+| **KnowledgeBase** | Transforms raw results into structured knowledge clusters with evidence sampling |
+| **KnowledgeManager** | Persistent storage layer, by default in Parquet format and stored in DuckDB |
+| **GrepRetriever** | High-performance _indexless_ file search with parallel processing |
+| **OpenAIChat** | Unified LLM interface supporting streaming and usage tracking |
+| **MonitorTracker** | Real-time system and application metrics collection |
+
+---
 
 <details>
 <summary><b>🔍 AgenticSearch</b></summary>
@@ -199,27 +183,7 @@ The web UI is built for fast, transparent workflows: chat, knowledge analytics, 
 | TF-IDF Scoring | Advanced document ranking with length penalty |
 | Knowledge Persistence | Auto-save search results as KnowledgeCluster objects |
 
-**Python API**
 
-```python
-import asyncio
-from sirchmunk import AgenticSearch
-
-async def main():
-    search = AgenticSearch()
-    
-    result = await search.search(
-        query="How does transformer attention work?",
-        search_paths=["/path/to/documents"],
-        keyword_levels=3,  # Coarse → Medium → Fine
-        top_k_files=5,
-        max_depth=10
-    )
-    
-    print(result)
-
-asyncio.run(main())
-```
 
 </details>
 
