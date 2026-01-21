@@ -12,7 +12,6 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
 [![ripgrep-all](https://img.shields.io/badge/ripgrep--all-Search-E67E22?style=flat-square&logo=rust&logoColor=white)](https://github.com/phiresky/ripgrep-all)
 [![OpenAI](https://img.shields.io/badge/OpenAI-API-412991?style=flat-square&logo=openai&logoColor=white)](https://github.com/openai/openai-python)
-[![Ollama](https://img.shields.io/badge/Ollama-Local_LLM-000000?style=flat-square&logo=ollama&logoColor=white)](https://ollama.com/)
 [![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square)](https://github.com/kreuzberg-dev/kreuzberg)
 
 
@@ -77,7 +76,7 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 ### Prerequisites
 
 - **Python** 3.10+
-- **LLM API Key** (OpenAI-compatible endpoint, or Ollama for local models)
+- **LLM API Key** (OpenAI-compatible endpoint, local or remote)
 - **Node.js** 18+ (Optional, for web interface)
 
 ### Installation
@@ -229,10 +228,9 @@ Sirchmunk takes an **indexless approach**:
 <details>
 <summary><b>What LLM providers are supported?</b></summary>
 
-Any OpenAI-compatible API endpoint, including:
+Any OpenAI-compatible API endpoint, including (but not limited too):
 - OpenAI (GPT-4, GPT-4o, GPT-3.5)
-- Azure OpenAI
-- Local models via Ollama, vLLM, or LM Studio
+- Local models served via Ollama, llama.cpp, vLLM, SGLang etc.
 - Claude via API proxy
 
 </details>
