@@ -2,7 +2,7 @@
 
 <img src="web/public/logo-v2.png" alt="Sirchmunk Logo" width="250" style="border-radius: 15px;">
 
-# Sirchmunk: From raw data to self-evolving real-time intelligence
+# Sirchmunk: Raw data to self-evolving intelligence, real-time. 
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
@@ -15,9 +15,6 @@
 [![Ollama](https://img.shields.io/badge/Ollama-Local_LLM-000000?style=flat-square&logo=ollama&logoColor=white)](https://ollama.com/)
 [![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square&logo=python&logoColor=white)](https://github.com/zalando/kreuzberg)
 
-<p align="center">
-  <b>Search, reason, and evolve knowledge in real time.</b>
-</p>
 
 [**Quick Start**](#-quick-start) · [**Architecture**](#-architecture) · [**Core Modules**](#-core-modules) · [**API Reference**](#-api-reference) · [**FAQ**](#-faq)
 
@@ -34,16 +31,9 @@
 
 ---
 
-## 🌰 What “Sirchmunk” Means
+## 🌰 Why “Sirchmunk”？
 
-**Sirchmunk** blends **Search** + **Chipmunk**: fast, adaptive, and always digging for relevant signals in large, messy data.
-
-The **chipmunk** stands for:
-
-- **Swift Action**: no vector database and no heavy indexing; just fast, direct retrieval  
-- **Not Picky**: handles complex, multi-format documents (PDF, code, markdown, logs)  
-- **Lightweight Design**: minimal dependencies, easy deployment  
-- **Adaptive Habitat**: self-evolving knowledge that grows with usage  
+Intelligence pipelines built upon vector-based retievals can be rigid and brittle. They rely on static vector embeddings that are **expensive to compute, blind to real-time changes, and detached from the raw context.** We introduce **Sirchmunk** to move towards a more agile paradigm, where data isn't a no longer treated as a snapshot, and insights can evalove together with the data.
 
 ---
 
@@ -536,13 +526,6 @@ pytest tests/
 ## 📄 License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
-
----
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/sirchmunk&type=Date)](https://star-history.com/#modelscope/sirchmunk&Date)
-
 
 ---
 
