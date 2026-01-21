@@ -212,15 +212,18 @@ The web UI is built for fast, transparent workflows: chat, knowledge analytics, 
 ### Installation 
 
 ```bash
-pip install "sirchmunk[web]"
+git clone https://github.com/modelscope/sirchmunk.git && cd sirchmunk
+
+pip install ".[web]"
+
+npm install --prefix web
 ```
+- Note: Node.js 18+ is required for the web interface.
 
 
 ### Running the Web UI
 
 ```bash
-git clone https://github.com/modelscope/sirchmunk.git && cd sirchmunk
-
 # Start frontend and backend
 python scripts/start_web.py 
 
