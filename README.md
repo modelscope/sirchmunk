@@ -61,7 +61,7 @@ Intelligence pipelines built upon vector-based retrieval can be _rigid and britt
 
 ### ⚡ Indexless Real-Time Retrieval
 
-- **No Pre-indexing Required**: Direct `grep`-based retrieval on raw files
+- **No Pre-indexing Required**: Direct retrieval on raw files
 - **Multi-Format Support**: PDF, DOCX, TXT, Markdown, code files, and more
 - **Blazing Fast**: Parallel file scanning with configurable concurrency
 
@@ -69,15 +69,15 @@ Intelligence pipelines built upon vector-based retrieval can be _rigid and britt
 
 - **WebSocket Streaming**: Real-time response streaming with search log visualization
 - **RAG Integration**: Seamless knowledge base augmented generation
-- **Session Management**: Persistent chat history with DuckDB storage
-- **LLM Usage Tracking**: Real-time token consumption monitoring
+- **Session Management**: Persistent history storage with DuckDB
+- **Token Usage Tracking**: Real-time token consumption monitoring
 
 ### 📊 Comprehensive Monitoring Dashboard
 
 - **System Metrics**: CPU, memory, disk usage tracking
 - **Chat Analytics**: Session statistics and activity monitoring
 - **Knowledge Analytics**: BI-style visualization for knowledge clusters
-- **LLM Usage Statistics**: Token consumption tracking by model
+- **Token Usage Statistics**: Token consumption tracking by model
 
 ---
 
@@ -93,8 +93,8 @@ Intelligence pipelines built upon vector-based retrieval can be _rigid and britt
 |:---|:---|
 | **AgenticSearch** | Main search orchestrator with LLM-powered keyword extraction and retrieval |
 | **KnowledgeBase** | Transforms raw results into structured knowledge clusters with evidence sampling |
-| **KnowledgeManager** | Persistent storage layer using DuckDB and Parquet format |
-| **GrepRetriever** | High-performance indexless file search with parallel processing |
+| **KnowledgeManager** | Persistent storage layer, by default in Parquet format and stored in DuckDB |
+| **GrepRetriever** | High-performance _indexless_ file search with parallel processing |
 | **OpenAIChat** | Unified LLM interface supporting streaming and usage tracking |
 | **MonitorTracker** | Real-time system and application metrics collection |
 
@@ -533,7 +533,7 @@ This project is licensed under the [Apache License 2.0](LICENSE).
 
 **[ModelScope](https://github.com/modelscope)** · [⭐ Star us](https://github.com/modelscope/sirchmunk/stargazers) · [🐛 Report a bug](https://github.com/modelscope/sirchmunk/issues) · [💬 Discussions](https://github.com/modelscope/sirchmunk/discussions)
 
-*✨ Sirchmunk: From raw data to self-evolving real-time intelligence.*
+*✨ Sirchmunk: Raw data to self-evolving intelligence, real-time.*
 
 </div>
 
