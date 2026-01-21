@@ -2,7 +2,7 @@
 
 <img src="web/public/logo-v2.png" alt="Sirchmunk 标志" width="250" style="border-radius: 15px;">
 
-# Sirchmunk：原始数据到自进化智能，实时 
+# Sirchmunk：无需向量数据库和预索引的自进化搜索引擎
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
@@ -32,15 +32,15 @@
 
 ## 🌰 为什么选择 “Sirchmunk”？
 
-基于向量检索的智能流水线往往 _僵硬且脆弱_。它们依赖静态向量嵌入，**计算成本高、对实时变化不敏感，并且脱离原始上下文**。我们引入 **Sirchmunk**，开启更敏捷的范式：数据不再是快照，洞见随数据共同演化。
+基于向量检索的智能流水线往往 _僵硬且脆弱_。它们依赖静态向量嵌入，**计算成本高、对实时变化不敏感，并且脱离原始上下文**。我们引入 **Sirchmunk**，开启更敏捷的范式：数据不再是静态的快照和分块，而是直接从原始数据中洞见所查。
 
 ---
 
 ## ✨ 核心特性
 
-### 1. 无需向量嵌入：直接面向原始数据形态
+### 1. 无需向量嵌入和预索引：直接面向原始数据形态
 
-**Sirchmunk** 直接处理 **原始数据** —— 无需将丰富文件压缩为固定维度向量的高成本过程。
+**Sirchmunk** 直接处理 **原始数据** —— 无需将大量而繁杂的文件压缩为固定维度向量，或是构建为图数据库。
 
 * **即开即用搜索：** 不再需要复杂、耗时的预处理与索引；直接添加文件即可检索。
 * **全量保真：** 零信息损失，避免向量近似带来的偏差。
@@ -50,11 +50,10 @@
 数据是流动的，而非静态快照。**Sirchmunk** 天然具备动态特性。相比之下，向量数据库可能在数据变化的瞬间就过时。
 
 * **上下文感知：** 随数据上下文实时演化。
-* **LLM 驱动自治：** 面向智能体设计，以 **高 token 效率** 推理，仅在必要时触发 LLM，兼顾智能与成本。
+* **LLM 自主驱动：** 面向智能体设计，通过精心设计的上下文检索技术，仅在必要时触发LLM推理，提高Token使用效率，兼顾智能与成本。
 
-### 3. 规模化智能：实时与海量
-**Sirchmunk** 以 **高吞吐** 与 **实时感知** 连接本地大型仓库与互联网。 
-它是 AI 智能体的统一智能枢纽，以接近思维速度洞察大规模数据。
+### 3. 规模化：实时与海量数据支持
+**Sirchmunk** 具备 **高吞吐** 与 **实时感知** 的特性，能够高效处理本地大型数据集和文件系统。
 
 ---
 
@@ -140,7 +139,7 @@
 ### 前置条件
 
 - **Python** 3.10+
-- **LLM API Key**（OpenAI 兼容端点，本地或远程）
+- **LLM API Key**（OpenAI 兼容 Endpoint，本地或远程）
 - **Node.js** 18+（可选，用于 Web 界面）
 
 ### 安装
@@ -200,12 +199,12 @@ asyncio.run(main())
 Web UI 专为快速、透明的工作流设计：对话、知识分析、系统监控一体化。
 
 <div align="center">
-  <img src="assets/pic/Sirchmunk_Home.png" alt="Sirchmunk Home" width="80%">
+  <img src="assets/pic/Sirchmunk_Home.png" alt="Sirchmunk Home" width="85%">
   <p><sub>Home — 流式日志聊天、基于文件的 RAG 与会话管理。</sub></p>
 </div>
 
 <div align="center">
-  <img src="assets/pic/Sirchmunk_Monitor.png" alt="Sirchmunk Monitor" width="80%">
+  <img src="assets/pic/Sirchmunk_Monitor.png" alt="Sirchmunk Monitor" width="85%">
   <p><sub>Monitor — 系统健康、聊天活动、知识分析与 LLM 用量。</sub></p>
 </div>
 
@@ -234,6 +233,10 @@ python scripts/stop_web.py
 **默认访问地址：**
    - 后端API列表： http://localhost:8584/docs
    - 前端主页： http://localhost:8585
+
+**配置:**
+
+- 访问 `Settings` → `Envrionment Variables` 设置 LLM API Key 和其他环境变量
 
 
 ---
@@ -288,7 +291,7 @@ Sirchmunk 采用 **无索引** 方法：
 1. **无预索引**：无需向量数据库，直接检索文件
 2. **自进化**：知识聚类随检索模式演化
 3. **多层检索**：自适应关键词粒度提升召回
-4. **证据驱动**：蒙特卡洛采样实现精准内容抽取
+4. **证据驱动**：蒙特卡洛重要性采样实现精准内容定位和抽取
 
 </details>
 
@@ -313,8 +316,6 @@ result = await search.search(
     search_paths=["/path/to/folder", "/path/to/file.pdf"]
 )
 ```
-
-无需预处理或索引！
 
 </details>
 
