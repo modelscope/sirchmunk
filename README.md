@@ -60,15 +60,71 @@ It provides a unified, intelligent pulse for AI Agents, delivering deep insights
 
 ---
 
-### How it compares
+### Traditional RAG vs. Sirchmunk
 
-| Feature | RAG (Chunking+VectorDB)                       | **Sirchmunk** |
-| --- |------------------------------| --- |
-| **Setup Cost** | High (Models + Infra)        | **Zero (Direct Retrieval)** |
-| **Data Freshness** | Stale (Requires re-indexing) | **Instant (Self-evolving)** |
-| **Scalability** | Costly/Complex at Scale      | **Native Large-Scale Support** |
-| **Accuracy** | Approximate (Probabilistic)  | **Exact & Contextual** |
-| **Workflow** | Complex ETL Pipelines        | **Drop-and-Search** |
+<table style="width: 100%; border-collapse: separate; border-spacing: 0; overflow: hidden; border-radius: 12px; font-family: sans-serif; border: 1px solid rgba(128, 128, 128, 0.2);">
+  <thead>
+    <tr style="background-color: rgba(128, 128, 128, 0.05);">
+      <th style="text-align: left; padding: 16px; border-bottom: 2px solid rgba(128, 128, 128, 0.2); font-size: 1.3em;">Dimension</th>
+      <th style="text-align: left; padding: 16px; border-bottom: 2px solid rgba(128, 128, 128, 0.2); font-size: 1.3em; opacity: 0.7;">Traditional RAG</th>
+      <th style="text-align: left; padding: 16px; border-bottom: 2px solid rgba(58, 134, 255, 0.5); color: #3a86ff; font-weight: 800; font-size: 1.3em;">✨Sirchmunk</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="padding: 16px; font-weight: 600; border-bottom: 1px solid rgba(128, 128, 128, 0.1);">💰 Setup Cost</td>
+      <td style="padding: 16px; opacity: 0.6; border-bottom: 1px solid rgba(128, 128, 128, 0.1);">High Overhead <br/> (VectorDB, GraphDB, Complex Document Parser...)</td>
+      <td style="padding: 16px; background-color: rgba(58, 134, 255, 0.08); color: #4895ef; border-bottom: 1px solid rgba(128, 128, 128, 0.1);">
+        ✅ Zero Infrastructure <br/>
+        <small style="opacity: 0.8; font-size: 0.85em;">Direct-to-data retrieval without vector silos</small>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding: 16px; font-weight: 600; border-bottom: 1px solid rgba(128, 128, 128, 0.1);">🕒 Data Freshness</td>
+      <td style="padding: 16px; opacity: 0.6; border-bottom: 1px solid rgba(128, 128, 128, 0.1);">Stale (Batch Re-indexing)</td>
+      <td style="padding: 16px; background-color: rgba(58, 134, 255, 0.08); color: #4895ef; border-bottom: 1px solid rgba(128, 128, 128, 0.1);">
+        ✅ Instant &amp; Dynamic <br/>
+        <small style="opacity: 0.8; font-size: 0.85em;">Self-evolving index that reflects live changes</small>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding: 16px; font-weight: 600; border-bottom: 1px solid rgba(128, 128, 128, 0.1);">📈 Scalability</td>
+      <td style="padding: 16px; opacity: 0.6; border-bottom: 1px solid rgba(128, 128, 128, 0.1);">Linear Cost Growth</td>
+      <td style="padding: 16px; background-color: rgba(58, 134, 255, 0.08); color: #4895ef; border-bottom: 1px solid rgba(128, 128, 128, 0.1);">
+        ✅ Extremely low RAM/CPU consumption <br/>
+        <small style="opacity: 0.8; font-size: 0.85em;">Native Elastic Support, efficiently handles large-scale datasets</small>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding: 16px; font-weight: 600; border-bottom: 1px solid rgba(128, 128, 128, 0.1);">🎯 Accuracy</td>
+      <td style="padding: 16px; opacity: 0.6; border-bottom: 1px solid rgba(128, 128, 128, 0.1);">Approximate Vector Matches</td>
+      <td style="padding: 16px; background-color: rgba(58, 134, 255, 0.08); color: #4895ef; border-bottom: 1px solid rgba(128, 128, 128, 0.1);">
+        ✅ Deterministic &amp; Contextual <br/>
+        <small style="opacity: 0.8; font-size: 0.85em;">Hybrid logic ensuring semantic precision</small>
+      </td>
+    </tr>
+    <tr>
+      <td style="padding: 16px; font-weight: 600;">⚙️ Workflow</td>
+      <td style="padding: 16px; opacity: 0.6;">Complex ETL Pipelines</td>
+      <td style="padding: 16px; background-color: rgba(58, 134, 255, 0.08); color: #4895ef;">
+        ✅ Drop-and-Search <br/>
+        <small style="opacity: 0.8; font-size: 0.85em;">Zero-config integration for rapid deployment</small>
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+
+## Demo
+
+The web UI is built for fast, transparent workflows: chat, knowledge analytics, and system monitoring in one place.
+
+<div align="center">
+  <img src="assets/gif/Sirchmunk_Web.gif" alt="Sirchmunk WebUI" width="100%">
+  <p><sub> Access files directly to start chatting </sub></p>
+</div>
 
 ---
 
