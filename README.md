@@ -30,25 +30,9 @@
 
 ---
 
-## 🔤 What “Sirchmunk” Means
+## 🌰 What “Sirchmunk” Means
 
 **Sirchmunk** blends **Search** + **Chipmunk**: fast, adaptive, and always digging for relevant signals in large, messy data.
-
-We also use the name as a mnemonic for the system’s design principles:
-
-| Letter | Meaning | Intent |
-|:--:|:--|:--|
-| **S** | Search | Find relevant evidence without heavy pre-processing |
-| **I** | Intelligence | LLM-guided reasoning and extraction |
-| **R** | Retrieval | Indexless, on-the-fly access to raw data |
-| **C** | Cognition | Structured knowledge generation from evidence |
-| **H** | Hybrid | Combine LLM inference with deterministic tools |
-| **M** | Memory | Persistent knowledge and history with DuckDB |
-| **U** | Unified | One pipeline from search to knowledge |
-| **N** | Networked | Ready for multi-source and multi-modal inputs |
-| **K** | Knowledge | Continuously evolving knowledge clusters |
-
-### 🌰 Logo & Brand Story
 
 The **chipmunk** stands for:
 
