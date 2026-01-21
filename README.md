@@ -15,7 +15,7 @@
 [![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square)](https://github.com/kreuzberg-dev/kreuzberg)
 
 
-[**Quick Start**](#-quick-start) · [**Architecture**](#-architecture) · [**Core Modules**](#-core-modules) · [**API Reference**](#-api-reference) · [**FAQ**](#-faq)
+[**Quick Start**](#-quick-start) · [**Key Features**](#-key-features) · [**Web UI**](#-web-ui) · [**How it Works**](#-how-it-works) · [**FAQ**](#-faq)
 
 [🇨🇳 中文](README_zh.md)
 
