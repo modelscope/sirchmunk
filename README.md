@@ -200,7 +200,7 @@ asyncio.run(main())
 The web UI is built for fast, transparent workflows: chat, knowledge analytics, and system monitoring in one place.
 
 <div align="center">
-  <img src="https://raw.githubusercontent.com/modelscope/sirchmunk/main/assets/pic/Sirchmunk_Home.png" alt="Sirchmunk Home" width="80%">
+  <img src="assets/pic/Sirchmunk_Home.png" alt="Sirchmunk Home" width="80%">
   <p><sub>Home — Chat with streaming logs, file-based RAG, and session management.</sub></p>
 </div>
 
