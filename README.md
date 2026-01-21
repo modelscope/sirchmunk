@@ -125,6 +125,10 @@ async def main():
 asyncio.run(main())
 ```
 
+**⚠️ Notes:**
+- Upon initialization, AgenticSearch automatically checks if ripgrep-all and ripgrep are installed. If they are missing, it will attempt to install them automatically. If the automatic installation fails, please install them manually.
+  - References: https://github.com/BurntSushi/ripgrep | https://github.com/phiresky/ripgrep-all
+- Replace `"your-api-key"`, `"your-base-url"`, `"your-model-name"` and `/path/to/documents` with your actual values.
 
 
 
