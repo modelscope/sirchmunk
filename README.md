@@ -10,6 +10,10 @@
 [![TailwindCSS](https://img.shields.io/badge/Tailwind-3.4-06B6D4?style=flat-square&logo=tailwindcss&logoColor=white)](https://tailwindcss.com/)
 [![DuckDB](https://img.shields.io/badge/DuckDB-OLAP-FFF000?style=flat-square&logo=duckdb&logoColor=black)](https://duckdb.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
+[![ripgrep-all](https://img.shields.io/badge/ripgrep--all-Search-E67E22?style=flat-square&logo=rust&logoColor=white)](https://github.com/phiresky/ripgrep-all)
+[![OpenAI](https://img.shields.io/badge/OpenAI-API-412991?style=flat-square&logo=openai&logoColor=white)](https://github.com/openai/openai-python)
+[![Ollama](https://img.shields.io/badge/Ollama-Local_LLM-000000?style=flat-square&logo=ollama&logoColor=white)](https://ollama.com/)
+[![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square&logo=python&logoColor=white)](https://github.com/zalando/kreuzberg)
 
 <p align="center">
   <b>Search, reason, and evolve knowledge in real time.</b>
@@ -30,25 +34,9 @@
 
 ---
 
-## 🔤 What “Sirchmunk” Means
+## 🌰 What “Sirchmunk” Means
 
 **Sirchmunk** blends **Search** + **Chipmunk**: fast, adaptive, and always digging for relevant signals in large, messy data.
-
-We also use the name as a mnemonic for the system’s design principles:
-
-| Letter | Meaning | Intent |
-|:--:|:--|:--|
-| **S** | Search | Find relevant evidence without heavy pre-processing |
-| **I** | Intelligence | LLM-guided reasoning and extraction |
-| **R** | Retrieval | Indexless, on-the-fly access to raw data |
-| **C** | Cognition | Structured knowledge generation from evidence |
-| **H** | Hybrid | Combine LLM inference with deterministic tools |
-| **M** | Memory | Persistent knowledge and history with DuckDB |
-| **U** | Unified | One pipeline from search to knowledge |
-| **N** | Networked | Ready for multi-source and multi-modal inputs |
-| **K** | Knowledge | Continuously evolving knowledge clusters |
-
-### 🌰 Logo & Brand Story
 
 The **chipmunk** stands for:
 

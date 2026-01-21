@@ -10,6 +10,10 @@
 [![TailwindCSS](https://img.shields.io/badge/Tailwind-3.4-06B6D4?style=flat-square&logo=tailwindcss&logoColor=white)](https://tailwindcss.com/)
 [![DuckDB](https://img.shields.io/badge/DuckDB-OLAP-FFF000?style=flat-square&logo=duckdb&logoColor=black)](https://duckdb.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square)](LICENSE)
+[![ripgrep-all](https://img.shields.io/badge/ripgrep--all-Search-E67E22?style=flat-square&logo=rust&logoColor=white)](https://github.com/phiresky/ripgrep-all)
+[![OpenAI](https://img.shields.io/badge/OpenAI-API-412991?style=flat-square&logo=openai&logoColor=white)](https://github.com/openai/openai-python)
+[![Ollama](https://img.shields.io/badge/Ollama-Local_LLM-000000?style=flat-square&logo=ollama&logoColor=white)](https://ollama.com/)
+[![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square&logo=python&logoColor=white)](https://github.com/zalando/kreuzberg)
 
 <p align="center">
   <b>实时搜索、推理与知识演化。</b>
@@ -30,27 +34,11 @@
 
 ---
 
-## 🔤 “Sirchmunk” 的含义
+## 🌰 “Sirchmunk” 的含义
 
 **Sirchmunk** 由 **Search** 与 **Chipmunk** 融合而来：快速、灵活、擅长在庞杂数据中精准挖掘价值信号。
 
-我们也将其作为系统设计原则的助记符：
-
-| 字母 | 含义 | 设计意图 |
-|:--:|:--|:--|
-| **S** | Search | 无需重度预处理即可定位证据 |
-| **I** | Intelligence | LLM 引导的推理与抽取 |
-| **R** | Retrieval | 免索引、即时访问原始数据 |
-| **C** | Cognition | 基于证据生成结构化知识 |
-| **H** | Hybrid | 结合 LLM 推理与确定性工具 |
-| **M** | Memory | DuckDB 持久化知识与历史 |
-| **U** | Unified | 一条链路贯通搜索与知识 |
-| **N** | Networked | 支持多源与多模态扩展 |
-| **K** | Knowledge | 持续演化的知识聚类 |
-
-### 🌰 品牌与 Logo 故事
-
-小花栗鼠象征：
+Logo象征：
 
 - **动作迅捷**：无需向量数据库与耗时索引，即刻检索  
 - **不挑食**：可处理 PDF、代码、Markdown、日志等复杂文档  
