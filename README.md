@@ -15,7 +15,7 @@
 [![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square)](https://github.com/kreuzberg-dev/kreuzberg)
 
 
-[**Quick Start**](#-quick-start) · [**Architecture**](#-architecture) · [**Core Modules**](#-core-modules) · [**API Reference**](#-api-reference) · [**FAQ**](#-faq)
+[**Quick Start**](#-quick-start) · [**Key Features**](#-key-features) · [**Web UI**](#-web-ui) · [**How it Works**](#-how-it-works) · [**FAQ**](#-faq)
 
 [🇨🇳 中文](README_zh.md)
 
@@ -212,15 +212,18 @@ The web UI is built for fast, transparent workflows: chat, knowledge analytics, 
 ### Installation 
 
 ```bash
-pip install "sirchmunk[web]"
+git clone https://github.com/modelscope/sirchmunk.git && cd sirchmunk
+
+pip install ".[web]"
+
+npm install --prefix web
 ```
+- Note: Node.js 18+ is required for the web interface.
 
 
 ### Running the Web UI
 
 ```bash
-git clone https://github.com/modelscope/sirchmunk.git && cd sirchmunk
-
 # Start frontend and backend
 python scripts/start_web.py 
 
