@@ -19,7 +19,7 @@ from .monitor import router as monitor_router
 # Create FastAPI application
 app = FastAPI(
     title="Sirchmunk API",
-    description="Mock API for Sirchmunk AI Education System",
+    description="APIs for Sirchmunk",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -48,7 +48,7 @@ async def root():
     return {
         "name": "Sirchmunk API",
         "version": "1.0.0",
-        "description": "Mock API for AI-powered education system",
+        "description": "APIs for Sirchmunk",
         "status": "running",
         "endpoints": {
             "knowledge": "/api/v1/knowledge",
@@ -111,7 +111,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8001,
+        port=8584,
         reload=True,
         log_level="info"
     )

@@ -4,7 +4,7 @@ Generate Stargazers and Forkers roster SVG images for GitHub README.
 Modern, minimal style - shows latest users with "and X others" text.
 
 Usage:
-    python generate_roster.py --repo HKUDS/DeepTutor --output assets/roster
+    python generate_roster.py --repo modelscope/sirchmunk --output assets/roster
 """
 
 import argparse
