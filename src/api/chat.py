@@ -4,6 +4,7 @@ Unified API endpoints for chat and search functionality
 Provides WebSocket endpoint for real-time chat conversations with integrated search
 """
 import platform
+import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
 from typing import Dict, Any, List, Optional, Union
@@ -333,12 +334,16 @@ def get_search_instance(log_callback=None):
         return AgenticSearch(log_callback=log_callback)
 
 
+_COOLDOWN_SECONDS = 1.0
 _DIALOG_LOCK = threading.Lock()
+_LAST_CLOSE_TIME = 0
 _ROOT_INSTANCE = None
+
 
 def _get_bg_root():
     """
-    Retrieves or creates the global, hidden Tk root window.
+    Retrieves the global root window.
+    Initializes it only once (Singleton pattern) to prevent lag.
     """
     global _ROOT_INSTANCE
 
@@ -347,53 +352,50 @@ def _get_bg_root():
 
     if _ROOT_INSTANCE is None or not _ROOT_INSTANCE.winfo_exists():
         _ROOT_INSTANCE = tk.Tk()
-        _ROOT_INSTANCE.withdraw()  # Completely hide the main window
-
+        _ROOT_INSTANCE.title("File Picker")
         _ROOT_INSTANCE.attributes("-alpha", 0.0)
-        _ROOT_INSTANCE.attributes("-topmost", True)
-
-        if platform.system() == "Darwin":
-            _ROOT_INSTANCE.update_idletasks()
+        _ROOT_INSTANCE.withdraw()
 
     return _ROOT_INSTANCE
 
 
 def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[str]:
     """
-    Open native file dialog (Win/Mac/Linux).
-    Robust version using a singleton root window with extended file type support.
+    Opens a native file picker dialog using tkinter.
     """
+    global _LAST_CLOSE_TIME
+
     if not _DIALOG_LOCK.acquire(blocking=False):
         return []
-    
-    selected_paths = []
-    
-    try:
-        # Get singleton root
-        root = _get_bg_root()
 
-        # Lift window to ensure the dialog appears on top
-        root.lift()
+    selected_paths = []
+
+    try:
+        if time.time() - _LAST_CLOSE_TIME < _COOLDOWN_SECONDS:
+            return []
+
+        root = _get_bg_root()
+        root.deiconify()
         root.attributes("-topmost", True)
-        # Force update to ensure focus is correct in the Python process
-        root.update()
+        root.lift()
+        root.focus_force()
+
+        if platform.system() == "Darwin":
+            root.update_idletasks()
+        else:
+            root.update()
 
         kwargs = {"parent": root, "title": "Select File(s)"}
 
-        # Handle file dialog types
+        # Set file types filter
         if dialog_type == "files":
             filetypes = [
                 ("All Files", "*.*"),
                 ("PDF Documents", "*.pdf"),
                 ("Word Documents", "*.docx *.doc"),
-                ("PowerPoint Presentations", "*.pptx *.ppt"),
                 ("Excel Spreadsheets", "*.xlsx *.xls *.csv"),
-                ("Markdown & Text", "*.md *.markdown *.txt"),
-                ("JSON & Data", "*.json *.xml *.yaml *.yml"),
-                ("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.svg *.webp"),
-                ("Python Files", "*.py *.pyw"),
-                ("Web Files", "*.html *.htm *.css *.js"),
-                ("Archives", "*.zip *.tar *.gz *.rar *.7z"),
+                ("Images", "*.png *.jpg *.jpeg *.gif *.svg"),
+                ("Text Files", "*.txt *.md *.json *.xml"),
             ]
 
             if multiple:
@@ -408,17 +410,19 @@ def open_file_dialog(dialog_type: str = "files", multiple: bool = True) -> List[
             res = filedialog.askdirectory(**kwargs)
             selected_paths = [res] if res else []
 
-        root.attributes("-topmost", False)
-        root.update()
-
     except Exception as e:
         print(f"Dialog Error: {e}")
         selected_paths = []
-    
+
     finally:
-        # Release the lock
+        if _ROOT_INSTANCE is not None and _ROOT_INSTANCE.winfo_exists():
+            _ROOT_INSTANCE.attributes("-topmost", False)
+            _ROOT_INSTANCE.withdraw()
+            _ROOT_INSTANCE.update()
+
+        _LAST_CLOSE_TIME = time.time()
         _DIALOG_LOCK.release()
-    
+
     return selected_paths
 
 

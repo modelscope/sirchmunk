@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from loguru import logger
 
-from ..utils.constants import GREP_CONCURRENT_LIMIT
+from ..utils.constants import GREP_CONCURRENT_LIMIT, DEFAULT_WORK_PATH
 from ..utils.file_utils import StorageStructure
 from .base import BaseRetriever
 
@@ -26,32 +26,14 @@ class GrepRetriever(BaseRetriever):
     For more information about ripgrep-all, please refer to `https://github.com/phiresky/ripgrep-all`
     """
 
-    def __init__(self, work_path: Union[str, Path], **kwargs):
+    def __init__(self, work_path: Union[str, Path] = None, **kwargs):
         super().__init__()
 
-        self.work_path: Path = Path(work_path)
+        self.work_path: Path = Path(work_path or DEFAULT_WORK_PATH)
         self.rga_cache: Path = (
             self.work_path / StorageStructure.CACHE_DIR / StorageStructure.GREP_DIR
         )
         self.rga_cache.mkdir(parents=True, exist_ok=True)
-
-        try:
-            self.init_rga()
-        except Exception as e:
-            logger.warning(
-                f"Failed to initialize `ripgrep-all`: {e}"
-                f"You can try to install it manually, refer to `https://github.com/phiresky/ripgrep-all`."
-            )
-            raise
-
-    @staticmethod
-    def init_rga():
-        """
-        Ensure ripgrep-all is installed. If not, install it.
-        """
-        from sirchmunk.utils.installation_utils import install_rga
-
-        install_rga()
 
     async def retrieve(
         self,
@@ -324,6 +306,15 @@ class GrepRetriever(BaseRetriever):
                 text=True,
                 check=False,  # we handle non-zero exit codes manually
             )
+
+            if result.returncode != 0:
+                if "ripgrep" in result.stderr.lower() or " rg " in result.stderr:
+                    raise RuntimeError(
+                        f"ripgrep-all depends on 'ripgrep' (rg), but it's missing: {result.stderr.strip()}"
+                    )
+                elif result.returncode > 1:
+                    raise RuntimeError(f"rga execution failed: {result.stderr.strip()}")
+
             # Parse JSON Lines if requested
             if json_output and result.returncode in (0, 1) and result.stdout.strip():
                 lines = result.stdout.strip().splitlines()
@@ -340,15 +331,13 @@ class GrepRetriever(BaseRetriever):
 
     @staticmethod
     async def _run_rga_async(
-        args: List[str], json_output: bool = True, timeout: float = 60.0
+            args: List[str], json_output: bool = True, timeout: float = 60.0
     ) -> Dict[str, Any]:
         cmd = ["rga", "--no-config"]
         if json_output:
             cmd.append("--json")
         cmd.extend(args)
 
-        # 1. Wait for a slot in the semaphore with a timeout
-        # We await the acquire() method specifically.
         try:
             await asyncio.wait_for(RGA_SEMAPHORE.acquire(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -357,13 +346,14 @@ class GrepRetriever(BaseRetriever):
             )
 
         try:
-            # 2. Launch and wait for the subprocess
-            process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+            except FileNotFoundError:
+                raise RuntimeError("ripgrep-all ('rga') not found. Please install it first.")
 
             try:
-                # 3. Wait for the process to finish
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(), timeout=timeout
                 )
@@ -372,12 +362,22 @@ class GrepRetriever(BaseRetriever):
                 stderr_str = stderr.decode().strip()
                 returncode = process.returncode
 
+                if returncode != 0:
+                    if "ripgrep" in stderr_str.lower() or " rg " in stderr_str:
+                        raise RuntimeError(
+                            f"ripgrep-all depends on 'ripgrep' (rg), but it's missing or failed: {stderr_str}"
+                        )
+                    elif returncode > 1:
+                        raise RuntimeError(f"rga execution failed with code {returncode}: {stderr_str}")
                 # 4. Parse JSON Lines
                 parsed_stdout = stdout_str
                 if json_output and returncode in (0, 1) and stdout_str:
-                    parsed_stdout = [
-                        json.loads(line) for line in stdout_str.splitlines() if line
-                    ]
+                    try:
+                        parsed_stdout = [
+                            json.loads(line) for line in stdout_str.splitlines() if line
+                        ]
+                    except json.JSONDecodeError as e:
+                        raise RuntimeError(f"Failed to parse rga JSON output: {e}")
 
                 return {
                     "returncode": returncode,
@@ -385,7 +385,6 @@ class GrepRetriever(BaseRetriever):
                     "stderr": stderr_str,
                 }
             except asyncio.TimeoutError:
-                # Kill the process if it times out
                 try:
                     process.kill()
                 except ProcessLookupError:
@@ -393,7 +392,6 @@ class GrepRetriever(BaseRetriever):
                 raise RuntimeError(f"rga process execution timed out ({timeout}s).")
 
         finally:
-            # 5. release the semaphore slot
             RGA_SEMAPHORE.release()
 
     @staticmethod

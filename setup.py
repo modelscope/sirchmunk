@@ -4,8 +4,8 @@ import os
 from os.path import exists
 import sys
 import re
-from setuptools import find_packages, setup
 from typing import List
+from setuptools import find_packages, setup
 
 
 def readme():
@@ -29,7 +29,7 @@ def get_version():
     raise RuntimeError("Unable to find version string.")
 
 
-def parse_requirements(fname='requirements.txt', with_version=True):
+def parse_requirements(fname='requirements.txt', with_version=True) -> List[str]:
     """
     Parse the package dependencies listed in a requirements file but strips
     specific versioning information.

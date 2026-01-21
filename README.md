@@ -13,7 +13,7 @@
 [![ripgrep-all](https://img.shields.io/badge/ripgrep--all-Search-E67E22?style=flat-square&logo=rust&logoColor=white)](https://github.com/phiresky/ripgrep-all)
 [![OpenAI](https://img.shields.io/badge/OpenAI-API-412991?style=flat-square&logo=openai&logoColor=white)](https://github.com/openai/openai-python)
 [![Ollama](https://img.shields.io/badge/Ollama-Local_LLM-000000?style=flat-square&logo=ollama&logoColor=white)](https://ollama.com/)
-[![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square&logo=python&logoColor=white)](https://github.com/zalando/kreuzberg)
+[![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square)](https://github.com/kreuzberg-dev/kreuzberg)
 
 
 [**Quick Start**](#-quick-start) · [**Architecture**](#-architecture) · [**Core Modules**](#-core-modules) · [**API Reference**](#-api-reference) · [**FAQ**](#-faq)
@@ -39,181 +39,85 @@ Intelligence pipelines built upon vector-based retrieval can be _rigid and britt
 
 ## ✨ Key Features
 
-### 🔍 Agentic Search with Multi-Level Keyword Extraction
+### 1. Embedding-Free: Data in its Purest Form
 
-- **Intelligent Query Understanding**: LLM-powered keyword extraction with configurable granularity levels (coarse → fine)
-- **Priority-Hit Retrieval**: Sequential search across keyword levels, stopping at first successful match for optimal efficiency
-- **TF-IDF Scoring**: Advanced document ranking with customizable weighting algorithms
+Traditional RAG (Retrieval-Augmented Generation) forces nuanced files into fixed-dimensional vectors. **Sirchmunk** retrieves directly from **raw data**.
 
-### 🧠 Self-Evolving Knowledge Clusters
+* **Instant Search:** No complex pre-processing pipelines or multi-hour indexing; drop files and search immediately.
+* **Full Fidelity:** Zero information loss—no vector approximation, just raw precision.
 
-- **Automatic Knowledge Structuring**: Raw search results transformed into structured `KnowledgeCluster` objects
-- **Evidence-Based Learning**: Monte Carlo sampling for relevant region identification with LLM evaluation
-- **Lifecycle Management**: Track knowledge states (`STABLE`, `EMERGING`, `CONTESTED`, `DEPRECATED`)
-- **Persistent Storage**: DuckDB + Parquet for efficient knowledge persistence and retrieval
-- **Dynamic Knowledge Generation**: New clusters are built and updated continuously as search patterns evolve
+### 2. Self-Evolving: A Living Index
 
-### 📚 Large-Scale Document Understanding
+Data is a stream, not a snapshot. While vector databases become stale the moment data changes, **Sirchmunk** is **dynamic by design**.
 
-- **High-Volume Coverage**: Handle large repositories without pre-indexing
-- **Granular Evidence Tracing**: Extracts and scores precise spans from massive documents
-- **Fast Multi-Level Recall**: Coarse-to-fine keyword tiers improve hit rate on long or noisy corpora
+* **Context-Aware:** The index evolves in real-time as your files grow and change.
+* **LLM-Powered Autonomy:** Designed for Agents that perceive data as it lives, utilizing **token-efficient** reasoning that triggers LLM inference only when necessary to maximize intelligence while minimizing cost.
 
-### ⚡ Indexless Real-Time Retrieval
+### 3. Intelligence at Scale: Real-Time & Massive
 
-- **No Pre-indexing Required**: Direct retrieval on raw files
-- **Multi-Format Support**: PDF, DOCX, TXT, Markdown, code files, and more
-- **Blazing Fast**: Parallel file scanning with configurable concurrency
-
-### 💬 Interactive Chat Interface
-
-- **WebSocket Streaming**: Real-time response streaming with search log visualization
-- **RAG Integration**: Seamless knowledge base augmented generation
-- **Session Management**: Persistent history storage with DuckDB
-- **Token Usage Tracking**: Real-time token consumption monitoring
-
-### 📊 Comprehensive Monitoring Dashboard
-
-- **System Metrics**: CPU, memory, disk usage tracking
-- **Chat Analytics**: Session statistics and activity monitoring
-- **Knowledge Analytics**: BI-style visualization for knowledge clusters
-- **Token Usage Statistics**: Token consumption tracking by model
+**Sirchmunk** bridges massive local repositories and the web with **Large-Scale** throughput and **Real-Time** perception. </br>
+It provides a unified, intelligent pulse for AI Agents, delivering deep insights across vast datasets with the speed of thought.
 
 ---
 
-## 🏗️ Architecture
+### How it compares
 
-<div align="center">
-  <img src="assets/pic/Sirchmunk_Architecture.png" alt="Sirchmunk Architecture" width="80%">
-</div>
-
-### Core Components
-
-| Component | Description |
-|:---|:---|
-| **AgenticSearch** | Main search orchestrator with LLM-powered keyword extraction and retrieval |
-| **KnowledgeBase** | Transforms raw results into structured knowledge clusters with evidence sampling |
-| **KnowledgeManager** | Persistent storage layer, by default in Parquet format and stored in DuckDB |
-| **GrepRetriever** | High-performance _indexless_ file search with parallel processing |
-| **OpenAIChat** | Unified LLM interface supporting streaming and usage tracking |
-| **MonitorTracker** | Real-time system and application metrics collection |
+| Feature | RAG (Chunking+VectorDB)                       | **Sirchmunk** |
+| --- |------------------------------| --- |
+| **Setup Cost** | High (Models + Infra)        | **Zero (Direct Retrieval)** |
+| **Data Freshness** | Stale (Requires re-indexing) | **Instant (Self-evolving)** |
+| **Scalability** | Costly/Complex at Scale      | **Native Large-Scale Support** |
+| **Accuracy** | Approximate (Probabilistic)  | **Exact & Contextual** |
+| **Workflow** | Complex ETL Pipelines        | **Drop-and-Search** |
 
 ---
+
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 
 - **Python** 3.10+
-- **Node.js** 18+ (for web interface)
-- **LLM API Key** (OpenAI-compatible endpoint)
+- **LLM API Key** (OpenAI-compatible endpoint, or Ollama for local models)
+- **Node.js** 18+ (Optional, for web interface)
 
-### Step 1: Clone & Configure
-
-```bash
-# Clone the repository
-git clone https://github.com/modelscope/sirchmunk.git
-cd sirchmunk
-
-# Create environment file
-cp .env.example .env
-# Edit .env with your LLM API credentials
-```
-
-<details>
-<summary>📋 <b>Environment Variables Reference</b></summary>
-
-| Variable | Required | Description |
-|:---|:---:|:---|
-| `LLM_BASE_URL` | **Yes** | LLM API endpoint (e.g., `https://api.openai.com/v1`) |
-| `LLM_API_KEY` | **Yes** | Your LLM API key |
-| `LLM_MODEL_NAME` | **Yes** | Model name (e.g., `gpt-4o`, `gpt-4o-mini`) |
-| `WORK_PATH` | No | Working directory for data storage (default: current directory) |
-| `GREP_CONCURRENT_LIMIT` | No | Parallel grep workers (default: `10`) |
-
-</details>
-
-### Step 2: Install Dependencies
+### Installation
 
 ```bash
 # Create virtual environment (recommended)
-conda create -n sirchmunk python=3.10 && conda activate sirchmunk
-# Or: python -m venv venv && source venv/bin/activate
+conda create -n sirchmunk python=3.13 -y && conda activate sirchmunk 
 
-# Install Python dependencies
-pip install -r requirements.txt
+pip install sirchmunk
 
-# Install web dependencies
-npm install --prefix web
+# Or via UV:
+uv pip install sirchmunk
+
+# Alternatively, install from source:
+git clone https://github.com/modelscope/sirchmunk.git && cd sirchmunk
+pip install -e .
 ```
 
-### Step 3: Launch
-
-```bash
-# Start both backend and frontend
-python scripts/start_web.py
-
-# Or start separately:
-# Backend: python src/api/run_server.py
-# Frontend: cd web && npm run dev
-```
-
-### Access URLs
-
-| Service | URL | Description |
-|:---:|:---|:---|
-| **Web Interface** | http://localhost:3000 | Main chat and dashboard |
-| **API Documentation** | http://localhost:8000/docs | Interactive Swagger UI |
-
----
-
-## 🖥️ Web Experience
-
-The web UI is built for fast, transparent workflows: chat, knowledge analytics, and system monitoring in one place.
-
-<div align="center">
-  <img src="assets/pic/Sirchmunk_Home.png" alt="Sirchmunk Home" width="80%">
-  <p><sub>Home — Chat with streaming logs, file-based RAG, and session management.</sub></p>
-</div>
-
-<div align="center">
-  <img src="assets/pic/Sirchmunk_Monitor.png" alt="Sirchmunk Monitor" width="80%">
-  <p><sub>Monitor — System health, chat activity, knowledge analytics, and LLM usage.</sub></p>
-</div>
-
----
-
-## 📦 Core Modules
-
-<details>
-<summary><b>🔍 AgenticSearch</b></summary>
-
-> **Intelligent search engine** with multi-level keyword extraction, priority-hit retrieval, and automatic knowledge clustering.
-
-**Core Features**
-
-| Feature | Description |
-|:---:|:---|
-| Multi-Level Keywords | Extract keywords at configurable granularity levels (1-N) |
-| Priority-Hit Search | Stop search as soon as results are found at any level |
-| TF-IDF Scoring | Advanced document ranking with length penalty |
-| Knowledge Persistence | Auto-save search results as KnowledgeCluster objects |
-
-**Python API**
+### Python SDK Usage
 
 ```python
 import asyncio
+
 from sirchmunk import AgenticSearch
+from sirchmunk.llm import OpenAIChat
+
+llm = OpenAIChat(
+        api_key="your-api-key",
+        base_url="your-base-url",   # e.g., https://api.openai.com/v1
+        model="your-model-name"     # e.g., gpt-4o
+    )
 
 async def main():
-    search = AgenticSearch()
     
-    result = await search.search(
+    agent_search = AgenticSearch(llm=llm)
+    
+    result: str = await agent_search.search(
         query="How does transformer attention work?",
         search_paths=["/path/to/documents"],
-        keyword_levels=3,  # Coarse → Medium → Fine
-        top_k_files=5,
-        max_depth=10
     )
     
     print(result)
@@ -221,215 +125,91 @@ async def main():
 asyncio.run(main())
 ```
 
-</details>
+**⚠️ Notes:**
+- Upon initialization, AgenticSearch automatically checks if ripgrep-all and ripgrep are installed. If they are missing, it will attempt to install them automatically. If the automatic installation fails, please install them manually.
+  - References: https://github.com/BurntSushi/ripgrep | https://github.com/phiresky/ripgrep-all
+- Replace `"your-api-key"`, `"your-base-url"`, `"your-model-name"` and `/path/to/documents` with your actual values.
+
+
+
+
 
 ---
 
-<details>
-<summary><b>🧠 KnowledgeBase</b></summary>
+## 🖥️ Web UI
 
-> **Evidence processor** that transforms raw search results into structured knowledge clusters using Monte Carlo sampling and LLM evaluation.
+The web UI is built for fast, transparent workflows: chat, knowledge analytics, and system monitoring in one place.
 
-**Core Features**
+<div align="center">
+  <img src="assets/gif/Sirchmunk_Web.gif" alt="Sirchmunk WebUI" width="85%">
+  <p><sub> Access files directly to start chatting </sub></p>
+</div>
 
-| Feature | Description |
-|:---:|:---|
-| Monte Carlo Sampling | Identify relevant regions in large documents through iterative sampling |
-| LLM Evidence Evaluation | Score and validate evidence snippets with reasoning |
-| Fuzzy Anchoring | RapidFuzz-based pre-filtering for efficient sampling |
-| Structured Output | Generate KnowledgeCluster with evidences, patterns, and constraints |
 
-**Knowledge Cluster Schema**
+### Installation 
 
-```python
-@dataclass
-class KnowledgeCluster:
-    id: str
-    name: str
-    description: List[str]
-    content: Union[str, List[str]]
-    evidences: List[EvidenceUnit]
-    patterns: List[str]
-    constraints: List[Constraint]
-    confidence: float
-    abstraction_level: AbstractionLevel
-    lifecycle: Lifecycle  # STABLE, EMERGING, CONTESTED, DEPRECATED
-    hotness: float
-    search_results: List[str]
+```bash
+pip install "sirchmunk[web]"
 ```
 
-</details>
+
+### Running the Web UI
+
+```bash
+git clone https://github.com/modelscope/sirchmunk.git && cd sirchmunk
+
+# Start frontend and backend
+python scripts/start_web.py 
+
+# Stop frontend and backend
+python scripts/stop_web.py
+```
+
+**Access the web UI at (By default):**
+   - Backend APIs:  http://localhost:8584/docs
+   - Frontend: http://localhost:8585
+
 
 ---
 
-<details>
-<summary><b>💾 KnowledgeManager</b></summary>
+## 🏗️ How it Works
 
-> **Persistent storage layer** for knowledge clusters using DuckDB and Parquet format.
+### Sirchmunk Framework
 
-**Core Features**
+<div align="center">
+  <img src="assets/pic/Sirchmunk_Architecture.png" alt="Sirchmunk Architecture" width="85%">
+</div>
 
-| Feature | Description |
-|:---:|:---|
-| CRUD Operations | Full create, read, update, delete support |
-| Fuzzy Search | Find clusters by name, description, or content |
-| Merge & Split | Combine or divide knowledge clusters |
-| Statistics | Get analytics and distribution metrics |
+### Core Components
 
-**Python API**
+| Component             | Description                                                              |
+|:----------------------|:-------------------------------------------------------------------------|
+| **AgenticSearch**     | Search orchestrator with LLM-enhanced retrieval capabilities             |
+| **KnowledgeBase**     | Transforms raw results into structured knowledge clusters with evidences |
+| **EvidenceProcessor** | Evidence processing based on the MonteCarlo Importance Sampling          |
+| **GrepRetriever**     | High-performance _indexless_ file search with parallel processing        |
+| **OpenAIChat**        | Unified LLM interface supporting streaming and usage tracking            |
+| **MonitorTracker**    | Real-time system and application metrics collection                      |
 
-```python
-from sirchmunk.storage import KnowledgeManager
+---
 
-# Initialize manager
-km = KnowledgeManager(work_path="/path/to/workspace")
 
-# Insert a cluster
-await km.insert(cluster)
+### Data Storage
 
-# Search clusters
-results = await km.find("transformer attention")
-
-# Get statistics
-stats = km.get_stats()
-print(f"Total clusters: {stats['custom_stats']['total_clusters']}")
-```
-
-**Storage Location**
+All persistent data is stored in the configured `WORK_PATH` (default: `~/.sirchmunk/`):
 
 ```
 {WORK_PATH}/
-└── .cache/
-    └── knowledge/
-        └── knowledge_clusters.parquet
-```
-
-</details>
-
----
-
-<details>
-<summary><b>⚡ GrepRetriever</b></summary>
-
-> **High-performance indexless retriever** using parallel grep for real-time file search.
-
-**Core Features**
-
-| Feature | Description |
-|:---:|:---|
-| Parallel Processing | Configurable concurrent workers |
-| Multi-Format Support | PDF, DOCX, TXT, MD, code files, and more |
-| Regex Support | Full regular expression pattern matching |
-| Result Merging | Deduplicate and merge results across files |
-
-**Supported File Types**
-
-- Documents: PDF, DOCX, TXT, Markdown
-- Code: Python, JavaScript, TypeScript, Java, Go, Rust, C/C++
-- Data: JSON, YAML, XML, CSV
-- Archives: ZIP, TAR (with extraction)
-
-</details>
-
----
-
-<details>
-<summary><b>💬 Chat API</b></summary>
-
-> **WebSocket-based chat interface** with RAG integration and real-time streaming.
-
-**Chat Modes**
-
-| Mode | Description |
-|:---:|:---|
-| Pure Chat | Direct LLM conversation without retrieval |
-| Chat + RAG | Knowledge-augmented generation from local files |
-| Chat + Web | Web search augmented responses (coming soon) |
-| Chat + RAG + Web | Combined knowledge and web search |
-
-**WebSocket Message Format**
-
-```json
-{
-  "type": "message",
-  "content": "Your question here",
-  "session_id": "uuid",
-  "enable_rag": true,
-  "kb_name": "/path/to/documents"
-}
-```
-
-**Response Types**
-
-```json
-// Streaming content
-{"type": "content", "content": "..."}
-
-// Search logs
-{"type": "search_log", "level": "info", "message": "...", "is_streaming": false}
-
-// Status updates
-{"type": "status", "stage": "generating", "message": "..."}
-
-// Completion
-{"type": "done", "message_id": "uuid", "sources": {...}}
-```
-
-</details>
-
----
-
-## 📂 Data Storage
-
-All persistent data is stored in the configured `WORK_PATH`:
+  ├── .cache/
+    ├── history/              # Chat session history (DuckDB)
+    │   └── chat_history.db
+    ├── knowledge/            # Knowledge clusters (Parquet)
+    │   └── knowledge_clusters.parquet
+    └── settings/             # User settings (DuckDB)
+        └── settings.db
 
 ```
-{WORK_PATH}/
-├── .cache/
-│   ├── history/              # Chat session history (DuckDB)
-│   │   └── chat_history.db
-│   ├── knowledge/            # Knowledge clusters (Parquet)
-│   │   └── knowledge_clusters.parquet
-│   └── settings/             # User settings (DuckDB)
-│       └── settings.db
-└── logs/                     # Application logs
-```
 
----
-
-## 🔧 API Reference
-
-### REST Endpoints
-
-| Endpoint | Method | Description |
-|:---|:---:|:---|
-| `/api/v1/chat/sessions` | GET | List all chat sessions |
-| `/api/v1/chat/session/{id}` | GET | Get session details |
-| `/api/v1/chat/ws` | WS | WebSocket chat endpoint |
-| `/api/v1/knowledge/list` | GET | List knowledge clusters |
-| `/api/v1/knowledge/stats` | GET | Get knowledge statistics |
-| `/api/v1/knowledge/search` | POST | Search knowledge clusters |
-| `/api/v1/monitor/overview` | GET | Get system overview |
-| `/api/v1/monitor/llm` | GET | Get LLM usage statistics |
-| `/api/v1/settings` | GET/POST | Manage settings |
-
-### Python SDK
-
-```python
-from sirchmunk import AgenticSearch
-from sirchmunk.llm import OpenAIChat
-from sirchmunk.storage import KnowledgeManager
-
-# Initialize with custom LLM
-llm = OpenAIChat(
-    base_url="https://api.openai.com/v1",
-    api_key="your-key",
-    model="gpt-4o"
-)
-
-search = AgenticSearch(llm=llm)
-result = await search.search(query="...", search_paths=["..."])
-```
 
 ---
 
@@ -499,7 +279,7 @@ You can query them using DuckDB or the `KnowledgeManager` API.
 
 ## 📋 Roadmap
 
-- [x] Multi-level keyword extraction
+- [x] Text-retrieval from raw files
 - [x] Knowledge structuring & persistence
 - [x] Real-time chat with RAG
 - [x] Web UI support
@@ -513,13 +293,7 @@ You can query them using DuckDB or the `KnowledgeManager` API.
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
-
-```bash
-# Development setup
-pip install -r requirements/tests.txt
-pytest tests/
-```
+We welcome [contributions](https://github.com/modelscope/sirchmunk/pulls) !
 
 ---
 

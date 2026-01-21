@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stop script for DeepTutor Web Platform
+Stop script for Sirchmunk Web UI
 Terminates all backend and frontend processes to free up ports
 """
 
@@ -9,7 +9,6 @@ import signal
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 
 def print_flush(*args, **kwargs):
@@ -20,7 +19,7 @@ def print_flush(*args, **kwargs):
 
 def get_backend_port():
     """Get backend port from environment or use default"""
-    return int(os.environ.get("BACKEND_PORT", os.environ.get("API_PORT", "8001")))
+    return int(os.environ.get("BACKEND_PORT", os.environ.get("API_PORT", "8584")))
 
 
 def get_frontend_port():
@@ -224,24 +223,8 @@ def stop_processes_by_name(patterns, service_name):
 
 def main():
     print_flush("=" * 50)
-    print_flush("DeepTutor Web Platform Stopper")
+    print_flush("Stop Sirchmunk Web UI")
     print_flush("=" * 50)
-
-    # Load environment variables from .env files
-    project_root = Path(__file__).parent.parent
-    env_files = [project_root / "DeepTutor.env", project_root / ".env"]
-
-    for env_file in env_files:
-        if env_file.exists():
-            try:
-                from dotenv import load_dotenv
-
-                load_dotenv(env_file, override=False)
-                print_flush(f"✅ Loaded environment from {env_file}")
-                break
-            except ImportError:
-                print_flush("⚠️ python-dotenv not installed, using default ports")
-                break
 
     backend_port = get_backend_port()
     frontend_port = get_frontend_port()

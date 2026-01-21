@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FastAPI server runner for DeepTutor API
+FastAPI server runner for Sirchmunk API
 Provides a simple way to start the API server with proper configuration
 """
 
@@ -20,11 +20,11 @@ def main():
         
         # Get configuration from environment
         host = os.environ.get("API_HOST", "0.0.0.0")
-        port = int(os.environ.get("API_PORT", os.environ.get("BACKEND_PORT", "8001")))
+        port = int(os.environ.get("API_PORT", os.environ.get("BACKEND_PORT", "8584")))
         reload = os.environ.get("API_RELOAD", "true").lower() == "true"
         log_level = os.environ.get("API_LOG_LEVEL", "info")
         
-        print(f"🚀 Starting DeepTutor API server...")
+        print(f"🚀 Starting Sirchmunk API server...")
         print(f"   Host: {host}")
         print(f"   Port: {port}")
         print(f"   Reload: {reload}")
