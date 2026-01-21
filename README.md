@@ -201,12 +201,12 @@ asyncio.run(main())
 The web UI is built for fast, transparent workflows: chat, knowledge analytics, and system monitoring in one place.
 
 <div align="center">
-  <img src="assets/pic/Sirchmunk_Home.png" alt="Sirchmunk Home" width="80%">
+  <img src="assets/pic/Sirchmunk_Home.png" alt="Sirchmunk Home" width="85%">
   <p><sub>Home — Chat with streaming logs, file-based RAG, and session management.</sub></p>
 </div>
 
 <div align="center">
-  <img src="assets/pic/Sirchmunk_Monitor.png" alt="Sirchmunk Monitor" width="80%">
+  <img src="assets/pic/Sirchmunk_Monitor.png" alt="Sirchmunk Monitor" width="85%">
   <p><sub>Monitor — System health, chat activity, knowledge analytics, and LLM usage.</sub></p>
 </div>
 
@@ -235,6 +235,10 @@ python scripts/stop_web.py
 **Access the web UI at (By default):**
    - Backend APIs:  http://localhost:8584/docs
    - Frontend: http://localhost:8585
+
+**Configuration:**
+
+- Access `Settings` → `Envrionment Variables` to configure LLM API, and other parameters.
 
 
 ---
