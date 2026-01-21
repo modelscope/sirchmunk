@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from sirchmunk.base import BaseSearch
-from sirchmunk.learnings.knowledge_bank import KnowledgeBank
+from sirchmunk.learnings.knowledge_base import KnowledgeBase
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import (
     generate_keyword_extraction_prompt,
@@ -52,8 +52,8 @@ class AgenticSearch(BaseSearch):
         # Create bound logger with callback - returns AsyncLogger instance
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
 
-        # Pass log_callback to KnowledgeBank so it can also log through the same callback
-        self.knowledge_bank = KnowledgeBank(
+        # Pass log_callback to KnowledgeBase so it can also log through the same callback
+        self.knowledge_base = KnowledgeBase(
             llm=self.llm,
             work_path=self.work_path,
             log_callback=log_callback
@@ -409,7 +409,7 @@ class AgenticSearch(BaseSearch):
 
         # Build knowledge cluster
         await self._logger.info("Building knowledge cluster", flush=True, end="")
-        cluster: KnowledgeCluster = await self.knowledge_bank.build(
+        cluster: KnowledgeCluster = await self.knowledge_base.build(
             request=request,
             retrieved_infos=grep_results,
             keywords=query_keywords,
@@ -418,7 +418,7 @@ class AgenticSearch(BaseSearch):
             verbose=verbose,
         )
 
-        self.llm_usages.extend(self.knowledge_bank.llm_usages)
+        self.llm_usages.extend(self.knowledge_base.llm_usages)
         
         await self._logger.success(" ✓", flush=True)
 

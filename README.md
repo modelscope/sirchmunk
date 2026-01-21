@@ -92,7 +92,7 @@ Intelligence pipelines built upon vector-based retrieval can be _rigid and britt
 | Component | Description |
 |:---|:---|
 | **AgenticSearch** | Main search orchestrator with LLM-powered keyword extraction and retrieval |
-| **KnowledgeBank** | Transforms raw results into structured knowledge clusters with evidence sampling |
+| **KnowledgeBase** | Transforms raw results into structured knowledge clusters with evidence sampling |
 | **KnowledgeManager** | Persistent storage layer using DuckDB and Parquet format |
 | **GrepRetriever** | High-performance indexless file search with parallel processing |
 | **OpenAIChat** | Unified LLM interface supporting streaming and usage tracking |
@@ -226,7 +226,7 @@ asyncio.run(main())
 ---
 
 <details>
-<summary><b>🧠 KnowledgeBank</b></summary>
+<summary><b>🧠 KnowledgeBase</b></summary>
 
 > **Evidence processor** that transforms raw search results into structured knowledge clusters using Monte Carlo sampling and LLM evaluation.
 

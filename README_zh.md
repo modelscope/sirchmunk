@@ -102,7 +102,7 @@ Logo象征：
 | 组件 | 描述 |
 |:---|:---|
 | **AgenticSearch** | 主搜索协调器，具有 LLM 驱动的关键词提取和检索功能 |
-| **KnowledgeBank** | 将原始结果转换为结构化知识聚类，包含证据采样 |
+| **KnowledgeBase** | 将原始结果转换为结构化知识聚类，包含证据采样 |
 | **KnowledgeManager** | 使用 DuckDB 和 Parquet 格式的持久化存储层 |
 | **GrepRetriever** | 高性能免索引文件搜索，支持并行处理 |
 | **OpenAIChat** | 统一的 LLM 接口，支持流式传输和用量追踪 |
@@ -236,7 +236,7 @@ asyncio.run(main())
 ---
 
 <details>
-<summary><b>🧠 KnowledgeBank</b></summary>
+<summary><b>🧠 KnowledgeBase</b></summary>
 
 > **证据处理器**，使用蒙特卡洛采样和 LLM 评估将原始搜索结果转换为结构化知识聚类。
 
