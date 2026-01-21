@@ -16,8 +16,10 @@ from sirchmunk.schema.knowledge import KnowledgeCluster
 from sirchmunk.schema.request import ContentItem, ImageURL, Message, Request
 from sirchmunk.storage.knowledge_manager import KnowledgeManager
 from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME, WORK_PATH
+from sirchmunk.utils.deps import check_dependencies
 from sirchmunk.utils.file_utils import get_fast_hash
 from sirchmunk.utils import create_logger, LogCallback
+from sirchmunk.utils.install_rga import install_rga
 from sirchmunk.utils.utils import (
     KeywordValidation,
     extract_fields,
@@ -68,6 +70,10 @@ class AgenticSearch(BaseSearch):
         self.verbose: bool = verbose
 
         self.llm_usages: List[Dict[str, Any]] = []
+
+        if not check_dependencies():
+            print("Installing rga (ripgrep-all) and rg (ripgrep)...", flush=True)
+            install_rga()
     
     def _load_historical_knowledge(self):
         """Load historical knowledge clusters from local cache"""
@@ -75,9 +81,9 @@ class AgenticSearch(BaseSearch):
             stats = self.knowledge_manager.get_stats()
             cluster_count = stats.get('custom_stats', {}).get('total_clusters', 0)
             # Use sync logger for initialization
-            self._logger.info(f"Loaded {cluster_count} historical knowledge clusters from cache")
+            print(f"Loaded {cluster_count} historical knowledge clusters from cache")
         except Exception as e:
-            self._logger.warning(f"Failed to load historical knowledge: {e}")
+            print(f"[WARNING] Failed to load historical knowledge: {e}")
 
     @staticmethod
     def _extract_and_validate_keywords(llm_resp: str) -> dict:
@@ -313,7 +319,7 @@ class AgenticSearch(BaseSearch):
         )
 
         # Extract multi-level keywords in one LLM call
-        await self._logger.info(f"Extracting {keyword_levels}-level query keywords", flush=True, end="")
+        await self._logger.info(f"Extracting {keyword_levels}-level query keywords.")
 
         # Generate dynamic prompt based on keyword_levels
         dynamic_prompt = generate_keyword_extraction_prompt(num_levels=keyword_levels)
@@ -354,7 +360,7 @@ class AgenticSearch(BaseSearch):
                 continue
 
             specificity = "General" if level_idx == 1 else "Specific" if level_idx == keyword_levels else f"Level {level_idx}"
-            await self._logger.info(f"Searching with Level {level_idx} ({specificity}) keywords", flush=True, end="")
+            await self._logger.info(f"Searching with Level {level_idx} ({specificity}) keywords.")
 
             # Perform grep search with current keyword set
             temp_grep_results: List[Dict[str, Any]] = await self.grep_retriever.retrieve(
@@ -408,7 +414,7 @@ class AgenticSearch(BaseSearch):
             return f"No relevant information found for the query: {query}"
 
         # Build knowledge cluster
-        await self._logger.info("Building knowledge cluster", flush=True, end="")
+        await self._logger.info("Building knowledge cluster...")
         cluster: KnowledgeCluster = await self.knowledge_base.build(
             request=request,
             retrieved_infos=grep_results,
@@ -440,7 +446,7 @@ class AgenticSearch(BaseSearch):
             text_content=cluster_text_content,
         )
 
-        await self._logger.info("Generating search result summary", flush=True, end="")
+        await self._logger.info("Generating search result summary...")
         search_result_response = await self.llm.achat(
             messages=[{"role": "user", "content": result_sum_prompt}],
             stream=True,

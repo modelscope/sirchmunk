@@ -127,7 +127,7 @@ class MonteCarloEvidenceSampling:
             List[SampleWindow]: List of sampled windows based on fuzzy matching.
         """
         if self.verbose:
-            await self._log.info(">> Executing RapidFuzz heuristic pre-filtering...")
+            await self._log.info("Executing RapidFuzz heuristic pre-filtering...")
 
         keywords = keywords or []
 
@@ -459,7 +459,7 @@ class MonteCarloEvidenceSampling:
             if top_seeds and top_seeds[0].score >= confidence_threshold:
                 if self.verbose:
                     await self._log.info(
-                        f">> High confidence target found (Score >= {confidence_threshold}), stopping early."
+                        f"High confidence target found (Score >= {confidence_threshold}), stopping early."
                     )
                 break
 
