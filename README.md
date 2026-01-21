@@ -33,7 +33,7 @@
 
 ## 🌰 Why “Sirchmunk”？
 
-Intelligence pipelines built upon vector-based retievals can be rigid and brittle. They rely on static vector embeddings that are **expensive to compute, blind to real-time changes, and detached from the raw context.** We introduce **Sirchmunk** to move towards a more agile paradigm, where data isn't a no longer treated as a snapshot, and insights can evalove together with the data.
+Intelligence pipelines built upon vector-based retrieval can be _rigid and brittle_. They rely on static vector embeddings that are **expensive to compute, blind to real-time changes, and detached from the raw context**. We introduce **Sirchmunk** to usher in a more agile paradigm, where data is no longer treated as a snapshot, and insights can evolve together with the data.
 
 ---
 
