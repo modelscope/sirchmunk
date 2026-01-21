@@ -522,14 +522,14 @@ You can query them using DuckDB or the `KnowledgeManager` API.
 ## 📋 Roadmap
 
 - [x] Multi-level keyword extraction
-- [x] Knowledge cluster persistence
+- [x] Knowledge structuring & persistence
 - [x] Real-time chat with RAG
-- [x] System monitoring dashboard
+- [x] Web UI support
 - [ ] Web search integration
-- [ ] Multi-modal support (images, audio)
+- [ ] Multi-modal support (images, videos)
 - [ ] Distributed search across nodes
-- [ ] Knowledge graph visualization
-- [ ] Plugin system for custom retrievers
+- [ ] Knowledge visualization and deep analytics
+- [ ] More file type support
 
 ---
 
@@ -558,3 +558,17 @@ This project is licensed under the [Apache License 2.0](LICENSE).
 *✨ Sirchmunk: From raw data to self-evolving real-time intelligence.*
 
 </div>
+
+---
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/sirchmunk&type=Date)](https://star-history.com/#modelscope/sirchmunk&Date)
+
+
+---
+
+<p align="center">
+  <em> ❤️ Thanks for Visiting ✨ Sirchmunk !</em><br><br>
+  <img src="https://visitor-badge.laobi.icu/badge?page_id=modelscope.sirchmunk&style=for-the-badge&color=00d4ff" alt="Views">
+</p>

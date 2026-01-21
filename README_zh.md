@@ -522,14 +522,14 @@ result = await search.search(
 ## 📋 路线图
 
 - [x] 多级关键词提取
-- [x] 知识聚类持久化
+- [x] 知识结构化表示与持久化
 - [x] RAG 实时对话
+- [x] 支持Web UI
 - [x] 系统监控仪表板
+- [ ] 多模态支持（图片、视频等）
 - [ ] Web 搜索集成
-- [ ] 多模态支持（图片、音频）
-- [ ] 跨节点分布式搜索
-- [ ] 知识图谱可视化
-- [ ] 自定义检索器插件系统
+- [ ] 知识可视化和深度分析
+- [ ] 更多文件类型的支持
 
 ---
 
@@ -558,3 +558,17 @@ pytest tests/
 *✨ Sirchmunk：从原始数据到自进化的实时智能。*
 
 </div>
+
+---
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/sirchmunk&type=Date)](https://star-history.com/#modelscope/sirchmunk&Date)
+
+
+---
+
+<p align="center">
+  <em> ❤️ Thanks for Visiting ✨ Sirchmunk !</em><br><br>
+  <img src="https://visitor-badge.laobi.icu/badge?page_id=modelscope.sirchmunk&style=for-the-badge&color=00d4ff" alt="Views">
+</p>
