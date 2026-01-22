@@ -8,7 +8,7 @@ authors = [
   {name = "ModelScope Team"},
   {email = "contact@modelscope.cn"}
 ]
-keywords = ["LLM", "Agentic", "Search", "RAG", "Indexless", "Self-evolving", "Real-time Intelligence", "Multi-modal"]
+keywords = ["LLM", "Agentic Search", "Embedding-Free", "RAG", "Indexless", "Self-evolving", "Real-time Intelligence", "Multi-modal"]
 requires-python = ">=3.10"
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -35,35 +35,20 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 include-package-data = true
 
-[tool.setuptools.dynamic]
-version = {attr = "sirchmunk.version.__version__"}
-
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["sirchmunk*"]
 
-[tool.black]
-line-length = 88
-target-version = ["py313"]
-include = "\\.pyi?$"
-exclude = '''
-/(
-    \.eggs
-  | \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | _build
-  | buck-out
-  | build
-  | dist
-  | src/sirchmunk/.*/__pycache__
-)/
-'''
+[tool.setuptools.dynamic]
+version = {attr = "sirchmunk.version.__version__"}
+dependencies = {file = ["requirements/core.txt"]}
 
-[tool.ruff]
-select = ["E", "W", "F", "I"]
-ignore = ["E501"]
-target-version = "py313"
-line-length = 88
+[tool.setuptools.dynamic.optional-dependencies]
+web = {file = ["requirements/web.txt"]}
+docs     = {file = ["requirements/docs.txt"]}
+tests         = {file = ["requirements/tests.txt"]}
+all = {file = [
+  "requirements/web.txt",
+  "requirements/docs.txt",
+  "requirements/tests.txt",
+]}
