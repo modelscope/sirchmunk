@@ -136,6 +136,13 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 ---
 
 
+## 🎉 News
+
+* 🎉🎉 Jan 22, 2026: Introducing **Sirchmunk**: Initial Release v0.0.1 Now Available!
+
+
+---
+
 ## 🚀 Quick Start
 
 ### Prerequisites
