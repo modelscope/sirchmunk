@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import ast
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
@@ -35,6 +36,7 @@ class AgenticSearch(BaseSearch):
         work_path: Optional[Union[str, Path]] = None,
         verbose: bool = False,
         log_callback: LogCallback = None,
+        reuse_knowledge: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -71,6 +73,31 @@ class AgenticSearch(BaseSearch):
 
         self.llm_usages: List[Dict[str, Any]] = []
 
+        # Maximum number of queries to keep per cluster (FIFO strategy)
+        self.max_queries_per_cluster: int = 5
+
+        # Initialize embedding client for cluster reuse
+        self.embedding_client = None
+        # Similarity threshold for cluster reuse
+        self.cluster_sim_threshold: float = kwargs.pop('cluster_sim_threshold', 0.85)
+        self.cluster_sim_top_k: int = kwargs.pop('cluster_sim_top_k', 3)
+        if reuse_knowledge:
+            try:
+                from sirchmunk.utils.embedding_util import EmbeddingUtil
+                
+                self.embedding_client = EmbeddingUtil(
+                    cache_dir=str(self.work_path / ".cache" / "models")
+                )
+                print(
+                    f"Embedding client initialized: {self.embedding_client.get_model_info()}"
+                )
+            except Exception as e:
+                print(
+                    f"[WARNING] Failed to initialize embedding client: {e}. "
+                    f"Cluster reuse disabled."
+                )
+                self.embedding_client = None
+
         if not check_dependencies():
             print("Installing rga (ripgrep-all) and rg (ripgrep)...", flush=True)
             install_rga()
@@ -84,6 +111,194 @@ class AgenticSearch(BaseSearch):
             print(f"Loaded {cluster_count} historical knowledge clusters from cache")
         except Exception as e:
             print(f"[WARNING] Failed to load historical knowledge: {e}")
+    
+    async def _try_reuse_cluster(self, query: str) -> Optional[str]:
+        """
+        Try to reuse existing knowledge cluster based on semantic similarity.
+        
+        Args:
+            query: Search query string
+        
+        Returns:
+            Cluster content if found and reused, None otherwise
+        """
+        if not self.embedding_client:
+            return None
+        
+        try:
+            await self._logger.info("Searching for similar knowledge clusters...")
+            
+            # Compute query embedding
+            query_embedding = (await self.embedding_client.embed([query]))[0]
+            
+            # Search for similar clusters
+            similar_clusters = await self.knowledge_manager.search_similar_clusters(
+                query_embedding=query_embedding,
+                top_k=self.cluster_sim_top_k,
+                similarity_threshold=self.cluster_sim_threshold,
+            )
+            
+            if not similar_clusters:
+                await self._logger.info("No similar clusters found, performing new search...")
+                return None
+            
+            # Found similar cluster - process reuse
+            best_match = similar_clusters[0]
+            await self._logger.success(
+                f"♻️ Found similar cluster: {best_match['name']} "
+                f"(similarity: {best_match['similarity']:.3f})"
+            )
+            
+            # Retrieve full cluster object
+            existing_cluster = await self.knowledge_manager.get(best_match["id"])
+            
+            if not existing_cluster:
+                await self._logger.warning("Failed to retrieve cluster, falling back to new search")
+                return None
+            
+            # Add current query to queries list with FIFO strategy
+            self._add_query_to_cluster(existing_cluster, query)
+            
+            # Update hotness and timestamp for reused cluster
+            existing_cluster.hotness = min(1.0, (existing_cluster.hotness or 0.5) + 0.1)
+            existing_cluster.last_modified = datetime.now()
+            
+            # Recompute embedding with new query (before update to avoid double save)
+            if self.embedding_client:
+                try:
+                    from sirchmunk.utils.embedding_util import compute_text_hash
+                    
+                    combined_text = self.knowledge_manager.combine_cluster_fields(
+                        existing_cluster.queries
+                    )
+                    text_hash = compute_text_hash(combined_text)
+                    embedding_vector = (await self.embedding_client.embed([combined_text]))[0]
+                    
+                    # Update embedding fields in database without triggering save
+                    self.knowledge_manager.db.execute(
+                        f"""
+                        UPDATE {self.knowledge_manager.table_name}
+                        SET 
+                            embedding_vector = ?::FLOAT[384],
+                            embedding_model = ?,
+                            embedding_timestamp = CURRENT_TIMESTAMP,
+                            embedding_text_hash = ?
+                        WHERE id = ?
+                        """,
+                        [embedding_vector, self.embedding_client.model_id, text_hash, existing_cluster.id]
+                    )
+                    await self._logger.debug(f"Updated embedding for cluster {existing_cluster.id}")
+                except Exception as emb_error:
+                    await self._logger.warning(f"Failed to update embedding: {emb_error}")
+            
+            # Single update call - saves cluster data and embedding together
+            await self.knowledge_manager.update(existing_cluster)
+            
+            # Format and return existing cluster content
+            content = existing_cluster.content
+            if isinstance(content, list):
+                content = "\n".join(content)
+            
+            await self._logger.success("Reused existing knowledge cluster")
+            return str(content) if content else "Knowledge cluster found but content is empty"
+        
+        except Exception as e:
+            await self._logger.warning(
+                f"Failed to search similar clusters: {e}. Falling back to full search."
+            )
+            return None
+    
+    def _add_query_to_cluster(self, cluster: KnowledgeCluster, query: str) -> None:
+        """
+        Add query to cluster's queries list with FIFO strategy.
+        Keeps only the most recent N queries (where N = max_queries_per_cluster).
+        
+        Args:
+            cluster: KnowledgeCluster to update
+            query: New query to add
+        """
+        # Add query if not already present
+        if query not in cluster.queries:
+            cluster.queries.append(query)
+        
+        # Apply FIFO strategy: keep only the most recent N queries
+        if len(cluster.queries) > self.max_queries_per_cluster:
+            # Remove oldest queries (from the beginning)
+            cluster.queries = cluster.queries[-self.max_queries_per_cluster:]
+    
+    async def _save_cluster_with_embedding(self, cluster: KnowledgeCluster) -> None:
+        """
+        Save knowledge cluster to persistent storage and compute embedding.
+        
+        Args:
+            cluster: KnowledgeCluster to save
+        """
+        # Save knowledge cluster to persistent storage
+        try:
+            await self.knowledge_manager.insert(cluster)
+            await self._logger.info(f"Saved knowledge cluster {cluster.id} to cache")
+        except Exception as e:
+            # If cluster exists, update it instead
+            try:
+                await self.knowledge_manager.update(cluster)
+                await self._logger.info(f"Updated knowledge cluster {cluster.id} in cache")
+            except Exception as update_error:
+                await self._logger.warning(f"Failed to save knowledge cluster: {update_error}")
+                return
+        
+        # Compute and store embedding for the cluster
+        if self.embedding_client:
+            try:
+                from sirchmunk.utils.embedding_util import compute_text_hash
+                
+                # Combine queries for embedding
+                combined_text = self.knowledge_manager.combine_cluster_fields(
+                    cluster.queries
+                )
+                text_hash = compute_text_hash(combined_text)
+                
+                # Compute embedding
+                embedding_vector = (await self.embedding_client.embed([combined_text]))[0]
+                
+                # Store embedding
+                await self.knowledge_manager.store_embedding(
+                    cluster_id=cluster.id,
+                    embedding_vector=embedding_vector,
+                    embedding_model=self.embedding_client.model_id,
+                    embedding_text_hash=text_hash
+                )
+                
+                await self._logger.debug(f"Computed and stored embedding for cluster {cluster.id}")
+            
+            except Exception as e:
+                await self._logger.warning(f"Failed to compute embedding for cluster {cluster.id}: {e}")
+    
+    @staticmethod
+    def _parse_summary_response(llm_response: str) -> tuple[str, bool]:
+        """
+        Parse LLM response to extract summary and save decision.
+        
+        Args:
+            llm_response: Raw LLM response containing SUMMARY and SHOULD_SAVE tags
+        
+        Returns:
+            Tuple of (summary_text, should_save_flag)
+        """
+        # Extract SUMMARY content
+        summary_fields = extract_fields(content=llm_response, tags=["SUMMARY", "SHOULD_SAVE"])
+        
+        summary = summary_fields.get("summary", "").strip()
+        should_save_str = summary_fields.get("should_save", "true").strip().lower()
+        
+        # Parse should_save flag
+        should_save = should_save_str in ["true", "yes", "1"]
+        
+        # If extraction failed, use entire response as summary and assume should save
+        if not summary:
+            summary = llm_response.strip()
+            should_save = True
+        
+        return summary, should_save
 
     @staticmethod
     def _extract_and_validate_keywords(llm_resp: str) -> dict:
@@ -295,6 +510,11 @@ class AgenticSearch(BaseSearch):
             Search result summary string
         """
 
+        # Try to reuse existing cluster based on semantic similarity
+        reused_content = await self._try_reuse_cluster(query)
+        if reused_content:
+            return reused_content
+
         # Build request
         text_items: List[ContentItem] = [ContentItem(type="text", text=query)]
         image_items: List[ContentItem] = []
@@ -451,25 +671,27 @@ class AgenticSearch(BaseSearch):
             messages=[{"role": "user", "content": result_sum_prompt}],
             stream=True,
         )
-        search_result: str = search_result_response.content
+        llm_response: str = search_result_response.content
         self.llm_usages.append(search_result_response.usage)
         await self._logger.success(" ✓", flush=True)
         await self._logger.success("Search completed successfully!")
 
+        # Parse LLM response to extract summary and save decision
+        search_result, should_save = self._parse_summary_response(llm_response)
+
         # Add search results (file paths) to the cluster
         if grep_results:
             cluster.search_results.append(search_result)
+        
+        # Add current query to queries list with FIFO strategy
+        self._add_query_to_cluster(cluster, query)
 
-        # Save knowledge cluster to persistent storage
-        try:
-            await self.knowledge_manager.insert(cluster)
-            await self._logger.info(f"Saved knowledge cluster {cluster.id} to cache")
-        except Exception as e:
-            # If cluster exists, update it instead
-            try:
-                await self.knowledge_manager.update(cluster)
-                await self._logger.info(f"Updated knowledge cluster {cluster.id} in cache")
-            except Exception as update_error:
-                await self._logger.warning(f"Failed to save knowledge cluster: {update_error}")
+        # Save cluster based on LLM's quality evaluation
+        if should_save:
+            await self._save_cluster_with_embedding(cluster)
+        else:
+            await self._logger.info(
+                "Cluster not saved - LLM determined insufficient quality or relevance"
+            )
 
         return search_result

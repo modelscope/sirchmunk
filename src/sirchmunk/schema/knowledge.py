@@ -230,12 +230,19 @@ class KnowledgeCluster:
     # Used to track which sources contributed to this knowledge cluster
     search_results: List[str] = None
 
+    # Historical queries: list of original user input queries that led to this cluster
+    # Used for semantic similarity matching and cluster reuse
+    queries: List[str] = None
+
     def __post_init__(self):
         if self.related_clusters is None:
             self.related_clusters = []
 
         if self.search_results is None:
             self.search_results = []
+
+        if self.queries is None:
+            self.queries = []
 
         if self.create_time is None:
             self.create_time = datetime.now(timezone.utc)
@@ -279,6 +286,7 @@ class KnowledgeCluster:
             "version": self.version,
             "related_clusters": [rc.to_dict() for rc in self.related_clusters],
             "search_results": self.search_results,
+            "queries": self.queries,
         }
 
 

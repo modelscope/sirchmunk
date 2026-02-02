@@ -208,6 +208,7 @@ class KnowledgeBase:
 
         cluster_id = f"C{hashlib.sha256(cluster_text.encode('utf-8')).hexdigest()[:10]}"
 
+        # TODO: Adapt cluster attributes based on real scenarios
         cluster = KnowledgeCluster(
             id=cluster_id,
             name=cluster_name,
