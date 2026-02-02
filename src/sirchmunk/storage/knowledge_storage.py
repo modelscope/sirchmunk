@@ -6,6 +6,7 @@ Manages KnowledgeCluster objects with persistence
 
 import os
 import json
+import asyncio
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 from datetime import datetime
@@ -23,7 +24,7 @@ from sirchmunk.schema.knowledge import (
 from ..utils.constants import DEFAULT_WORK_PATH
 
 
-class KnowledgeManager:
+class KnowledgeStorage:
     """
     Manages persistent storage of KnowledgeCluster objects using DuckDB and Parquet
     
@@ -53,6 +54,9 @@ class KnowledgeManager:
         
         # Parquet file path
         self.parquet_file = str(self.knowledge_path / "knowledge_clusters.parquet")
+        
+        # Initialize async lock for thread-safe parquet operations
+        self._parquet_lock = asyncio.Lock()
         
         # Initialize DuckDB (in-memory for fast operations)
         self.db = DuckDBManager(db_path=None)  # In-memory database
@@ -107,19 +111,50 @@ class KnowledgeManager:
             "version": "INTEGER",
             "related_clusters": "VARCHAR",  # JSON array
             "search_results": "VARCHAR",  # JSON array
+            "queries": "VARCHAR",  # JSON array of historical queries
+            "embedding_vector": "FLOAT[384]",  # 384-dim embedding vector
+            "embedding_model": "VARCHAR",  # Model identifier
+            "embedding_timestamp": "TIMESTAMP",  # Embedding computation time
+            "embedding_text_hash": "VARCHAR",  # Hash of embedded text
         }
         self.db.create_table(self.table_name, schema, if_not_exists=True)
         logger.info(f"Created table {self.table_name}")
     
-    def _save_to_parquet(self):
-        """Save current knowledge clusters to parquet file"""
-        try:
-            # Export table to parquet
-            self.db.export_to_parquet(self.table_name, self.parquet_file)
-            logger.debug(f"Saved knowledge clusters to {self.parquet_file}")
-        except Exception as e:
-            logger.error(f"Failed to save to parquet: {e}")
-            raise
+    async def _save_to_parquet(self):
+        """
+        Save current knowledge clusters to parquet file with thread-safe atomic write.
+        Uses async lock to prevent concurrent writes and temp file + rename for atomicity.
+        """
+        async with self._parquet_lock:
+            temp_file = None
+            try:
+                # Generate temporary file path with timestamp for uniqueness
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                temp_file = f"{self.parquet_file}.tmp_{timestamp}"
+                
+                # Export table to temporary parquet file
+                self.db.export_to_parquet(self.table_name, temp_file)
+                
+                # Verify temporary file was created successfully
+                if not Path(temp_file).exists():
+                    raise IOError(f"Temporary file not created: {temp_file}")
+                
+                # Atomically replace the target file with the temporary file
+                # os.replace() is atomic on both Unix and Windows
+                os.replace(temp_file, self.parquet_file)
+                
+                logger.debug(f"Atomically saved knowledge clusters to {self.parquet_file}")
+                
+            except Exception as e:
+                logger.error(f"Failed to save to parquet: {e}")
+                # Clean up temporary file if it exists
+                if temp_file and Path(temp_file).exists():
+                    try:
+                        Path(temp_file).unlink()
+                        logger.debug(f"Cleaned up temporary file: {temp_file}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Failed to clean up temp file {temp_file}: {cleanup_error}")
+                raise
     
     def _cluster_to_row(self, cluster: KnowledgeCluster) -> Dict[str, Any]:
         """Convert KnowledgeCluster to database row"""
@@ -155,34 +190,32 @@ class KnowledgeManager:
             "version": cluster.version,
             "related_clusters": json.dumps([rc.to_dict() for rc in cluster.related_clusters]),
             "search_results": json.dumps(cluster.search_results) if cluster.search_results else None,
+            "queries": json.dumps(cluster.queries) if cluster.queries else None,
         }
     
     def _row_to_cluster(self, row: tuple) -> KnowledgeCluster:
-        """Convert database row to KnowledgeCluster"""
-        # Unpack row (order matches schema). Older tables may not include search_results.
-        if len(row) == 19:
-            (
-                id, name, description, content, scripts, resources, evidences, patterns,
-                constraints, confidence, abstraction_level, landmark_potential, hotness,
-                lifecycle, create_time, last_modified, version, related_clusters, search_results
-            ) = row
-        elif len(row) == 18:
-            (
-                id, name, description, content, scripts, resources, evidences, patterns,
-                constraints, confidence, abstraction_level, landmark_potential, hotness,
-                lifecycle, create_time, last_modified, version, related_clusters
-            ) = row
-            search_results = None
-        elif len(row) == 17:
-            (
-                id, name, description, content, scripts, resources, evidences, patterns,
-                constraints, confidence, abstraction_level, landmark_potential, hotness,
-                lifecycle, create_time, last_modified, version
-            ) = row
-            related_clusters = None
-            search_results = None
-        else:
-            raise ValueError(f"Unexpected knowledge_clusters row length: {len(row)}")
+        """
+        Convert database row to KnowledgeCluster.
+        
+        Expected row structure (24 columns):
+        id, name, description, content, scripts, resources, evidences, patterns,
+        constraints, confidence, abstraction_level, landmark_potential, hotness,
+        lifecycle, create_time, last_modified, version, related_clusters, search_results, queries,
+        embedding_vector, embedding_model, embedding_timestamp, embedding_text_hash
+        """
+        if len(row) != 24:
+            raise ValueError(
+                f"Expected 24 columns in knowledge_clusters row, got {len(row)}. "
+                f"Please ensure the table schema is up to date."
+            )
+        
+        # Unpack row (embedding fields are ignored as they're not part of KnowledgeCluster schema)
+        (
+            id, name, description, content, scripts, resources, evidences, patterns,
+            constraints, confidence, abstraction_level, landmark_potential, hotness,
+            lifecycle, create_time, last_modified, version, related_clusters, search_results, queries,
+            _embedding_vector, _embedding_model, _embedding_timestamp, _embedding_text_hash
+        ) = row
         
         # Parse JSON fields
         try:
@@ -204,13 +237,22 @@ class KnowledgeManager:
         if evidences:
             evidences_data = json.loads(evidences)
             for ev_dict in evidences_data:
+                # Parse extracted_at field (handle both string and datetime types)
+                extracted_at_raw = ev_dict.get("extracted_at")
+                extracted_at_parsed = None
+                if extracted_at_raw:
+                    if isinstance(extracted_at_raw, str):
+                        extracted_at_parsed = datetime.fromisoformat(extracted_at_raw)
+                    elif isinstance(extracted_at_raw, datetime):
+                        extracted_at_parsed = extracted_at_raw
+                
                 evidences_parsed.append(EvidenceUnit(
                     doc_id=ev_dict["doc_id"],
                     file_or_url=Path(ev_dict["file_or_url"]),
                     summary=ev_dict["summary"],
                     is_found=ev_dict["is_found"],
                     snippets=ev_dict["snippets"],
-                    extracted_at=datetime.fromisoformat(ev_dict["extracted_at"]),
+                    extracted_at=extracted_at_parsed or datetime.now(),
                     conflict_group=ev_dict.get("conflict_group")
                 ))
         
@@ -233,6 +275,26 @@ class KnowledgeManager:
         if search_results:
             search_results_parsed = json.loads(search_results)
         
+        # Parse queries
+        queries_parsed = []
+        if queries:
+            queries_parsed = json.loads(queries)
+        
+        # Parse datetime fields (handle both string and datetime types)
+        create_time_parsed = None
+        if create_time:
+            if isinstance(create_time, str):
+                create_time_parsed = datetime.fromisoformat(create_time)
+            elif isinstance(create_time, datetime):
+                create_time_parsed = create_time
+        
+        last_modified_parsed = None
+        if last_modified:
+            if isinstance(last_modified, str):
+                last_modified_parsed = datetime.fromisoformat(last_modified)
+            elif isinstance(last_modified, datetime):
+                last_modified_parsed = last_modified
+        
         return KnowledgeCluster(
             id=id,
             name=name,
@@ -248,11 +310,12 @@ class KnowledgeManager:
             landmark_potential=landmark_potential,
             hotness=hotness,
             lifecycle=Lifecycle[lifecycle],
-            create_time=datetime.fromisoformat(create_time) if create_time else None,
-            last_modified=datetime.fromisoformat(last_modified) if last_modified else None,
+            create_time=create_time_parsed,
+            last_modified=last_modified_parsed,
             version=version,
             related_clusters=related_clusters_parsed,
             search_results=search_results_parsed,
+            queries=queries_parsed,
         )
     
     async def get(self, cluster_id: str) -> Optional[KnowledgeCluster]:
@@ -308,8 +371,8 @@ class KnowledgeManager:
             row = self._cluster_to_row(cluster)
             self.db.insert_data(self.table_name, row)
             
-            # Save to parquet
-            self._save_to_parquet()
+            # Save to parquet with atomic write
+            await self._save_to_parquet()
             
             logger.info(f"Inserted cluster: {cluster.id}")
             return True
@@ -351,8 +414,8 @@ class KnowledgeManager:
                 where_params=[cluster.id]
             )
             
-            # Save to parquet
-            self._save_to_parquet()
+            # Save to parquet with atomic write
+            await self._save_to_parquet()
             
             logger.info(f"Updated cluster: {cluster.id} (version {cluster.version})")
             return True
@@ -381,8 +444,8 @@ class KnowledgeManager:
             # Delete from database
             self.db.delete_data(self.table_name, "id = ?", [cluster_id])
             
-            # Save to parquet
-            self._save_to_parquet()
+            # Save to parquet with atomic write
+            await self._save_to_parquet()
             
             logger.info(f"Removed cluster: {cluster_id}")
             return True
@@ -666,9 +729,7 @@ class KnowledgeManager:
             Dictionary with statistics
         """
         try:
-            stats = self.db.analyze_table(self.table_name)
-            
-            # Add custom stats
+            # Get basic table count
             total_count = self.db.get_table_count(self.table_name)
             
             # Count by lifecycle
@@ -686,12 +747,24 @@ class KnowledgeManager:
             )
             avg_confidence = avg_confidence_row[0] if avg_confidence_row and avg_confidence_row[0] else 0
             
-            stats["custom_stats"] = {
-                "total_clusters": total_count,
-                "lifecycle_distribution": lifecycle_counts,
-                "average_confidence": round(avg_confidence, 4) if avg_confidence else None,
-                "parquet_file": self.parquet_file,
-                "parquet_exists": Path(self.parquet_file).exists(),
+            # Count clusters with embeddings
+            embedding_count_row = self.db.fetch_one(
+                f"SELECT COUNT(*) FROM {self.table_name} WHERE embedding_vector IS NOT NULL"
+            )
+            embedding_count = embedding_count_row[0] if embedding_count_row else 0
+            
+            # Build stats dictionary
+            stats = {
+                "table_name": self.table_name,
+                "row_count": total_count,
+                "custom_stats": {
+                    "total_clusters": total_count,
+                    "clusters_with_embeddings": embedding_count,
+                    "lifecycle_distribution": lifecycle_counts,
+                    "average_confidence": round(avg_confidence, 4) if avg_confidence else None,
+                    "parquet_file": self.parquet_file,
+                    "parquet_exists": Path(self.parquet_file).exists(),
+                }
             }
             
             return stats
@@ -699,6 +772,138 @@ class KnowledgeManager:
         except Exception as e:
             logger.error(f"Failed to get stats: {e}")
             return {}
+    
+    @staticmethod
+    def combine_cluster_fields(queries: List[str]) -> str:
+        """
+        Combine cluster queries into single text for embedding.
+        
+        Args:
+            queries: List of historical user queries
+        
+        Returns:
+            Combined text string
+        """
+        if not queries:
+            return "unknown"
+        
+        # Join all queries with newline separator
+        return "\n".join(queries)
+    
+    async def store_embedding(
+        self,
+        cluster_id: str,
+        embedding_vector: List[float],
+        embedding_model: str,
+        embedding_text_hash: str
+    ) -> bool:
+        """
+        Store embedding vector for a knowledge cluster.
+        
+        Args:
+            cluster_id: Cluster ID
+            embedding_vector: 384-dim embedding vector
+            embedding_model: Model identifier used for embedding
+            embedding_text_hash: Hash of the text that was embedded
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Verify embedding dimension
+            if len(embedding_vector) != 384:
+                logger.error(
+                    f"Invalid embedding dimension: expected 384, got {len(embedding_vector)}"
+                )
+                return False
+            
+            # Update embedding fields in database
+            self.db.execute(
+                f"""
+                UPDATE {self.table_name}
+                SET 
+                    embedding_vector = ?::FLOAT[384],
+                    embedding_model = ?,
+                    embedding_timestamp = CURRENT_TIMESTAMP,
+                    embedding_text_hash = ?
+                WHERE id = ?
+                """,
+                [embedding_vector, embedding_model, embedding_text_hash, cluster_id]
+            )
+            
+            # Save to parquet with atomic write
+            await self._save_to_parquet()
+            
+            logger.debug(f"Stored embedding for cluster {cluster_id}")
+            return True
+        
+        except Exception as e:
+            logger.error(f"Failed to store embedding for cluster {cluster_id}: {e}")
+            return False
+    
+    async def search_similar_clusters(
+        self,
+        query_embedding: List[float],
+        top_k: int = 3,
+        similarity_threshold: float = 0.82
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for similar clusters using vector similarity.
+        
+        Args:
+            query_embedding: 384-dim query embedding vector
+            top_k: Maximum number of results to return
+            similarity_threshold: Minimum cosine similarity threshold
+        
+        Returns:
+            List of similar clusters with metadata and similarity scores
+        """
+        try:
+            # Verify query embedding dimension
+            if len(query_embedding) != 384:
+                logger.error(
+                    f"Invalid query embedding dimension: expected 384, got {len(query_embedding)}"
+                )
+                return []
+            
+            # DuckDB cosine similarity query
+            query = f"""
+            SELECT 
+                id, name, description, confidence, hotness,
+                list_cosine_similarity(embedding_vector, ?::FLOAT[384]) AS similarity
+            FROM {self.table_name}
+            WHERE embedding_vector IS NOT NULL
+            ORDER BY similarity DESC
+            LIMIT ?
+            """
+            
+            results = self.db.fetch_all(query, [query_embedding, top_k])
+            
+            # Filter by similarity threshold
+            filtered_results = []
+            for row in results:
+                similarity = row[5]
+                if similarity >= similarity_threshold:
+                    filtered_results.append({
+                        "id": row[0],
+                        "name": row[1],
+                        "description": row[2],
+                        "confidence": row[3],
+                        "hotness": row[4],
+                        "similarity": similarity
+                    })
+            
+            if filtered_results:
+                logger.debug(
+                    f"Found {len(filtered_results)} similar clusters "
+                    f"(threshold: {similarity_threshold})"
+                )
+            
+            return filtered_results
+        
+        except Exception as e:
+            logger.error(f"Failed to search similar clusters: {e}")
+            return []
     
     def close(self):
         """Close database connection"""

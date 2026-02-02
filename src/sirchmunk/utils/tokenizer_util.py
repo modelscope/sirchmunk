@@ -27,8 +27,43 @@ class TokenizerUtil:
         """
         if not content.strip():
             return []
-
         return self.tokenizer.encode(content.strip())
+
+    def decode(self, token_ids: List[int]) -> str:
+        """Decode a list of token IDs back into a natural text string.
+
+        Args:
+            token_ids: List of token IDs to decode.
+
+        Returns:
+            Decoded text string.
+        """
+        if not token_ids:
+            return ""
+        return self.tokenizer.decode(token_ids, skip_special_tokens=True)
+
+    def segment(self, content: str) -> List[str]:
+        """Tokenize text into a list of token strings suitable for BM25-like algorithms indexing/retrieval.
+
+        This method returns the actual sub-word tokens as strings (e.g., ["▁Hello", "▁world"]),
+        preserving token boundaries. These tokens can be directly used as terms in BM25.
+
+        Args:
+            content: Input text string.
+
+        Returns:
+            List of token strings (not IDs), ready for BM25-style processing.
+        """
+        if not content.strip():
+            return []
+
+        token_ids = self.encode(content)
+        # Decode each token ID individually to get its string representation
+        token_strings = [
+            self.tokenizer.decode([tid], skip_special_tokens=True)
+            for tid in token_ids
+        ]
+        return token_strings
 
     def count_tokens(self, contents: Union[str, List[str]]) -> Union[int, List[int]]:
         """

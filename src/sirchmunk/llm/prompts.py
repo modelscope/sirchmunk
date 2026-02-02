@@ -169,8 +169,19 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 - **User Input**: {user_input}
 - **Search Result Text**: {text_content}
 
-### Output
+### Quality Evaluation
+After generating the summary, evaluate whether this knowledge cluster is worth saving to the persistent cache based on:
+1. Does the search result contain substantial, relevant information for the user input?
+2. Is the content meaningful and not just error messages or "no information found"?
+3. Are there sufficient evidences and context to answer the user's query?
+
+If YES to all above, output "true"; otherwise output "false".
+
+### Output Format
+<SUMMARY>
 [Generate the Markdown Briefing here]
+</SUMMARY>
+<SHOULD_SAVE>true/false</SHOULD_SAVE>
 """
 
 
