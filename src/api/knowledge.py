@@ -8,13 +8,13 @@ from fastapi import APIRouter, HTTPException
 from typing import Optional
 from pydantic import BaseModel
 
-from sirchmunk.storage.knowledge_manager import KnowledgeManager
+from sirchmunk.storage.knowledge_storage import KnowledgeStorage
 from sirchmunk.schema.knowledge import AbstractionLevel
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge"])
 
 # Initialize Knowledge Manager
-km = KnowledgeManager()
+km = KnowledgeStorage()
 
 # === Request/Response Models ===
 

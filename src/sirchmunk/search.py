@@ -14,7 +14,7 @@ from sirchmunk.llm.prompts import (
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.schema.knowledge import KnowledgeCluster
 from sirchmunk.schema.request import ContentItem, ImageURL, Message, Request
-from sirchmunk.storage.knowledge_manager import KnowledgeManager
+from sirchmunk.storage.knowledge_storage import KnowledgeStorage
 from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME, WORK_PATH
 from sirchmunk.utils.deps import check_dependencies
 from sirchmunk.utils.file_utils import get_fast_hash
@@ -62,7 +62,7 @@ class AgenticSearch(BaseSearch):
         )
 
         # Initialize KnowledgeManager for persistent storage
-        self.knowledge_manager = KnowledgeManager(work_path=str(self.work_path))
+        self.knowledge_manager = KnowledgeStorage(work_path=str(self.work_path))
         
         # Load historical knowledge clusters from cache
         self._load_historical_knowledge()

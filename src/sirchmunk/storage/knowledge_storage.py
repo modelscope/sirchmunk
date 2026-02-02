@@ -6,6 +6,7 @@ Manages KnowledgeCluster objects with persistence
 
 import os
 import json
+import asyncio
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 from datetime import datetime
@@ -23,7 +24,7 @@ from sirchmunk.schema.knowledge import (
 from ..utils.constants import DEFAULT_WORK_PATH
 
 
-class KnowledgeManager:
+class KnowledgeStorage:
     """
     Manages persistent storage of KnowledgeCluster objects using DuckDB and Parquet
     
@@ -53,6 +54,9 @@ class KnowledgeManager:
         
         # Parquet file path
         self.parquet_file = str(self.knowledge_path / "knowledge_clusters.parquet")
+        
+        # Initialize async lock for thread-safe parquet operations
+        self._parquet_lock = asyncio.Lock()
         
         # Initialize DuckDB (in-memory for fast operations)
         self.db = DuckDBManager(db_path=None)  # In-memory database
@@ -111,15 +115,41 @@ class KnowledgeManager:
         self.db.create_table(self.table_name, schema, if_not_exists=True)
         logger.info(f"Created table {self.table_name}")
     
-    def _save_to_parquet(self):
-        """Save current knowledge clusters to parquet file"""
-        try:
-            # Export table to parquet
-            self.db.export_to_parquet(self.table_name, self.parquet_file)
-            logger.debug(f"Saved knowledge clusters to {self.parquet_file}")
-        except Exception as e:
-            logger.error(f"Failed to save to parquet: {e}")
-            raise
+    async def _save_to_parquet(self):
+        """
+        Save current knowledge clusters to parquet file with thread-safe atomic write.
+        Uses async lock to prevent concurrent writes and temp file + rename for atomicity.
+        """
+        async with self._parquet_lock:
+            temp_file = None
+            try:
+                # Generate temporary file path with timestamp for uniqueness
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                temp_file = f"{self.parquet_file}.tmp_{timestamp}"
+                
+                # Export table to temporary parquet file
+                self.db.export_to_parquet(self.table_name, temp_file)
+                
+                # Verify temporary file was created successfully
+                if not Path(temp_file).exists():
+                    raise IOError(f"Temporary file not created: {temp_file}")
+                
+                # Atomically replace the target file with the temporary file
+                # os.replace() is atomic on both Unix and Windows
+                os.replace(temp_file, self.parquet_file)
+                
+                logger.debug(f"Atomically saved knowledge clusters to {self.parquet_file}")
+                
+            except Exception as e:
+                logger.error(f"Failed to save to parquet: {e}")
+                # Clean up temporary file if it exists
+                if temp_file and Path(temp_file).exists():
+                    try:
+                        Path(temp_file).unlink()
+                        logger.debug(f"Cleaned up temporary file: {temp_file}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"Failed to clean up temp file {temp_file}: {cleanup_error}")
+                raise
     
     def _cluster_to_row(self, cluster: KnowledgeCluster) -> Dict[str, Any]:
         """Convert KnowledgeCluster to database row"""
@@ -308,8 +338,8 @@ class KnowledgeManager:
             row = self._cluster_to_row(cluster)
             self.db.insert_data(self.table_name, row)
             
-            # Save to parquet
-            self._save_to_parquet()
+            # Save to parquet with atomic write
+            await self._save_to_parquet()
             
             logger.info(f"Inserted cluster: {cluster.id}")
             return True
@@ -351,8 +381,8 @@ class KnowledgeManager:
                 where_params=[cluster.id]
             )
             
-            # Save to parquet
-            self._save_to_parquet()
+            # Save to parquet with atomic write
+            await self._save_to_parquet()
             
             logger.info(f"Updated cluster: {cluster.id} (version {cluster.version})")
             return True
@@ -381,8 +411,8 @@ class KnowledgeManager:
             # Delete from database
             self.db.delete_data(self.table_name, "id = ?", [cluster_id])
             
-            # Save to parquet
-            self._save_to_parquet()
+            # Save to parquet with atomic write
+            await self._save_to_parquet()
             
             logger.info(f"Removed cluster: {cluster_id}")
             return True

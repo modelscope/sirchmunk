@@ -11,7 +11,7 @@ from typing import Dict, Any, List, Optional
 from pathlib import Path
 import threading
 
-from sirchmunk.storage.knowledge_manager import KnowledgeManager
+from sirchmunk.storage.knowledge_storage import KnowledgeStorage
 from api.components.history_storage import HistoryStorage
 from sirchmunk.utils.constants import DEFAULT_WORK_PATH
 
@@ -122,7 +122,7 @@ class MonitorTracker:
             self.history_storage = None
         
         try:
-            self.knowledge_manager = KnowledgeManager()
+            self.knowledge_manager = KnowledgeStorage()
         except:
             self.knowledge_manager = None
     
