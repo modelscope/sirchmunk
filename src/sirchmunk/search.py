@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import ast
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -282,6 +283,92 @@ class AgenticSearch(BaseSearch):
             except Exception as e:
                 await self._logger.warning(f"Failed to compute embedding for cluster {cluster.id}: {e}")
     
+    async def _search_by_filename(
+        self,
+        query: str,
+        search_paths: Union[str, Path, List[str], List[Path]],
+        max_depth: Optional[int] = 5,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        grep_timeout: Optional[float] = 60.0,
+        top_k: Optional[int] = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Perform filename-only search without LLM keyword extraction.
+        
+        Args:
+            query: Search query (used as filename pattern)
+            search_paths: Paths to search in
+            max_depth: Maximum directory depth
+            include: File patterns to include
+            exclude: File patterns to exclude
+            grep_timeout: Timeout for grep operations
+            top_k: Maximum number of results to return
+        
+        Returns:
+            List of file matches with metadata
+        """
+        await self._logger.info("Performing filename-only search...")
+        
+        # Extract potential filename patterns from query
+        patterns = []
+        
+        # Check if query looks like a file pattern (contains file extensions or wildcards)
+        if any(char in query for char in ['*', '?', '[', ']']):
+            # Treat as direct glob/regex pattern
+            patterns = [query]
+            await self._logger.info(f"Using direct pattern: {query}")
+        else:
+            # Split into words and create flexible patterns
+            words = [w.strip() for w in query.strip().split() if w.strip()]
+            
+            if not words:
+                await self._logger.warning("No valid words in query")
+                return []
+            
+            # Strategy: Create patterns for each word that match anywhere in filename
+            # Use non-greedy matching and case-insensitive by default
+            for word in words:
+                # Escape special regex characters in the word
+                escaped_word = re.escape(word)
+                # Match word anywhere in filename (case-insensitive handled in retrieve_by_filename)
+                pattern = f".*{escaped_word}.*"
+                patterns.append(pattern)
+                await self._logger.debug(f"Created pattern for word '{word}': {pattern}")
+        
+        if not patterns:
+            await self._logger.warning("No valid filename patterns extracted from query")
+            return []
+        
+        await self._logger.info(f"Searching with {len(patterns)} pattern(s): {patterns}")
+        
+        try:
+            # Use GrepRetriever's filename search
+            await self._logger.debug(f"Calling retrieve_by_filename with {len(patterns)} patterns")
+            results = await self.grep_retriever.retrieve_by_filename(
+                patterns=patterns,
+                path=search_paths,
+                case_sensitive=False,
+                max_depth=max_depth,
+                include=include,
+                exclude=exclude or ["*.pyc", "*.log"],
+                timeout=grep_timeout,
+            )
+            
+            if results:
+                results = results[:top_k]
+                await self._logger.success(f" ✓ Found {len(results)} matching files", flush=True)
+            else:
+                await self._logger.warning("No files matched the patterns")
+            
+            return results
+        
+        except Exception as e:
+            await self._logger.error(f"Filename search failed: {e}")
+            import traceback
+            await self._logger.error(f"Traceback: {traceback.format_exc()}")
+            return []
+    
     @staticmethod
     def _parse_summary_response(llm_response: str) -> tuple[str, bool]:
         """
@@ -486,8 +573,8 @@ class AgenticSearch(BaseSearch):
         self,
         query: str,
         search_paths: Union[str, Path, List[str], List[Path]],
-        mode: Literal["FAST", "DEEP", "FILENAME_ONLY"] = "DEEP",  # TODO
         *,
+        mode: Literal["FAST", "DEEP", "FILENAME_ONLY"] = "DEEP",  # TODO
         images: Optional[list] = None,
         max_depth: Optional[int] = 5,
         top_k_files: Optional[int] = 3,
@@ -497,7 +584,7 @@ class AgenticSearch(BaseSearch):
         verbose: Optional[bool] = True,
         grep_timeout: Optional[float] = 60.0,
         return_cluster: Optional[bool] = False,
-    ) -> Union[str, KnowledgeCluster]:
+    ) -> Union[str, List[Dict[str, Any]], KnowledgeCluster]:
         """
         Perform intelligent search with multi-level keyword extraction.
 
@@ -507,7 +594,7 @@ class AgenticSearch(BaseSearch):
             mode: Search mode (FAST/DEEP/FILENAME_ONLY)
             images: Optional image inputs
             max_depth: Maximum directory depth to search
-            top_k_files: Number of top files to return
+            top_k_files: Number of top files to grep-retrieve
             keyword_levels: Number of keyword granularity levels (default: 3)
                           - Higher values provide more fallback options
                           - Recommended: 3-5 levels
@@ -515,11 +602,35 @@ class AgenticSearch(BaseSearch):
             exclude: File patterns to exclude
             verbose: Enable verbose logging
             grep_timeout: Timeout for grep operations
-            return_cluster: Whether to return the full knowledge cluster.
+            return_cluster: Whether to return the full knowledge cluster. Ignore if mode is `FILENAME_ONLY`.
+
+        Notes:
+            - In FILENAME_ONLY mode, performs fast filename search without LLM involvement. Returns list of matching files.
+               Format: {'filename': 'Attention_Is_All_You_Need.pdf', 'match_score': 0.8, 'matched_pattern': '.*Attention.*', 'path': '/path/to/Attention_Is_All_You_Need.pdf', 'type': 'filename_match'}
 
         Returns:
-            Search result summary string, or KnowledgeCluster if return_cluster is True
+            Search result summary string, or KnowledgeCluster if return_cluster is True, or List[Dict[str, Any]] for FILENAME_ONLY mode.
         """
+        # Handle FILENAME_ONLY mode: fast filename search without LLM
+        if mode == "FILENAME_ONLY":
+            filename_results: List[Dict[str, Any]] = await self._search_by_filename(
+                query=query,
+                search_paths=search_paths,
+                max_depth=max_depth,
+                include=include,
+                exclude=exclude,
+                grep_timeout=grep_timeout,
+                top_k=top_k_files,
+            )
+
+            if not filename_results:
+                error_msg = f"No files found matching query: '{query}'"
+                await self._logger.warning(error_msg)
+                return None if return_cluster else error_msg
+
+            await self._logger.success(f"Retrieved {len(filename_results)} matching files")
+
+            return filename_results
 
         # Try to reuse existing cluster based on semantic similarity
         reused_result = await self._try_reuse_cluster(query, return_cluster=return_cluster)
