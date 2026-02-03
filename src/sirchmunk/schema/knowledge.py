@@ -253,6 +253,117 @@ class KnowledgeCluster:
         if self.version is None:
             self.version = 0
 
+    def __repr__(self) -> str:
+        """
+        Return a concise representation for debugging.
+        """
+        # Get content length
+        content_len = 0
+        if isinstance(self.content, str):
+            content_len = len(self.content)
+        elif isinstance(self.content, list):
+            content_len = sum(len(c) for c in self.content)
+        
+        return (
+            f"KnowledgeCluster(id={self.id!r}, name={self.name!r}, "
+            f"version={self.version}, lifecycle={self.lifecycle.value}, "
+            f"evidences={len(self.evidences)}, queries={len(self.queries)}, "
+            f"content_len={content_len}, search_results={len(self.search_results)})"
+        )
+
+    def __str__(self) -> str:
+        """
+        Return a human-readable string representation.
+        """
+        separator = "─" * 70  # Horizontal separator line
+        
+        # Extract description text
+        desc_text = ""
+        if isinstance(self.description, str):
+            desc_text = self.description
+        elif isinstance(self.description, list):
+            desc_preview = []
+            for i, item in enumerate(self.description, 1):
+                desc_preview.append(f"  [{i}] {item}")
+            desc_text = "\n".join(desc_preview)
+        
+        # Extract content text
+        content_text = ""
+        if isinstance(self.content, str):
+            content_text = self.content
+        elif isinstance(self.content, list):
+            content_text = self.content[0] if self.content else ""  # Preview first item
+        
+        # Build basic info
+        lines = [
+            f"━━━ KnowledgeCluster: {self.name} ━━━",
+            f"ID: {self.id}",
+            f"Description:\n{desc_text}" if desc_text else "Description: N/A",
+            f"Lifecycle: {self.lifecycle.value} | Version: {self.version}",
+            f"Confidence: {self.confidence:.3f}" if self.confidence else "Confidence: N/A",
+        ]
+        
+        # Add content preview
+        if content_text:
+            lines.append(separator)
+            lines.append(f"Content Preview:\n{content_text}")
+        
+        # Add evidences with preview (max 5)
+        if self.evidences:
+            lines.append(separator)
+            lines.append(f"Evidences ({len(self.evidences)} total):")
+            for i, evidence in enumerate(self.evidences[:5], 1):
+                file_path = str(evidence.file_or_url)
+                # Shorten path if too long
+                if len(file_path) > 60:
+                    file_path = "..." + file_path[-57:]
+                summary_preview = evidence.summary[:80] + "..." if len(evidence.summary) > 80 else evidence.summary
+                lines.append(f"  [{i}] {file_path}")
+                lines.append(f"      {summary_preview}")
+                lines.append(f"      Snippets: {len(evidence.snippets)}, Found: {evidence.is_found}")
+            if len(self.evidences) > 5:
+                lines.append(f"  ... (+{len(self.evidences) - 5} more evidences)")
+        
+        # Add optional fields
+        has_optional_fields = False
+        optional_lines = []
+        
+        if self.hotness is not None:
+            optional_lines.append(f"Hotness: {self.hotness:.3f}")
+            has_optional_fields = True
+        
+        if self.abstraction_level:
+            optional_lines.append(f"Abstraction: {self.abstraction_level.name}")
+            has_optional_fields = True
+        
+        if self.queries:
+            queries_preview = ", ".join(f'"{q}"' for q in self.queries[:3])
+            if len(self.queries) > 3:
+                queries_preview += f" (+{len(self.queries) - 3} more)"
+            optional_lines.append(f"Related Queries: {queries_preview}")
+            has_optional_fields = True
+        
+        if has_optional_fields:
+            lines.append(separator)
+            lines.extend(optional_lines)
+        
+        # Add search results
+        if self.search_results:
+            lines.append(separator)
+            lines.append(f"Search Results ({len(self.search_results)} files):")
+            for i, result in enumerate(self.search_results[:5], 1):
+                result_preview = result[:80] + "..." if len(result) > 80 else result
+                lines.append(f"  [{i}] {result_preview}")
+            if len(self.search_results) > 5:
+                lines.append(f"  ... (+{len(self.search_results) - 5} more)")
+        
+        # Add timestamp
+        if self.last_modified:
+            lines.append(separator)
+            lines.append(f"Last Modified: {self.last_modified.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        return "\n".join(lines)
+
     @property
     def primary_evidence_files(self) -> Set[str]:
         """Return set of unique file IDs backing this cluster — useful for evidence-layer prefetch."""
@@ -289,38 +400,3 @@ class KnowledgeCluster:
             "queries": self.queries,
         }
 
-
-if __name__ == "__main__":
-
-    # Create instance
-    cluster = KnowledgeCluster(
-        id="C1001",
-        name="Test Cluster",
-        description=["A desc from perspective A.", "A desc from perspective B."],
-        content="Detailed content of the knowledge cluster.",
-        scripts=["print('Hello World')"],
-        resources=[
-            {"type": "url", "value": "https://example.com"},
-            {"type": "file", "value": "/data/image1.png"},
-        ],
-        patterns=["pattern A", "pattern B"],
-        constraints=[Constraint("x > 0", "low", "x must be positive")],
-        evidences=[
-            EvidenceUnit(
-                doc_id="doc1",
-                file_or_url=Path("/data/file.txt"),
-                segment={"text": "supporting text", "type": "match", "line_number": 10},
-                score=0.9,
-                extracted_at=datetime(2025, 1, 1),
-            )
-        ],
-        confidence=0.85,
-        abstraction_level=AbstractionLevel.PRINCIPLE,
-        landmark_potential=0.6,
-        hotness=0.4,
-        lifecycle=Lifecycle.STABLE,
-        create_time=datetime(2025, 1, 1),
-        last_modified=datetime(2025, 1, 2),
-    )
-
-    print(cluster.to_dict())

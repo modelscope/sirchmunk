@@ -112,15 +112,20 @@ class AgenticSearch(BaseSearch):
         except Exception as e:
             print(f"[WARNING] Failed to load historical knowledge: {e}")
     
-    async def _try_reuse_cluster(self, query: str) -> Optional[str]:
+    async def _try_reuse_cluster(
+        self, 
+        query: str, 
+        return_cluster: bool = False
+    ) -> Optional[Union[str, KnowledgeCluster]]:
         """
         Try to reuse existing knowledge cluster based on semantic similarity.
         
         Args:
             query: Search query string
+            return_cluster: Whether to return the full cluster object or just content string
         
         Returns:
-            Cluster content if found and reused, None otherwise
+            Cluster content string or KnowledgeCluster object if found, None otherwise
         """
         if not self.embedding_client:
             return None
@@ -194,13 +199,17 @@ class AgenticSearch(BaseSearch):
             # Single update call - saves cluster data and embedding together
             await self.knowledge_manager.update(existing_cluster)
             
-            # Format and return existing cluster content
-            content = existing_cluster.content
-            if isinstance(content, list):
-                content = "\n".join(content)
-            
             await self._logger.success("Reused existing knowledge cluster")
-            return str(content) if content else "Knowledge cluster found but content is empty"
+            
+            # Return based on return_cluster flag
+            if return_cluster:
+                return existing_cluster
+            else:
+                # Format and return cluster content as string
+                content = existing_cluster.content
+                if isinstance(content, list):
+                    content = "\n".join(content)
+                return str(content) if content else "Knowledge cluster found but content is empty"
         
         except Exception as e:
             await self._logger.warning(
@@ -487,7 +496,8 @@ class AgenticSearch(BaseSearch):
         exclude: Optional[List[str]] = None,
         verbose: Optional[bool] = True,
         grep_timeout: Optional[float] = 60.0,
-    ) -> str:
+        return_cluster: Optional[bool] = False,
+    ) -> Union[str, KnowledgeCluster]:
         """
         Perform intelligent search with multi-level keyword extraction.
 
@@ -505,15 +515,16 @@ class AgenticSearch(BaseSearch):
             exclude: File patterns to exclude
             verbose: Enable verbose logging
             grep_timeout: Timeout for grep operations
+            return_cluster: Whether to return the full knowledge cluster.
 
         Returns:
-            Search result summary string
+            Search result summary string, or KnowledgeCluster if return_cluster is True
         """
 
         # Try to reuse existing cluster based on semantic similarity
-        reused_content = await self._try_reuse_cluster(query)
-        if reused_content:
-            return reused_content
+        reused_result = await self._try_reuse_cluster(query, return_cluster=return_cluster)
+        if reused_result:
+            return reused_result
 
         # Build request
         text_items: List[ContentItem] = [ContentItem(type="text", text=query)]
@@ -631,7 +642,8 @@ class AgenticSearch(BaseSearch):
             await self._logger.info(f"Found {len(grep_results)} files, top {len(file_list)}:\n{tmp_sep.join(file_list)}")
 
         if len(grep_results) == 0:
-            return f"No relevant information found for the query: {query}"
+            error_msg = f"No relevant information found for the query: {query}"
+            return None if return_cluster else error_msg
 
         # Build knowledge cluster
         await self._logger.info("Building knowledge cluster...")
@@ -649,7 +661,8 @@ class AgenticSearch(BaseSearch):
         await self._logger.success(" ✓", flush=True)
 
         if cluster is None:
-            return f"No relevant information found for the query: {query}"
+            error_msg = f"No relevant information found for the query: {query}"
+            return None if return_cluster else error_msg
 
         if self.verbose:
             await self._logger.info(json.dumps(cluster.to_dict(), ensure_ascii=False, indent=2))
@@ -694,4 +707,4 @@ class AgenticSearch(BaseSearch):
                 "Cluster not saved - LLM determined insufficient quality or relevance"
             )
 
-        return search_result
+        return cluster if return_cluster else search_result
