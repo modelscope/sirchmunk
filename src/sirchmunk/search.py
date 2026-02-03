@@ -604,9 +604,18 @@ class AgenticSearch(BaseSearch):
             grep_timeout: Timeout for grep operations
             return_cluster: Whether to return the full knowledge cluster. Ignore if mode is `FILENAME_ONLY`.
 
-        Notes:
+        Mode behaviors:
             - In FILENAME_ONLY mode, performs fast filename search without LLM involvement. Returns list of matching files.
                Format: {'filename': 'Attention_Is_All_You_Need.pdf', 'match_score': 0.8, 'matched_pattern': '.*Attention.*', 'path': '/path/to/Attention_Is_All_You_Need.pdf', 'type': 'filename_match'}
+
+            +--------------+------------------+-----------------------+------------------------+
+            | Feature      | FILENAME_ONLY    | FAST (To be designed) | DEEP (Current)         |
+            +--------------+------------------+-----------------------+------------------------+
+            | Speed        | Very Fast (<1s)  | Fast (<5s)           | Slow (5-30s)          |
+            | LLM Calls    | 0 times          | 1-2 times             | 4-5 times              |
+            | Return Type  | List[Dict]       | str / Cluster         | str / Cluster          |
+            | Use Case     | File Location    | Rapid Content Search  | Deep Knowledge Extract |
+            +--------------+------------------+-----------------------+------------------------+
 
         Returns:
             Search result summary string, or KnowledgeCluster if return_cluster is True, or List[Dict[str, Any]] for FILENAME_ONLY mode.
