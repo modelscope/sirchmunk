@@ -688,6 +688,190 @@ class GrepRetriever(BaseRetriever):
 
         return result["stdout"].strip().splitlines() if result["stdout"].strip() else []
 
+    async def retrieve_by_filename(
+        self,
+        patterns: Union[str, List[str]],
+        path: Union[str, Path, List[str], List[Path], None] = None,
+        *,
+        case_sensitive: bool = False,
+        max_depth: Optional[int] = None,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        file_type: Optional[str] = None,
+        rank: bool = True,
+        timeout: float = 60.0,
+    ) -> List[Dict[str, Any]]:
+        """Search for files by filename patterns (fast file name matching).
+        
+        This method performs filename-only search without reading file contents,
+        making it significantly faster than content-based search.
+        
+        Args:
+            patterns: Single pattern (str) or list of patterns (List[str]) to match filenames.
+                     Patterns are treated as regex by default (e.g., "test.*\\.py").
+            path: Single path (str/Path) or multiple paths (List[str]/List[Path]) to search in.
+            case_sensitive: If True, enable case-sensitive filename matching.
+            max_depth: Maximum directory depth to search.
+            include: List of glob patterns to include (e.g., ["*.py", "*.md"]).
+            exclude: List of glob patterns to exclude (e.g., ["*.pyc", "*.log"]).
+            file_type: Search only files of given type (e.g., 'py', 'md').
+            rank: If True, rank results by pattern match quality (e.g., exact match > partial match).
+            timeout: Maximum time in seconds to wait for the search to complete.
+        
+        Returns:
+            List of match objects with structure:
+            [
+                {
+                    'path': '/absolute/path/to/file.py',
+                    'filename': 'file.py',
+                    'match_score': 1.0,  # relevance score (0.0-1.0)
+                    'type': 'filename_match'
+                },
+                ...
+            ]
+        """
+        # Normalize patterns
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        
+        logger.debug(f"retrieve_by_filename called with patterns: {patterns}, path: {path}, "
+                    f"include: {include}, exclude: {exclude}, max_depth: {max_depth}")
+        
+        # Normalize paths
+        if path is None:
+            paths = ["."]
+        elif isinstance(path, (str, Path)):
+            paths = [str(path)]
+        else:
+            paths = [str(p) for p in path]
+        
+        # List all files in the specified paths
+        all_files = []
+        for search_path in paths:
+            try:
+                files = await self.list_files(
+                    path=search_path,
+                    max_depth=max_depth,
+                    include=include,
+                    exclude=exclude,
+                    file_type=file_type,
+                )
+                all_files.extend(files)
+            except Exception as e:
+                logger.warning(f"Failed to list files in {search_path}: {e}")
+                continue
+        
+        if not all_files:
+            logger.debug("No files found to search")
+            return []
+        
+        logger.debug(f"Searching through {len(all_files)} files with patterns: {patterns}")
+        
+        # Filter files by patterns
+        results = []
+        for file_path in all_files:
+            # Get both absolute and relative paths for proper handling
+            file_path_obj = Path(file_path)
+            filename = file_path_obj.name
+            
+            # Check if filename matches any pattern
+            for pattern in patterns:
+                try:
+                    # Compile regex pattern
+                    flags = 0 if case_sensitive else re.IGNORECASE
+                    regex = re.compile(pattern, flags)
+                    
+                    match = regex.search(filename)
+                    if match:
+                        logger.debug(f"Pattern '{pattern}' matched file: {filename}")
+                        
+                        # Calculate match score
+                        match_score = self._calculate_filename_match_score(
+                            filename=filename,
+                            pattern=pattern,
+                            case_sensitive=case_sensitive
+                        )
+                        
+                        # Use absolute path if file exists, otherwise keep original path
+                        try:
+                            abs_path = str(file_path_obj.resolve())
+                        except (OSError, RuntimeError):
+                            abs_path = str(file_path_obj.absolute()) if file_path_obj.is_absolute() else file_path
+                        
+                        results.append({
+                            'path': abs_path,
+                            'filename': filename,
+                            'match_score': match_score,
+                            'type': 'filename_match',
+                            'matched_pattern': pattern,
+                        })
+                        break  # Only count each file once (first matching pattern)
+                
+                except re.error as e:
+                    logger.warning(f"Invalid regex pattern '{pattern}': {e}")
+                    continue
+        
+        logger.debug(f"Found {len(results)} matching files")
+        
+        # Rank results by match score if requested
+        if rank and results:
+            results.sort(key=lambda x: x['match_score'], reverse=True)
+        
+        return results
+
+    @staticmethod
+    def _calculate_filename_match_score(
+        filename: str,
+        pattern: str,
+        case_sensitive: bool = False
+    ) -> float:
+        """Calculate relevance score for filename pattern match.
+        
+        Args:
+            filename: The filename that matched
+            pattern: The regex pattern that was matched
+            case_sensitive: Whether the match was case-sensitive
+        
+        Returns:
+            Score between 0.0 and 1.0, where:
+            - 1.0 = exact match (highest priority)
+            - 0.9 = exact match with different case
+            - 0.7-0.8 = starts with pattern
+            - 0.5-0.6 = contains pattern
+            - 0.3-0.4 = partial regex match
+        """
+        # Normalize for comparison
+        fn_lower = filename.lower()
+        pattern_lower = pattern.lower()
+        
+        # Remove regex special characters for literal comparison
+        pattern_literal = re.sub(r'[.*+?^${}()|[\]\\]', '', pattern)
+        pattern_literal_lower = pattern_literal.lower()
+        
+        # Exact match (case-sensitive)
+        if filename == pattern or filename == pattern_literal:
+            return 1.0
+        
+        # Exact match (case-insensitive)
+        if not case_sensitive and (fn_lower == pattern_lower or fn_lower == pattern_literal_lower):
+            return 0.9
+        
+        # Starts with pattern
+        if filename.startswith(pattern_literal):
+            return 0.8
+        if fn_lower.startswith(pattern_literal_lower):
+            return 0.75
+        
+        # Contains pattern (full)
+        if pattern_literal in filename:
+            return 0.6
+        if pattern_literal_lower in fn_lower:
+            return 0.55
+        
+        # Partial match (proportional to match length)
+        match_ratio = len(pattern_literal) / max(len(filename), 1)
+        return 0.3 + (match_ratio * 0.2)  # Score between 0.3 and 0.5
+
     def file_types(self) -> Dict[str, List[str]]:
         """List supported file types and their associated globs/extensions.
 
