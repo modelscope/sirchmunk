@@ -574,7 +574,7 @@ class AgenticSearch(BaseSearch):
         query: str,
         search_paths: Union[str, Path, List[str], List[Path]],
         *,
-        mode: Literal["FAST", "DEEP", "FILENAME_ONLY"] = "DEEP",  # TODO
+        mode: Literal["DEEP", "FILENAME_ONLY"] = "DEEP",
         images: Optional[list] = None,
         max_depth: Optional[int] = 5,
         top_k_files: Optional[int] = 3,
@@ -591,7 +591,7 @@ class AgenticSearch(BaseSearch):
         Args:
             query: Search query string
             search_paths: Paths to search in
-            mode: Search mode (FAST/DEEP/FILENAME_ONLY)
+            mode: Search mode (DEEP/FILENAME_ONLY), default is DEEP
             images: Optional image inputs
             max_depth: Maximum directory depth to search
             top_k_files: Number of top files to grep-retrieve
