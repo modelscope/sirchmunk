@@ -100,8 +100,8 @@ Claude will use the Sirchmunk MCP tool to perform an intelligent search!
 
 ## 📚 What's Next?
 
-- [Full Documentation](README_MCP.md) - Complete feature guide
-- [Installation Guide](INSTALL_MCP.md) - Detailed setup instructions
+- [Full Documentation](README) - Complete feature guide
+- [Installation Guide](INSTALL) - Detailed setup instructions
 - [Configuration Options](config/env.example) - All available settings
 
 ---

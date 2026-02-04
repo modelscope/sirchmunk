@@ -491,7 +491,7 @@ sirchmunk-mcp serve
 
 ## Getting Help
 
-- **Documentation**: [README_MCP.md](README_MCP.md)
+- **Documentation**: [README_MCP.md](README)
 - **GitHub Issues**: https://github.com/modelscope/sirchmunk/issues
 - **Logs**: Check `~/.sirchmunk/logs/` for detailed error messages
 - **Verbose Mode**: Run with `SIRCHMUNK_VERBOSE=true` for debugging
@@ -502,7 +502,7 @@ sirchmunk-mcp serve
 
 After successful installation:
 
-1. Read the [README_MCP.md](README_MCP.md) for usage examples
+1. Read the [README_MCP.md](README) for usage examples
 2. Explore available tools and their parameters
 3. Try different search modes (DEEP/FAST/FILENAME_ONLY)
 4. Experiment with knowledge cluster management

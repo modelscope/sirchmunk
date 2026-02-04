@@ -334,6 +334,6 @@ jobs:
 
 ---
 
-For installation instructions, see [INSTALL_MCP.md](INSTALL_MCP.md).
+For installation instructions, see [INSTALL_MCP.md](INSTALL).
 
-For usage instructions, see [README_MCP.md](README_MCP.md).
+For usage instructions, see [README_MCP.md](README).
