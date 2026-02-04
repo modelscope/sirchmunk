@@ -7,12 +7,12 @@ Provides actual system metrics and activity tracking
 import psutil
 import os
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 from pathlib import Path
 import threading
 
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
-from api.components.history_storage import HistoryStorage
+from sirchmunk.api.components.history_storage import HistoryStorage
 from sirchmunk.utils.constants import DEFAULT_WORK_PATH
 
 

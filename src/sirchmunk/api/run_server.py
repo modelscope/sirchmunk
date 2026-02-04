@@ -16,7 +16,7 @@ def main():
     """Main entry point for running the FastAPI server"""
     try:
         import uvicorn
-        from src.api.main import app
+        from sirchmunk.api.main import app
         
         # Get configuration from environment
         host = os.environ.get("API_HOST", "0.0.0.0")

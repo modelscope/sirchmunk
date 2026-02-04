@@ -19,9 +19,9 @@ import threading
 from sirchmunk.search import AgenticSearch
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME
-from api.components.history_storage import HistoryStorage
-from api.components.settings_storage import SettingsStorage
-from api.components.monitor_tracker import llm_usage_tracker
+from sirchmunk.api.components.history_storage import HistoryStorage
+from sirchmunk.api.components.settings_storage import SettingsStorage
+from sirchmunk.api.components.monitor_tracker import llm_usage_tracker
 
 
 # Try to import tkinter for file dialogs
