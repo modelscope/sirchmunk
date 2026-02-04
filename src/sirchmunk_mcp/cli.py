@@ -44,13 +44,7 @@ def _setup_stdio_safe_environment():
     os.environ["TRANSFORMERS_VERBOSITY"] = "error"
     os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-    os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-    os.environ["TQDM_DISABLE"] = "1"
-    
-    # Suppress loguru default output (used by sirchmunk core)
-    os.environ["LOGURU_LEVEL"] = "ERROR"
-    
+
     # Suppress warnings
     import warnings
     warnings.filterwarnings("ignore")
