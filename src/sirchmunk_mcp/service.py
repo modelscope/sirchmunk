@@ -6,18 +6,43 @@ Provides a high-level interface to Sirchmunk's AgenticSearch functionality,
 managing initialization, configuration, and session state.
 """
 
-import logging
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from __future__ import annotations
 
-from sirchmunk.search import AgenticSearch
-from sirchmunk.llm.openai_chat import OpenAIChat
-from sirchmunk.schema.knowledge import KnowledgeCluster
+import contextlib
+import io
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from .config import Config
 
+if TYPE_CHECKING:
+    from sirchmunk.schema.knowledge import KnowledgeCluster
+
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def suppress_stdout():
+    """Context manager to suppress stdout output.
+    
+    Used during initialization to prevent third-party libraries
+    (ModelScope, transformers, etc.) from printing to stdout,
+    which would break MCP stdio protocol.
+    """
+    # Check if we're in stdio MCP mode (stdout should be protected)
+    if os.environ.get("MCP_TRANSPORT") == "stdio":
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
+    else:
+        yield
 
 
 class SirchmunkService:
@@ -61,6 +86,12 @@ class SirchmunkService:
         Raises:
             Exception: If AgenticSearch initialization fails
         """
+        # Import sirchmunk modules inside function to allow stdout suppression
+        # These imports may trigger model downloads that print to stdout
+        with suppress_stdout():
+            from sirchmunk.search import AgenticSearch
+            from sirchmunk.llm.openai_chat import OpenAIChat
+        
         # Create LLM client
         llm = OpenAIChat(
             base_url=self.config.llm.base_url,
@@ -68,15 +99,17 @@ class SirchmunkService:
             model=self.config.llm.model_name,
         )
         
-        # Create AgenticSearch instance
-        self.searcher = AgenticSearch(
-            llm=llm,
-            work_path=self.config.sirchmunk.work_path,
-            verbose=self.config.sirchmunk.verbose,
-            reuse_knowledge=self.config.sirchmunk.enable_cluster_reuse,
-            cluster_sim_threshold=self.config.sirchmunk.cluster_similarity.threshold,
-            cluster_sim_top_k=self.config.sirchmunk.cluster_similarity.top_k,
-        )
+        # Create AgenticSearch instance with stdout suppression
+        # AgenticSearch may load embedding models which print progress
+        with suppress_stdout():
+            self.searcher = AgenticSearch(
+                llm=llm,
+                work_path=self.config.sirchmunk.work_path,
+                verbose=False,  # Disable verbose in stdio mode to prevent stdout pollution
+                reuse_knowledge=self.config.sirchmunk.enable_cluster_reuse,
+                cluster_sim_threshold=self.config.sirchmunk.cluster_similarity.threshold,
+                cluster_sim_top_k=self.config.sirchmunk.cluster_similarity.top_k,
+            )
         
         logger.info("AgenticSearch instance created")
     

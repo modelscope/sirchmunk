@@ -29,6 +29,33 @@ def get_mcp_version():
         return None
 
 
+def _setup_stdio_safe_environment():
+    """Configure environment for safe stdio MCP communication.
+    
+    In MCP stdio mode, stdout is reserved exclusively for JSON-RPC messages.
+    Any non-JSON output to stdout will break the protocol. This function
+    sets environment variables to suppress verbose output from third-party
+    libraries (ModelScope, transformers, tqdm, etc.) that might print to stdout.
+    """
+    # Set environment variables to suppress third-party library outputs
+    # These must be set BEFORE importing the libraries
+    os.environ["MODELSCOPE_LOG_LEVEL"] = "ERROR"
+    os.environ["MODELSCOPE_CACHE"] = os.path.expanduser("~/.sirchmunk/.cache/models")
+    os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+    os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+    os.environ["TQDM_DISABLE"] = "1"
+    
+    # Suppress loguru default output (used by sirchmunk core)
+    os.environ["LOGURU_LEVEL"] = "ERROR"
+    
+    # Suppress warnings
+    import warnings
+    warnings.filterwarnings("ignore")
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run MCP server.
     
@@ -49,14 +76,25 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if args.port:
             os.environ["MCP_PORT"] = str(args.port)
         
-        # Load configuration
+        # Determine transport mode early (before loading config triggers imports)
+        transport = args.transport or os.environ.get("MCP_TRANSPORT", "stdio")
+        
+        # Set up safe environment BEFORE any sirchmunk imports for stdio mode
+        # This prevents ModelScope/transformers from printing to stdout
+        if transport == "stdio":
+            os.environ["MCP_TRANSPORT"] = "stdio"  # Signal to service.py
+            _setup_stdio_safe_environment()
+        
+        # Load configuration (may trigger sirchmunk imports)
         config = Config.from_env()
         
-        # Configure logging
+        # Configure logging - MUST use stderr for stdio transport
+        # stdout is reserved for JSON-RPC messages in MCP stdio mode
         log_level = args.log_level or config.mcp.log_level
         logging.basicConfig(
             level=getattr(logging, log_level.upper()),
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            stream=sys.stderr,  # Critical: logs must go to stderr, not stdout
         )
         
         logger.info(f"Sirchmunk MCP Server v{__version__}")
