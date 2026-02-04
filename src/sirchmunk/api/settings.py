@@ -7,9 +7,8 @@ Provides UI settings and environment variable management
 from fastapi import APIRouter, HTTPException
 from typing import Dict, Any, Optional
 from pydantic import BaseModel
-import os
 
-from api.components.settings_storage import SettingsStorage
+from sirchmunk.api.components.settings_storage import SettingsStorage
 from sirchmunk.utils.constants import (
     GREP_CONCURRENT_LIMIT,
     LLM_BASE_URL,

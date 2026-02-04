@@ -5,10 +5,9 @@ Provides actual system metrics and activity tracking
 """
 
 from fastapi import APIRouter, HTTPException
-from typing import Dict, Any, Optional
 from datetime import datetime
 
-from api.components.monitor_tracker import get_monitor_tracker, llm_usage_tracker
+from sirchmunk.api.components.monitor_tracker import get_monitor_tracker, llm_usage_tracker
 
 router = APIRouter(prefix="/api/v1/monitor", tags=["monitor"])
 

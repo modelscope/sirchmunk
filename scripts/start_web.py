@@ -175,9 +175,9 @@ def start_backend():
     backend_port = get_backend_port()
     print_flush(f"✅ Backend port: {backend_port}")
 
-    # Check if src.api.main can be imported
+    # Check if sirchmunk.api.main can be imported
     try:
-
+        from sirchmunk.api.main import app  # noqa: F401
         print_flush("✅ Backend module import successful")
     except Exception as e:
         print_flush(f"❌ Failed to import backend module: {e}")
@@ -191,7 +191,7 @@ def start_backend():
         sys.executable,
         "-m",
         "uvicorn",
-        "src.api.main:app",
+        "sirchmunk.api.main:app",
         "--host",
         "0.0.0.0",
         "--port",
