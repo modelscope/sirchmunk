@@ -574,7 +574,7 @@ class AgenticSearch(BaseSearch):
         query: str,
         search_paths: Union[str, Path, List[str], List[Path]],
         *,
-        mode: Literal["FAST", "DEEP", "FILENAME_ONLY"] = "DEEP",  # TODO
+        mode: Literal["DEEP", "FILENAME_ONLY"] = "DEEP",
         images: Optional[list] = None,
         max_depth: Optional[int] = 5,
         top_k_files: Optional[int] = 3,
@@ -591,7 +591,7 @@ class AgenticSearch(BaseSearch):
         Args:
             query: Search query string
             search_paths: Paths to search in
-            mode: Search mode (FAST/DEEP/FILENAME_ONLY)
+            mode: Search mode (DEEP/FILENAME_ONLY), default is DEEP
             images: Optional image inputs
             max_depth: Maximum directory depth to search
             top_k_files: Number of top files to grep-retrieve
@@ -604,9 +604,18 @@ class AgenticSearch(BaseSearch):
             grep_timeout: Timeout for grep operations
             return_cluster: Whether to return the full knowledge cluster. Ignore if mode is `FILENAME_ONLY`.
 
-        Notes:
+        Mode behaviors:
             - In FILENAME_ONLY mode, performs fast filename search without LLM involvement. Returns list of matching files.
                Format: {'filename': 'Attention_Is_All_You_Need.pdf', 'match_score': 0.8, 'matched_pattern': '.*Attention.*', 'path': '/path/to/Attention_Is_All_You_Need.pdf', 'type': 'filename_match'}
+
+            +--------------+------------------+-----------------------+------------------------+
+            | Feature      | FILENAME_ONLY    | FAST (To be designed) | DEEP (Current)         |
+            +--------------+------------------+-----------------------+------------------------+
+            | Speed        | Very Fast (<1s)  | Fast (<5s)           | Slow (5-30s)          |
+            | LLM Calls    | 0 times          | 1-2 times             | 4-5 times              |
+            | Return Type  | List[Dict]       | str / Cluster         | str / Cluster          |
+            | Use Case     | File Location    | Rapid Content Search  | Deep Knowledge Extract |
+            +--------------+------------------+-----------------------+------------------------+
 
         Returns:
             Search result summary string, or KnowledgeCluster if return_cluster is True, or List[Dict[str, Any]] for FILENAME_ONLY mode.
