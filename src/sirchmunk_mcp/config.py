@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -24,7 +25,7 @@ class LLMConfig(BaseModel):
         description="LLM API key (required)"
     )
     model_name: str = Field(
-        default="gpt-4-turbo-preview",
+        default="gpt-5.2",
         description="LLM model name"
     )
     timeout: float = Field(
@@ -187,6 +188,8 @@ class Config(BaseModel):
     def from_env(cls) -> "Config":
         """Load configuration from environment variables.
         
+        Automatically loads .env file from work_path (~/.sirchmunk/.env by default).
+        
         Environment variables:
             LLM_BASE_URL: LLM API base URL
             LLM_API_KEY: LLM API key (required)
@@ -214,11 +217,19 @@ class Config(BaseModel):
         Raises:
             ValueError: If required configuration is missing or invalid
         """
+        # Load .env from work_path (default: ~/.sirchmunk/.env)
+        work_path = Path(os.getenv("SIRCHMUNK_WORK_PATH", str(Path.home() / ".sirchmunk")))
+        work_path = work_path.expanduser().resolve()
+        env_file = work_path / ".env"
+        
+        if env_file.exists():
+            load_dotenv(env_file, override=False)
+        
         # LLM configuration
         llm_config = LLMConfig(
             base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
             api_key=os.getenv("LLM_API_KEY", ""),
-            model_name=os.getenv("LLM_MODEL_NAME", "gpt-4-turbo-preview"),
+            model_name=os.getenv("LLM_MODEL_NAME", "gpt-5.2"),
             timeout=float(os.getenv("LLM_TIMEOUT", "60.0")),
         )
         

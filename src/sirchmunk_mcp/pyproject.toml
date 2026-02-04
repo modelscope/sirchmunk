@@ -5,43 +5,40 @@ build-backend = "hatchling.build"
 [project]
 name = "sirchmunk-mcp"
 version = "0.1.0"
-description = "MCP server for Sirchmunk intelligent code and document search"
-readme = "README_MCP.md"
-requires-python = ">=3.9"
+description = "MCP server for Sirchmunk intelligent indexless search for large-scale raw data."
+readme = "README.md"
+requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "ModelScope Contributors", email = "contact@modelscope.cn"},
 ]
-keywords = ["mcp", "search", "code-search", "ai", "llm", "knowledge-management", "document-search"]
+keywords = ["mcp", "search", "raw data", "llm", "knowledge-management", "document-search"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Text Processing :: Indexing",
 ]
 
 dependencies = [
-    "mcp>=0.9.0",
+    "sirchmunk",
+    "mcp>=1.15.0",
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
-    "openai>=1.0.0",
-    "loguru>=0.7.0",
     "aiofiles>=23.0.0",
-    "duckdb>=0.10.0",
+    "modelscope",
+
 ]
 
 [project.optional-dependencies]
-full = [
-    "sentence-transformers>=2.0.0",
-    "modelscope>=1.9.0",
-    "torch>=2.0.0",
-]
+full = []
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
@@ -64,12 +61,12 @@ packages = ["."]
 
 [tool.black]
 line-length = 100
-target-version = ["py39", "py310", "py311"]
+target-version = ["py310", "py311", "py312", "py313"]
 include = '\.pyi?$'
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py313"
 select = [
     "E",  # pycodestyle errors
     "W",  # pycodestyle warnings
@@ -84,7 +81,7 @@ ignore = [
 ]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.13"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false

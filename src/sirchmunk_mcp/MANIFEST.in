@@ -1,11 +1,13 @@
 # Include documentation
 include README.md
-include INSTALL_MCP.md
-include MCP_QUICKSTART.md
+include BUILD.md
 include LICENSE
 
 # Include configuration templates
 recursive-include config *.example *.json
+
+# Include examples
+recursive-include examples *.md *.json
 
 # Include Python package files
 recursive-include sirchmunk_mcp *.py

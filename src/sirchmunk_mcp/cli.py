@@ -12,7 +12,6 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Optional
 
 from . import __version__
 from .config import Config
@@ -20,6 +19,14 @@ from .server import run_stdio_server, run_http_server
 
 
 logger = logging.getLogger(__name__)
+
+
+def get_mcp_version():
+    try:
+        import importlib.metadata
+        return importlib.metadata.version("mcp")
+    except ImportError:
+        return None
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -130,11 +137,11 @@ def cmd_init(args: argparse.Namespace) -> int:
                 print("  Please install manually: https://github.com/phiresky/ripgrep-all")
         
         # Check Python packages
-        try:
-            import mcp
-            print(f"✓ mcp package installed (v{mcp.__version__})")
-        except ImportError:
-            print("✗ mcp package not found")
+        mcp_version = get_mcp_version()
+        if mcp_version:
+            print(f"✓ MCP package installed (v{mcp_version})")
+        else:
+            print("✗ MCP package not found")
             print("  Install with: pip install mcp")
         
         try:
@@ -181,13 +188,18 @@ def cmd_config(args: argparse.Namespace) -> int:
     """
     try:
         if args.generate:
-            # Generate .env.example
-            env_example = Path.cwd() / ".env.example"
+            # Determine work path
+            work_path = Path(os.getenv("SIRCHMUNK_WORK_PATH", str(Path.home() / ".sirchmunk")))
+            work_path = work_path.expanduser().resolve()
+            work_path.mkdir(parents=True, exist_ok=True)
+            
+            # Generate .env file in work_path
+            env_file = work_path / ".env"
             
             env_content = """# ===== LLM Configuration =====
 LLM_BASE_URL=https://api.openai.com/v1
-LLM_API_KEY=sk-your-api-key-here
-LLM_MODEL_NAME=gpt-4-turbo-preview
+LLM_API_KEY=your-api-key
+LLM_MODEL_NAME=gpt-5.2
 
 # ===== Sirchmunk Settings =====
 SIRCHMUNK_WORK_PATH=~/.sirchmunk
@@ -212,8 +224,8 @@ MCP_LOG_LEVEL=INFO
 MCP_TRANSPORT=stdio
 """
             
-            env_example.write_text(env_content)
-            print(f"Generated {env_example}")
+            env_file.write_text(env_content)
+            print(f"Generated {env_file}")
             
             # Generate MCP client config
             if args.output:
@@ -228,8 +240,8 @@ MCP_TRANSPORT=stdio
       "args": ["serve"],
       "env": {
         "LLM_BASE_URL": "https://api.openai.com/v1",
-        "LLM_API_KEY": "sk-your-api-key-here",
-        "LLM_MODEL_NAME": "gpt-4-turbo-preview",
+        "LLM_API_KEY": "your-api-key",
+        "LLM_MODEL_NAME": "gpt-5.2",
         "SIRCHMUNK_WORK_PATH": "~/.sirchmunk",
         "SIRCHMUNK_VERBOSE": "false"
       }
@@ -243,6 +255,8 @@ MCP_TRANSPORT=stdio
             
             print()
             print("Configuration files generated successfully!")
+            print()
+            print(f"⚠️  Please edit {env_file} to set your LLM_API_KEY")
             print()
             print("To use with Claude Desktop:")
             print("1. Edit mcp_config.json with your API key")
@@ -295,12 +309,12 @@ def cmd_version(args: argparse.Namespace) -> int:
     """
     print(f"Sirchmunk MCP Server v{__version__}")
     
-    try:
-        import mcp
-        print(f"MCP SDK v{mcp.__version__}")
-    except ImportError:
-        pass
-    
+    mcp_version = get_mcp_version()
+    if mcp_version:
+        print(f"MCP package v{mcp_version}")
+    else:
+        print("MCP package (not installed)")
+
     try:
         import sirchmunk
         print(f"Sirchmunk Core (installed)")

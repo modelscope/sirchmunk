@@ -1,0 +1,17 @@
+{
+  "_comment": "Example configuration for using sirchmunk-mcp with local LLM (Ollama, LM Studio, etc.)",
+  "mcpServers": {
+    "sirchmunk": {
+      "command": "sirchmunk-mcp",
+      "args": ["serve"],
+      "env": {
+        "LLM_BASE_URL": "http://localhost:11434/v1",
+        "LLM_API_KEY": "ollama",
+        "LLM_MODEL_NAME": "llama3:8b",
+        "SIRCHMUNK_WORK_PATH": "~/.sirchmunk",
+        "SIRCHMUNK_ENABLE_CLUSTER_REUSE": "false",
+        "MCP_LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}

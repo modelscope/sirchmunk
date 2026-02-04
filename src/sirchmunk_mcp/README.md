@@ -6,7 +6,6 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that ex
 
 - **🔍 Multi-Mode Search**
   - **DEEP**: Comprehensive knowledge extraction with full context analysis (~10-30s)
-  - **FAST**: Quick content search without deep LLM processing (~3-8s)
   - **FILENAME_ONLY**: Fast filename pattern matching (<1s)
 
 - **🧠 Knowledge Cluster Management**
@@ -16,83 +15,152 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that ex
 
 - **🔌 MCP Integration**
   - Standard MCP protocol support
-  - Stdio transport (Claude Desktop compatible)
-  - SSE transport (coming soon)
+  - Stdio transport (Claude Desktop / Claude Code compatible)
+  - Streamable HTTP transport (for web-based clients)
 
-## Installation
+---
 
-### From PyPI (Recommended)
+## Quick Start (5 Minutes)
+
+### Step 1: Install
 
 ```bash
 pip install sirchmunk-mcp
 ```
 
-### From Source
+### Step 2: Initialize
 
 ```bash
-git clone https://github.com/modelscope/sirchmunk.git
-cd sirchmunk
-pip install -e .
-```
-
-## Quick Start
-
-### 1. Initialize
-
-```bash
-# Initialize Sirchmunk environment
 sirchmunk-mcp init
-
-# Generate configuration templates
 sirchmunk-mcp config --generate
 ```
 
-### 2. Configure
+### Step 3: Configure
 
-Edit the generated `.env` file with your LLM API credentials:
+Edit `.env` with your API key:
 
 ```bash
 # Required
-LLM_API_KEY=sk-your-api-key-here
-
-# Optional (defaults shown)
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_MODEL_NAME=gpt-4-turbo-preview
-SIRCHMUNK_WORK_PATH=~/.sirchmunk
+LLM_API_KEY=your-api-key
 ```
 
-### 3. Run Server
+### Step 4: Test
 
 ```bash
-# Start MCP server (stdio mode)
-sirchmunk-mcp serve
-
-# Or with custom configuration
-MCP_LOG_LEVEL=DEBUG sirchmunk-mcp serve
+MCP_LOG_LEVEL=INFO sirchmunk-mcp serve
 ```
 
-## Integration with Claude Desktop
+You should see:
+```
+INFO - Sirchmunk MCP Server v0.1.0
+INFO - Transport: stdio
+INFO - MCP server listening on stdio
+```
 
-### macOS
+Press `Ctrl+C` to stop.
 
-1. Edit `mcp_config.json` with your API key
-2. Copy to Claude Desktop config directory:
-   ```bash
-   cp config/mcp_config.json ~/Library/Application\ Support/Claude/claude_desktop_config.json
-   ```
-3. Restart Claude Desktop
+---
 
-### Linux
+## Installation
+
+### Prerequisites
+
+- **Python**: 3.10 or higher
+- **Memory**: At least 2GB RAM recommended
+- **LLM API Key**: OpenAI or compatible endpoint
+
+### Method 1: From PyPI (Recommended)
 
 ```bash
-cp config/mcp_config.json ~/.config/Claude/claude_desktop_config.json
+# Create a virtual environment (optional but recommended)
+conda create -n sirchmunk_mcp python=3.13 -y
+conda activate sirchmunk_mcp
+
+# Basic installation
+pip install sirchmunk-mcp
 ```
 
-### Windows
+### Method 2: From Source
 
-```cmd
-copy config\mcp_config.json %APPDATA%\Claude\claude_desktop_config.json
+```bash
+git clone https://github.com/modelscope/sirchmunk.git
+cd sirchmunk/src/sirchmunk_mcp
+pip install -e .
 ```
+
+### Installing ripgrep-all (Optional)
+
+Sirchmunk uses `ripgrep-all` for document search. 
+<br/>
+It will be installed automatically during initialization, but you can install it manually, see https://github.com/phiresky/ripgrep-all
+
+---
+
+## Integration with Claude Code / Claude Desktop
+
+### Cursor IDE
+
+Edit `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "sirchmunk": {
+      "command": "sirchmunk-mcp",
+      "args": ["serve"],
+      "env": {
+        "LLM_API_KEY": "your-api-key",
+        "LLM_MODEL_NAME": "gpt-5.2"
+      }
+    }
+  }
+}
+```
+
+### Claude Desktop
+
+Edit the configuration file:
+
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "sirchmunk": {
+      "command": "sirchmunk-mcp",
+      "args": ["serve"],
+      "env": {
+        "LLM_API_KEY": "your-api-key",
+        "LLM_MODEL_NAME": "gpt-5.2",
+        "SIRCHMUNK_WORK_PATH": "~/.sirchmunk",
+        "MCP_LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}
+```
+
+**Note:** If using virtual environment, use the full path:
+
+```json
+{
+  "mcpServers": {
+    "sirchmunk": {
+      "command": "/path/to/sirchmunk-env/bin/sirchmunk-mcp",
+      "args": ["serve"],
+      "env": { ... }
+    }
+  }
+}
+```
+
+### Restart Client
+
+After configuration, completely quit and restart your Claude client.
+
+---
 
 ## Usage Examples
 
@@ -109,11 +177,7 @@ Claude: [Using sirchmunk_search tool]
   "top_k_files": 3
 }
 
-Response: Comprehensive analysis with:
-- 3 relevant files identified
-- Key code snippets extracted
-- Implementation patterns discovered
-- Usage context provided
+Response: Comprehensive analysis with code snippets and patterns
 ```
 
 ### Example 2: Fast Filename Search
@@ -125,31 +189,28 @@ Claude: [Using sirchmunk_search tool]
 {
   "query": "test",
   "search_paths": ["/path/to/project"],
-  "mode": "FILENAME_ONLY",
-  "top_k_files": 10
+  "mode": "FILENAME_ONLY"
 }
 
-Response: List of matching files with paths and relevance scores
+Response: List of matching files with paths
 ```
 
-### Example 3: Retrieve Knowledge Cluster
+### Example 3: Knowledge Cluster Management
 
 ```
-User: "Show me the saved knowledge about authentication"
+User: "Show saved knowledge clusters"
 
 Claude: [Using sirchmunk_list_clusters tool]
-{
-  "limit": 5,
-  "sort_by": "hotness"
-}
 
-[Then using sirchmunk_get_cluster tool]
+User: "Show details of cluster C1007"
+
+Claude: [Using sirchmunk_get_cluster tool]
 {
   "cluster_id": "C1007"
 }
-
-Response: Detailed cluster information with evidences and patterns
 ```
+
+---
 
 ## Available Tools
 
@@ -157,68 +218,75 @@ Response: Detailed cluster information with evidences and patterns
 
 Intelligent code and document search.
 
-**Parameters:**
-- `query` (string, required): Search query or question
-- `search_paths` (array, required): Paths to search in
-- `mode` (string): Search mode (DEEP/FAST/FILENAME_ONLY, default: DEEP)
-- `max_depth` (integer): Maximum directory depth (default: 5)
-- `top_k_files` (integer): Number of top files to return (default: 3)
-- `keyword_levels` (integer): Keyword granularity levels (default: 3, DEEP mode only)
-- `include` (array): File patterns to include (glob)
-- `exclude` (array): File patterns to exclude (glob)
-- `return_cluster` (boolean): Return full KnowledgeCluster object (default: false)
-
-**Returns:**
-- DEEP/FAST mode: Formatted search result summary (string)
-- FILENAME_ONLY mode: List of file matches with metadata (array)
-- With `return_cluster=true`: Full KnowledgeCluster object
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `query` | string | ✅ | - | Search query or question |
+| `search_paths` | array | ✅ | - | Paths to search in |
+| `mode` | string | | "DEEP" | DEEP/FILENAME_ONLY |
+| `max_depth` | integer | | 5 | Directory search depth |
+| `top_k_files` | integer | | 3 | Files to return |
+| `keyword_levels` | integer | | 3 | Keyword granularity (DEEP only) |
+| `include` | array | | - | Glob patterns to include |
+| `exclude` | array | | - | Glob patterns to exclude |
+| `return_cluster` | boolean | | false | Return full KnowledgeCluster |
 
 ### `sirchmunk_get_cluster`
 
 Retrieve a saved knowledge cluster by ID.
 
-**Parameters:**
-- `cluster_id` (string, required): Cluster ID (e.g., 'C1007')
-
-**Returns:** Full cluster information or error message
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `cluster_id` | string | ✅ | Cluster ID (e.g., 'C1007') |
 
 ### `sirchmunk_list_clusters`
 
 List all saved knowledge clusters.
 
-**Parameters:**
-- `limit` (integer): Maximum number of clusters (default: 10)
-- `sort_by` (string): Sort field (hotness/confidence/last_modified, default: last_modified)
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | integer | 10 | Maximum clusters to return |
+| `sort_by` | string | "last_modified" | hotness/confidence/last_modified |
 
-**Returns:** List of cluster metadata
+---
 
 ## Configuration
 
 ### Environment Variables
 
-See `config/env.example` for all available environment variables.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLM_API_KEY` | (required) | Your LLM API key |
+| `LLM_BASE_URL` | `https://api.openai.com/v1` | LLM API endpoint |
+| `LLM_MODEL_NAME` | `gpt-5.2` | Model to use |
+| `SIRCHMUNK_WORK_PATH` | `~/.sirchmunk` | Working directory |
+| `SIRCHMUNK_ENABLE_CLUSTER_REUSE` | `true` | Enable knowledge reuse |
+| `CLUSTER_SIM_THRESHOLD` | `0.85` | Similarity threshold |
+| `DEFAULT_MAX_DEPTH` | `5` | Default search depth |
+| `DEFAULT_TOP_K_FILES` | `3` | Default files count |
+| `MCP_LOG_LEVEL` | `INFO` | Logging level |
 
-**Key Settings:**
+### Using Custom LLM Providers
 
-```bash
-# LLM Configuration
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_API_KEY=sk-xxx
-LLM_MODEL_NAME=gpt-4-turbo-preview
+**Local LLM (Ollama, LM Studio):**
+```json
+{
+  "env": {
+    "LLM_BASE_URL": "http://localhost:11434/v1",
+    "LLM_API_KEY": "ollama",
+    "LLM_MODEL_NAME": "llama3"
+  }
+}
+```
 
-# Search Behavior
-DEFAULT_MAX_DEPTH=5
-DEFAULT_TOP_K_FILES=3
-DEFAULT_KEYWORD_LEVELS=3
-
-# Cluster Reuse
-SIRCHMUNK_ENABLE_CLUSTER_REUSE=true
-CLUSTER_SIM_THRESHOLD=0.85
-CLUSTER_SIM_TOP_K=3
-
-# Logging
-MCP_LOG_LEVEL=INFO
-SIRCHMUNK_VERBOSE=false
+**Azure OpenAI:**
+```json
+{
+  "env": {
+    "LLM_BASE_URL": "https://your-resource.openai.azure.com/",
+    "LLM_API_KEY": "your-azure-key",
+    "LLM_MODEL_NAME": "gpt-5.2"
+  }
+}
 ```
 
 ### Programmatic Configuration
@@ -229,23 +297,11 @@ from sirchmunk_mcp import Config, create_server
 # Load from environment
 config = Config.from_env()
 
-# Or create custom config
-config = Config(
-    llm=LLMConfig(
-        base_url="https://api.openai.com/v1",
-        api_key="sk-xxx",
-        model_name="gpt-4-turbo-preview",
-    ),
-    sirchmunk=SirchmunkConfig(
-        work_path=Path.home() / ".sirchmunk",
-        enable_cluster_reuse=True,
-    )
-)
-
 # Create and run server
 server = create_server(config)
-await run_stdio_server(config)
 ```
+
+---
 
 ## CLI Reference
 
@@ -257,9 +313,9 @@ Run the MCP server.
 sirchmunk-mcp serve [OPTIONS]
 
 Options:
-  --transport {stdio,sse}  Transport protocol (default: stdio)
-  --host TEXT              Host for SSE transport (default: localhost)
-  --port INTEGER           Port for SSE transport (default: 8080)
+  --transport {stdio,http}  Transport protocol (default: stdio)
+  --host TEXT               Host for HTTP transport (default: localhost)
+  --port INTEGER            Port for HTTP transport (default: 8080)
   --log-level {DEBUG,INFO,WARNING,ERROR}  Logging level
 ```
 
@@ -290,132 +346,189 @@ Options:
 
 Show version information.
 
-```bash
-sirchmunk-mcp version
-```
+---
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────┐
-│   MCP Client (Claude Desktop)   │
+│   MCP Client (Claude/Cursor)    │
 └────────────┬────────────────────┘
-             │ MCP Protocol (stdio)
+             │ MCP Protocol (stdio/http)
              ↓
 ┌─────────────────────────────────┐
 │    Sirchmunk MCP Server         │
 │  ┌──────────────────────────┐   │
-│  │  MCP Service Layer       │   │
-│  │  - Tool Registration     │   │
-│  │  - Request Handling      │   │
+│  │  FastMCP Layer           │   │
+│  │  - @mcp.tool() decorators│   │
+│  │  - Auto tool discovery   │   │
 │  └──────────┬───────────────┘   │
-│             ↓                    │
+│             ↓                   │
 │  ┌──────────────────────────┐   │
 │  │  Sirchmunk Service       │   │
 │  │  - AgenticSearch Init    │   │
 │  │  - Config Management     │   │
 │  └──────────┬───────────────┘   │
-│             ↓                    │
+│             ↓                   │
 │  ┌──────────────────────────┐   │
 │  │  AgenticSearch Core      │   │
-│  │  - DEEP/FAST/FILENAME    │   │
+│  │  - DEEP/FILENAME         │   │
 │  │  - KnowledgeBase         │   │
 │  │  - GrepRetriever         │   │
-│  │  - EmbeddingUtil         │   │
 │  └──────────────────────────┘   │
 └─────────────────────────────────┘
 ```
+
+---
 
 ## Performance
 
 | Mode | LLM Calls | Speed | Use Case |
 |------|-----------|-------|----------|
 | DEEP | 4-6 | 10-30s | Comprehensive analysis |
-| FAST | 0-2 | 3-8s | Quick content search |
 | FILENAME_ONLY | 0 | <1s | File discovery |
+
+### Performance Tips
+
+1. **Use specific search paths** - Narrow paths = faster searches
+2. **Choose appropriate mode** - Match mode to task complexity
+3. **Leverage cluster reuse** - Similar queries reuse cached knowledge
+4. **Adjust depth** - Lower `max_depth` for faster results
+
+---
 
 ## Troubleshooting
 
-### Server won't start
-
-1. Check API key is set:
-   ```bash
-   echo $LLM_API_KEY
-   ```
-
-2. Verify dependencies:
-   ```bash
-   sirchmunk-mcp init
-   ```
-
-3. Check logs:
-   ```bash
-   MCP_LOG_LEVEL=DEBUG sirchmunk-mcp serve
-   ```
-
-### ripgrep-all not found
-
-Install ripgrep-all manually:
+### "Command not found: sirchmunk-mcp"
 
 ```bash
-# macOS
-brew install rga
+# Verify installation
+pip show sirchmunk-mcp
 
-# Linux
-# Download from https://github.com/phiresky/ripgrep-all/releases
+# Reinstall
+pip install --force-reinstall sirchmunk-mcp
 ```
 
-### Claude Desktop not detecting server
+### "LLM API key cannot be empty"
 
-1. Verify config file location
-2. Check JSON syntax in `claude_desktop_config.json`
-3. Restart Claude Desktop completely
-4. Check Claude Desktop logs
+```bash
+# Check environment variable
+echo $LLM_API_KEY
+
+# Set it
+export LLM_API_KEY="your-api-key"
+```
+
+### "ripgrep-all not found"
+
+```bash
+# Try auto-install
+sirchmunk-mcp init
+
+# Or install manually (see Installation section)
+```
+
+### Claude Desktop/Cursor not showing tools
+
+1. Verify config file location and JSON syntax:
+   ```bash
+   python -m json.tool ~/.cursor/mcp.json
+   ```
+2. Check Claude client logs for MCP errors
+3. Completely restart the client (quit, not just close)
+
+### Slow initialization
+
+First-time startup downloads embedding models. To skip:
+```bash
+export SIRCHMUNK_ENABLE_CLUSTER_REUSE=false
+```
+
+### Debug Mode
+
+```bash
+MCP_LOG_LEVEL=DEBUG SIRCHMUNK_VERBOSE=true sirchmunk-mcp serve
+```
+
+Check logs in `~/.sirchmunk/logs/`.
+
+---
+
+## Updating
+
+```bash
+# From PyPI
+pip install --upgrade sirchmunk-mcp
+
+# Re-initialize
+sirchmunk-mcp init
+```
+
+---
+
+## Uninstallation
+
+```bash
+# Remove package
+pip uninstall sirchmunk-mcp
+
+# Remove data (optional)
+rm -rf ~/.sirchmunk
+```
+
+---
 
 ## Development
 
-### Setup
-
 ```bash
+# Clone and install
 git clone https://github.com/modelscope/sirchmunk.git
-cd sirchmunk
+cd sirchmunk/src/sirchmunk_mcp
 pip install -e ".[dev]"
-```
 
-### Run Tests
-
-```bash
+# Run tests
 pytest tests/
+
+# Code style
+black .
+ruff check .
+mypy .
 ```
 
-### Code Style
+---
 
-```bash
-# Format code
-black src/
+## Security Best Practices
 
-# Lint
-ruff check src/
+1. **Never commit API keys** - Use environment variables
+2. **Review search paths** - Only include trusted directories
+3. **Monitor API usage** - DEEP mode uses more tokens
+4. **Update regularly** - Keep dependencies current
 
-# Type check
-mypy src/
-```
+---
 
-## Contributing
+## Examples
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+See the `examples/` directory for configuration templates:
 
-## License
+- `cursor_mcp_config.json` - Basic Cursor setup
+- `cursor_mcp_config_venv.json` - Virtual environment setup
+- `cursor_mcp_config_local_llm.json` - Local LLM setup
+- `claude_code_setup.md` - Complete setup guide
 
-Apache License 2.0 - see [LICENSE](LICENSE) for details.
+---
 
 ## Links
 
 - [Sirchmunk GitHub](https://github.com/modelscope/sirchmunk)
 - [MCP Documentation](https://modelcontextprotocol.io)
+- [MCP Specification](https://github.com/modelcontextprotocol/modelcontextprotocol)
 - [Claude Desktop](https://claude.ai/desktop)
+
+## License
+
+Apache License 2.0 - see [LICENSE](LICENSE)
 
 ## Support
 
-- GitHub Issues: https://github.com/modelscope/sirchmunk/issues
-- Documentation: https://github.com/modelscope/sirchmunk#readme
+- **Issues**: https://github.com/modelscope/sirchmunk/issues
+- **Logs**: `~/.sirchmunk/logs/`
