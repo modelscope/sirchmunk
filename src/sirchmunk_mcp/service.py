@@ -42,7 +42,7 @@ class SirchmunkService:
             RuntimeError: If initialization fails
         """
         self.config = config
-        self.search: Optional[AgenticSearch] = None
+        self.searcher: Optional[AgenticSearch] = None
         self.initialized = False
         
         logger.info(f"Initializing Sirchmunk service with config: {config.sirchmunk.work_path}")
@@ -69,7 +69,7 @@ class SirchmunkService:
         )
         
         # Create AgenticSearch instance
-        self.search = AgenticSearch(
+        self.searcher = AgenticSearch(
             llm=llm,
             work_path=self.config.sirchmunk.work_path,
             verbose=self.config.sirchmunk.verbose,
@@ -118,7 +118,7 @@ class SirchmunkService:
             RuntimeError: If service is not initialized
             ValueError: If parameters are invalid
         """
-        if not self.initialized or self.search is None:
+        if not self.initialized or self.searcher is None:
             raise RuntimeError("Sirchmunk service is not initialized")
         
         # Validate mode
@@ -147,7 +147,7 @@ class SirchmunkService:
         
         try:
             # Perform search
-            result = await self.search.search(
+            result = await self.searcher.search(
                 query=query,
                 search_paths=search_paths,
                 mode=mode,
@@ -180,11 +180,11 @@ class SirchmunkService:
         Raises:
             RuntimeError: If service is not initialized
         """
-        if not self.initialized or self.search is None:
+        if not self.initialized or self.searcher is None:
             raise RuntimeError("Sirchmunk service is not initialized")
         
         try:
-            cluster = await self.search.knowledge_manager.get(cluster_id)
+            cluster = await self.searcher.knowledge_manager.get(cluster_id)
             if cluster:
                 logger.info(f"Retrieved cluster: {cluster_id}")
             else:
@@ -211,12 +211,12 @@ class SirchmunkService:
         Raises:
             RuntimeError: If service is not initialized
         """
-        if not self.initialized or self.search is None:
+        if not self.initialized or self.searcher is None:
             raise RuntimeError("Sirchmunk service is not initialized")
         
         try:
             # Get all cluster IDs
-            all_clusters = await self.search.knowledge_manager.list_all()
+            all_clusters = await self.searcher.knowledge_manager.list_all()
             
             # Sort clusters
             if sort_by == "hotness":
@@ -260,12 +260,12 @@ class SirchmunkService:
         Raises:
             RuntimeError: If service is not initialized
         """
-        if not self.initialized or self.search is None:
+        if not self.initialized or self.searcher is None:
             raise RuntimeError("Sirchmunk service is not initialized")
         
         try:
             # Get knowledge manager stats
-            stats = self.search.knowledge_manager.get_stats()
+            stats = self.searcher.knowledge_manager.get_stats()
             
             # Add service-level stats
             stats["service"] = {

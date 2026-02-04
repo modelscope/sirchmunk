@@ -64,6 +64,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
         
         # Run server
         if config.mcp.transport == "stdio":
+            # Check if running in interactive terminal
+            if sys.stdin.isatty():
+                print()
+                print("=" * 60)
+                print("  Sirchmunk MCP Server - STDIO Mode")
+                print("=" * 60)
+                print()
+                print("  This server is designed to be launched by an MCP client")
+                print("  (e.g., Claude Desktop, Cursor IDE).")
+                print()
+                print("  DO NOT type in this terminal - the server expects")
+                print("  JSON-RPC messages from an MCP client, not manual input.")
+                print()
+                print("  Press Ctrl+C to stop the server.")
+                print()
+                print("=" * 60)
+                print()
             asyncio.run(run_stdio_server(config))
         elif config.mcp.transport == "http":
             asyncio.run(run_http_server(config))
