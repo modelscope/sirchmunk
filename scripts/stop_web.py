@@ -240,7 +240,7 @@ def main():
         success = False
 
     # Also try to stop by process name patterns
-    backend_patterns = ["uvicorn", "src.api.main", "fastapi", "python.*api.*main"]
+    backend_patterns = ["uvicorn", "sirchmunk.api.main", "fastapi", "python.*api.*main"]
     stop_processes_by_name(backend_patterns, "Backend")
 
     print_flush("")
