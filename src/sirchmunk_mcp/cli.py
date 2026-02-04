@@ -68,19 +68,37 @@ def cmd_serve(args: argparse.Namespace) -> int:
             if sys.stdin.isatty():
                 print()
                 print("=" * 60)
-                print("  Sirchmunk MCP Server - STDIO Mode")
+                print("  ⚠️  Sirchmunk MCP Server - STDIO Mode")
                 print("=" * 60)
                 print()
-                print("  This server is designed to be launched by an MCP client")
-                print("  (e.g., Claude Desktop, Cursor IDE).")
+                print("  STDIO mode is designed to be launched by an MCP client")
+                print("  (e.g., Claude Desktop, Cursor IDE), not run directly")
+                print("  in an interactive terminal.")
                 print()
-                print("  DO NOT type in this terminal - the server expects")
-                print("  JSON-RPC messages from an MCP client, not manual input.")
+                print("  The server expects JSON-RPC messages from an MCP client.")
+                print("  Running in a terminal will cause errors.")
                 print()
-                print("  Press Ctrl+C to stop the server.")
+                print("  Options:")
+                print("  1. Configure your MCP client to launch this server")
+                print("  2. Use HTTP mode: sirchmunk-mcp serve --transport http")
                 print()
                 print("=" * 60)
                 print()
+                
+                # Ask user if they want to continue anyway
+                try:
+                    response = input("Continue anyway? (y/N): ").strip().lower()
+                    if response != 'y':
+                        print("Server not started. Use an MCP client to launch this server.")
+                        return 0
+                    print()
+                    print("Starting server... Press Ctrl+C to stop.")
+                    print("(Any input you type will cause errors)")
+                    print()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nServer not started.")
+                    return 0
+            
             asyncio.run(run_stdio_server(config))
         elif config.mcp.transport == "http":
             asyncio.run(run_http_server(config))

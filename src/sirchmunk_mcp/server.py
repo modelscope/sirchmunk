@@ -83,7 +83,7 @@ def create_server(config: Config) -> FastMCP:
         logger.info(f"sirchmunk_search: mode={mode}, query='{query[:50]}...'")
         
         try:
-            result = await _service.search.search(
+            result = await _service.searcher.search(
                 query=query,
                 search_paths=search_paths,
                 mode=mode,
@@ -263,6 +263,11 @@ async def run_stdio_server(config: Config) -> None:
     
     Args:
         config: Configuration object
+    
+    Note:
+        This mode should be launched by an MCP client, not run directly
+        in an interactive terminal. Manual terminal input will cause
+        JSON parsing errors.
     """
     logger.info("Starting MCP server with stdio transport")
     
@@ -271,20 +276,9 @@ async def run_stdio_server(config: Config) -> None:
     
     # Run with stdio transport
     logger.info("MCP server listening on stdio")
+    logger.info("Waiting for MCP client connection...")
     
-    try:
-        await mcp.run_stdio_async()
-    except Exception as e:
-        error_msg = str(e)
-        # Handle common errors gracefully
-        if "EOF" in error_msg or "json_invalid" in error_msg:
-            logger.warning(
-                "Received invalid input on stdin. "
-                "This server expects JSON-RPC messages from an MCP client, "
-                "not manual terminal input. Use Ctrl+C to stop."
-            )
-        else:
-            raise
+    await mcp.run_stdio_async()
 
 
 async def run_http_server(config: Config) -> None:
