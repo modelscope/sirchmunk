@@ -42,22 +42,37 @@ Edit `.env` with your API key:
 ```bash
 # Required
 LLM_API_KEY=your-api-key
+LLM_MODEL_NAME=gpt-5.2
+LLM_BASE_URL=https://api.openai.com/v1
 ```
 
 ### Step 4: Test
 
+Anthropic provides a dedicated debugging tool called MCP Inspector (runnable via npx). It simulates a Client's behavior and provides a web-based interface for interaction.
+
 ```bash
-MCP_LOG_LEVEL=INFO sirchmunk-mcp serve
+MCP_LOG_LEVEL=INFO npx @modelcontextprotocol/inspector sirchmunk-mcp serve
 ```
 
 You should see:
 ```
-INFO - Sirchmunk MCP Server v0.1.0
-INFO - Transport: stdio
-INFO - MCP server listening on stdio
+Starting MCP inspector...
+⚙️ Proxy server listening on localhost:6277
+🔑 Session token: a2057c4...
+   Use this token to authenticate requests or set DANGEROUSLY_OMIT_AUTH=true to disable auth
+
+🚀 MCP Inspector is up and running at:
+   http://localhost:6274/?MCP_PROXY_AUTH_TOKEN=a2057c4...
+
+🌐 Opening browser...
+
 ```
 
 Press `Ctrl+C` to stop.
+
+**How to use**:
+- Connect -> Tools -> List Tools -> `sirchmunk_search` -> Input parameters (`query` and `search_paths`) -> Run Tool
+- Check the response for search results.
 
 ---
 
