@@ -5,8 +5,8 @@
       "args": ["serve"],
       "env": {
         "LLM_BASE_URL": "https://api.openai.com/v1",
-        "LLM_API_KEY": "sk-your-api-key-here",
-        "LLM_MODEL_NAME": "gpt-4-turbo-preview",
+        "LLM_API_KEY": "your-api-key",
+        "LLM_MODEL_NAME": "gpt-5.2",
         "SIRCHMUNK_WORK_PATH": "~/.sirchmunk",
         "SIRCHMUNK_VERBOSE": "false",
         "SIRCHMUNK_ENABLE_CLUSTER_REUSE": "true",
