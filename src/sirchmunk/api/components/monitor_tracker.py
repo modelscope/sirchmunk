@@ -13,7 +13,7 @@ import threading
 
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
 from sirchmunk.api.components.history_storage import HistoryStorage
-from sirchmunk.utils.constants import DEFAULT_WORK_PATH
+from sirchmunk.utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH
 
 
 class LLMUsageTracker:
@@ -353,7 +353,7 @@ class MonitorTracker:
             Storage information
         """
         try:
-            work_path = Path(os.getenv("WORK_PATH", DEFAULT_WORK_PATH))
+            work_path = Path(os.getenv("SIRCHMUNK_WORK_PATH", DEFAULT_SIRCHMUNK_WORK_PATH))
             cache_path = work_path / ".cache"
             
             storage_info = {

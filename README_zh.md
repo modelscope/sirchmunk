@@ -198,6 +198,72 @@ asyncio.run(main())
 - 将 `"your-api-key"`、`"your-base-url"`、`"your-model-name"` 和 `/path/to/documents` 替换为实际值。
 
 
+### 命令行界面
+
+Sirchmunk 提供强大的 CLI，用于服务器管理和搜索操作。
+
+#### 初始化
+
+```bash
+# 使用默认设置初始化 Sirchmunk
+sirchmunk init
+
+# 使用自定义工作路径初始化
+sirchmunk init --work-path /path/to/workspace
+```
+
+#### 配置
+
+```bash
+# 生成配置文件 (~/.sirchmunk/.env)
+sirchmunk config --generate
+
+# 显示当前配置
+sirchmunk config
+```
+
+#### 启动 API 服务器
+
+```bash
+# 使用默认设置启动服务器
+sirchmunk serve
+
+# 自定义主机和端口
+sirchmunk serve --host 0.0.0.0 --port 8000
+
+# 开发模式，支持热重载
+sirchmunk serve --reload
+```
+
+#### 搜索
+
+```bash
+# 在当前目录搜索
+sirchmunk search "认证是如何工作的？"
+
+# 在指定路径搜索
+sirchmunk search "查找所有 API 端点" ./src ./docs
+
+# 快速文件名搜索
+sirchmunk search "config" --mode FILENAME_ONLY
+
+# 输出为 JSON 格式
+sirchmunk search "数据库模式" --output json
+
+# 通过 API 服务器搜索（需要先启动服务器）
+sirchmunk search "查询" --api --api-url http://localhost:8584
+```
+
+#### 可用命令
+
+| 命令 | 说明 |
+|------|------|
+| `sirchmunk init` | 初始化工作目录和配置 |
+| `sirchmunk config` | 显示或生成配置 |
+| `sirchmunk serve` | 启动 API 服务器 |
+| `sirchmunk search` | 执行搜索查询 |
+| `sirchmunk version` | 显示版本信息 |
+
 ---
 
 ## 🖥️ Web UI
@@ -271,10 +337,10 @@ python scripts/stop_web.py
 
 ### 数据存储
 
-所有持久化数据存储在配置的 `WORK_PATH`（默认：`~/.sirchmunk/`）：
+所有持久化数据存储在配置的 `SIRCHMUNK_WORK_PATH`（默认：`~/.sirchmunk/`）：
 
 ```
-{WORK_PATH}/
+{SIRCHMUNK_WORK_PATH}/
   ├── .cache/
     ├── history/              # 聊天会话历史（DuckDB）
     │   └── chat_history.db
@@ -330,7 +396,7 @@ result = await search.search(
 
 知识聚类以 Parquet 格式持久化于：
 ```
-{WORK_PATH}/.cache/knowledge/knowledge_clusters.parquet
+{SIRCHMUNK_WORK_PATH}/.cache/knowledge/knowledge_clusters.parquet
 ```
 
 你可以使用 DuckDB 或 `KnowledgeManager` API 查询。

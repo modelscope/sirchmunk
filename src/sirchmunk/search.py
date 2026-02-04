@@ -17,7 +17,7 @@ from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.schema.knowledge import KnowledgeCluster
 from sirchmunk.schema.request import ContentItem, ImageURL, Message, Request
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
-from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME, WORK_PATH
+from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME, SIRCHMUNK_WORK_PATH
 from sirchmunk.utils.deps import check_dependencies
 from sirchmunk.utils.file_utils import get_fast_hash
 from sirchmunk.utils import create_logger, LogCallback
@@ -42,7 +42,7 @@ class AgenticSearch(BaseSearch):
     ):
         super().__init__(**kwargs)
 
-        work_path = work_path or WORK_PATH
+        work_path = work_path or SIRCHMUNK_WORK_PATH
         self.work_path: Path = Path(work_path)
 
         self.llm: OpenAIChat = llm or OpenAIChat(

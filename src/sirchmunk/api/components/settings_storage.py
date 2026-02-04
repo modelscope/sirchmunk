@@ -12,7 +12,7 @@ from datetime import datetime
 from loguru import logger
 
 from sirchmunk.storage.duckdb import DuckDBManager
-from sirchmunk.utils.constants import DEFAULT_WORK_PATH
+from sirchmunk.utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH
 
 
 class SettingsStorage:
@@ -30,11 +30,11 @@ class SettingsStorage:
         Initialize Settings Storage
         
         Args:
-            work_path: Base work path. If None, uses WORK_PATH env variable
+            work_path: Base work path. If None, uses SIRCHMUNK_WORK_PATH env variable
         """
         # Get work path from env if not provided
         if work_path is None:
-            work_path = os.getenv("WORK_PATH", DEFAULT_WORK_PATH)
+            work_path = os.getenv("SIRCHMUNK_WORK_PATH", DEFAULT_SIRCHMUNK_WORK_PATH)
         
         # Create settings storage path
         self.settings_path = Path(work_path) / ".cache" / "settings"

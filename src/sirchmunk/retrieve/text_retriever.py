@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from loguru import logger
 
-from ..utils.constants import GREP_CONCURRENT_LIMIT, DEFAULT_WORK_PATH
+from ..utils.constants import GREP_CONCURRENT_LIMIT, DEFAULT_SIRCHMUNK_WORK_PATH
 from ..utils.file_utils import StorageStructure
 from .base import BaseRetriever
 
@@ -29,7 +29,7 @@ class GrepRetriever(BaseRetriever):
     def __init__(self, work_path: Union[str, Path] = None, **kwargs):
         super().__init__()
 
-        self.work_path: Path = Path(work_path or DEFAULT_WORK_PATH)
+        self.work_path: Path = Path(work_path or DEFAULT_SIRCHMUNK_WORK_PATH)
         self.rga_cache: Path = (
             self.work_path / StorageStructure.CACHE_DIR / StorageStructure.GREP_DIR
         )

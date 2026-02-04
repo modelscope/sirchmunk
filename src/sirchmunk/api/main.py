@@ -15,6 +15,7 @@ from .settings import router as settings_router
 from .history import router as history_router, dashboard_router
 from .chat import router as chat_router
 from .monitor import router as monitor_router
+from .search import router as search_router
 
 # Create FastAPI application
 app = FastAPI(
@@ -41,6 +42,7 @@ app.include_router(history_router)
 app.include_router(dashboard_router)
 app.include_router(chat_router)
 app.include_router(monitor_router)
+app.include_router(search_router)
 
 @app.get("/")
 async def root():
@@ -51,6 +53,7 @@ async def root():
         "description": "APIs for Sirchmunk",
         "status": "running",
         "endpoints": {
+            "search": "/api/v1/search",
             "knowledge": "/api/v1/knowledge",
             "settings": "/api/v1/settings",
             "history": "/api/v1/history",

@@ -201,6 +201,72 @@ asyncio.run(main())
 - Replace `"your-api-key"`, `"your-base-url"`, `"your-model-name"` and `/path/to/documents` with your actual values.
 
 
+### Command Line Interface
+
+Sirchmunk provides a powerful CLI for server management and search operations.
+
+#### Initialize
+
+```bash
+# Initialize Sirchmunk with default settings
+sirchmunk init
+
+# Initialize with custom work path
+sirchmunk init --work-path /path/to/workspace
+```
+
+#### Configure
+
+```bash
+# Generate configuration file (~/.sirchmunk/.env)
+sirchmunk config --generate
+
+# Show current configuration
+sirchmunk config
+```
+
+#### Start API Server
+
+```bash
+# Start server with default settings
+sirchmunk serve
+
+# Custom host and port
+sirchmunk serve --host 0.0.0.0 --port 8000
+
+# Development mode with auto-reload
+sirchmunk serve --reload
+```
+
+#### Search
+
+```bash
+# Search in current directory
+sirchmunk search "How does authentication work?"
+
+# Search in specific paths
+sirchmunk search "find all API endpoints" ./src ./docs
+
+# Quick filename search
+sirchmunk search "config" --mode FILENAME_ONLY
+
+# Output as JSON
+sirchmunk search "database schema" --output json
+
+# Use API server (requires running server)
+sirchmunk search "query" --api --api-url http://localhost:8584
+```
+
+#### Available Commands
+
+| Command | Description |
+|---------|-------------|
+| `sirchmunk init` | Initialize working directory and configuration |
+| `sirchmunk config` | Show or generate configuration |
+| `sirchmunk serve` | Start the API server |
+| `sirchmunk search` | Perform search queries |
+| `sirchmunk version` | Show version information |
+
 ---
 
 ## 🖥️ Web UI
@@ -274,10 +340,10 @@ python scripts/stop_web.py
 
 ### Data Storage
 
-All persistent data is stored in the configured `WORK_PATH` (default: `~/.sirchmunk/`):
+All persistent data is stored in the configured `SIRCHMUNK_WORK_PATH` (default: `~/.sirchmunk/`):
 
 ```
-{WORK_PATH}/
+{SIRCHMUNK_WORK_PATH}/
   ├── .cache/
     ├── history/              # Chat session history (DuckDB)
     │   └── chat_history.db
@@ -335,7 +401,7 @@ No pre-processing or indexing required!
 
 Knowledge clusters are persisted in Parquet format at:
 ```
-{WORK_PATH}/.cache/knowledge/knowledge_clusters.parquet
+{SIRCHMUNK_WORK_PATH}/.cache/knowledge/knowledge_clusters.parquet
 ```
 
 You can query them using DuckDB or the `KnowledgeManager` API.
