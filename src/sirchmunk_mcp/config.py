@@ -188,7 +188,7 @@ class Config(BaseModel):
     def from_env(cls) -> "Config":
         """Load configuration from environment variables.
         
-        Automatically loads .env file from work_path (~/.sirchmunk/.env by default).
+        Automatically loads .mcp_env file from work_path (~/.sirchmunk/.mcp_env by default).
         
         Environment variables:
             LLM_BASE_URL: LLM API base URL
@@ -217,10 +217,10 @@ class Config(BaseModel):
         Raises:
             ValueError: If required configuration is missing or invalid
         """
-        # Load .env from work_path (default: ~/.sirchmunk/.env)
+        # Load .mcp_env from work_path (default: ~/.sirchmunk/.mcp_env)
         work_path = Path(os.getenv("SIRCHMUNK_WORK_PATH", str(Path.home() / ".sirchmunk")))
         work_path = work_path.expanduser().resolve()
-        env_file = work_path / ".env"
+        env_file = work_path / ".mcp_env"
         
         if env_file.exists():
             load_dotenv(env_file, override=False)

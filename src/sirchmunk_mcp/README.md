@@ -37,7 +37,7 @@ sirchmunk-mcp config --generate
 
 ### Step 3: Configure
 
-Edit `.env` with your API key:
+Edit `.mcp_env` with your API key:
 
 ```bash
 # Required

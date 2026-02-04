@@ -227,13 +227,13 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"✓ LLM_API_KEY is set ({llm_api_key[:8]}...)")
         else:
             print("✗ LLM_API_KEY is not set")
-            print("  Set it in your .env file or environment")
+            print("  Set it in your .mcp_env file or environment")
         
         print()
         print("Initialization complete!")
         print()
         print("Next steps:")
-        print("1. Configure LLM_API_KEY in .env file")
+        print("1. Configure LLM_API_KEY in .mcp_env file")
         print("2. Run 'sirchmunk-mcp serve' to start the server")
         print("3. Configure your MCP client (e.g., Claude Desktop)")
         
@@ -260,8 +260,8 @@ def cmd_config(args: argparse.Namespace) -> int:
             work_path = work_path.expanduser().resolve()
             work_path.mkdir(parents=True, exist_ok=True)
             
-            # Generate .env file in work_path
-            env_file = work_path / ".env"
+            # Generate .mcp_env file in work_path
+            env_file = work_path / ".mcp_env"
             
             env_content = """# ===== LLM Configuration =====
 LLM_BASE_URL=https://api.openai.com/v1
