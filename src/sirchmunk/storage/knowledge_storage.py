@@ -21,7 +21,7 @@ from sirchmunk.schema.knowledge import (
     Lifecycle,
     AbstractionLevel
 )
-from ..utils.constants import DEFAULT_WORK_PATH
+from ..utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH
 
 
 class KnowledgeStorage:
@@ -34,7 +34,7 @@ class KnowledgeStorage:
     - Provides full CRUD operations with fuzzy search capabilities
     - Follows Single Responsibility Principle (SRP)
     
-    Storage Path: {WORK_PATH}/.cache/knowledge/
+    Storage Path: {SIRCHMUNK_WORK_PATH}/.cache/knowledge/
     """
     
     def __init__(self, work_path: Optional[str] = None):
@@ -42,11 +42,11 @@ class KnowledgeStorage:
         Initialize Knowledge Manager
         
         Args:
-            work_path: Base work path. If None, uses WORK_PATH env variable
+            work_path: Base work path. If None, uses SIRCHMUNK_WORK_PATH env variable
         """
         # Get work path from env if not provided
         if work_path is None:
-            work_path = os.getenv("WORK_PATH", DEFAULT_WORK_PATH)
+            work_path = os.getenv("SIRCHMUNK_WORK_PATH", DEFAULT_SIRCHMUNK_WORK_PATH)
         
         # Create knowledge storage path
         self.knowledge_path = Path(work_path) / ".cache" / "knowledge"

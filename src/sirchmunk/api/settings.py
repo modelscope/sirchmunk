@@ -14,7 +14,7 @@ from sirchmunk.utils.constants import (
     LLM_BASE_URL,
     LLM_API_KEY,
     LLM_MODEL_NAME,
-    WORK_PATH
+    SIRCHMUNK_WORK_PATH
 )
 
 router = APIRouter(prefix="/api/v1/settings", tags=["settings"])
@@ -33,7 +33,7 @@ class UISettings(BaseModel):
     language: str = "en"
 
 class EnvironmentVariables(BaseModel):
-    WORK_PATH: Optional[str] = None
+    SIRCHMUNK_WORK_PATH: Optional[str] = None
     LLM_BASE_URL: Optional[str] = None
     LLM_API_KEY: Optional[str] = None
     LLM_MODEL_NAME: Optional[str] = None
@@ -55,16 +55,16 @@ def get_default_ui_settings() -> Dict[str, Any]:
 def get_current_env_variables() -> Dict[str, Any]:
     """Get current environment variables with saved overrides"""
     # Get saved values from storage
-    saved_work_path = settings_storage.get_env_variable("WORK_PATH")
+    saved_work_path = settings_storage.get_env_variable("SIRCHMUNK_WORK_PATH")
     saved_llm_base_url = settings_storage.get_env_variable("LLM_BASE_URL")
     saved_llm_api_key = settings_storage.get_env_variable("LLM_API_KEY")
     saved_llm_model = settings_storage.get_env_variable("LLM_MODEL_NAME")
     saved_grep_limit = settings_storage.get_env_variable("GREP_CONCURRENT_LIMIT")
     
     return {
-        "WORK_PATH": {
-            "value": saved_work_path or str(WORK_PATH),
-            "default": str(WORK_PATH),
+        "SIRCHMUNK_WORK_PATH": {
+            "value": saved_work_path or str(SIRCHMUNK_WORK_PATH),
+            "default": str(SIRCHMUNK_WORK_PATH),
             "description": "Working directory for Sirchmunk data",
             "category": "system"
         },
