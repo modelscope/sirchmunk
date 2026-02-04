@@ -1,0 +1,294 @@
+# Copyright (c) ModelScope Contributors. All rights reserved.
+"""
+Sirchmunk Service Wrapper for MCP Server.
+
+Provides a high-level interface to Sirchmunk's AgenticSearch functionality,
+managing initialization, configuration, and session state.
+"""
+
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+from sirchmunk.search import AgenticSearch
+from sirchmunk.llm.openai_chat import OpenAIChat
+from sirchmunk.schema.knowledge import KnowledgeCluster
+
+from .config import Config
+
+
+logger = logging.getLogger(__name__)
+
+
+class SirchmunkService:
+    """Service wrapper for AgenticSearch with lifecycle management.
+    
+    This class manages the AgenticSearch instance and provides a clean interface
+    for MCP tool implementations.
+    
+    Attributes:
+        config: Configuration object
+        search: AgenticSearch instance
+        initialized: Whether the service is initialized
+    """
+    
+    def __init__(self, config: Config):
+        """Initialize Sirchmunk service.
+        
+        Args:
+            config: Configuration object
+        
+        Raises:
+            RuntimeError: If initialization fails
+        """
+        self.config = config
+        self.search: Optional[AgenticSearch] = None
+        self.initialized = False
+        
+        logger.info(f"Initializing Sirchmunk service with config: {config.sirchmunk.work_path}")
+        
+        try:
+            self._initialize_search()
+            self.initialized = True
+            logger.info("Sirchmunk service initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Sirchmunk service: {e}")
+            raise RuntimeError(f"Sirchmunk service initialization failed: {e}") from e
+    
+    def _initialize_search(self) -> None:
+        """Initialize AgenticSearch instance with configuration.
+        
+        Raises:
+            Exception: If AgenticSearch initialization fails
+        """
+        # Create LLM client
+        llm = OpenAIChat(
+            base_url=self.config.llm.base_url,
+            api_key=self.config.llm.api_key,
+            model=self.config.llm.model_name,
+        )
+        
+        # Create AgenticSearch instance
+        self.search = AgenticSearch(
+            llm=llm,
+            work_path=self.config.sirchmunk.work_path,
+            verbose=self.config.sirchmunk.verbose,
+            reuse_knowledge=self.config.sirchmunk.enable_cluster_reuse,
+            cluster_sim_threshold=self.config.sirchmunk.cluster_similarity.threshold,
+            cluster_sim_top_k=self.config.sirchmunk.cluster_similarity.top_k,
+        )
+        
+        logger.info("AgenticSearch instance created")
+    
+    async def search(
+        self,
+        query: str,
+        search_paths: Union[str, List[str]],
+        mode: str = "DEEP",
+        max_depth: Optional[int] = None,
+        top_k_files: Optional[int] = None,
+        keyword_levels: Optional[int] = None,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        return_cluster: bool = False,
+    ) -> Union[str, List[Dict[str, Any]], KnowledgeCluster, None]:
+        """Search and retrieve various types of raw documents using AgenticSearch.
+        
+        This method performs intelligent search across code, documentation, and 
+        other text-based documents. It directly retrieves and analyzes raw content
+        from multiple file types including source code, markdown files, PDFs, 
+        text files, and other document formats supported by ripgrep-all.
+        
+        Args:
+            query: Search query or question to find relevant documents
+            search_paths: Paths to search in (files or directories)
+            mode: Search mode (DEEP, FAST, FILENAME_ONLY)
+            max_depth: Maximum directory depth to search
+            top_k_files: Number of top files to return
+            keyword_levels: Number of keyword granularity levels (DEEP mode)
+            include: File patterns to include (glob)
+            exclude: File patterns to exclude (glob)
+            return_cluster: Whether to return full KnowledgeCluster object
+        
+        Returns:
+            Search results: str (summary), List[Dict] (FILENAME_ONLY), 
+            KnowledgeCluster (if return_cluster=True), or None (if no results)
+        
+        Raises:
+            RuntimeError: If service is not initialized
+            ValueError: If parameters are invalid
+        """
+        if not self.initialized or self.search is None:
+            raise RuntimeError("Sirchmunk service is not initialized")
+        
+        # Validate mode
+        if mode not in ("DEEP", "FAST", "FILENAME_ONLY"):
+            raise ValueError(f"Invalid mode: {mode}. Must be DEEP, FAST, or FILENAME_ONLY")
+        
+        # Normalize search_paths
+        if isinstance(search_paths, str):
+            search_paths = [search_paths]
+        
+        # Validate search paths
+        for path in search_paths:
+            path_obj = Path(path)
+            if not path_obj.exists():
+                logger.warning(f"Search path does not exist: {path}")
+        
+        # Apply defaults from configuration
+        max_depth = max_depth or self.config.sirchmunk.search_defaults.max_depth
+        top_k_files = top_k_files or self.config.sirchmunk.search_defaults.top_k_files
+        keyword_levels = keyword_levels or self.config.sirchmunk.search_defaults.keyword_levels
+        
+        logger.info(
+            f"Starting search: mode={mode}, query='{query[:50]}...', "
+            f"paths={len(search_paths)}, max_depth={max_depth}"
+        )
+        
+        try:
+            # Perform search
+            result = await self.search.search(
+                query=query,
+                search_paths=search_paths,
+                mode=mode,
+                max_depth=max_depth,
+                top_k_files=top_k_files,
+                keyword_levels=keyword_levels,
+                include=include,
+                exclude=exclude,
+                verbose=self.config.sirchmunk.verbose,
+                grep_timeout=self.config.sirchmunk.search_defaults.grep_timeout,
+                return_cluster=return_cluster,
+            )
+            
+            logger.info(f"Search completed: mode={mode}, result_type={type(result).__name__}")
+            return result
+        
+        except Exception as e:
+            logger.error(f"Search failed: {e}", exc_info=True)
+            raise
+    
+    async def get_cluster(self, cluster_id: str) -> Optional[KnowledgeCluster]:
+        """Retrieve a knowledge cluster by ID.
+        
+        Args:
+            cluster_id: Cluster ID (e.g., 'C1007')
+        
+        Returns:
+            KnowledgeCluster if found, None otherwise
+        
+        Raises:
+            RuntimeError: If service is not initialized
+        """
+        if not self.initialized or self.search is None:
+            raise RuntimeError("Sirchmunk service is not initialized")
+        
+        try:
+            cluster = await self.search.knowledge_manager.get(cluster_id)
+            if cluster:
+                logger.info(f"Retrieved cluster: {cluster_id}")
+            else:
+                logger.warning(f"Cluster not found: {cluster_id}")
+            return cluster
+        except Exception as e:
+            logger.error(f"Failed to get cluster {cluster_id}: {e}")
+            raise
+    
+    async def list_clusters(
+        self,
+        limit: int = 10,
+        sort_by: str = "last_modified",
+    ) -> List[Dict[str, Any]]:
+        """List saved knowledge clusters with optional filtering.
+        
+        Args:
+            limit: Maximum number of clusters to return
+            sort_by: Sort field (hotness, confidence, last_modified)
+        
+        Returns:
+            List of cluster metadata dictionaries
+        
+        Raises:
+            RuntimeError: If service is not initialized
+        """
+        if not self.initialized or self.search is None:
+            raise RuntimeError("Sirchmunk service is not initialized")
+        
+        try:
+            # Get all cluster IDs
+            all_clusters = await self.search.knowledge_manager.list_all()
+            
+            # Sort clusters
+            if sort_by == "hotness":
+                all_clusters.sort(key=lambda c: c.hotness or 0.0, reverse=True)
+            elif sort_by == "confidence":
+                all_clusters.sort(key=lambda c: c.confidence or 0.0, reverse=True)
+            else:  # last_modified
+                all_clusters.sort(key=lambda c: c.last_modified, reverse=True)
+            
+            # Limit results
+            result_clusters = all_clusters[:limit]
+            
+            # Convert to dictionaries
+            results = []
+            for cluster in result_clusters:
+                results.append({
+                    "id": cluster.id,
+                    "name": cluster.name,
+                    "confidence": cluster.confidence,
+                    "hotness": cluster.hotness,
+                    "lifecycle": cluster.lifecycle.value,
+                    "version": cluster.version,
+                    "last_modified": cluster.last_modified.isoformat() if cluster.last_modified else None,
+                    "queries": cluster.queries,
+                    "evidences_count": len(cluster.evidences),
+                })
+            
+            logger.info(f"Listed {len(results)} clusters (limit={limit}, sort_by={sort_by})")
+            return results
+        
+        except Exception as e:
+            logger.error(f"Failed to list clusters: {e}")
+            raise
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get service statistics.
+        
+        Returns:
+            Dictionary with service statistics
+        
+        Raises:
+            RuntimeError: If service is not initialized
+        """
+        if not self.initialized or self.search is None:
+            raise RuntimeError("Sirchmunk service is not initialized")
+        
+        try:
+            # Get knowledge manager stats
+            stats = self.search.knowledge_manager.get_stats()
+            
+            # Add service-level stats
+            stats["service"] = {
+                "initialized": self.initialized,
+                "work_path": str(self.config.sirchmunk.work_path),
+                "cluster_reuse_enabled": self.config.sirchmunk.enable_cluster_reuse,
+            }
+            
+            return stats
+        except Exception as e:
+            logger.error(f"Failed to get stats: {e}")
+            return {"error": str(e)}
+    
+    async def shutdown(self) -> None:
+        """Gracefully shutdown the service.
+        
+        Performs cleanup operations like closing connections and saving state.
+        """
+        logger.info("Shutting down Sirchmunk service")
+        
+        try:
+            # Currently no cleanup needed, but this provides extension point
+            self.initialized = False
+            logger.info("Sirchmunk service shutdown complete")
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
