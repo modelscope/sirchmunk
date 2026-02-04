@@ -500,14 +500,6 @@ rm -rf ~/.sirchmunk
 git clone https://github.com/modelscope/sirchmunk.git
 cd sirchmunk/src/sirchmunk_mcp
 pip install -e ".[dev]"
-
-# Run tests
-pytest tests/
-
-# Code style
-black .
-ruff check .
-mypy .
 ```
 
 ---
@@ -521,23 +513,12 @@ mypy .
 
 ---
 
-## Examples
-
-See the `examples/` directory for configuration templates:
-
-- `cursor_mcp_config.json` - Basic Cursor setup
-- `cursor_mcp_config_venv.json` - Virtual environment setup
-- `cursor_mcp_config_local_llm.json` - Local LLM setup
-- `claude_code_setup.md` - Complete setup guide
-
----
-
 ## Links
 
 - [Sirchmunk GitHub](https://github.com/modelscope/sirchmunk)
 - [MCP Documentation](https://modelcontextprotocol.io)
 - [MCP Specification](https://github.com/modelcontextprotocol/modelcontextprotocol)
-- [Claude Desktop](https://claude.ai/desktop)
+- [Claude Desktop](https://claude.ai)
 
 ## License
 
