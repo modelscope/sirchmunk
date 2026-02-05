@@ -6,17 +6,12 @@ Provides embedding computation using SentenceTransformer models loaded from Mode
 
 import asyncio
 import hashlib
-import logging
 import warnings
 from typing import List, Optional, Dict, Any
 
 import torch
 import numpy as np
 from loguru import logger
-
-# Suppress SentenceTransformer and transformers INFO/WARNING logs
-logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
-logging.getLogger("transformers").setLevel(logging.ERROR)
 
 
 class EmbeddingUtil:
@@ -70,7 +65,7 @@ class EmbeddingUtil:
         )
     
     @staticmethod
-    def _load_model(model_id: str, cache_dir: Optional[str] = None, verbose: bool = False) -> str:
+    def _load_model(model_id: str, cache_dir: Optional[str] = None) -> str:
         """
         Load the embedding model from ModelScope or Hugging Face.
         
@@ -82,14 +77,6 @@ class EmbeddingUtil:
         Returns:
             Path to downloaded model directory
         """
-        import os
-        
-        # Suppress ModelScope download progress if not verbose
-        if not verbose:
-            os.environ["MODELSCOPE_LOG_LEVEL"] = "ERROR"
-        
-        logger.debug(f"Loading embedding model: {model_id}...")
-        
         try:
             from modelscope import snapshot_download
             
@@ -200,16 +187,8 @@ class EmbeddingUtil:
         Returns:
             Path to downloaded model directory
         """
-        import os
-        
         model_id = model_id or cls.DEFAULT_MODEL_ID
-        
-        # Set verbose mode for download progress
-        if verbose:
-            os.environ["MODELSCOPE_LOG_LEVEL"] = "INFO"
-        else:
-            os.environ["MODELSCOPE_LOG_LEVEL"] = "ERROR"
-        
+
         return cls._load_model(model_id, cache_dir, verbose=verbose)
 
 
@@ -224,3 +203,18 @@ def compute_text_hash(text: str) -> str:
         Hex string of hash (first 16 characters)
     """
     return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
+
+
+if __name__ == '__main__':
+
+    # Example usage
+    import asyncio
+
+    async def main():
+        embed_util = EmbeddingUtil()
+        texts = ["Hello world", "ModelScope embedding"]
+        embeddings = await embed_util.embed(texts)
+        for text, emb in zip(texts, embeddings):
+            print(f"Text: {text}\nEmbedding: {emb}\n")
+
+    asyncio.run(main())
