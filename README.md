@@ -183,9 +183,9 @@ llm = OpenAIChat(
 
 async def main():
     
-    agent_search = AgenticSearch(llm=llm)
+    searcher = AgenticSearch(llm=llm)
     
-    result: str = await agent_search.search(
+    result: str = await searcher.search(
         query="How does transformer attention work?",
         search_paths=["/path/to/documents"],
     )
@@ -205,24 +205,34 @@ asyncio.run(main())
 
 Sirchmunk provides a powerful CLI for server management and search operations.
 
+#### Installation
+
+```bash
+pip install "sirchmunk[web]"
+
+# or install via UV
+uv pip install "sirchmunk[web]"
+```
+
+
 #### Initialize
 
 ```bash
-# Initialize Sirchmunk with default settings
+# Initialize Sirchmunk with default settings (Default work path: `~/.sirchmunk/`)
 sirchmunk init
 
-# Initialize with custom work path
+# Alternatively, initialize with custom work path
 sirchmunk init --work-path /path/to/workspace
 ```
 
 #### Configure
 
 ```bash
-# Generate configuration file (~/.sirchmunk/.env)
-sirchmunk config --generate
-
 # Show current configuration
 sirchmunk config
+
+# Regenerate configuration file if needed (Default config file: ~/.sirchmunk/.env)
+sirchmunk config --generate
 ```
 
 #### Start API Server
@@ -386,7 +396,7 @@ Any OpenAI-compatible API endpoint, including (but not limited too):
 Simply specify the path in your search query:
 
 ```python
-result = await search.search(
+result = await searcher.search(
     query="Your question",
     search_paths=["/path/to/folder", "/path/to/file.pdf"]
 )
@@ -413,7 +423,7 @@ You can query them using DuckDB or the `KnowledgeManager` API.
 
 1. **Web Dashboard**: Visit the Monitor page for real-time statistics
 2. **API**: `GET /api/v1/monitor/llm` returns usage metrics
-3. **Code**: Access `search.llm_usages` after search completion
+3. **Code**: Access `searcher.llm_usages` after search completion
 
 </details>
 

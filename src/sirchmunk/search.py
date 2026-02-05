@@ -1,12 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import ast
 import json
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from sirchmunk.base import BaseSearch
+
+logger = logging.getLogger(__name__)
 from sirchmunk.learnings.knowledge_base import KnowledgeBase
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import (
@@ -43,7 +46,8 @@ class AgenticSearch(BaseSearch):
         super().__init__(**kwargs)
 
         work_path = work_path or SIRCHMUNK_WORK_PATH
-        self.work_path: Path = Path(work_path)
+        # Ensure path is expanded (handle ~ and environment variables)
+        self.work_path: Path = Path(work_path).expanduser().resolve()
 
         self.llm: OpenAIChat = llm or OpenAIChat(
             base_url=LLM_BASE_URL,
@@ -89,13 +93,12 @@ class AgenticSearch(BaseSearch):
                 self.embedding_client = EmbeddingUtil(
                     cache_dir=str(self.work_path / ".cache" / "models")
                 )
-                print(
+                logger.debug(
                     f"Embedding client initialized: {self.embedding_client.get_model_info()}"
                 )
             except Exception as e:
-                print(
-                    f"[WARNING] Failed to initialize embedding client: {e}. "
-                    f"Cluster reuse disabled."
+                logger.warning(
+                    f"Failed to initialize embedding client: {e}. Cluster reuse disabled."
                 )
                 self.embedding_client = None
 

@@ -202,24 +202,35 @@ asyncio.run(main())
 
 Sirchmunk 提供强大的 CLI，用于服务器管理和搜索操作。
 
+
+#### 安装
+
+```bash
+pip install "sirchmunk[web]"
+
+# 或使用UV安装
+uv pip install "sirchmunk[web]"
+```
+
+
 #### 初始化
 
 ```bash
-# 使用默认设置初始化 Sirchmunk
+# 使用默认设置初始化 Sirchmunk，默认工作路径为 `~/.sirchmunk/`
 sirchmunk init
 
-# 使用自定义工作路径初始化
+# 或者，也可以使用自定义工作路径初始化
 sirchmunk init --work-path /path/to/workspace
 ```
 
 #### 配置
 
 ```bash
-# 生成配置文件 (~/.sirchmunk/.env)
-sirchmunk config --generate
-
 # 显示当前配置
 sirchmunk config
+
+# 如需要，可重新生成配置文件 (默认配置文件路径，~/.sirchmunk/.env)
+sirchmunk config --generate
 ```
 
 #### 启动 API 服务器

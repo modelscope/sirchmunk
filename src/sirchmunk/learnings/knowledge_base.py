@@ -51,7 +51,9 @@ class KnowledgeBase:
         self.llm = llm
         self.metadata_map = metadata_map
         self.work_path: Path = (
-            DEFAULT_SIRCHMUNK_WORK_PATH if work_path is None else Path(work_path).resolve()
+            Path(DEFAULT_SIRCHMUNK_WORK_PATH).expanduser().resolve() 
+            if work_path is None 
+            else Path(work_path).expanduser().resolve()
         )
         self.metadata_path: Path = (
             self.work_path / StorageStructure.CACHE_DIR / StorageStructure.METADATA_DIR

@@ -6,12 +6,17 @@ Provides embedding computation using SentenceTransformer models loaded from Mode
 
 import asyncio
 import hashlib
+import logging
+import warnings
 from typing import List, Optional, Dict, Any
-from pathlib import Path
 
 import torch
 import numpy as np
 from loguru import logger
+
+# Suppress SentenceTransformer and transformers INFO/WARNING logs
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 
 class EmbeddingUtil:
@@ -45,34 +50,45 @@ class EmbeddingUtil:
         else:
             self.device = device
         
-        # Load model
+        # Load model with suppressed warnings
         model_dir = self._load_model(model_id, cache_dir)
         
-        # Import SentenceTransformer here to avoid dependency issues
+        # Import SentenceTransformer and load model with warnings suppressed
+        # The 'embeddings.position_ids' warning is expected and can be ignored
         from sentence_transformers import SentenceTransformer
-        self.model = SentenceTransformer(model_dir, device=self.device)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*position_ids.*")
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            self.model = SentenceTransformer(model_dir, device=self.device)
         
         # Warm up model with dummy inference
         self._warmup()
         
-        logger.info(
+        logger.debug(
             f"Loaded embedding model: {model_id} "
             f"(device={self.device}, dim={self.dimension})"
         )
     
     @staticmethod
-    def _load_model(model_id: str, cache_dir: Optional[str] = None) -> str:
+    def _load_model(model_id: str, cache_dir: Optional[str] = None, verbose: bool = False) -> str:
         """
         Load the embedding model from ModelScope or Hugging Face.
         
         Args:
             model_id: Model identifier
             cache_dir: Optional cache directory for model files
+            verbose: Whether to show download progress
         
         Returns:
             Path to downloaded model directory
         """
-        logger.info(f"Loading embedding model: {model_id}...")
+        import os
+        
+        # Suppress ModelScope download progress if not verbose
+        if not verbose:
+            os.environ["MODELSCOPE_LOG_LEVEL"] = "ERROR"
+        
+        logger.debug(f"Loading embedding model: {model_id}...")
         
         try:
             from modelscope import snapshot_download
@@ -85,7 +101,7 @@ class EmbeddingUtil:
                     "rust_model.ot", "tf_model.h5"
                 ]
             )
-            logger.info(f"Model loaded successfully: {model_dir}")
+            logger.debug(f"Model loaded successfully: {model_dir}")
             return model_dir
         
         except Exception as e:
@@ -161,6 +177,40 @@ class EmbeddingUtil:
             "device": self.device,
             "max_seq_length": self.model.max_seq_length,
         }
+
+
+    @classmethod
+    def preload_model(
+        cls, 
+        cache_dir: Optional[str] = None,
+        model_id: str = None,
+        verbose: bool = True
+    ) -> str:
+        """
+        Pre-download the embedding model without initializing.
+        
+        This is useful during initialization to download the model
+        without loading it into memory.
+        
+        Args:
+            cache_dir: Cache directory for model files
+            model_id: Model identifier (uses default if None)
+            verbose: Whether to show download progress
+        
+        Returns:
+            Path to downloaded model directory
+        """
+        import os
+        
+        model_id = model_id or cls.DEFAULT_MODEL_ID
+        
+        # Set verbose mode for download progress
+        if verbose:
+            os.environ["MODELSCOPE_LOG_LEVEL"] = "INFO"
+        else:
+            os.environ["MODELSCOPE_LOG_LEVEL"] = "ERROR"
+        
+        return cls._load_model(model_id, cache_dir, verbose=verbose)
 
 
 def compute_text_hash(text: str) -> str:

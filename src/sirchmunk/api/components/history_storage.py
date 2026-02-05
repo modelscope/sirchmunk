@@ -33,12 +33,12 @@ class HistoryStorage:
         Args:
             work_path: Base work path. If None, uses SIRCHMUNK_WORK_PATH env variable
         """
-        # Get work path from env if not provided
+        # Get work path from env if not provided, and expand ~ in path
         if work_path is None:
             work_path = os.getenv("SIRCHMUNK_WORK_PATH", DEFAULT_SIRCHMUNK_WORK_PATH)
         
-        # Create history storage path
-        self.history_path = Path(work_path) / ".cache" / "history"
+        # Create history storage path (expand ~ and resolve to absolute path)
+        self.history_path = Path(work_path).expanduser().resolve() / ".cache" / "history"
         self.history_path.mkdir(parents=True, exist_ok=True)
         
         # Initialize DuckDB
