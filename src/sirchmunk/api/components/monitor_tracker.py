@@ -353,7 +353,7 @@ class MonitorTracker:
             Storage information
         """
         try:
-            work_path = Path(os.getenv("SIRCHMUNK_WORK_PATH", DEFAULT_SIRCHMUNK_WORK_PATH))
+            work_path = Path(os.getenv("SIRCHMUNK_WORK_PATH", DEFAULT_SIRCHMUNK_WORK_PATH)).expanduser().resolve()
             cache_path = work_path / ".cache"
             
             storage_info = {

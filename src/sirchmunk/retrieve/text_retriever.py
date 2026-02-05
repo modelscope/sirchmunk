@@ -29,7 +29,7 @@ class GrepRetriever(BaseRetriever):
     def __init__(self, work_path: Union[str, Path] = None, **kwargs):
         super().__init__()
 
-        self.work_path: Path = Path(work_path or DEFAULT_SIRCHMUNK_WORK_PATH)
+        self.work_path: Path = Path(work_path or DEFAULT_SIRCHMUNK_WORK_PATH).expanduser().resolve()
         self.rga_cache: Path = (
             self.work_path / StorageStructure.CACHE_DIR / StorageStructure.GREP_DIR
         )

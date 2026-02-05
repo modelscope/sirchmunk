@@ -32,12 +32,12 @@ class SettingsStorage:
         Args:
             work_path: Base work path. If None, uses SIRCHMUNK_WORK_PATH env variable
         """
-        # Get work path from env if not provided
+        # Get work path from env if not provided, and expand ~ in path
         if work_path is None:
             work_path = os.getenv("SIRCHMUNK_WORK_PATH", DEFAULT_SIRCHMUNK_WORK_PATH)
         
-        # Create settings storage path
-        self.settings_path = Path(work_path) / ".cache" / "settings"
+        # Create settings storage path (expand ~ and resolve to absolute path)
+        self.settings_path = Path(work_path).expanduser().resolve() / ".cache" / "settings"
         self.settings_path.mkdir(parents=True, exist_ok=True)
         
         # Initialize DuckDB

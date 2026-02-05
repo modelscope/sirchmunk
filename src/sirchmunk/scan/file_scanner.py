@@ -58,9 +58,9 @@ class FileScanner(BaseScanner):
             corpus_path = [corpus_path]
         self.corpus_paths: List[Path] = [Path(p).resolve() for p in corpus_path]
 
-        # Set work and metadata paths
+        # Set work and metadata paths (expand ~ and resolve to absolute path)
         self.work_path: Path = (
-            Path.cwd() if work_path is None else Path(work_path).resolve()
+            Path.cwd() if work_path is None else Path(work_path).expanduser().resolve()
         )
         self.metadata_path: Path = (
             self.work_path / StorageStructure.CACHE_DIR / StorageStructure.METADATA_DIR

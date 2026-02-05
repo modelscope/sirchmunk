@@ -6,8 +6,8 @@ Provides embedding computation using SentenceTransformer models loaded from Mode
 
 import asyncio
 import hashlib
+import warnings
 from typing import List, Optional, Dict, Any
-from pathlib import Path
 
 import torch
 import numpy as np
@@ -45,17 +45,21 @@ class EmbeddingUtil:
         else:
             self.device = device
         
-        # Load model
+        # Load model with suppressed warnings
         model_dir = self._load_model(model_id, cache_dir)
         
-        # Import SentenceTransformer here to avoid dependency issues
+        # Import SentenceTransformer and load model with warnings suppressed
+        # The 'embeddings.position_ids' warning is expected and can be ignored
         from sentence_transformers import SentenceTransformer
-        self.model = SentenceTransformer(model_dir, device=self.device)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*position_ids.*")
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            self.model = SentenceTransformer(model_dir, device=self.device)
         
         # Warm up model with dummy inference
         self._warmup()
         
-        logger.info(
+        logger.debug(
             f"Loaded embedding model: {model_id} "
             f"(device={self.device}, dim={self.dimension})"
         )
@@ -68,12 +72,10 @@ class EmbeddingUtil:
         Args:
             model_id: Model identifier
             cache_dir: Optional cache directory for model files
-        
+
         Returns:
             Path to downloaded model directory
         """
-        logger.info(f"Loading embedding model: {model_id}...")
-        
         try:
             from modelscope import snapshot_download
             
@@ -85,7 +87,7 @@ class EmbeddingUtil:
                     "rust_model.ot", "tf_model.h5"
                 ]
             )
-            logger.info(f"Model loaded successfully: {model_dir}")
+            logger.debug(f"Model loaded successfully: {model_dir}")
             return model_dir
         
         except Exception as e:
@@ -163,6 +165,30 @@ class EmbeddingUtil:
         }
 
 
+    @classmethod
+    def preload_model(
+        cls, 
+        cache_dir: Optional[str] = None,
+        model_id: str = None,
+    ) -> str:
+        """
+        Pre-download the embedding model without initializing.
+        
+        This is useful during initialization to download the model
+        without loading it into memory.
+        
+        Args:
+            cache_dir: Cache directory for model files
+            model_id: Model identifier (uses default if None)
+
+        Returns:
+            Path to downloaded model directory
+        """
+        model_id = model_id or cls.DEFAULT_MODEL_ID
+
+        return cls._load_model(model_id, cache_dir)
+
+
 def compute_text_hash(text: str) -> str:
     """
     Compute SHA256 hash for text content.
@@ -174,3 +200,18 @@ def compute_text_hash(text: str) -> str:
         Hex string of hash (first 16 characters)
     """
     return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
+
+
+if __name__ == '__main__':
+
+    # Example usage
+    import asyncio
+
+    async def main():
+        embed_util = EmbeddingUtil()
+        texts = ["Hello world", "ModelScope embedding"]
+        embeddings = await embed_util.embed(texts)
+        for text, emb in zip(texts, embeddings):
+            print(f"Text: {text}\nEmbedding: {emb}\n")
+
+    asyncio.run(main())

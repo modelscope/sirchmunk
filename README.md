@@ -13,6 +13,7 @@
 [![ripgrep-all](https://img.shields.io/badge/ripgrep--all-Search-E67E22?style=flat-square&logo=rust&logoColor=white)](https://github.com/phiresky/ripgrep-all)
 [![OpenAI](https://img.shields.io/badge/OpenAI-API-412991?style=flat-square&logo=openai&logoColor=white)](https://github.com/openai/openai-python)
 [![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square)](https://github.com/kreuzberg-dev/kreuzberg)
+[![MCP](https://img.shields.io/badge/MCP-Python_SDK-8B5CF6?style=flat-square&logo=python&logoColor=white)](https://github.com/modelcontextprotocol/python-sdk)
 
 
 [**Quick Start**](#-quick-start) · [**Key Features**](#-key-features) · [**Web UI**](#-web-ui) · [**How it Works**](#-how-it-works) · [**FAQ**](#-faq)
@@ -138,6 +139,12 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 ## 🎉 News
 
+* 🚀 **Feb 5, 2026**: Release **v0.0.2** — MCP Support, CLI Commands & Knowledge Persistence!
+  - **MCP Integration**: Full [Model Context Protocol](https://modelcontextprotocol.io) support, works seamlessly with Claude Desktop and Cursor IDE.
+  - **CLI Commands**: New `sirchmunk` CLI with `init`, `config`, `serve`, and `search` commands.
+  - **KnowledgeCluster Persistence**: DuckDB-powered storage with Parquet export for efficient knowledge management.
+  - **Knowledge Reuse**: Semantic similarity-based cluster retrieval for faster searches via embedding vectors.
+
 * 🎉🎉 Jan 22, 2026: Introducing **Sirchmunk**: Initial Release v0.0.1 Now Available!
 
 
@@ -183,9 +190,9 @@ llm = OpenAIChat(
 
 async def main():
     
-    agent_search = AgenticSearch(llm=llm)
+    searcher = AgenticSearch(llm=llm)
     
-    result: str = await agent_search.search(
+    result: str = await searcher.search(
         query="How does transformer attention work?",
         search_paths=["/path/to/documents"],
     )
@@ -205,24 +212,34 @@ asyncio.run(main())
 
 Sirchmunk provides a powerful CLI for server management and search operations.
 
+#### Installation
+
+```bash
+pip install "sirchmunk[web]"
+
+# or install via UV
+uv pip install "sirchmunk[web]"
+```
+
+
 #### Initialize
 
 ```bash
-# Initialize Sirchmunk with default settings
+# Initialize Sirchmunk with default settings (Default work path: `~/.sirchmunk/`)
 sirchmunk init
 
-# Initialize with custom work path
+# Alternatively, initialize with custom work path
 sirchmunk init --work-path /path/to/workspace
 ```
 
 #### Configure
 
 ```bash
-# Generate configuration file (~/.sirchmunk/.env)
-sirchmunk config --generate
-
 # Show current configuration
 sirchmunk config
+
+# Regenerate configuration file if needed (Default config file: ~/.sirchmunk/.env)
+sirchmunk config --generate
 ```
 
 #### Start API Server
@@ -266,6 +283,36 @@ sirchmunk search "query" --api --api-url http://localhost:8584
 | `sirchmunk serve` | Start the API server |
 | `sirchmunk search` | Perform search queries |
 | `sirchmunk version` | Show version information |
+
+---
+
+## 🔌 MCP Server
+
+Sirchmunk provides a [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that exposes its intelligent search capabilities as MCP tools. This enables seamless integration with AI assistants like **Claude Desktop** and **Cursor IDE**.
+
+### Quick Start
+
+```bash
+# Install MCP package
+pip install sirchmunk-mcp
+
+# Initialize and configure
+sirchmunk-mcp init
+sirchmunk-mcp config --generate
+
+# Edit ~/.sirchmunk/.mcp_env with your LLM API key
+
+# Test with MCP Inspector
+npx @modelcontextprotocol/inspector sirchmunk-mcp serve
+```
+
+### Features
+
+- **Multi-Mode Search**: DEEP mode for comprehensive analysis, FILENAME_ONLY for fast file discovery
+- **Knowledge Cluster Management**: Automatic extraction, storage, and reuse of knowledge
+- **Standard MCP Protocol**: Works with stdio and Streamable HTTP transports
+
+📖 **For detailed documentation, see [Sirchmunk MCP README](src/sirchmunk_mcp/README.md)**.
 
 ---
 
@@ -386,7 +433,7 @@ Any OpenAI-compatible API endpoint, including (but not limited too):
 Simply specify the path in your search query:
 
 ```python
-result = await search.search(
+result = await searcher.search(
     query="Your question",
     search_paths=["/path/to/folder", "/path/to/file.pdf"]
 )
@@ -413,7 +460,7 @@ You can query them using DuckDB or the `KnowledgeManager` API.
 
 1. **Web Dashboard**: Visit the Monitor page for real-time statistics
 2. **API**: `GET /api/v1/monitor/llm` returns usage metrics
-3. **Code**: Access `search.llm_usages` after search completion
+3. **Code**: Access `searcher.llm_usages` after search completion
 
 </details>
 

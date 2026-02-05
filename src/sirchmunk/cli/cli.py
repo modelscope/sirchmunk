@@ -184,6 +184,22 @@ def cmd_init(args: argparse.Namespace) -> int:
         llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
         print(f"  • LLM_BASE_URL: {llm_base_url}")
         
+        # Pre-download embedding model
+        print()
+        print("Downloading embedding model...")
+        print("  (This may take a few minutes on first run)")
+        try:
+            from sirchmunk.utils.embedding_util import EmbeddingUtil
+            
+            model_cache_dir = str(work_path / ".cache" / "models")
+            model_dir = EmbeddingUtil.preload_model(
+                cache_dir=model_cache_dir,
+            )
+            print(f"  ✓ Embedding model downloaded: {model_dir}")
+        except Exception as e:
+            print(f"  ✗ Failed to download embedding model: {e}")
+            print("    Model will be downloaded on first search.")
+        
         print()
         print("=" * 60)
         print("✅ Initialization complete!")
@@ -393,19 +409,24 @@ async def _search_local(
     """
     from sirchmunk.search import AgenticSearch
     from sirchmunk.llm.openai_chat import OpenAIChat
-    from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME
+    
+    # Read LLM config from environment at runtime (after .env is loaded)
+    # Don't use constants module values as they are loaded at import time
+    llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+    llm_api_key = os.getenv("LLM_API_KEY", "")
+    llm_model_name = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
     
     # Validate API key
-    if not LLM_API_KEY:
+    if not llm_api_key:
         print("❌ LLM_API_KEY is not set.")
         print("   Configure it in ~/.sirchmunk/.env or set the environment variable.")
         return 1
     
     # Create LLM client
     llm = OpenAIChat(
-        base_url=LLM_BASE_URL,
-        api_key=LLM_API_KEY,
-        model=LLM_MODEL_NAME,
+        base_url=llm_base_url,
+        api_key=llm_api_key,
+        model=llm_model_name,
     )
     
     # Create search instance

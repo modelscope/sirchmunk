@@ -12,4 +12,6 @@ LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
 
 # Sirchmunk Working Directory Configuration
 DEFAULT_SIRCHMUNK_WORK_PATH = os.path.expanduser("~/.sirchmunk")
-SIRCHMUNK_WORK_PATH = os.getenv("SIRCHMUNK_WORK_PATH", DEFAULT_SIRCHMUNK_WORK_PATH)
+# Expand ~ in environment variable if set
+_env_work_path = os.getenv("SIRCHMUNK_WORK_PATH")
+SIRCHMUNK_WORK_PATH = os.path.expanduser(_env_work_path) if _env_work_path else DEFAULT_SIRCHMUNK_WORK_PATH

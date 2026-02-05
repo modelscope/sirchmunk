@@ -44,12 +44,12 @@ class KnowledgeStorage:
         Args:
             work_path: Base work path. If None, uses SIRCHMUNK_WORK_PATH env variable
         """
-        # Get work path from env if not provided
+        # Get work path from env if not provided, and expand ~ in path
         if work_path is None:
             work_path = os.getenv("SIRCHMUNK_WORK_PATH", DEFAULT_SIRCHMUNK_WORK_PATH)
         
-        # Create knowledge storage path
-        self.knowledge_path = Path(work_path) / ".cache" / "knowledge"
+        # Create knowledge storage path (expand ~ and resolve to absolute path)
+        self.knowledge_path = Path(work_path).expanduser().resolve() / ".cache" / "knowledge"
         self.knowledge_path.mkdir(parents=True, exist_ok=True)
         
         # Parquet file path
