@@ -72,8 +72,7 @@ class EmbeddingUtil:
         Args:
             model_id: Model identifier
             cache_dir: Optional cache directory for model files
-            verbose: Whether to show download progress
-        
+
         Returns:
             Path to downloaded model directory
         """
@@ -171,7 +170,6 @@ class EmbeddingUtil:
         cls, 
         cache_dir: Optional[str] = None,
         model_id: str = None,
-        verbose: bool = True
     ) -> str:
         """
         Pre-download the embedding model without initializing.
@@ -182,14 +180,13 @@ class EmbeddingUtil:
         Args:
             cache_dir: Cache directory for model files
             model_id: Model identifier (uses default if None)
-            verbose: Whether to show download progress
-        
+
         Returns:
             Path to downloaded model directory
         """
         model_id = model_id or cls.DEFAULT_MODEL_ID
 
-        return cls._load_model(model_id, cache_dir, verbose=verbose)
+        return cls._load_model(model_id, cache_dir)
 
 
 def compute_text_hash(text: str) -> str:

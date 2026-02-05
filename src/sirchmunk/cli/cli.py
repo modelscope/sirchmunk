@@ -194,7 +194,6 @@ def cmd_init(args: argparse.Namespace) -> int:
             model_cache_dir = str(work_path / ".cache" / "models")
             model_dir = EmbeddingUtil.preload_model(
                 cache_dir=model_cache_dir,
-                verbose=True
             )
             print(f"  ✓ Embedding model downloaded: {model_dir}")
         except Exception as e:
