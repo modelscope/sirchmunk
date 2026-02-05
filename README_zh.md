@@ -13,6 +13,7 @@
 [![ripgrep-all](https://img.shields.io/badge/ripgrep--all-Search-E67E22?style=flat-square&logo=rust&logoColor=white)](https://github.com/phiresky/ripgrep-all)
 [![OpenAI](https://img.shields.io/badge/OpenAI-API-412991?style=flat-square&logo=openai&logoColor=white)](https://github.com/openai/openai-python)
 [![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square)](https://github.com/kreuzberg-dev/kreuzberg)
+[![MCP](https://img.shields.io/badge/MCP-Python_SDK-8B5CF6?style=flat-square&logo=python&logoColor=white)](https://github.com/modelcontextprotocol/python-sdk)
 
 
 [**快速开始**](#-快速开始) · [**核心特性**](#-核心特性) · [**Web UI**](#-web-ui) · [**工作原理**](#-工作原理) · [**FAQ**](#-faq)
@@ -134,6 +135,12 @@
 ---
 
 ## 🎉 News
+
+* 🚀 **2026.2.5**: 发布 **v0.0.2** — MCP 支持、CLI 命令行 & 知识持久化！
+  - **MCP 集成**：完整支持 [Model Context Protocol](https://modelcontextprotocol.io)，与 Claude Desktop 和 Cursor IDE 无缝协作。
+  - **CLI 命令行**：全新 `sirchmunk` 命令行工具，支持 `init`、`config`、`serve` 和 `search` 命令。
+  - **KnowledgeCluster 持久化**：基于 DuckDB 存储，支持 Parquet 导出，高效管理知识聚类。
+  - **知识复用**：基于语义相似度的知识聚类检索，通过 embedding 向量加速搜索。
 
 * 🎉🎉 2026.1.22: **Sirchmunk** 初始版本 v0.0.1 现已发布！
 
@@ -274,6 +281,36 @@ sirchmunk search "查询" --api --api-url http://localhost:8584
 | `sirchmunk serve` | 启动 API 服务器 |
 | `sirchmunk search` | 执行搜索查询 |
 | `sirchmunk version` | 显示版本信息 |
+
+---
+
+## 🔌 MCP 服务器
+
+Sirchmunk 提供 [Model Context Protocol (MCP)](https://modelcontextprotocol.io) 服务器，将其智能搜索能力作为 MCP 工具暴露。可与 **Claude Desktop** 和 **Cursor IDE** 等 AI 助手无缝集成。
+
+### 快速开始
+
+```bash
+# 安装 MCP 包
+pip install sirchmunk-mcp
+
+# 初始化和配置
+sirchmunk-mcp init
+sirchmunk-mcp config --generate
+
+# 编辑 ~/.sirchmunk/.mcp_env 配置 LLM API Key
+
+# 使用 MCP Inspector 测试
+npx @modelcontextprotocol/inspector sirchmunk-mcp serve
+```
+
+### 特性
+
+- **多模式搜索**：DEEP 模式进行全面分析，FILENAME_ONLY 模式快速发现文件
+- **知识聚类管理**：自动提取、存储和复用知识
+- **标准 MCP 协议**：支持 stdio 和 Streamable HTTP 传输
+
+📖 **详细文档请参阅 [Sirchmunk MCP README](src/sirchmunk_mcp/README.md)**。
 
 ---
 
