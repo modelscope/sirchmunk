@@ -135,7 +135,7 @@ class SirchmunkService:
         Args:
             query: Search query or question to find relevant documents
             search_paths: Paths to search in (files or directories)
-            mode: Search mode (DEEP, FAST, FILENAME_ONLY)
+            mode: Search mode (DEEP, FILENAME_ONLY)
             max_depth: Maximum directory depth to search
             top_k_files: Number of top files to return
             keyword_levels: Number of keyword granularity levels (DEEP mode)
@@ -155,8 +155,8 @@ class SirchmunkService:
             raise RuntimeError("Sirchmunk service is not initialized")
         
         # Validate mode
-        if mode not in ("DEEP", "FAST", "FILENAME_ONLY"):
-            raise ValueError(f"Invalid mode: {mode}. Must be DEEP, FAST, or FILENAME_ONLY")
+        if mode not in ("DEEP", "FILENAME_ONLY"):
+            raise ValueError(f"Invalid mode: {mode}. Must be DEEP, or FILENAME_ONLY")
         
         # Normalize search_paths
         if isinstance(search_paths, str):

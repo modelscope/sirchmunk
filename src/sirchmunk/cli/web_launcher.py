@@ -233,12 +233,41 @@ def build_frontend(
         if static_dir.exists():
             shutil.rmtree(static_dir)
         shutil.copytree(build_output, static_dir)
+
+        # Fix SPA routing: Next.js static export creates directories (e.g. monitor/)
+        # alongside HTML files (e.g. monitor.html) for RSC payloads. Starlette's
+        # StaticFiles(html=True) resolves the directory first and looks for
+        # {dir}/index.html, which doesn't exist, causing 404 errors. We fix
+        # this by copying each {route}.html into {route}/index.html so that
+        # both GET and HEAD requests resolve correctly.
+        _fix_static_route_dirs(static_dir)
+
         _print(f"  ✓ Static files cached at {static_dir}")
     except Exception as e:
         _print(f"  ✗ Failed to copy build output: {e}")
         return False
 
     return True
+
+
+def _fix_static_route_dirs(static_dir: Path):
+    """Fix SPA route directories for StaticFiles compatibility.
+
+    For each ``{route}.html`` file at the top level, if a corresponding
+    ``{route}/`` directory exists without an ``index.html``, copy the HTML
+    file into the directory as ``index.html``. This ensures Starlette's
+    ``StaticFiles(html=True)`` correctly serves pages for paths like
+    ``/monitor``, ``/history``, ``/knowledge``, ``/settings``, etc.
+
+    Args:
+        static_dir: Root directory of the static build output
+    """
+    for html_file in static_dir.glob("*.html"):
+        route_name = html_file.stem  # e.g. "monitor" from "monitor.html"
+        route_dir = static_dir / route_name
+        if route_dir.is_dir() and not (route_dir / "index.html").exists():
+            shutil.copy2(html_file, route_dir / "index.html")
+            logger.debug(f"Created {route_dir / 'index.html'} for SPA routing")
 
 
 # ---------------------------------------------------------------------------

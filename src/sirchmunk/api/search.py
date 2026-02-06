@@ -29,12 +29,13 @@ class SearchRequest(BaseModel):
     """Request model for search endpoint."""
     query: str = Field(..., description="Search query or question")
     search_paths: List[str] = Field(
-        default_factory=list,
-        description="Paths to search (directories or files)"
+        ...,
+        min_length=1,
+        description="Paths to search (directories or files). At least one path is required."
     )
-    mode: Literal["FAST", "DEEP", "FILENAME_ONLY"] = Field(
+    mode: Literal["DEEP", "FILENAME_ONLY"] = Field(
         default="DEEP",
-        description="Search mode: FAST, DEEP, or FILENAME_ONLY"
+        description="Search mode: DEEP (comprehensive analysis) or FILENAME_ONLY (fast file discovery)"
     )
     max_depth: Optional[int] = Field(
         default=None,
@@ -140,8 +141,7 @@ async def execute_search(request: SearchRequest) -> SearchResponse:
     try:
         searcher = _get_search_instance()
         
-        # Use current directory if no paths provided
-        search_paths = request.search_paths if request.search_paths else ["."]
+        search_paths = request.search_paths
         
         logger.info(f"Executing search: query='{request.query}', mode={request.mode}, paths={search_paths}")
         

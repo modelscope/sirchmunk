@@ -421,6 +421,155 @@ python scripts/stop_web.py
 
 ---
 
+## 🔗 HTTP 客户端访问（Search API）
+
+服务器启动后（`sirchmunk serve` 或 `sirchmunk serve --ui`），Search API 可通过任何 HTTP 客户端访问。
+
+<details>
+<summary><b>API 端点</b></summary>
+
+| 方法 | 端点 | 说明 |
+|------|------|------|
+| `POST` | `/api/v1/search` | 执行搜索查询 |
+| `GET` | `/api/v1/search/status` | 检查服务器和 LLM 配置状态 |
+
+**交互式文档：** http://localhost:8584/docs（Swagger UI）
+
+</details>
+
+<details>
+<summary><b>cURL 示例</b></summary>
+
+```bash
+# 基础搜索（DEEP 模式）
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "认证是如何工作的？",
+    "search_paths": ["/path/to/project"],
+    "mode": "DEEP"
+  }'
+
+# 文件名搜索（快速，无需 LLM）
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "config",
+    "search_paths": ["/path/to/project"],
+    "mode": "FILENAME_ONLY"
+  }'
+
+# 完整参数示例
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "数据库连接池",
+    "search_paths": ["/path/to/project/src"],
+    "mode": "DEEP",
+    "max_depth": 10,
+    "top_k_files": 20,
+    "keyword_levels": 3,
+    "include_patterns": ["*.py", "*.java"],
+    "exclude_patterns": ["*test*", "*__pycache__*"],
+    "return_cluster": true
+  }'
+
+# 检查服务器状态
+curl http://localhost:8584/api/v1/search/status
+```
+
+</details>
+
+<details>
+<summary><b>Python 客户端示例</b></summary>
+
+**使用 `requests`：**
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:8584/api/v1/search",
+    json={
+        "query": "认证是如何工作的？",
+        "search_paths": ["/path/to/project"],
+        "mode": "DEEP"
+    },
+    timeout=300  # DEEP 模式可能耗时较长
+)
+
+data = response.json()
+if data["success"]:
+    print(data["data"]["result"])
+```
+
+**使用 `httpx`（异步）：**
+
+```python
+import httpx
+import asyncio
+
+async def search():
+    async with httpx.AsyncClient(timeout=300) as client:
+        resp = await client.post(
+            "http://localhost:8584/api/v1/search",
+            json={
+                "query": "查找所有 API 端点",
+                "search_paths": ["/path/to/project"],
+                "mode": "DEEP"
+            }
+        )
+        data = resp.json()
+        print(data["data"]["result"])
+
+asyncio.run(search())
+```
+
+</details>
+
+<details>
+<summary><b>JavaScript 客户端示例</b></summary>
+
+```javascript
+const response = await fetch("http://localhost:8584/api/v1/search", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    query: "认证是如何工作的？",
+    search_paths: ["/path/to/project"],
+    mode: "DEEP"
+  })
+});
+
+const data = await response.json();
+if (data.success) {
+  console.log(data.data.result);
+}
+```
+
+</details>
+
+<details>
+<summary><b>请求参数说明</b></summary>
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `query` | `string` | *必填* | 搜索查询或问题 |
+| `search_paths` | `string[]` | *必填* | 搜索的目录或文件（至少 1 个） |
+| `mode` | `string` | `"DEEP"` | `DEEP` 或 `FILENAME_ONLY` |
+| `max_depth` | `int` | `null` | 最大目录深度 |
+| `top_k_files` | `int` | `null` | 返回的文件数量 |
+| `keyword_levels` | `int` | `null` | 关键词粒度层级 |
+| `include_patterns` | `string[]` | `null` | 文件 glob 匹配模式（包含） |
+| `exclude_patterns` | `string[]` | `null` | 文件 glob 匹配模式（排除） |
+| `return_cluster` | `bool` | `false` | 是否返回完整的 KnowledgeCluster 对象 |
+
+> **注意：** `FILENAME_ONLY` 模式无需 LLM API Key。`DEEP` 模式需要配置 LLM。
+
+</details>
+
+---
+
 ## ❓ FAQ
 
 <details>

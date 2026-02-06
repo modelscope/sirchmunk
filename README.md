@@ -423,6 +423,155 @@ All persistent data is stored in the configured `SIRCHMUNK_WORK_PATH` (default: 
 
 ---
 
+## 🔗 HTTP Client Access (Search API)
+
+When the server is running (`sirchmunk serve` or `sirchmunk serve --ui`), the Search API is accessible via any HTTP client.
+
+<details>
+<summary><b>API Endpoints</b></summary>
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/v1/search` | Execute a search query |
+| `GET` | `/api/v1/search/status` | Check server and LLM configuration status |
+
+**Interactive Docs:** http://localhost:8584/docs (Swagger UI)
+
+</details>
+
+<details>
+<summary><b>cURL Examples</b></summary>
+
+```bash
+# Basic search (DEEP mode)
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "How does authentication work?",
+    "search_paths": ["/path/to/project"],
+    "mode": "DEEP"
+  }'
+
+# Filename search (fast, no LLM required)
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "config",
+    "search_paths": ["/path/to/project"],
+    "mode": "FILENAME_ONLY"
+  }'
+
+# Full parameters
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "database connection pooling",
+    "search_paths": ["/path/to/project/src"],
+    "mode": "DEEP",
+    "max_depth": 10,
+    "top_k_files": 20,
+    "keyword_levels": 3,
+    "include_patterns": ["*.py", "*.java"],
+    "exclude_patterns": ["*test*", "*__pycache__*"],
+    "return_cluster": true
+  }'
+
+# Check server status
+curl http://localhost:8584/api/v1/search/status
+```
+
+</details>
+
+<details>
+<summary><b>Python Client Examples</b></summary>
+
+**Using `requests`:**
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:8584/api/v1/search",
+    json={
+        "query": "How does authentication work?",
+        "search_paths": ["/path/to/project"],
+        "mode": "DEEP"
+    },
+    timeout=300  # DEEP mode may take a while
+)
+
+data = response.json()
+if data["success"]:
+    print(data["data"]["result"])
+```
+
+**Using `httpx` (async):**
+
+```python
+import httpx
+import asyncio
+
+async def search():
+    async with httpx.AsyncClient(timeout=300) as client:
+        resp = await client.post(
+            "http://localhost:8584/api/v1/search",
+            json={
+                "query": "find all API endpoints",
+                "search_paths": ["/path/to/project"],
+                "mode": "DEEP"
+            }
+        )
+        data = resp.json()
+        print(data["data"]["result"])
+
+asyncio.run(search())
+```
+
+</details>
+
+<details>
+<summary><b>JavaScript Client Example</b></summary>
+
+```javascript
+const response = await fetch("http://localhost:8584/api/v1/search", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    query: "How does authentication work?",
+    search_paths: ["/path/to/project"],
+    mode: "DEEP"
+  })
+});
+
+const data = await response.json();
+if (data.success) {
+  console.log(data.data.result);
+}
+```
+
+</details>
+
+<details>
+<summary><b>Request Parameters</b></summary>
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query` | `string` | *required* | Search query or question |
+| `search_paths` | `string[]` | *required* | Directories or files to search (min 1) |
+| `mode` | `string` | `"DEEP"` | `DEEP` or `FILENAME_ONLY` |
+| `max_depth` | `int` | `null` | Maximum directory depth |
+| `top_k_files` | `int` | `null` | Number of top files to return |
+| `keyword_levels` | `int` | `null` | Keyword granularity levels |
+| `include_patterns` | `string[]` | `null` | File glob patterns to include |
+| `exclude_patterns` | `string[]` | `null` | File glob patterns to exclude |
+| `return_cluster` | `bool` | `false` | Return full KnowledgeCluster object |
+
+> **Note:** `FILENAME_ONLY` mode does not require an LLM API key. `DEEP` mode requires a configured LLM.
+
+</details>
+
+---
+
 ## ❓ FAQ
 
 <details>

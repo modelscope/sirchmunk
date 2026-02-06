@@ -24,7 +24,7 @@ import {
   GripVertical,
 } from "lucide-react";
 import { apiUrl } from "@/lib/api";
-import { getTranslation } from "@/lib/i18n";
+import { getTranslation, type Language } from "@/lib/i18n";
 import { useGlobal } from "@/context/GlobalContext";
 
 interface HubFile {
@@ -61,7 +61,7 @@ export default function RightSidebar({
   onWidthChange
 }: RightSidebarProps) {
   const { uiSettings } = useGlobal();
-  const t = (key: string) => getTranslation(uiSettings.language, key);
+  const t = (key: string) => getTranslation(uiSettings.language as Language, key);
 
   const [hubFiles, setHubFiles] = useState<HubFile[]>([]);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);

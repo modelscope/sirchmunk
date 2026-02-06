@@ -23,7 +23,6 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
     description=(
         "Intelligent code and document search with multi-mode support. "
         "DEEP mode provides comprehensive knowledge extraction with full context analysis. "
-        "FAST mode offers quick content search without deep LLM processing. "
         "FILENAME_ONLY mode performs fast filename pattern matching without content search."
     ),
     inputSchema={
@@ -40,11 +39,11 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
             },
             "mode": {
                 "type": "string",
-                "enum": ["DEEP", "FAST", "FILENAME_ONLY"],
+                "enum": ["DEEP", "FILENAME_ONLY"],
                 "default": "DEEP",
                 "description": (
                     "Search mode: DEEP (comprehensive analysis, 10-30s), "
-                    "FAST (quick search, 3-8s), FILENAME_ONLY (file discovery, <1s)"
+                    "FILENAME_ONLY (file discovery, <1s)"
                 ),
             },
             "max_depth": {
@@ -81,7 +80,7 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
             "return_cluster": {
                 "type": "boolean",
                 "default": False,
-                "description": "Return full KnowledgeCluster object (DEEP/FAST modes only)",
+                "description": "Return full KnowledgeCluster object (DEEP mode only)",
             },
         },
         "required": ["query", "search_paths"],
@@ -202,7 +201,7 @@ async def handle_sirchmunk_search(
             response_text = f"No results found for query: {query}"
         
         elif isinstance(result, str):
-            # DEEP or FAST mode: string summary
+            # DEEP mode: string summary
             response_text = result
         
         elif isinstance(result, list):

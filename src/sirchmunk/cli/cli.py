@@ -361,16 +361,19 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print(f"Sirchmunk Server v{__version__}")
         print("=" * 60)
         print()
+        # Display host: use "localhost" for URLs when binding to 0.0.0.0
+        display_host = "localhost" if args.host in ("0.0.0.0", "::") else args.host
+        
         print(f"  Host:   {args.host}")
         print(f"  Port:   {args.port}")
         print(f"  Reload: {args.reload}")
         print(f"  WebUI:  {'enabled (single port)' if serve_ui else 'disabled'}")
         print()
         if serve_ui:
-            print(f"  🌐 WebUI: http://{args.host}:{args.port}/")
-        print(f"  📡 API:   http://{args.host}:{args.port}/api/v1/")
-        print(f"  📖 Docs:  http://{args.host}:{args.port}/docs")
-        print(f"  ❤️  Health: http://{args.host}:{args.port}/health")
+            print(f"  🌐 WebUI: http://{display_host}:{args.port}/")
+        print(f"  📡 API:   http://{display_host}:{args.port}/api/v1/")
+        print(f"  📖 Docs:  http://{display_host}:{args.port}/docs")
+        print(f"  ❤️  Health: http://{display_host}:{args.port}/health")
         print()
         print("Press Ctrl+C to stop the server.")
         print("=" * 60)
@@ -510,7 +513,7 @@ async def _search_local(
     Args:
         query: Search query
         search_paths: Paths to search
-        mode: Search mode (FAST, DEEP, FILENAME_ONLY)
+        mode: Search mode (DEEP, FILENAME_ONLY)
         output_format: Output format (text, json)
         verbose: Enable verbose output
         
@@ -860,8 +863,8 @@ Examples:
     search_parser.add_argument(
         "--mode", "-m",
         default="DEEP",
-        choices=["FAST", "DEEP", "FILENAME_ONLY"],
-        help="Search mode (default: DEEP)",
+        choices=["DEEP", "FILENAME_ONLY"],
+        help="Search mode: DEEP (comprehensive analysis) or FILENAME_ONLY (fast file discovery)",
     )
     search_parser.add_argument(
         "--output", "-o",
