@@ -141,6 +141,13 @@ export default function KnowledgePage() {
   };
 
   const handleRefresh = async () => {
+    setRefreshing(true);
+    try {
+      // Force backend to reload from parquet first, then fetch fresh data
+      await fetch(apiUrl("/api/v1/knowledge/refresh"), { method: "POST" });
+    } catch {
+      // Non-critical: auto-reload in backend will still detect changes
+    }
     await Promise.all([fetchStats(false), fetchPatterns()]);
   };
 

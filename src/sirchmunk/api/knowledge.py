@@ -24,6 +24,26 @@ class SearchRequest(BaseModel):
 
 # === API Endpoints ===
 
+@router.post("/refresh")
+async def refresh_knowledge():
+    """Force reload knowledge clusters from the parquet file.
+
+    This is useful when clusters have been created by external processes
+    (e.g. AgenticSearch via CLI or chat) and the in-memory data is stale.
+    """
+    try:
+        km.reload()
+        stats = km.get_stats()
+        total = stats.get('custom_stats', {}).get('total_clusters', 0)
+        return {
+            "success": True,
+            "message": f"Reloaded {total} knowledge clusters from parquet",
+            "total_clusters": total,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/list")
 async def list_knowledge_bases_alias():
     """Alias for /clusters endpoint (backward compatibility)"""
@@ -45,10 +65,10 @@ async def get_all_clusters(
         abstraction_level: Filter by abstraction level
     """
     try:
+        # Auto-detect external changes (e.g. from AgenticSearch)
+        km._check_and_reload()
+
         stats = km.get_stats()
-        
-        # Get all clusters by searching with empty query (returns all)
-        all_clusters = []
         
         # Fetch clusters using DuckDB directly
         sql = "SELECT * FROM knowledge_clusters"
@@ -302,6 +322,9 @@ async def get_top_patterns(limit: int = 20):
         limit: Number of top patterns to return
     """
     try:
+        # Auto-detect external changes (e.g. from AgenticSearch)
+        km._check_and_reload()
+
         # Fetch all patterns and count occurrences
         rows = km.db.fetch_all("SELECT patterns FROM knowledge_clusters WHERE patterns IS NOT NULL")
         
@@ -336,6 +359,9 @@ async def get_knowledge_graph():
     Returns clusters as nodes and related_clusters as edges
     """
     try:
+        # Auto-detect external changes (e.g. from AgenticSearch)
+        km._check_and_reload()
+
         # Get all clusters
         rows = km.db.fetch_all(
             "SELECT id, name, confidence, hotness, lifecycle, abstraction_level, related_clusters FROM knowledge_clusters"

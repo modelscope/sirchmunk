@@ -74,6 +74,12 @@ class KnowledgeStorage:
         # Table name
         self.table_name = "knowledge_clusters"
 
+        # Track parquet file modification time for stale-data detection.
+        # When another KnowledgeStorage instance (e.g. from AgenticSearch)
+        # writes to the same parquet file, this instance can detect the
+        # change and reload automatically.
+        self._parquet_loaded_mtime: float = 0.0
+
         # Load data from parquet if exists
         self._load_from_parquet()
 
@@ -92,24 +98,62 @@ class KnowledgeStorage:
         logger.info(f"Knowledge Manager initialized at: {self.knowledge_path}")
 
     def _load_from_parquet(self):
-        """Load knowledge clusters from parquet file into DuckDB"""
+        """Load knowledge clusters from parquet file into DuckDB.
+
+        Also records the file's modification time so that
+        ``_check_and_reload()`` can detect external changes later.
+        """
         try:
-            if Path(self.parquet_file).exists():
+            pq = Path(self.parquet_file)
+            if pq.exists():
                 # Drop existing table first to avoid conflicts
                 self.db.drop_table(self.table_name, if_exists=True)
                 # Load parquet file into DuckDB table
                 self.db.import_from_parquet(self.table_name, self.parquet_file, create_table=True)
                 count = self.db.get_table_count(self.table_name)
+                # Record mtime for stale-detection
+                self._parquet_loaded_mtime = pq.stat().st_mtime
                 logger.info(f"Loaded {count} knowledge clusters from {self.parquet_file}")
             else:
                 # Create empty table with schema
                 self._create_table()
+                self._parquet_loaded_mtime = 0.0
                 logger.info("Created new knowledge clusters table")
         except Exception as e:
             logger.error(f"Failed to load from parquet: {e}")
             # Try to recreate table
             self.db.drop_table(self.table_name, if_exists=True)
             self._create_table()
+            self._parquet_loaded_mtime = 0.0
+
+    def _check_and_reload(self):
+        """Check if the parquet file was modified externally and reload if so.
+
+        This handles the common scenario where ``AgenticSearch`` creates its
+        own ``KnowledgeStorage`` instance, writes clusters, and syncs them to
+        the same parquet file.  The API's singleton instance can call this
+        before read operations to pick up the latest data without a restart.
+        """
+        try:
+            pq = Path(self.parquet_file)
+            if not pq.exists():
+                return
+            current_mtime = pq.stat().st_mtime
+            if current_mtime > self._parquet_loaded_mtime:
+                logger.info(
+                    "Parquet file changed externally, reloading knowledge clusters"
+                )
+                self._load_from_parquet()
+        except Exception as e:
+            logger.warning(f"Failed to check parquet staleness: {e}")
+
+    def reload(self):
+        """Force reload knowledge clusters from the parquet file.
+
+        Public API for explicit refresh (e.g. from an API endpoint).
+        """
+        logger.info("Force reloading knowledge clusters from parquet")
+        self._load_from_parquet()
 
     def _create_table(self):
         """Create knowledge clusters table with schema"""
@@ -824,12 +868,17 @@ class KnowledgeStorage:
 
     def get_stats(self) -> Dict[str, Any]:
         """
-        Get statistics about stored knowledge clusters
+        Get statistics about stored knowledge clusters.
+
+        Automatically checks if the parquet file was modified externally
+        and reloads data before computing statistics.
 
         Returns:
             Dictionary with statistics
         """
         try:
+            # Auto-detect external changes to the parquet file
+            self._check_and_reload()
             # Get basic table count
             total_count = self.db.get_table_count(self.table_name)
 

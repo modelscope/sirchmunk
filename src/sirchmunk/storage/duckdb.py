@@ -103,18 +103,65 @@ class DuckDBManager:
     #  Persist mode: disk load / sync / daemon thread / shutdown hook     #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _checkpoint_wal(db_file: str):
+        """
+        Checkpoint a stale WAL file by briefly opening the database in
+        read-write mode.  DuckDB cannot open a file in READ_ONLY mode when
+        a WAL file exists because recovery requires write access.  This
+        helper applies the WAL and removes it so that subsequent READ_ONLY
+        ATTACH operations succeed.
+        """
+        wal_file = Path(f"{db_file}.wal")
+        if not wal_file.exists():
+            return
+
+        logger.info(
+            f"Stale WAL detected at {wal_file}, checkpointing before load"
+        )
+        try:
+            tmp_conn = duckdb.connect(db_file)
+            tmp_conn.execute("CHECKPOINT")
+            tmp_conn.close()
+            logger.info(f"WAL checkpoint completed for {db_file}")
+        except Exception as e:
+            logger.warning(f"WAL checkpoint failed for {db_file}: {e}")
+            # Last resort: remove the stale WAL so READ_ONLY ATTACH can proceed
+            try:
+                wal_file.unlink()
+                logger.info(f"Removed stale WAL file {wal_file}")
+            except Exception:
+                pass
+
+    @staticmethod
+    def _cleanup_wal(db_file: str):
+        """Remove leftover WAL file for the given database path if present."""
+        wal_file = Path(f"{db_file}.wal")
+        if wal_file.exists():
+            try:
+                wal_file.unlink()
+                logger.debug(f"Cleaned up WAL file {wal_file}")
+            except Exception:
+                pass
+
     def _load_from_disk(self):
         """
         Load all tables from disk DuckDB file into in-memory database.
         Uses ATTACH (READ_ONLY) to briefly open the disk file, copy tables,
         then DETACH. READ_ONLY prevents exclusive file locks so multiple
         processes can load from the same disk file concurrently.
+
+        Before loading, any stale WAL file is checkpointed so that
+        READ_ONLY ATTACH does not fail.
         """
         if not self.persist_path or not Path(self.persist_path).exists():
             logger.info(
                 f"No disk file at {self.persist_path}, starting with empty database"
             )
             return
+
+        # Checkpoint stale WAL (if any) so READ_ONLY ATTACH succeeds
+        self._checkpoint_wal(self.persist_path)
 
         try:
             escaped_path = str(self.persist_path).replace("'", "''")
@@ -189,8 +236,15 @@ class DuckDBManager:
                         pass
                     raise
 
+                # Clean up temp WAL file left by ATTACH/DETACH
+                self._cleanup_wal(temp_path)
+
                 # Atomically replace the disk file
                 os.replace(temp_path, self.persist_path)
+
+                # Clean up any stale WAL for the persist path (belongs to an
+                # older version of the file, not the one we just swapped in)
+                self._cleanup_wal(self.persist_path)
 
                 synced_ops = self._dirty_count
                 self._dirty_count = 0
@@ -201,11 +255,13 @@ class DuckDBManager:
 
             except Exception as e:
                 logger.error(f"Failed to sync to disk: {e}")
-                if Path(temp_path).exists():
-                    try:
-                        Path(temp_path).unlink()
-                    except Exception:
-                        pass
+                # Clean up temp file and its WAL on failure
+                for p in (temp_path, f"{temp_path}.wal"):
+                    if Path(p).exists():
+                        try:
+                            Path(p).unlink()
+                        except Exception:
+                            pass
 
     def force_sync(self):
         """Force immediate sync to disk regardless of dirty count"""
