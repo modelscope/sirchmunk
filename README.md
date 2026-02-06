@@ -228,6 +228,9 @@ uv pip install "sirchmunk[web]"
 # Initialize Sirchmunk with default settings (Default work path: `~/.sirchmunk/`)
 sirchmunk init
 
+# Initialize with WebUI frontend build (requires Node.js 18+)
+sirchmunk init --ui
+
 # Alternatively, initialize with custom work path
 sirchmunk init --work-path /path/to/workspace
 ```
@@ -242,17 +245,20 @@ sirchmunk config
 sirchmunk config --generate
 ```
 
-#### Start API Server
+#### Start Server
 
 ```bash
-# Start server with default settings
+# Start backend API server only
 sirchmunk serve
+
+# Start with WebUI on a single port (requires prior `sirchmunk init --ui`)
+sirchmunk serve --ui
+
+# Development mode: backend + Next.js dev server with hot-reload
+sirchmunk serve --ui --dev
 
 # Custom host and port
 sirchmunk serve --host 0.0.0.0 --port 8000
-
-# Development mode with auto-reload
-sirchmunk serve --reload
 ```
 
 #### Search
@@ -279,8 +285,11 @@ sirchmunk search "query" --api --api-url http://localhost:8584
 | Command | Description |
 |---------|-------------|
 | `sirchmunk init` | Initialize working directory and configuration |
+| `sirchmunk init --ui` | Initialize with WebUI frontend build |
 | `sirchmunk config` | Show or generate configuration |
-| `sirchmunk serve` | Start the API server |
+| `sirchmunk serve` | Start the API server (backend only) |
+| `sirchmunk serve --ui` | Start with embedded WebUI (single port) |
+| `sirchmunk serve --ui --dev` | Start with Next.js dev server (hot-reload) |
 | `sirchmunk search` | Perform search queries |
 | `sirchmunk version` | Show version information |
 
@@ -330,31 +339,42 @@ The web UI is built for fast, transparent workflows: chat, knowledge analytics, 
   <p><sub>Monitor — System health, chat activity, knowledge analytics, and LLM usage.</sub></p>
 </div>
 
-### Installation 
+### Option 1: Single-Port Mode (Recommended)
+
+Build the frontend once, then serve everything from a single port — no Node.js needed at runtime.
 
 ```bash
-git clone https://github.com/modelscope/sirchmunk.git && cd sirchmunk
+# Initialize with WebUI build (requires Node.js 18+ at build time)
+sirchmunk init --ui
 
-pip install ".[web]"
-
-npm install --prefix web
+# Start server with embedded WebUI
+sirchmunk serve --ui
 ```
-- Note: Node.js 18+ is required for the web interface.
 
+**Access:** http://localhost:8584 (API + WebUI on the same port)
 
-### Running the Web UI
+### Option 2: Development Mode
+
+For frontend development with hot-reload:
 
 ```bash
-# Start frontend and backend
+# Start backend + Next.js dev server
+sirchmunk serve --ui --dev
+```
+
+**Access:**
+   - Frontend (hot-reload): http://localhost:8585
+   - Backend APIs: http://localhost:8584/docs
+
+### Option 3: Legacy Script
+
+```bash
+# Start frontend and backend via script
 python scripts/start_web.py 
 
-# Stop frontend and backend
+# Stop all services
 python scripts/stop_web.py
 ```
-
-**Access the web UI at (By default):**
-   - Backend APIs:  http://localhost:8584/docs
-   - Frontend: http://localhost:8585
 
 **Configuration:**
 

@@ -226,6 +226,9 @@ uv pip install "sirchmunk[web]"
 # 使用默认设置初始化 Sirchmunk，默认工作路径为 `~/.sirchmunk/`
 sirchmunk init
 
+# 初始化并构建 WebUI 前端（需要 Node.js 18+）
+sirchmunk init --ui
+
 # 或者，也可以使用自定义工作路径初始化
 sirchmunk init --work-path /path/to/workspace
 ```
@@ -240,17 +243,20 @@ sirchmunk config
 sirchmunk config --generate
 ```
 
-#### 启动 API 服务器
+#### 启动服务器
 
 ```bash
-# 使用默认设置启动服务器
+# 仅启动后端 API 服务器
 sirchmunk serve
+
+# 单端口模式：同时提供 API 和 WebUI（需先执行 sirchmunk init --ui）
+sirchmunk serve --ui
+
+# 开发模式：后端 + Next.js 开发服务器，支持热重载
+sirchmunk serve --ui --dev
 
 # 自定义主机和端口
 sirchmunk serve --host 0.0.0.0 --port 8000
-
-# 开发模式，支持热重载
-sirchmunk serve --reload
 ```
 
 #### 搜索
@@ -277,8 +283,11 @@ sirchmunk search "查询" --api --api-url http://localhost:8584
 | 命令 | 说明 |
 |------|------|
 | `sirchmunk init` | 初始化工作目录和配置 |
+| `sirchmunk init --ui` | 初始化并构建 WebUI 前端 |
 | `sirchmunk config` | 显示或生成配置 |
-| `sirchmunk serve` | 启动 API 服务器 |
+| `sirchmunk serve` | 仅启动后端 API 服务器 |
+| `sirchmunk serve --ui` | 单端口模式，内嵌 WebUI |
+| `sirchmunk serve --ui --dev` | 开发模式，Next.js 热重载 |
 | `sirchmunk search` | 执行搜索查询 |
 | `sirchmunk version` | 显示版本信息 |
 
@@ -328,33 +337,44 @@ Web UI 专为快速、透明的工作流设计：对话、知识分析、系统�
   <p><sub>Monitor — 系统健康、聊天活动、知识分析与 LLM 用量。</sub></p>
 </div>
 
-### 安装 
+### 方式一：单端口模式（推荐）
+
+一次构建前端，随后通过单端口同时提供 API 和 WebUI — 运行时无需 Node.js。
 
 ```bash
-git clone https://github.com/modelscope/sirchmunk.git && cd sirchmunk
+# 初始化并构建 WebUI（构建时需要 Node.js 18+）
+sirchmunk init --ui
 
-pip install ".[web]"
-
-npm install --prefix web
+# 启动含内嵌 WebUI 的服务器
+sirchmunk serve --ui
 ```
-- 备注: 需要安装 Node.js 18+
 
+**访问地址：** http://localhost:8584（API + WebUI 同端口）
 
-### 运行 Web UI
+### 方式二：开发模式
+
+支持前端热重载的开发环境：
 
 ```bash
-# 启动前端和后端
+# 启动后端 + Next.js 开发服务器
+sirchmunk serve --ui --dev
+```
+
+**访问地址：**
+   - 前端（热重载）：http://localhost:8585
+   - 后端 API：http://localhost:8584/docs
+
+### 方式三：传统脚本
+
+```bash
+# 通过脚本启动前后端
 python scripts/start_web.py 
 
-# 停止前端和后端
+# 停止所有服务
 python scripts/stop_web.py
 ```
 
-**默认访问地址：**
-   - 后端API列表： http://localhost:8584/docs
-   - 前端主页： http://localhost:8585
-
-**配置:**
+**配置：**
 
 - 访问 `Settings` → `Envrionment Variables` 设置 LLM API Key 和其他环境变量
 
