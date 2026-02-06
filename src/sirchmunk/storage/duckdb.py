@@ -106,7 +106,9 @@ class DuckDBManager:
     def _load_from_disk(self):
         """
         Load all tables from disk DuckDB file into in-memory database.
-        Uses ATTACH to briefly open the disk file, copy tables, then DETACH.
+        Uses ATTACH (READ_ONLY) to briefly open the disk file, copy tables,
+        then DETACH. READ_ONLY prevents exclusive file locks so multiple
+        processes can load from the same disk file concurrently.
         """
         if not self.persist_path or not Path(self.persist_path).exists():
             logger.info(
@@ -116,7 +118,9 @@ class DuckDBManager:
 
         try:
             escaped_path = str(self.persist_path).replace("'", "''")
-            self.connection.execute(f"ATTACH '{escaped_path}' AS disk_db")
+            self.connection.execute(
+                f"ATTACH '{escaped_path}' AS disk_db (READ_ONLY)"
+            )
 
             # Use duckdb_tables() to list tables from the attached database
             # (information_schema does not support cross-database queries)
