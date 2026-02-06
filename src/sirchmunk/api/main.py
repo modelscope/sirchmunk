@@ -4,6 +4,35 @@ Main FastAPI application for Sirchmunk API
 Combines all API modules and provides centralized configuration
 """
 
+import os
+from pathlib import Path
+
+# Load .env file from Sirchmunk work directory before any module imports.
+# This ensures environment variables (LLM_API_KEY, LLM_BASE_URL, etc.) are
+# available when constants.py and other modules are first imported.
+_work_path = Path(
+    os.getenv("SIRCHMUNK_WORK_PATH", os.path.expanduser("~/.sirchmunk"))
+).expanduser().resolve()
+_env_file = _work_path / ".env"
+if _env_file.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(str(_env_file), override=False)
+    except ImportError:
+        # Fallback: manual .env parsing if python-dotenv is not installed
+        try:
+            with open(_env_file, "r") as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if _line and not _line.startswith("#") and "=" in _line:
+                        _key, _, _val = _line.partition("=")
+                        _key = _key.strip()
+                        _val = _val.strip().strip('"').strip("'")
+                        if _key and _key not in os.environ:
+                            os.environ[_key] = _val
+        except Exception:
+            pass
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse

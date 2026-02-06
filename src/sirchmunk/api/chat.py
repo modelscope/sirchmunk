@@ -18,7 +18,6 @@ import os
 import threading
 from sirchmunk.search import AgenticSearch
 from sirchmunk.llm.openai_chat import OpenAIChat
-from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME
 from sirchmunk.api.components.history_storage import HistoryStorage
 from sirchmunk.api.components.settings_storage import SettingsStorage
 from sirchmunk.api.components.monitor_tracker import llm_usage_tracker
@@ -272,9 +271,11 @@ class SearchRequest(BaseModel):
 
 def get_envs() -> Dict[str, Any]:
     """
-    Get LLM configuration from settings storage or environment variables.
+    Get LLM configuration with priority resolution.
+
+    Priority: SettingsStorage (WebUI) > os.getenv() (includes .env) > defaults
     """
-    # Try to get from settings storage first (if available)
+    # Try to get from settings storage first (highest priority: user WebUI overrides)
     if settings_storage is not None:
         base_url = settings_storage.get_env_variable("LLM_BASE_URL", "")
         api_key = settings_storage.get_env_variable("LLM_API_KEY", "")
@@ -284,13 +285,13 @@ def get_envs() -> Dict[str, Any]:
         api_key = ""
         model_name = ""
 
-    # Fallback to environment variables if not in settings
+    # Fallback to os.getenv() which includes .env values loaded at startup
     if not base_url:
-        base_url = LLM_BASE_URL
+        base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
     if not api_key:
-        api_key = LLM_API_KEY
+        api_key = os.getenv("LLM_API_KEY", "")
     if not model_name:
-        model_name = LLM_MODEL_NAME
+        model_name = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
 
     print(f"[ENV CONFIG] base_url={base_url}, model_name={model_name}, api_key={'***' if api_key else '(not set)'}")
 
