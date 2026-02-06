@@ -122,9 +122,9 @@ class MonitorTracker:
             self.history_storage = None
         
         try:
-            self.knowledge_manager = KnowledgeStorage()
+            self.knowledge_storage = KnowledgeStorage()
         except:
-            self.knowledge_manager = None
+            self.knowledge_storage = None
     
     def get_system_metrics(self) -> Dict[str, Any]:
         """
@@ -298,7 +298,7 @@ class MonitorTracker:
         Returns:
             Knowledge cluster statistics
         """
-        if not self.knowledge_manager:
+        if not self.knowledge_storage:
             return {
                 "total_clusters": 0,
                 "recent_clusters": [],
@@ -306,11 +306,11 @@ class MonitorTracker:
             }
         
         try:
-            stats = self.knowledge_manager.get_stats()
+            stats = self.knowledge_storage.get_stats()
             custom_stats = stats.get('custom_stats', {})
             
             # Get recent clusters
-            recent_rows = self.knowledge_manager.db.fetch_all(
+            recent_rows = self.knowledge_storage.db.fetch_all(
                 """
                 SELECT id, name, lifecycle, last_modified, confidence
                 FROM knowledge_clusters
@@ -476,8 +476,8 @@ class MonitorTracker:
                 "healthy": bool(self.history_storage),
             },
             "knowledge_manager": {
-                "status": "connected" if self.knowledge_manager else "unavailable",
-                "healthy": bool(self.knowledge_manager),
+                "status": "connected" if self.knowledge_storage else "unavailable",
+                "healthy": bool(self.knowledge_storage),
             },
         }
         

@@ -217,7 +217,7 @@ class SirchmunkService:
             raise RuntimeError("Sirchmunk service is not initialized")
         
         try:
-            cluster = await self.searcher.knowledge_manager.get(cluster_id)
+            cluster = await self.searcher.knowledge_storage.get(cluster_id)
             if cluster:
                 logger.info(f"Retrieved cluster: {cluster_id}")
             else:
@@ -249,7 +249,7 @@ class SirchmunkService:
         
         try:
             # Get all cluster IDs
-            all_clusters = await self.searcher.knowledge_manager.list_all()
+            all_clusters = await self.searcher.knowledge_storage.list_all()
             
             # Sort clusters
             if sort_by == "hotness":
@@ -298,7 +298,7 @@ class SirchmunkService:
         
         try:
             # Get knowledge manager stats
-            stats = self.searcher.knowledge_manager.get_stats()
+            stats = self.searcher.knowledge_storage.get_stats()
             
             # Add service-level stats
             stats["service"] = {
