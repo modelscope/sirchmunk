@@ -164,10 +164,14 @@ def start_backend():
     print_flush(f"🚀 Starting FastAPI Backend using {sys.executable}...")
     base_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(base_dir)
+    src_dir = os.path.join(project_root, "src")
     print_flush(f"📁 Working directory: {base_dir}")
     print_flush(f"📁 Project root: {project_root}")
 
-    # Ensure project root is in Python path
+    # Ensure src directory is in Python path so workspace code takes priority
+    # over any installed site-packages version of sirchmunk
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
@@ -206,6 +210,8 @@ def start_backend():
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
+    # Ensure subprocess (uvicorn) uses workspace source code, not installed package
+    env["PYTHONPATH"] = src_dir + os.pathsep + env.get("PYTHONPATH", "")
     if os.name == "nt":
         env["PYTHONLEGACYWINDOWSSTDIO"] = "0"
 

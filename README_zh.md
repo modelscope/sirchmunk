@@ -226,6 +226,9 @@ uv pip install "sirchmunk[web]"
 # 使用默认设置初始化 Sirchmunk，默认工作路径为 `~/.sirchmunk/`
 sirchmunk init
 
+# 初始化并构建 WebUI 前端（需要 Node.js 18+）
+sirchmunk init --ui
+
 # 或者，也可以使用自定义工作路径初始化
 sirchmunk init --work-path /path/to/workspace
 ```
@@ -240,17 +243,20 @@ sirchmunk config
 sirchmunk config --generate
 ```
 
-#### 启动 API 服务器
+#### 启动服务器
 
 ```bash
-# 使用默认设置启动服务器
+# 仅启动后端 API 服务器
 sirchmunk serve
+
+# 单端口模式：同时提供 API 和 WebUI（需先执行 sirchmunk init --ui）
+sirchmunk serve --ui
+
+# 开发模式：后端 + Next.js 开发服务器，支持热重载
+sirchmunk serve --ui --dev
 
 # 自定义主机和端口
 sirchmunk serve --host 0.0.0.0 --port 8000
-
-# 开发模式，支持热重载
-sirchmunk serve --reload
 ```
 
 #### 搜索
@@ -277,8 +283,11 @@ sirchmunk search "查询" --api --api-url http://localhost:8584
 | 命令 | 说明 |
 |------|------|
 | `sirchmunk init` | 初始化工作目录和配置 |
+| `sirchmunk init --ui` | 初始化并构建 WebUI 前端 |
 | `sirchmunk config` | 显示或生成配置 |
-| `sirchmunk serve` | 启动 API 服务器 |
+| `sirchmunk serve` | 仅启动后端 API 服务器 |
+| `sirchmunk serve --ui` | 单端口模式，内嵌 WebUI |
+| `sirchmunk serve --ui --dev` | 开发模式，Next.js 热重载 |
 | `sirchmunk search` | 执行搜索查询 |
 | `sirchmunk version` | 显示版本信息 |
 
@@ -328,33 +337,44 @@ Web UI 专为快速、透明的工作流设计：对话、知识分析、系统�
   <p><sub>Monitor — 系统健康、聊天活动、知识分析与 LLM 用量。</sub></p>
 </div>
 
-### 安装 
+### 方式一：单端口模式（推荐）
+
+一次构建前端，随后通过单端口同时提供 API 和 WebUI — 运行时无需 Node.js。
 
 ```bash
-git clone https://github.com/modelscope/sirchmunk.git && cd sirchmunk
+# 初始化并构建 WebUI（构建时需要 Node.js 18+）
+sirchmunk init --ui
 
-pip install ".[web]"
-
-npm install --prefix web
+# 启动含内嵌 WebUI 的服务器
+sirchmunk serve --ui
 ```
-- 备注: 需要安装 Node.js 18+
 
+**访问地址：** http://localhost:8584（API + WebUI 同端口）
 
-### 运行 Web UI
+### 方式二：开发模式
+
+支持前端热重载的开发环境：
 
 ```bash
-# 启动前端和后端
+# 启动后端 + Next.js 开发服务器
+sirchmunk serve --ui --dev
+```
+
+**访问地址：**
+   - 前端（热重载）：http://localhost:8585
+   - 后端 API：http://localhost:8584/docs
+
+### 方式三：传统脚本
+
+```bash
+# 通过脚本启动前后端
 python scripts/start_web.py 
 
-# 停止前端和后端
+# 停止所有服务
 python scripts/stop_web.py
 ```
 
-**默认访问地址：**
-   - 后端API列表： http://localhost:8584/docs
-   - 前端主页： http://localhost:8585
-
-**配置:**
+**配置：**
 
 - 访问 `Settings` → `Envrionment Variables` 设置 LLM API Key 和其他环境变量
 
@@ -398,6 +418,155 @@ python scripts/stop_web.py
         └── settings.db
 
 ```
+
+---
+
+## 🔗 HTTP 客户端访问（Search API）
+
+服务器启动后（`sirchmunk serve` 或 `sirchmunk serve --ui`），Search API 可通过任何 HTTP 客户端访问。
+
+<details>
+<summary><b>API 端点</b></summary>
+
+| 方法 | 端点 | 说明 |
+|------|------|------|
+| `POST` | `/api/v1/search` | 执行搜索查询 |
+| `GET` | `/api/v1/search/status` | 检查服务器和 LLM 配置状态 |
+
+**交互式文档：** http://localhost:8584/docs（Swagger UI）
+
+</details>
+
+<details>
+<summary><b>cURL 示例</b></summary>
+
+```bash
+# 基础搜索（DEEP 模式）
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "认证是如何工作的？",
+    "search_paths": ["/path/to/project"],
+    "mode": "DEEP"
+  }'
+
+# 文件名搜索（快速，无需 LLM）
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "config",
+    "search_paths": ["/path/to/project"],
+    "mode": "FILENAME_ONLY"
+  }'
+
+# 完整参数示例
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "数据库连接池",
+    "search_paths": ["/path/to/project/src"],
+    "mode": "DEEP",
+    "max_depth": 10,
+    "top_k_files": 20,
+    "keyword_levels": 3,
+    "include_patterns": ["*.py", "*.java"],
+    "exclude_patterns": ["*test*", "*__pycache__*"],
+    "return_cluster": true
+  }'
+
+# 检查服务器状态
+curl http://localhost:8584/api/v1/search/status
+```
+
+</details>
+
+<details>
+<summary><b>Python 客户端示例</b></summary>
+
+**使用 `requests`：**
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:8584/api/v1/search",
+    json={
+        "query": "认证是如何工作的？",
+        "search_paths": ["/path/to/project"],
+        "mode": "DEEP"
+    },
+    timeout=300  # DEEP 模式可能耗时较长
+)
+
+data = response.json()
+if data["success"]:
+    print(data["data"]["result"])
+```
+
+**使用 `httpx`（异步）：**
+
+```python
+import httpx
+import asyncio
+
+async def search():
+    async with httpx.AsyncClient(timeout=300) as client:
+        resp = await client.post(
+            "http://localhost:8584/api/v1/search",
+            json={
+                "query": "查找所有 API 端点",
+                "search_paths": ["/path/to/project"],
+                "mode": "DEEP"
+            }
+        )
+        data = resp.json()
+        print(data["data"]["result"])
+
+asyncio.run(search())
+```
+
+</details>
+
+<details>
+<summary><b>JavaScript 客户端示例</b></summary>
+
+```javascript
+const response = await fetch("http://localhost:8584/api/v1/search", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    query: "认证是如何工作的？",
+    search_paths: ["/path/to/project"],
+    mode: "DEEP"
+  })
+});
+
+const data = await response.json();
+if (data.success) {
+  console.log(data.data.result);
+}
+```
+
+</details>
+
+<details>
+<summary><b>请求参数说明</b></summary>
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `query` | `string` | *必填* | 搜索查询或问题 |
+| `search_paths` | `string[]` | *必填* | 搜索的目录或文件（至少 1 个） |
+| `mode` | `string` | `"DEEP"` | `DEEP` 或 `FILENAME_ONLY` |
+| `max_depth` | `int` | `null` | 最大目录深度 |
+| `top_k_files` | `int` | `null` | 返回的文件数量 |
+| `keyword_levels` | `int` | `null` | 关键词粒度层级 |
+| `include_patterns` | `string[]` | `null` | 文件 glob 匹配模式（包含） |
+| `exclude_patterns` | `string[]` | `null` | 文件 glob 匹配模式（排除） |
+| `return_cluster` | `bool` | `false` | 是否返回完整的 KnowledgeCluster 对象 |
+
+> **注意：** `FILENAME_ONLY` 模式无需 LLM API Key。`DEEP` 模式需要配置 LLM。
+
+</details>
 
 ---
 

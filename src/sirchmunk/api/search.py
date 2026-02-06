@@ -11,14 +11,11 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Literal
 import logging
 
+import os
+
 from sirchmunk.search import AgenticSearch
 from sirchmunk.llm.openai_chat import OpenAIChat
-from sirchmunk.utils.constants import (
-    LLM_BASE_URL, 
-    LLM_API_KEY, 
-    LLM_MODEL_NAME,
-    DEFAULT_SIRCHMUNK_WORK_PATH,
-)
+from sirchmunk.utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH
 
 
 logger = logging.getLogger(__name__)
@@ -32,12 +29,13 @@ class SearchRequest(BaseModel):
     """Request model for search endpoint."""
     query: str = Field(..., description="Search query or question")
     search_paths: List[str] = Field(
-        default_factory=list,
-        description="Paths to search (directories or files)"
+        ...,
+        min_length=1,
+        description="Paths to search (directories or files). At least one path is required."
     )
-    mode: Literal["FAST", "DEEP", "FILENAME_ONLY"] = Field(
+    mode: Literal["DEEP", "FILENAME_ONLY"] = Field(
         default="DEEP",
-        description="Search mode: FAST, DEEP, or FILENAME_ONLY"
+        description="Search mode: DEEP (comprehensive analysis) or FILENAME_ONLY (fast file discovery)"
     )
     max_depth: Optional[int] = Field(
         default=None,
@@ -81,6 +79,8 @@ def _get_search_instance() -> AgenticSearch:
     """Get or create AgenticSearch instance.
     
     Uses lazy initialization and caches the instance for reuse.
+    Reads LLM configuration dynamically from os.getenv() (includes .env values)
+    so that settings changed via WebUI or .env file are picked up.
     
     Returns:
         AgenticSearch instance
@@ -91,16 +91,21 @@ def _get_search_instance() -> AgenticSearch:
     global _search_instance
     
     if _search_instance is None:
-        if not LLM_API_KEY:
+        # Read LLM config dynamically (os.getenv includes .env loaded at startup)
+        api_key = os.getenv("LLM_API_KEY", "")
+        base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+        model_name = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
+
+        if not api_key:
             raise HTTPException(
                 status_code=500,
                 detail="LLM_API_KEY is not configured. Set it in your environment or .env file."
             )
         
         llm = OpenAIChat(
-            base_url=LLM_BASE_URL,
-            api_key=LLM_API_KEY,
-            model=LLM_MODEL_NAME,
+            base_url=base_url,
+            api_key=api_key,
+            model=model_name,
         )
         
         _search_instance = AgenticSearch(
@@ -136,8 +141,7 @@ async def execute_search(request: SearchRequest) -> SearchResponse:
     try:
         searcher = _get_search_instance()
         
-        # Use current directory if no paths provided
-        search_paths = request.search_paths if request.search_paths else ["."]
+        search_paths = request.search_paths
         
         logger.info(f"Executing search: query='{request.query}', mode={request.mode}, paths={search_paths}")
         
@@ -212,14 +216,16 @@ async def get_search_status():
         Service status information
     """
     try:
-        has_api_key = bool(LLM_API_KEY)
+        api_key = os.getenv("LLM_API_KEY", "")
+        model_name = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
+        has_api_key = bool(api_key)
         
         return {
             "success": True,
             "data": {
                 "status": "ready" if has_api_key else "not_configured",
                 "llm_configured": has_api_key,
-                "llm_model": LLM_MODEL_NAME if has_api_key else None,
+                "llm_model": model_name if has_api_key else None,
                 "work_path": DEFAULT_SIRCHMUNK_WORK_PATH,
             }
         }

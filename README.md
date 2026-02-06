@@ -228,6 +228,9 @@ uv pip install "sirchmunk[web]"
 # Initialize Sirchmunk with default settings (Default work path: `~/.sirchmunk/`)
 sirchmunk init
 
+# Initialize with WebUI frontend build (requires Node.js 18+)
+sirchmunk init --ui
+
 # Alternatively, initialize with custom work path
 sirchmunk init --work-path /path/to/workspace
 ```
@@ -242,17 +245,20 @@ sirchmunk config
 sirchmunk config --generate
 ```
 
-#### Start API Server
+#### Start Server
 
 ```bash
-# Start server with default settings
+# Start backend API server only
 sirchmunk serve
+
+# Start with WebUI on a single port (requires prior `sirchmunk init --ui`)
+sirchmunk serve --ui
+
+# Development mode: backend + Next.js dev server with hot-reload
+sirchmunk serve --ui --dev
 
 # Custom host and port
 sirchmunk serve --host 0.0.0.0 --port 8000
-
-# Development mode with auto-reload
-sirchmunk serve --reload
 ```
 
 #### Search
@@ -279,8 +285,11 @@ sirchmunk search "query" --api --api-url http://localhost:8584
 | Command | Description |
 |---------|-------------|
 | `sirchmunk init` | Initialize working directory and configuration |
+| `sirchmunk init --ui` | Initialize with WebUI frontend build |
 | `sirchmunk config` | Show or generate configuration |
-| `sirchmunk serve` | Start the API server |
+| `sirchmunk serve` | Start the API server (backend only) |
+| `sirchmunk serve --ui` | Start with embedded WebUI (single port) |
+| `sirchmunk serve --ui --dev` | Start with Next.js dev server (hot-reload) |
 | `sirchmunk search` | Perform search queries |
 | `sirchmunk version` | Show version information |
 
@@ -330,31 +339,42 @@ The web UI is built for fast, transparent workflows: chat, knowledge analytics, 
   <p><sub>Monitor — System health, chat activity, knowledge analytics, and LLM usage.</sub></p>
 </div>
 
-### Installation 
+### Option 1: Single-Port Mode (Recommended)
+
+Build the frontend once, then serve everything from a single port — no Node.js needed at runtime.
 
 ```bash
-git clone https://github.com/modelscope/sirchmunk.git && cd sirchmunk
+# Initialize with WebUI build (requires Node.js 18+ at build time)
+sirchmunk init --ui
 
-pip install ".[web]"
-
-npm install --prefix web
+# Start server with embedded WebUI
+sirchmunk serve --ui
 ```
-- Note: Node.js 18+ is required for the web interface.
 
+**Access:** http://localhost:8584 (API + WebUI on the same port)
 
-### Running the Web UI
+### Option 2: Development Mode
+
+For frontend development with hot-reload:
 
 ```bash
-# Start frontend and backend
+# Start backend + Next.js dev server
+sirchmunk serve --ui --dev
+```
+
+**Access:**
+   - Frontend (hot-reload): http://localhost:8585
+   - Backend APIs: http://localhost:8584/docs
+
+### Option 3: Legacy Script
+
+```bash
+# Start frontend and backend via script
 python scripts/start_web.py 
 
-# Stop frontend and backend
+# Stop all services
 python scripts/stop_web.py
 ```
-
-**Access the web UI at (By default):**
-   - Backend APIs:  http://localhost:8584/docs
-   - Frontend: http://localhost:8585
 
 **Configuration:**
 
@@ -400,6 +420,155 @@ All persistent data is stored in the configured `SIRCHMUNK_WORK_PATH` (default: 
         └── settings.db
 
 ```
+
+---
+
+## 🔗 HTTP Client Access (Search API)
+
+When the server is running (`sirchmunk serve` or `sirchmunk serve --ui`), the Search API is accessible via any HTTP client.
+
+<details>
+<summary><b>API Endpoints</b></summary>
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/v1/search` | Execute a search query |
+| `GET` | `/api/v1/search/status` | Check server and LLM configuration status |
+
+**Interactive Docs:** http://localhost:8584/docs (Swagger UI)
+
+</details>
+
+<details>
+<summary><b>cURL Examples</b></summary>
+
+```bash
+# Basic search (DEEP mode)
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "How does authentication work?",
+    "search_paths": ["/path/to/project"],
+    "mode": "DEEP"
+  }'
+
+# Filename search (fast, no LLM required)
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "config",
+    "search_paths": ["/path/to/project"],
+    "mode": "FILENAME_ONLY"
+  }'
+
+# Full parameters
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "database connection pooling",
+    "search_paths": ["/path/to/project/src"],
+    "mode": "DEEP",
+    "max_depth": 10,
+    "top_k_files": 20,
+    "keyword_levels": 3,
+    "include_patterns": ["*.py", "*.java"],
+    "exclude_patterns": ["*test*", "*__pycache__*"],
+    "return_cluster": true
+  }'
+
+# Check server status
+curl http://localhost:8584/api/v1/search/status
+```
+
+</details>
+
+<details>
+<summary><b>Python Client Examples</b></summary>
+
+**Using `requests`:**
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:8584/api/v1/search",
+    json={
+        "query": "How does authentication work?",
+        "search_paths": ["/path/to/project"],
+        "mode": "DEEP"
+    },
+    timeout=300  # DEEP mode may take a while
+)
+
+data = response.json()
+if data["success"]:
+    print(data["data"]["result"])
+```
+
+**Using `httpx` (async):**
+
+```python
+import httpx
+import asyncio
+
+async def search():
+    async with httpx.AsyncClient(timeout=300) as client:
+        resp = await client.post(
+            "http://localhost:8584/api/v1/search",
+            json={
+                "query": "find all API endpoints",
+                "search_paths": ["/path/to/project"],
+                "mode": "DEEP"
+            }
+        )
+        data = resp.json()
+        print(data["data"]["result"])
+
+asyncio.run(search())
+```
+
+</details>
+
+<details>
+<summary><b>JavaScript Client Example</b></summary>
+
+```javascript
+const response = await fetch("http://localhost:8584/api/v1/search", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    query: "How does authentication work?",
+    search_paths: ["/path/to/project"],
+    mode: "DEEP"
+  })
+});
+
+const data = await response.json();
+if (data.success) {
+  console.log(data.data.result);
+}
+```
+
+</details>
+
+<details>
+<summary><b>Request Parameters</b></summary>
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query` | `string` | *required* | Search query or question |
+| `search_paths` | `string[]` | *required* | Directories or files to search (min 1) |
+| `mode` | `string` | `"DEEP"` | `DEEP` or `FILENAME_ONLY` |
+| `max_depth` | `int` | `null` | Maximum directory depth |
+| `top_k_files` | `int` | `null` | Number of top files to return |
+| `keyword_levels` | `int` | `null` | Keyword granularity levels |
+| `include_patterns` | `string[]` | `null` | File glob patterns to include |
+| `exclude_patterns` | `string[]` | `null` | File glob patterns to exclude |
+| `return_cluster` | `bool` | `false` | Return full KnowledgeCluster object |
+
+> **Note:** `FILENAME_ONLY` mode does not require an LLM API key. `DEEP` mode requires a configured LLM.
+
+</details>
 
 ---
 

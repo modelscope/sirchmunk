@@ -69,7 +69,7 @@ class AgenticSearch(BaseSearch):
         )
 
         # Initialize KnowledgeManager for persistent storage
-        self.knowledge_manager = KnowledgeStorage(work_path=str(self.work_path))
+        self.knowledge_storage = KnowledgeStorage(work_path=str(self.work_path))
         
         # Load historical knowledge clusters from cache
         self._load_historical_knowledge()
@@ -109,7 +109,7 @@ class AgenticSearch(BaseSearch):
     def _load_historical_knowledge(self):
         """Load historical knowledge clusters from local cache"""
         try:
-            stats = self.knowledge_manager.get_stats()
+            stats = self.knowledge_storage.get_stats()
             cluster_count = stats.get('custom_stats', {}).get('total_clusters', 0)
             # Use sync logger for initialization
             print(f"Loaded {cluster_count} historical knowledge clusters from cache")
@@ -141,7 +141,7 @@ class AgenticSearch(BaseSearch):
             query_embedding = (await self.embedding_client.embed([query]))[0]
             
             # Search for similar clusters
-            similar_clusters = await self.knowledge_manager.search_similar_clusters(
+            similar_clusters = await self.knowledge_storage.search_similar_clusters(
                 query_embedding=query_embedding,
                 top_k=self.cluster_sim_top_k,
                 similarity_threshold=self.cluster_sim_threshold,
@@ -159,7 +159,7 @@ class AgenticSearch(BaseSearch):
             )
             
             # Retrieve full cluster object
-            existing_cluster = await self.knowledge_manager.get(best_match["id"])
+            existing_cluster = await self.knowledge_storage.get(best_match["id"])
             
             if not existing_cluster:
                 await self._logger.warning("Failed to retrieve cluster, falling back to new search")
@@ -177,16 +177,16 @@ class AgenticSearch(BaseSearch):
                 try:
                     from sirchmunk.utils.embedding_util import compute_text_hash
                     
-                    combined_text = self.knowledge_manager.combine_cluster_fields(
+                    combined_text = self.knowledge_storage.combine_cluster_fields(
                         existing_cluster.queries
                     )
                     text_hash = compute_text_hash(combined_text)
                     embedding_vector = (await self.embedding_client.embed([combined_text]))[0]
                     
                     # Update embedding fields in database without triggering save
-                    self.knowledge_manager.db.execute(
+                    self.knowledge_storage.db.execute(
                         f"""
-                        UPDATE {self.knowledge_manager.table_name}
+                        UPDATE {self.knowledge_storage.table_name}
                         SET 
                             embedding_vector = ?::FLOAT[384],
                             embedding_model = ?,
@@ -201,7 +201,7 @@ class AgenticSearch(BaseSearch):
                     await self._logger.warning(f"Failed to update embedding: {emb_error}")
             
             # Single update call - saves cluster data and embedding together
-            await self.knowledge_manager.update(existing_cluster)
+            await self.knowledge_storage.update(existing_cluster)
             
             await self._logger.success("Reused existing knowledge cluster")
             
@@ -248,12 +248,12 @@ class AgenticSearch(BaseSearch):
         """
         # Save knowledge cluster to persistent storage
         try:
-            await self.knowledge_manager.insert(cluster)
+            await self.knowledge_storage.insert(cluster)
             await self._logger.info(f"Saved knowledge cluster {cluster.id} to cache")
         except Exception as e:
             # If cluster exists, update it instead
             try:
-                await self.knowledge_manager.update(cluster)
+                await self.knowledge_storage.update(cluster)
                 await self._logger.info(f"Updated knowledge cluster {cluster.id} in cache")
             except Exception as update_error:
                 await self._logger.warning(f"Failed to save knowledge cluster: {update_error}")
@@ -265,7 +265,7 @@ class AgenticSearch(BaseSearch):
                 from sirchmunk.utils.embedding_util import compute_text_hash
                 
                 # Combine queries for embedding
-                combined_text = self.knowledge_manager.combine_cluster_fields(
+                combined_text = self.knowledge_storage.combine_cluster_fields(
                     cluster.queries
                 )
                 text_hash = compute_text_hash(combined_text)
@@ -274,7 +274,7 @@ class AgenticSearch(BaseSearch):
                 embedding_vector = (await self.embedding_client.embed([combined_text]))[0]
                 
                 # Store embedding
-                await self.knowledge_manager.store_embedding(
+                await self.knowledge_storage.store_embedding(
                     cluster_id=cluster.id,
                     embedding_vector=embedding_vector,
                     embedding_model=self.embedding_client.model_id,

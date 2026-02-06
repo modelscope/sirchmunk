@@ -1,7 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """
 Chat History Storage using DuckDB
-Provides persistent storage for chat sessions and messages
+Provides persistent storage for chat sessions and messages.
+
+Uses in-memory DuckDB with periodic disk writeback (persist mode)
+to eliminate file locking issues in multi-process deployments.
 """
 
 import os
@@ -18,41 +21,42 @@ from sirchmunk.utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH
 class HistoryStorage:
     """
     Manages persistent storage of chat history using DuckDB
-    
+
     Architecture:
-    - Stores chat sessions and messages in DuckDB
+    - In-memory DuckDB for all read/write operations (zero lock contention)
+    - Daemon thread in DuckDBManager syncs dirty data to disk periodically
+    - Stores chat sessions and messages
     - Follows Single Responsibility Principle (SRP)
-    - Provides clean interface for CRUD operations
     - Decoupled from API layer (Dependency Inversion Principle)
     """
-    
+
     def __init__(self, work_path: Optional[str] = None):
         """
         Initialize History Storage
-        
+
         Args:
             work_path: Base work path. If None, uses SIRCHMUNK_WORK_PATH env variable
         """
         # Get work path from env if not provided, and expand ~ in path
         if work_path is None:
             work_path = os.getenv("SIRCHMUNK_WORK_PATH", DEFAULT_SIRCHMUNK_WORK_PATH)
-        
+
         # Create history storage path (expand ~ and resolve to absolute path)
         self.history_path = Path(work_path).expanduser().resolve() / ".cache" / "history"
         self.history_path.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize DuckDB
+
+        # Initialize DuckDB in persist mode (in-memory + periodic disk writeback)
         self.db_path = str(self.history_path / "chat_history.db")
-        self.db = DuckDBManager(db_path=self.db_path)
-        
+        self.db = DuckDBManager(persist_path=self.db_path, sync_interval=60, sync_threshold=50)
+
         # Create tables if not exist
         self._initialize_tables()
-        
+
         logger.info(f"History storage initialized at: {self.db_path}")
-    
+
     def _initialize_tables(self):
         """Create database tables for chat history"""
-        
+
         # Chat sessions table
         sessions_schema = {
             "session_id": "VARCHAR PRIMARY KEY",
@@ -63,7 +67,7 @@ class HistoryStorage:
             "message_count": "INTEGER DEFAULT 0",
         }
         self.db.create_table("chat_sessions", sessions_schema, if_not_exists=True)
-        
+
         # Chat messages table
         messages_schema = {
             "id": "VARCHAR PRIMARY KEY",
@@ -75,15 +79,15 @@ class HistoryStorage:
             "is_streaming": "BOOLEAN DEFAULT FALSE",
         }
         self.db.create_table("chat_messages", messages_schema, if_not_exists=True)
-        
+
         # Create index for faster queries
         if not self.db.table_exists("chat_messages"):
             self.db.create_index("chat_messages", ["session_id"], "idx_messages_session")
-    
+
     def save_session(self, session_data: Dict[str, Any]) -> bool:
         """
         Save or update a chat session
-        
+
         Args:
             session_data: Dictionary containing session information
                 - session_id: str
@@ -92,19 +96,19 @@ class HistoryStorage:
                 - updated_at: str (ISO format)
                 - settings: dict (optional)
                 - message_count: int (optional)
-        
+
         Returns:
             True if successful
         """
         try:
             session_id = session_data["session_id"]
-            
+
             # Check if session exists
             existing = self.db.fetch_one(
                 "SELECT session_id FROM chat_sessions WHERE session_id = ?",
                 [session_id]
             )
-            
+
             # Prepare data
             data_to_save = {
                 "session_id": session_id,
@@ -114,7 +118,7 @@ class HistoryStorage:
                 "settings": json.dumps(session_data.get("settings", {})),
                 "message_count": session_data.get("message_count", 0),
             }
-            
+
             if existing:
                 # Update existing session
                 set_clause = {k: v for k, v in data_to_save.items() if k != "session_id"}
@@ -129,17 +133,17 @@ class HistoryStorage:
                 # Insert new session
                 self.db.insert_data("chat_sessions", data_to_save)
                 logger.debug(f"Created new session: {session_id}")
-            
+
             return True
-        
+
         except Exception as e:
             logger.error(f"Failed to save session: {e}")
             return False
-    
+
     def save_message(self, session_id: str, message_data: Dict[str, Any]) -> bool:
         """
         Save a chat message
-        
+
         Args:
             session_id: Session ID
             message_data: Dictionary containing message information
@@ -148,21 +152,21 @@ class HistoryStorage:
                 - timestamp: str (ISO format) or int (Unix timestamp)
                 - search_logs: list (optional)
                 - is_streaming: bool (optional)
-        
+
         Returns:
             True if successful
         """
         try:
             # Generate message ID
             message_id = f"{session_id}_{datetime.now().timestamp()}"
-            
+
             # Handle timestamp conversion
             timestamp = message_data.get("timestamp")
             if isinstance(timestamp, int):
                 timestamp = datetime.fromtimestamp(timestamp).isoformat()
             elif not timestamp:
                 timestamp = datetime.now().isoformat()
-            
+
             # Prepare data
             data_to_save = {
                 "id": message_id,
@@ -173,14 +177,14 @@ class HistoryStorage:
                 "search_logs": json.dumps(message_data.get("searchLogs", [])),
                 "is_streaming": message_data.get("isStreaming", False),
             }
-            
+
             # Insert message
             self.db.insert_data("chat_messages", data_to_save)
-            
+
             # Update session message count
             self.db.execute(
                 """
-                UPDATE chat_sessions 
+                UPDATE chat_sessions
                 SET message_count = (
                     SELECT COUNT(*) FROM chat_messages WHERE session_id = ?
                 ),
@@ -189,21 +193,21 @@ class HistoryStorage:
                 """,
                 [session_id, datetime.now().isoformat(), session_id]
             )
-            
+
             logger.debug(f"Saved message to session: {session_id}")
             return True
-        
+
         except Exception as e:
             logger.error(f"Failed to save message: {e}")
             return False
-    
+
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
         Retrieve a chat session with all messages
-        
+
         Args:
             session_id: Session ID
-        
+
         Returns:
             Dictionary containing session data and messages, or None if not found
         """
@@ -213,10 +217,10 @@ class HistoryStorage:
                 "SELECT * FROM chat_sessions WHERE session_id = ?",
                 [session_id]
             )
-            
+
             if not session_row:
                 return None
-            
+
             # Parse session data
             session_data = {
                 "session_id": session_row[0],
@@ -226,18 +230,18 @@ class HistoryStorage:
                 "settings": json.loads(session_row[4]) if session_row[4] else {},
                 "message_count": session_row[5],
             }
-            
+
             # Get messages
             message_rows = self.db.fetch_all(
                 """
                 SELECT id, role, content, timestamp, search_logs, is_streaming
-                FROM chat_messages 
+                FROM chat_messages
                 WHERE session_id = ?
                 ORDER BY timestamp ASC
                 """,
                 [session_id]
             )
-            
+
             messages = []
             for row in message_rows:
                 messages.append({
@@ -248,22 +252,22 @@ class HistoryStorage:
                     "searchLogs": json.loads(row[4]) if row[4] else [],
                     "isStreaming": row[5],
                 })
-            
+
             session_data["messages"] = messages
             return session_data
-        
+
         except Exception as e:
             logger.error(f"Failed to get session {session_id}: {e}")
             return None
-    
+
     def get_all_sessions(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         """
         Retrieve all chat sessions (without messages)
-        
+
         Args:
             limit: Maximum number of sessions to retrieve
             offset: Number of sessions to skip
-        
+
         Returns:
             List of session dictionaries
         """
@@ -277,7 +281,7 @@ class HistoryStorage:
                 """,
                 [limit, offset]
             )
-            
+
             sessions = []
             for row in rows:
                 sessions.append({
@@ -288,49 +292,49 @@ class HistoryStorage:
                     "settings": json.loads(row[4]) if row[4] else {},
                     "message_count": row[5],
                 })
-            
+
             return sessions
-        
+
         except Exception as e:
             logger.error(f"Failed to get all sessions: {e}")
             return []
-    
+
     def delete_session(self, session_id: str) -> bool:
         """
         Delete a chat session and all its messages
-        
+
         Args:
             session_id: Session ID
-        
+
         Returns:
             True if successful
         """
         try:
             # Delete messages first
             self.db.delete_data("chat_messages", "session_id = ?", [session_id])
-            
+
             # Delete session
             self.db.delete_data("chat_sessions", "session_id = ?", [session_id])
-            
+
             logger.info(f"Deleted session: {session_id}")
             return True
-        
+
         except Exception as e:
             logger.error(f"Failed to delete session {session_id}: {e}")
             return False
-    
+
     def get_session_count(self) -> int:
         """Get total number of sessions"""
         return self.db.get_table_count("chat_sessions")
-    
+
     def search_sessions(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         """
         Search sessions by title or message content
-        
+
         Args:
             query: Search query
             limit: Maximum results
-        
+
         Returns:
             List of matching sessions
         """
@@ -346,7 +350,7 @@ class HistoryStorage:
                 """,
                 [f"%{query.lower()}%", limit]
             )
-            
+
             # Search in message content
             content_matches = self.db.fetch_all(
                 """
@@ -359,11 +363,11 @@ class HistoryStorage:
                 """,
                 [f"%{query.lower()}%", limit]
             )
-            
+
             # Combine and deduplicate results
             session_ids = set()
             sessions = []
-            
+
             for row in title_matches + content_matches:
                 if row[0] not in session_ids:
                     session_ids.add(row[0])
@@ -375,27 +379,27 @@ class HistoryStorage:
                         "settings": json.loads(row[4]) if row[4] else {},
                         "message_count": row[5],
                     })
-            
+
             return sessions[:limit]
-        
+
         except Exception as e:
             logger.error(f"Failed to search sessions: {e}")
             return []
-    
+
     def close(self):
-        """Close database connection"""
+        """Close database connection (triggers final sync to disk)"""
         if self.db:
             self.db.close()
             logger.info("History storage closed")
-    
+
     def __enter__(self):
         """Context manager entry"""
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit"""
         self.close()
-    
+
     def __del__(self):
         """Destructor to ensure connection is closed"""
         if hasattr(self, 'db') and self.db:

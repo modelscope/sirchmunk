@@ -6,10 +6,13 @@ Provides commands for server management, initialization, configuration,
 and search operations.
 
 Usage:
-    sirchmunk init          - Initialize Sirchmunk working directory
-    sirchmunk config        - Show or generate configuration
-    sirchmunk serve         - Start the API server
-    sirchmunk search        - Perform a search query
+    sirchmunk init              - Initialize Sirchmunk working directory
+    sirchmunk init --ui         - Initialize with WebUI frontend build
+    sirchmunk config            - Show or generate configuration
+    sirchmunk serve             - Start the API server (backend only)
+    sirchmunk serve --ui        - Start with embedded WebUI (single port)
+    sirchmunk serve --ui --dev  - Start with Next.js dev server (dual port)
+    sirchmunk search            - Perform a search query
 """
 
 import argparse
@@ -77,11 +80,11 @@ def _load_env_file(env_file: Path) -> bool:
 def cmd_init(args: argparse.Namespace) -> int:
     """Initialize Sirchmunk working directory.
     
-    Creates the work directory structure, checks dependencies, and generates
-    initial configuration.
+    Creates the work directory structure, checks dependencies, generates
+    initial configuration, and optionally builds the WebUI frontend.
     
     Args:
-        args: Command-line arguments
+        args: Command-line arguments (supports --ui flag)
         
     Returns:
         Exit code (0 for success, non-zero for failure)
@@ -90,12 +93,15 @@ def cmd_init(args: argparse.Namespace) -> int:
     
     try:
         work_path = Path(args.work_path).expanduser().resolve()
+        build_ui = getattr(args, "ui", False)
         
         print("=" * 60)
         print("  Sirchmunk Initialization")
         print("=" * 60)
         print()
         print(f"Work path: {work_path}")
+        if build_ui:
+            print(f"WebUI build: enabled")
         print()
         
         # Create directory structure
@@ -151,14 +157,14 @@ def cmd_init(args: argparse.Namespace) -> int:
         # Check Python packages
         try:
             import fastapi
-            print(f"  ✓ FastAPI is installed")
+            print("  ✓ FastAPI is installed")
         except ImportError:
             print("  ✗ FastAPI not found")
             print("    Install with: pip install fastapi")
         
         try:
             import uvicorn
-            print(f"  ✓ uvicorn is installed")
+            print("  ✓ uvicorn is installed")
         except ImportError:
             print("  ✗ uvicorn not found")
             print("    Install with: pip install uvicorn")
@@ -200,6 +206,27 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"  ✗ Failed to download embedding model: {e}")
             print("    Model will be downloaded on first search.")
         
+        # Build WebUI frontend (optional, requires Node.js)
+        if build_ui:
+            print()
+            print("Building WebUI frontend...")
+            from sirchmunk.cli.web_launcher import (
+                check_node_installed,
+                build_frontend,
+                has_static_build,
+            )
+            
+            if not check_node_installed():
+                print("  ✗ Node.js / npm is required to build the WebUI.")
+                print("    Install from: https://nodejs.org/")
+                print("    You can skip this step and run 'sirchmunk serve' without --ui.")
+            else:
+                success = build_frontend(work_path=work_path)
+                if success:
+                    print("  ✓ WebUI built successfully")
+                else:
+                    print("  ✗ WebUI build failed. You can retry with 'sirchmunk init --ui'.")
+        
         print()
         print("=" * 60)
         print("✅ Initialization complete!")
@@ -207,7 +234,11 @@ def cmd_init(args: argparse.Namespace) -> int:
         print()
         print("Next steps:")
         print(f"  1. Edit {env_file} to configure LLM_API_KEY")
-        print("  2. Run 'sirchmunk serve' to start the API server")
+        if build_ui:
+            print("  2. Run 'sirchmunk serve --ui' to start with WebUI (single port)")
+        else:
+            print("  2. Run 'sirchmunk serve' to start the API server")
+            print("     (or 'sirchmunk init --ui' to build WebUI first)")
         print("  3. Run 'sirchmunk search \"your query\"' to perform searches")
         print()
         
@@ -280,7 +311,12 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    """Start the Sirchmunk API server.
+    """Start the Sirchmunk server.
+    
+    Supports three modes:
+    - Backend only (default): Starts the FastAPI API server
+    - Production UI (--ui): Serves pre-built WebUI + API on a single port
+    - Development UI (--ui --dev): Runs backend + Next.js dev server (dual port)
     
     Args:
         args: Command-line arguments
@@ -295,6 +331,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if env_file.exists():
             _load_env_file(env_file)
         
+        serve_ui = getattr(args, "ui", False)
+        dev_mode = getattr(args, "dev", False)
+        
+        # Development mode: dual-port subprocess orchestration
+        if serve_ui and dev_mode:
+            return _serve_dev_mode(args, work_path)
+        
+        # Production UI mode: validate static build exists
+        if serve_ui:
+            from sirchmunk.cli.web_launcher import has_static_build
+            if not has_static_build(work_path):
+                print("❌ WebUI static build not found.")
+                print("   Build it first with: sirchmunk init --ui")
+                print("   Or use --dev for development mode: sirchmunk serve --ui --dev")
+                return 1
+            # Set environment variable so main.py mounts static files
+            os.environ["SIRCHMUNK_SERVE_UI"] = "true"
+        
         # Import uvicorn here to avoid slow startup
         try:
             import uvicorn
@@ -304,15 +358,22 @@ def cmd_serve(args: argparse.Namespace) -> int:
             return 1
         
         print("=" * 60)
-        print(f"Sirchmunk API Server v{__version__}")
+        print(f"Sirchmunk Server v{__version__}")
         print("=" * 60)
         print()
-        print(f"  Host: {args.host}")
-        print(f"  Port: {args.port}")
+        # Display host: use "localhost" for URLs when binding to 0.0.0.0
+        display_host = "localhost" if args.host in ("0.0.0.0", "::") else args.host
+        
+        print(f"  Host:   {args.host}")
+        print(f"  Port:   {args.port}")
         print(f"  Reload: {args.reload}")
+        print(f"  WebUI:  {'enabled (single port)' if serve_ui else 'disabled'}")
         print()
-        print(f"  API Docs: http://{args.host}:{args.port}/docs")
-        print(f"  Health: http://{args.host}:{args.port}/health")
+        if serve_ui:
+            print(f"  🌐 WebUI: http://{display_host}:{args.port}/")
+        print(f"  📡 API:   http://{display_host}:{args.port}/api/v1/")
+        print(f"  📖 Docs:  http://{display_host}:{args.port}/docs")
+        print(f"  ❤️  Health: http://{display_host}:{args.port}/health")
         print()
         print("Press Ctrl+C to stop the server.")
         print("=" * 60)
@@ -335,6 +396,58 @@ def cmd_serve(args: argparse.Namespace) -> int:
         logger.error(f"Server failed: {e}", exc_info=True)
         print(f"❌ Server error: {e}")
         return 1
+
+
+def _serve_dev_mode(args: argparse.Namespace, work_path: Path) -> int:
+    """Start in development mode with dual-port frontend + backend.
+    
+    Launches the FastAPI backend and Next.js dev server as child processes,
+    providing hot-reload for both frontend and backend development.
+    
+    Args:
+        args: Command-line arguments
+        work_path: Resolved Sirchmunk work path
+        
+    Returns:
+        Exit code
+    """
+    from sirchmunk.cli.web_launcher import (
+        check_node_installed,
+        find_web_source_dir,
+        serve_with_ui_dev,
+    )
+    
+    if not check_node_installed():
+        print("❌ Node.js / npm is required for development mode.")
+        print("   Install from: https://nodejs.org/")
+        return 1
+    
+    web_dir = find_web_source_dir()
+    if web_dir is None:
+        print("❌ Cannot locate web/ source directory.")
+        print("   Set SIRCHMUNK_WEB_DIR environment variable.")
+        return 1
+    
+    frontend_port = getattr(args, "frontend_port", 8585)
+    
+    print("=" * 60)
+    print(f"Sirchmunk Dev Server v{__version__}")
+    print("=" * 60)
+    print()
+    print(f"  Mode:     Development (hot-reload)")
+    print(f"  Backend:  {args.host}:{args.port}")
+    print(f"  Frontend: localhost:{frontend_port}")
+    print(f"  Web source: {web_dir}")
+    print()
+    
+    serve_with_ui_dev(
+        host=args.host,
+        backend_port=args.port,
+        frontend_port=frontend_port,
+        log_level=args.log_level.lower(),
+    )
+    
+    return 0
 
 
 def cmd_search(args: argparse.Namespace) -> int:
@@ -400,7 +513,7 @@ async def _search_local(
     Args:
         query: Search query
         search_paths: Paths to search
-        mode: Search mode (FAST, DEEP, FILENAME_ONLY)
+        mode: Search mode (DEEP, FILENAME_ONLY)
         output_format: Output format (text, json)
         verbose: Enable verbose output
         
@@ -626,9 +739,11 @@ def create_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   sirchmunk init                    Initialize Sirchmunk
+  sirchmunk init --ui               Initialize with WebUI build
   sirchmunk config --generate       Generate configuration file
-  sirchmunk serve                   Start API server
-  sirchmunk serve --port 8000       Start on custom port
+  sirchmunk serve                   Start API server (backend only)
+  sirchmunk serve --ui              Start with WebUI (single port)
+  sirchmunk serve --ui --dev        Start with Next.js dev server
   sirchmunk search "find auth"      Search in current directory
   sirchmunk search "bug" ./src      Search in specific path
   sirchmunk search "api" --mode FILENAME_ONLY
@@ -655,6 +770,11 @@ Examples:
         default=str(_get_default_work_path()),
         help="Working directory path (default: ~/.sirchmunk)",
     )
+    init_parser.add_argument(
+        "--ui",
+        action="store_true",
+        help="Build WebUI frontend (requires Node.js/npm)",
+    )
     init_parser.set_defaults(func=cmd_init)
     
     # === config command ===
@@ -678,8 +798,12 @@ Examples:
     # === serve command ===
     serve_parser = subparsers.add_parser(
         "serve",
-        help="Start the Sirchmunk API server",
-        description="Launch the FastAPI server for API access and WebUI.",
+        help="Start the Sirchmunk server",
+        description=(
+            "Launch the Sirchmunk server. By default, starts the backend API only. "
+            "Use --ui to serve the pre-built WebUI on the same port. "
+            "Use --ui --dev for development mode with hot-reload (requires Node.js)."
+        ),
     )
     serve_parser.add_argument(
         "--host",
@@ -693,9 +817,25 @@ Examples:
         help="Port to listen on (default: 8584)",
     )
     serve_parser.add_argument(
+        "--ui",
+        action="store_true",
+        help="Enable WebUI (single-port mode with pre-built static files)",
+    )
+    serve_parser.add_argument(
+        "--dev",
+        action="store_true",
+        help="Development mode: run Next.js dev server with hot-reload (requires --ui)",
+    )
+    serve_parser.add_argument(
+        "--frontend-port",
+        type=int,
+        default=8585,
+        help="Frontend port for dev mode (default: 8585, only with --ui --dev)",
+    )
+    serve_parser.add_argument(
         "--reload",
         action="store_true",
-        help="Enable auto-reload for development",
+        help="Enable backend auto-reload for development",
     )
     serve_parser.add_argument(
         "--log-level",
@@ -723,8 +863,8 @@ Examples:
     search_parser.add_argument(
         "--mode", "-m",
         default="DEEP",
-        choices=["FAST", "DEEP", "FILENAME_ONLY"],
-        help="Search mode (default: DEEP)",
+        choices=["DEEP", "FILENAME_ONLY"],
+        help="Search mode: DEEP (comprehensive analysis) or FILENAME_ONLY (fast file discovery)",
     )
     search_parser.add_argument(
         "--output", "-o",
