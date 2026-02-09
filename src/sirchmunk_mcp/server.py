@@ -115,6 +115,98 @@ def create_server(config: Config) -> FastMCP:
             return f"Search failed: {str(e)}"
     
     @mcp.tool()
+    async def sirchmunk_search_deep(
+        query: str,
+        search_paths: List[str],
+        max_loops: int = 10,
+        max_token_budget: int = 64000,
+        enable_dir_scan: bool = True,
+    ) -> str:
+        """Multi-hop agentic search using a ReAct reasoning loop.
+
+        The LLM autonomously decides which tools to call (keyword search,
+        file read, knowledge cache, directory scan) across multiple
+        iterations until it has enough evidence to answer.  Best for
+        complex, multi-faceted questions that require cross-document
+        reasoning.  No pre-built index required.
+
+        Args:
+            query: Natural-language question or information need
+            search_paths: Directories to search in
+            max_loops: Maximum ReAct iterations (1-20, default: 10)
+            max_token_budget: Token budget for retrieval content (default: 64000)
+            enable_dir_scan: Enable directory scanning tool (default: True)
+
+        Returns:
+            Synthesized answer with evidence from multiple sources
+        """
+        if _service is None:
+            return "Error: Service not initialized"
+
+        logger.info(f"sirchmunk_search_deep: query='{query[:50]}...'")
+
+        try:
+            result = await _service.searcher.search_deep(
+                query=query,
+                search_paths=search_paths,
+                max_loops=max_loops,
+                max_token_budget=max_token_budget,
+                enable_dir_scan=enable_dir_scan,
+            )
+            return result if isinstance(result, str) else str(result)
+        except Exception as e:
+            logger.error(f"Deep search failed: {e}", exc_info=True)
+            return f"Deep search failed: {str(e)}"
+
+    @mcp.tool()
+    async def sirchmunk_scan_dir(
+        query: str,
+        search_paths: List[str],
+        max_depth: int = 8,
+        max_files: int = 500,
+        top_k: int = 20,
+    ) -> str:
+        """Scan directories to discover and rank document candidates.
+
+        Performs a fast recursive scan of search_paths to collect file
+        metadata (title, size, type, keywords, preview), then uses the
+        LLM to rank the most promising candidates for the query.
+
+        Args:
+            query: Search query to rank files by relevance
+            search_paths: Root directories to scan
+            max_depth: Maximum recursion depth (1-20, default: 8)
+            max_files: Maximum files to scan (default: 500)
+            top_k: Number of top candidates for LLM ranking (default: 20)
+
+        Returns:
+            Ranked list of file candidates with relevance scores
+        """
+        if _service is None:
+            return "Error: Service not initialized"
+
+        logger.info(f"sirchmunk_scan_dir: query='{query[:50]}...'")
+
+        try:
+            from sirchmunk.scan.dir_scanner import DirectoryScanner
+
+            scanner = DirectoryScanner(
+                llm=_service.searcher.llm,
+                max_depth=max_depth,
+                max_files=max_files,
+            )
+            result = await scanner.scan_and_rank(
+                query=query,
+                search_paths=search_paths,
+                top_k=top_k,
+            )
+
+            return _format_scan_results(result, query)
+        except Exception as e:
+            logger.error(f"Dir scan failed: {e}", exc_info=True)
+            return f"Directory scan failed: {str(e)}"
+
+    @mcp.tool()
     async def sirchmunk_get_cluster(cluster_id: str) -> str:
         """Retrieve a previously saved knowledge cluster by its ID.
         
@@ -178,6 +270,43 @@ def create_server(config: Config) -> FastMCP:
             return f"Failed to list clusters: {str(e)}"
     
     return mcp
+
+
+def _format_scan_results(result, query: str) -> str:
+    """Format DirectoryScanner results for MCP output.
+
+    Args:
+        result: ScanResult from DirectoryScanner
+        query: Original query
+
+    Returns:
+        Formatted markdown string
+    """
+    lines = [
+        "# Directory Scan Results",
+        "",
+        f"**Query**: `{query}`",
+        f"**Files scanned**: {result.total_files}",
+        f"**Directories traversed**: {result.total_dirs}",
+        f"**Scan time**: {result.scan_duration_ms:.0f}ms",
+        f"**Rank time**: {result.rank_duration_ms:.0f}ms",
+        "",
+    ]
+
+    for i, c in enumerate(result.ranked_candidates, 1):
+        tag = f"[{c.relevance}]" if c.relevance else "[?]"
+        lines.append(f"## {i}. {tag} {c.filename}")
+        lines.append(f"- **Path**: `{c.path}`")
+        lines.append(f"- **Type**: {c.extension} | **Size**: {c._human_size()}")
+        if c.title:
+            lines.append(f"- **Title**: {c.title}")
+        if c.reason:
+            lines.append(f"- **Reason**: {c.reason}")
+        if c.keywords:
+            lines.append(f"- **Keywords**: {', '.join(c.keywords[:5])}")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def _format_filename_results(results: List[Dict[str, Any]], query: str) -> str:

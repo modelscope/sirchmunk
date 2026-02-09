@@ -313,10 +313,18 @@ class GrepRetriever(BaseRetriever):
                         f"ripgrep-all depends on 'ripgrep' (rg), but it's missing: {result.stderr.strip()}"
                     )
                 elif result.returncode > 1:
-                    raise RuntimeError(f"rga execution failed: {result.stderr.strip()}")
+                    # Exit code 2: partial errors (some files failed
+                    # preprocessing).  If stdout has content, continue
+                    # to parse — valid matches may still be present.
+                    if not result.stdout.strip():
+                        raise RuntimeError(f"rga execution failed: {result.stderr.strip()}")
+                    logger.warning(
+                        f"rga returned exit code {result.returncode} with partial errors "
+                        f"(first 300 chars): {result.stderr.strip()[:300]}"
+                    )
 
-            # Parse JSON Lines if requested
-            if json_output and result.returncode in (0, 1) and result.stdout.strip():
+            # Parse JSON Lines if requested (including exit code 2)
+            if json_output and result.returncode in (0, 1, 2) and result.stdout.strip():
                 lines = result.stdout.strip().splitlines()
                 result.stdout = [json.loads(line) for line in lines if line]
             return result
@@ -368,10 +376,23 @@ class GrepRetriever(BaseRetriever):
                             f"ripgrep-all depends on 'ripgrep' (rg), but it's missing or failed: {stderr_str}"
                         )
                     elif returncode > 1:
-                        raise RuntimeError(f"rga execution failed with code {returncode}: {stderr_str}")
-                # 4. Parse JSON Lines
+                        # Exit code 2 means "some errors occurred" (e.g.
+                        # preprocessor failures on individual files), but
+                        # valid matches may still be present in stdout.
+                        # Only raise if there is NO stdout content at all.
+                        if not stdout_str:
+                            raise RuntimeError(
+                                f"rga execution failed with code {returncode}: {stderr_str}"
+                            )
+                        # Log the errors but continue to parse results
+                        logger.warning(
+                            f"rga returned exit code {returncode} with partial errors "
+                            f"(first 300 chars): {stderr_str[:300]}"
+                        )
+
+                # Parse JSON Lines — also for exit code 2 when stdout has content
                 parsed_stdout = stdout_str
-                if json_output and returncode in (0, 1) and stdout_str:
+                if json_output and returncode in (0, 1, 2) and stdout_str:
                     try:
                         parsed_stdout = [
                             json.loads(line) for line in stdout_str.splitlines() if line
@@ -479,21 +500,27 @@ class GrepRetriever(BaseRetriever):
             timeout=timeout,
         )
 
-        if result["returncode"] == 0:
+        returncode = result["returncode"]
+        # Exit codes: 0 = matches found, 1 = no matches, 2 = partial errors
+        # (some files failed preprocessing but results may still be present)
+        if returncode in (0, 2):
             if count_only:
                 counts = []
-                for line in result.stdout.strip().splitlines():
-                    if ":" in line:
-                        p, c = line.rsplit(":", 1)
-                        counts.append({"path": p, "count": int(c)})
+                raw = result["stdout"]
+                if isinstance(raw, str):
+                    for line in raw.strip().splitlines():
+                        if ":" in line:
+                            p, c = line.rsplit(":", 1)
+                            counts.append({"path": p, "count": int(c)})
                 return counts
             else:
-                return result["stdout"]
-        elif result["returncode"] == 1:
+                stdout = result["stdout"]
+                return stdout if isinstance(stdout, list) else []
+        elif returncode == 1:
             return []
         else:
             raise RuntimeError(
-                f"ripgrep-all failed (exit {result['returncode']}): {result['stderr'].strip()}"
+                f"ripgrep-all failed (exit {returncode}): {result['stderr'].strip()}"
             )
 
     @staticmethod
@@ -501,23 +528,49 @@ class GrepRetriever(BaseRetriever):
         terms: List[str],
         **kwargs,
     ) -> (List[Dict[str, Any]], str):
-        """OR: Match any term — simply concatenate with | (ripgrep-all supports alternation)."""
-        # Escape terms if literal mode
+        """OR: Match any term.
+
+        When ``literal=True`` (``-F`` mode), ripgrep treats the *entire*
+        pattern as a fixed string — ``|`` is NOT interpreted as alternation.
+        In that case we must search each term individually and merge.
+        When ``literal=False`` (regex mode), we use ``|`` alternation
+        normally.
+        """
+        import asyncio as _aio
+
         literal = kwargs.get("literal", False)
         if literal:
-            escaped_terms = [
-                term.replace("\\", "\\\\").replace("|", "\\|") for term in terms
-            ]
-            pattern = "|".join(escaped_terms)
-            kwargs["literal"] = True  # still use -F to avoid regex meta
+            if len(terms) == 1:
+                # Single term — safe to use -F directly
+                result = await GrepRetriever._retrieve_single(
+                    pattern=terms[0], **kwargs
+                )
+                return result, terms[0]
+
+            # Multiple terms + literal mode: search each term separately
+            # then merge results to simulate OR.
+            async def _search_one(term: str):
+                return await GrepRetriever._retrieve_single(
+                    pattern=term, **kwargs
+                )
+
+            results_lists = await _aio.gather(*[_search_one(t) for t in terms])
+
+            # Merge all raw JSON events into a single list
+            combined: List[Dict[str, Any]] = []
+            for rl in results_lists:
+                combined.extend(rl)
+
+            pattern_desc = " | ".join(terms)
+            return combined, pattern_desc
         else:
             # Wrap each term in (?:...) to avoid precedence issues
             pattern = "|".join(f"(?:{term})" for term in terms)
             kwargs["literal"] = False
 
-        result = await GrepRetriever._retrieve_single(pattern=pattern, **kwargs)
+            result = await GrepRetriever._retrieve_single(pattern=pattern, **kwargs)
 
-        return result, pattern
+            return result, pattern
 
     @staticmethod
     async def _retrieve_and(

@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import asyncio
 import json
 import hashlib
 from datetime import datetime
@@ -111,34 +112,32 @@ class KnowledgeBase:
 
         return "\n\n".join([part for part in parts if part])
 
-    async def build(
+    async def _extract_evidence_for_file(
         self,
-        request: Request,
-        retrieved_infos: List[Dict[str, Any]],
-        keywords: Dict[str, float] = None,
-        top_k_files: Optional[int] = 3,
-        top_k_snippets: Optional[int] = 5,
-        confidence_threshold: Optional[float] = 8.0,
-        verbose: bool = True,
-    ) -> Union[KnowledgeCluster, None]:
-        """Build a knowledge cluster from retrieved information and metadata dynamically."""
+        file_path_or_url: str,
+        query: str,
+        keywords: Dict[str, float],
+        confidence_threshold: float,
+        top_k_snippets: int,
+        verbose: bool,
+    ) -> Optional[EvidenceUnit]:
+        """Extract evidence from a single file via Monte Carlo sampling.
 
-        if len(retrieved_infos) == 0:
-            await self._log.warning(
-                "No retrieved information available to build knowledge cluster."
-            )
-            return None
+        Performs text extraction followed by LLM-driven region-of-interest
+        identification.  Designed to run concurrently for multiple files.
 
-        retrieved_infos = retrieved_infos[:top_k_files]
+        Args:
+            file_path_or_url: Absolute path or URL to the document.
+            query: User's original search query.
+            keywords: Keyword → IDF-score map for scoring.
+            confidence_threshold: Minimum confidence for evidence acceptance.
+            top_k_snippets: Maximum evidence snippets per document.
+            verbose: Whether to enable verbose logging.
 
-        keywords = keywords or {}
-
-        # Get evidence units (regions of interest) from raw retrieved infos
-        evidences: List[EvidenceUnit] = []
-        for info in retrieved_infos:
-            file_path_or_url: str = info["path"]
-
-            # TODO: handle more file types; deal with large files; Async adaptive
+        Returns:
+            EvidenceUnit on success, None on extraction failure.
+        """
+        try:
             extraction_result = await fast_extract(file_path=file_path_or_url)
             doc_content: str = extraction_result.content
 
@@ -149,7 +148,7 @@ class KnowledgeBase:
                 log_callback=self.log_callback,
             )
             roi_result: RoiResult = await sampler.get_roi(
-                query=request.get_user_input(),
+                query=query,
                 keywords=keywords,
                 confidence_threshold=confidence_threshold,
                 top_k=top_k_snippets,
@@ -165,18 +164,88 @@ class KnowledgeBase:
                 conflict_group=[],
             )
             self.llm_usages.extend(sampler.llm_usages)
-            evidences.append(evidence_unit)
+            return evidence_unit
+
+        except Exception as exc:
+            await self._log.warning(
+                f"Evidence extraction failed for {file_path_or_url}: {exc}"
+            )
+            return None
+
+    async def build(
+        self,
+        request: Request,
+        retrieved_infos: List[Dict[str, Any]],
+        keywords: Dict[str, float] = None,
+        top_k_files: Optional[int] = 3,
+        top_k_snippets: Optional[int] = 5,
+        confidence_threshold: Optional[float] = 8.0,
+        verbose: bool = True,
+    ) -> Union[KnowledgeCluster, None]:
+        """Build a knowledge cluster from retrieved information and metadata.
+
+        Extracts evidence from each file via Monte Carlo sampling
+        (concurrently when multiple files are available), then uses
+        LLM to synthesise name / description / content.
+
+        Args:
+            request: User request (provides the query string).
+            retrieved_infos: List of dicts with at least a ``"path"`` key.
+            keywords: Keyword → IDF-score dict for evidence scoring.
+            top_k_files: Max files to process.
+            top_k_snippets: Max evidence snippets per file.
+            confidence_threshold: Min confidence for evidence acceptance.
+            verbose: Enable verbose logging.
+
+        Returns:
+            KnowledgeCluster on success, None if no evidence found.
+        """
+        if len(retrieved_infos) == 0:
+            await self._log.warning(
+                "No retrieved information available to build knowledge cluster."
+            )
+            return None
+
+        retrieved_infos = retrieved_infos[:top_k_files]
+        keywords = keywords or {}
+        query_text = request.get_user_input()
+
+        # ---- Parallel per-file evidence extraction ----
+        await self._log.info(
+            f"Extracting evidence from {len(retrieved_infos)} files (parallel)..."
+        )
+
+        tasks = [
+            self._extract_evidence_for_file(
+                file_path_or_url=info["path"],
+                query=query_text,
+                keywords=keywords,
+                confidence_threshold=confidence_threshold,
+                top_k_snippets=top_k_snippets,
+                verbose=verbose,
+            )
+            for info in retrieved_infos
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        evidences: List[EvidenceUnit] = []
+        for r in results:
+            if isinstance(r, EvidenceUnit):
+                evidences.append(r)
+            elif isinstance(r, Exception):
+                await self._log.warning(f"Evidence task failed: {r}")
 
         if len(evidences) == 0:
             await self._log.warning("No evidence units extracted from retrieved information.")
             return None
 
-        # Get `name`, `description` and `content` from user request and evidences using LLM
-        # TODO: to be processed other type of segments
+        await self._log.info(f"Collected {len(evidences)} evidence units")
+
+        # ---- LLM synthesis: name / description / content ----
         evidence_contents: List[str] = [ev.summary for ev in evidences]
 
         evidence_summary_prompt: str = EVIDENCE_SUMMARY.format(
-            user_input=request.get_user_input(),
+            user_input=query_text,
             evidences="\n\n".join(evidence_contents),
         )
 
@@ -206,11 +275,10 @@ class KnowledgeBase:
             content=cluster_content,
         )
         if not cluster_text:
-            cluster_text = request.get_user_input() or "unknown"
+            cluster_text = query_text or "unknown"
 
         cluster_id = f"C{hashlib.sha256(cluster_text.encode('utf-8')).hexdigest()[:10]}"
 
-        # TODO: Adapt cluster attributes based on real scenarios
         cluster = KnowledgeCluster(
             id=cluster_id,
             name=cluster_name,
