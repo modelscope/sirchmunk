@@ -4,16 +4,16 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that ex
 
 ## Features
 
-- **🔍 Multi-Mode Search**
+- **Multi-Mode Search**
   - **DEEP**: Comprehensive knowledge extraction with full context analysis (~10-30s)
   - **FILENAME_ONLY**: Fast filename pattern matching (<1s)
 
-- **🧠 Knowledge Cluster Management**
+- **Knowledge Cluster Management**
   - Automatic knowledge extraction and storage
   - Semantic similarity-based cluster reuse
   - Version tracking and lifecycle management
 
-- **🔌 MCP Integration**
+- **MCP Integration**
   - Standard MCP protocol support
   - Stdio transport (Claude Desktop / Claude Code compatible)
   - Streamable HTTP transport (for web-based clients)
@@ -25,19 +25,25 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that ex
 ### Step 1: Install
 
 ```bash
-pip install sirchmunk-mcp
+pip install sirchmunk[mcp]
 ```
 
 ### Step 2: Initialize
 
 ```bash
-sirchmunk-mcp init
-sirchmunk-mcp config --generate
+sirchmunk init
 ```
+
+This will:
+- Create `~/.sirchmunk` directory structure
+- Generate `~/.sirchmunk/.env` configuration file
+- Generate `~/.sirchmunk/mcp_config.json` client config template
+- Check dependencies (rga, MCP package)
+- Download embedding model
 
 ### Step 3: Configure
 
-Edit `.mcp_env` with your API key:
+Edit `~/.sirchmunk/.env` with your API key:
 
 ```bash
 # Required
@@ -51,21 +57,17 @@ LLM_BASE_URL=https://api.openai.com/v1
 Anthropic provides a dedicated debugging tool called MCP Inspector (runnable via npx). It simulates a Client's behavior and provides a web-based interface for interaction.
 
 ```bash
-MCP_LOG_LEVEL=INFO npx @modelcontextprotocol/inspector sirchmunk-mcp serve
+MCP_LOG_LEVEL=INFO npx @modelcontextprotocol/inspector sirchmunk mcp serve
 ```
 
 You should see:
 ```
 Starting MCP inspector...
-⚙️ Proxy server listening on localhost:6277
-🔑 Session token: a2057c4...
-   Use this token to authenticate requests or set DANGEROUSLY_OMIT_AUTH=true to disable auth
+Proxy server listening on localhost:6277
+Session token: a2057c4...
 
-🚀 MCP Inspector is up and running at:
+MCP Inspector is up and running at:
    http://localhost:6274/?MCP_PROXY_AUTH_TOKEN=a2057c4...
-
-🌐 Opening browser...
-
 ```
 
 Press `Ctrl+C` to stop.
@@ -88,24 +90,24 @@ Press `Ctrl+C` to stop.
 
 ```bash
 # Create a virtual environment (optional but recommended)
-conda create -n sirchmunk_mcp python=3.13 -y
-conda activate sirchmunk_mcp
+conda create -n sirchmunk python=3.13 -y
+conda activate sirchmunk
 
-# Basic installation
-pip install sirchmunk-mcp
+# Install with MCP support
+pip install sirchmunk[mcp]
 ```
 
 ### Method 2: From Source
 
 ```bash
 git clone https://github.com/modelscope/sirchmunk.git
-cd sirchmunk/src/sirchmunk_mcp
-pip install -e .
+cd sirchmunk
+pip install -e ".[mcp]"
 ```
 
 ### Installing ripgrep-all (Optional)
 
-Sirchmunk uses `ripgrep-all` for document search. 
+Sirchmunk uses `ripgrep-all` for document search.
 <br/>
 It will be installed automatically during initialization, but you can install it manually, see https://github.com/phiresky/ripgrep-all
 
@@ -121,8 +123,8 @@ Edit `~/.cursor/mcp.json`:
 {
   "mcpServers": {
     "sirchmunk": {
-      "command": "sirchmunk-mcp",
-      "args": ["serve"],
+      "command": "sirchmunk",
+      "args": ["mcp", "serve"],
       "env": {
         "LLM_API_KEY": "your-api-key",
         "LLM_MODEL_NAME": "gpt-5.2"
@@ -144,8 +146,8 @@ Edit the configuration file:
 {
   "mcpServers": {
     "sirchmunk": {
-      "command": "sirchmunk-mcp",
-      "args": ["serve"],
+      "command": "sirchmunk",
+      "args": ["mcp", "serve"],
       "env": {
         "LLM_API_KEY": "your-api-key",
         "LLM_MODEL_NAME": "gpt-5.2",
@@ -163,8 +165,8 @@ Edit the configuration file:
 {
   "mcpServers": {
     "sirchmunk": {
-      "command": "/path/to/sirchmunk-env/bin/sirchmunk-mcp",
-      "args": ["serve"],
+      "command": "/path/to/sirchmunk-env/bin/sirchmunk",
+      "args": ["mcp", "serve"],
       "env": { ... }
     }
   }
@@ -235,15 +237,17 @@ Intelligent code and document search.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `query` | string | ✅ | - | Search query or question |
-| `search_paths` | array | ✅ | - | Paths to search in |
-| `mode` | string | | "DEEP" | DEEP/FILENAME_ONLY |
-| `max_depth` | integer | | 5 | Directory search depth |
-| `top_k_files` | integer | | 3 | Files to return |
-| `keyword_levels` | integer | | 3 | Keyword granularity (DEEP only) |
-| `include` | array | | - | Glob patterns to include |
-| `exclude` | array | | - | Glob patterns to exclude |
-| `return_cluster` | boolean | | false | Return full KnowledgeCluster |
+| `query` | string | Yes | - | Search query or question |
+| `search_paths` | array | No | configured/cwd | Paths to search in |
+| `mode` | string | No | "DEEP" | DEEP / FILENAME_ONLY |
+| `max_depth` | integer | No | 5 | Directory search depth |
+| `top_k_files` | integer | No | 3 | Files to return |
+| `max_loops` | integer | No | 10 | ReAct iterations (DEEP) |
+| `max_token_budget` | integer | No | 64000 | Token budget (DEEP) |
+| `enable_dir_scan` | boolean | No | true | Directory scanning (DEEP) |
+| `include` | array | No | - | Glob patterns to include |
+| `exclude` | array | No | - | Glob patterns to exclude |
+| `return_cluster` | boolean | No | false | Return full KnowledgeCluster |
 
 ### `sirchmunk_get_cluster`
 
@@ -251,7 +255,7 @@ Retrieve a saved knowledge cluster by ID.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `cluster_id` | string | ✅ | Cluster ID (e.g., 'C1007') |
+| `cluster_id` | string | Yes | Cluster ID (e.g., 'C1007') |
 
 ### `sirchmunk_list_clusters`
 
@@ -274,6 +278,7 @@ List all saved knowledge clusters.
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | LLM API endpoint |
 | `LLM_MODEL_NAME` | `gpt-5.2` | Model to use |
 | `SIRCHMUNK_WORK_PATH` | `~/.sirchmunk` | Working directory |
+| `SIRCHMUNK_SEARCH_PATHS` | (empty) | Default search paths (comma-separated) |
 | `SIRCHMUNK_ENABLE_CLUSTER_REUSE` | `true` | Enable knowledge reuse |
 | `CLUSTER_SIM_THRESHOLD` | `0.85` | Similarity threshold |
 | `DEFAULT_MAX_DEPTH` | `5` | Default search depth |
@@ -320,12 +325,12 @@ server = create_server(config)
 
 ## CLI Reference
 
-### `sirchmunk-mcp serve`
+### `sirchmunk mcp serve`
 
 Run the MCP server.
 
 ```bash
-sirchmunk-mcp serve [OPTIONS]
+sirchmunk mcp serve [OPTIONS]
 
 Options:
   --transport {stdio,http}  Transport protocol (default: stdio)
@@ -334,32 +339,13 @@ Options:
   --log-level {DEBUG,INFO,WARNING,ERROR}  Logging level
 ```
 
-### `sirchmunk-mcp init`
+### `sirchmunk mcp version`
 
-Initialize Sirchmunk environment.
-
-```bash
-sirchmunk-mcp init [OPTIONS]
-
-Options:
-  --work-path PATH  Working directory path (default: ~/.sirchmunk)
-```
-
-### `sirchmunk-mcp config`
-
-Manage configuration.
+Show MCP version information.
 
 ```bash
-sirchmunk-mcp config [OPTIONS]
-
-Options:
-  --generate    Generate configuration templates
-  --output PATH Output path for generated config
+sirchmunk mcp version
 ```
-
-### `sirchmunk-mcp version`
-
-Show version information.
 
 ---
 
@@ -414,14 +400,14 @@ Show version information.
 
 ## Troubleshooting
 
-### "Command not found: sirchmunk-mcp"
+### "Command not found: sirchmunk"
 
 ```bash
 # Verify installation
-pip show sirchmunk-mcp
+pip show sirchmunk
 
-# Reinstall
-pip install --force-reinstall sirchmunk-mcp
+# Reinstall with MCP support
+pip install --force-reinstall "sirchmunk[mcp]"
 ```
 
 ### "LLM API key cannot be empty"
@@ -438,7 +424,7 @@ export LLM_API_KEY="your-api-key"
 
 ```bash
 # Try auto-install
-sirchmunk-mcp init
+sirchmunk init
 
 # Or install manually (see Installation section)
 ```
@@ -462,7 +448,7 @@ export SIRCHMUNK_ENABLE_CLUSTER_REUSE=false
 ### Debug Mode
 
 ```bash
-MCP_LOG_LEVEL=DEBUG SIRCHMUNK_VERBOSE=true sirchmunk-mcp serve
+MCP_LOG_LEVEL=DEBUG SIRCHMUNK_VERBOSE=true sirchmunk mcp serve
 ```
 
 Check logs in `~/.sirchmunk/logs/`.
@@ -473,10 +459,10 @@ Check logs in `~/.sirchmunk/logs/`.
 
 ```bash
 # From PyPI
-pip install --upgrade sirchmunk-mcp
+pip install --upgrade "sirchmunk[mcp]"
 
 # Re-initialize
-sirchmunk-mcp init
+sirchmunk init
 ```
 
 ---
@@ -485,7 +471,7 @@ sirchmunk-mcp init
 
 ```bash
 # Remove package
-pip uninstall sirchmunk-mcp
+pip uninstall sirchmunk
 
 # Remove data (optional)
 rm -rf ~/.sirchmunk
@@ -498,8 +484,8 @@ rm -rf ~/.sirchmunk
 ```bash
 # Clone and install
 git clone https://github.com/modelscope/sirchmunk.git
-cd sirchmunk/src/sirchmunk_mcp
-pip install -e ".[dev]"
+cd sirchmunk
+pip install -e ".[mcp]"
 ```
 
 ---
@@ -522,7 +508,7 @@ pip install -e ".[dev]"
 
 ## License
 
-Apache License 2.0 - see [LICENSE](LICENSE)
+Apache License 2.0 - see [LICENSE](../../LICENSE)
 
 ## Support
 

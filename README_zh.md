@@ -138,7 +138,7 @@
 
 * 🚀 **2026.2.5**: 发布 **v0.0.2** — MCP 支持、CLI 命令行 & 知识持久化！
   - **MCP 集成**：完整支持 [Model Context Protocol](https://modelcontextprotocol.io)，与 Claude Desktop 和 Cursor IDE 无缝协作。
-  - **CLI 命令行**：全新 `sirchmunk` 命令行工具，支持 `init`、`config`、`serve` 和 `search` 命令。
+  - **CLI 命令行**：全新 `sirchmunk` 命令行工具，支持 `init`、`serve`、`search`、`web` 和 `mcp` 命令。
   - **KnowledgeCluster 持久化**：基于 DuckDB 存储，支持 Parquet 导出，高效管理知识聚类。
   - **知识复用**：基于语义相似度的知识聚类检索，通过 embedding 向量加速搜索。
 
@@ -226,21 +226,8 @@ uv pip install "sirchmunk[web]"
 # 使用默认设置初始化 Sirchmunk，默认工作路径为 `~/.sirchmunk/`
 sirchmunk init
 
-# 初始化并构建 WebUI 前端（需要 Node.js 18+）
-sirchmunk init --ui
-
 # 或者，也可以使用自定义工作路径初始化
 sirchmunk init --work-path /path/to/workspace
-```
-
-#### 配置
-
-```bash
-# 显示当前配置
-sirchmunk config
-
-# 如需要，可重新生成配置文件 (默认配置文件路径，~/.sirchmunk/.env)
-sirchmunk config --generate
 ```
 
 #### 启动服务器
@@ -248,12 +235,6 @@ sirchmunk config --generate
 ```bash
 # 仅启动后端 API 服务器
 sirchmunk serve
-
-# 单端口模式：同时提供 API 和 WebUI（需先执行 sirchmunk init --ui）
-sirchmunk serve --ui
-
-# 开发模式：后端 + Next.js 开发服务器，支持热重载
-sirchmunk serve --ui --dev
 
 # 自定义主机和端口
 sirchmunk serve --host 0.0.0.0 --port 8000
@@ -282,13 +263,14 @@ sirchmunk search "查询" --api --api-url http://localhost:8584
 
 | 命令 | 说明 |
 |------|------|
-| `sirchmunk init` | 初始化工作目录和配置 |
-| `sirchmunk init --ui` | 初始化并构建 WebUI 前端 |
-| `sirchmunk config` | 显示或生成配置 |
+| `sirchmunk init` | 初始化工作目录、.env 及 MCP 配置 |
 | `sirchmunk serve` | 仅启动后端 API 服务器 |
-| `sirchmunk serve --ui` | 单端口模式，内嵌 WebUI |
-| `sirchmunk serve --ui --dev` | 开发模式，Next.js 热重载 |
 | `sirchmunk search` | 执行搜索查询 |
+| `sirchmunk web init` | 构建 WebUI 前端（需要 Node.js 18+） |
+| `sirchmunk web serve` | 启动 API + WebUI（单端口） |
+| `sirchmunk web serve --dev` | 开发模式，Next.js 热重载 |
+| `sirchmunk mcp serve` | 启动 MCP 服务器（stdio/HTTP） |
+| `sirchmunk mcp version` | 显示 MCP 版本信息 |
 | `sirchmunk version` | 显示版本信息 |
 
 ---
@@ -300,17 +282,16 @@ Sirchmunk 提供 [Model Context Protocol (MCP)](https://modelcontextprotocol.io)
 ### 快速开始
 
 ```bash
-# 安装 MCP 包
-pip install sirchmunk-mcp
+# 安装（含 MCP 支持）
+pip install sirchmunk[mcp]
 
-# 初始化和配置
-sirchmunk-mcp init
-sirchmunk-mcp config --generate
+# 初始化（生成 .env 和 mcp_config.json）
+sirchmunk init
 
-# 编辑 ~/.sirchmunk/.mcp_env 配置 LLM API Key
+# 编辑 ~/.sirchmunk/.env 配置 LLM API Key
 
 # 使用 MCP Inspector 测试
-npx @modelcontextprotocol/inspector sirchmunk-mcp serve
+npx @modelcontextprotocol/inspector sirchmunk mcp serve
 ```
 
 ### 特性
@@ -342,11 +323,11 @@ Web UI 专为快速、透明的工作流设计：对话、知识分析、系统�
 一次构建前端，随后通过单端口同时提供 API 和 WebUI — 运行时无需 Node.js。
 
 ```bash
-# 初始化并构建 WebUI（构建时需要 Node.js 18+）
-sirchmunk init --ui
+# 构建 WebUI 前端（构建时需要 Node.js 18+）
+sirchmunk web init
 
 # 启动含内嵌 WebUI 的服务器
-sirchmunk serve --ui
+sirchmunk web serve
 ```
 
 **访问地址：** http://localhost:8584（API + WebUI 同端口）
@@ -357,7 +338,7 @@ sirchmunk serve --ui
 
 ```bash
 # 启动后端 + Next.js 开发服务器
-sirchmunk serve --ui --dev
+sirchmunk web serve --dev
 ```
 
 **访问地址：**
@@ -423,7 +404,7 @@ python scripts/stop_web.py
 
 ## 🔗 HTTP 客户端访问（Search API）
 
-服务器启动后（`sirchmunk serve` 或 `sirchmunk serve --ui`），Search API 可通过任何 HTTP 客户端访问。
+服务器启动后（`sirchmunk serve` 或 `sirchmunk web serve`），Search API 可通过任何 HTTP 客户端访问。
 
 <details>
 <summary><b>API 端点</b></summary>

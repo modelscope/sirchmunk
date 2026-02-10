@@ -10,13 +10,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from sirchmunk.base import BaseSearch
-
-logger = logging.getLogger(__name__)
-
-# Suppress noisy pypdf warnings about malformed PDF cross-references.
-# These are emitted by pypdf._reader via logging.warning() and pollute output
-# when reading certain PDFs (e.g. "Ignoring wrong pointing object ...").
-logging.getLogger("pypdf._reader").setLevel(logging.ERROR)
 from sirchmunk.learnings.knowledge_base import KnowledgeBase
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import (
@@ -32,6 +25,7 @@ from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME,
 from sirchmunk.utils.deps import check_dependencies
 from sirchmunk.utils.file_utils import get_fast_hash
 from sirchmunk.utils import create_logger, LogCallback
+from loguru import logger as _loguru_logger
 from sirchmunk.utils.install_rga import install_rga
 from sirchmunk.utils.utils import (
     KeywordValidation,
@@ -46,12 +40,22 @@ class AgenticSearch(BaseSearch):
         self,
         llm: Optional[OpenAIChat] = None,
         work_path: Optional[Union[str, Path]] = None,
+        search_paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
         verbose: bool = False,
         log_callback: LogCallback = None,
         reuse_knowledge: bool = True,
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        # Normalise and store default search paths
+        if search_paths is not None:
+            if isinstance(search_paths, (str, Path)):
+                self.search_paths: Optional[List[str]] = [str(Path(search_paths).expanduser().resolve())]
+            else:
+                self.search_paths = [str(Path(p).expanduser().resolve()) for p in search_paths]
+        else:
+            self.search_paths = None
 
         work_path = work_path or SIRCHMUNK_WORK_PATH
         # Ensure path is expanded (handle ~ and environment variables)
@@ -101,11 +105,11 @@ class AgenticSearch(BaseSearch):
                 self.embedding_client = EmbeddingUtil(
                     cache_dir=str(self.work_path / ".cache" / "models")
                 )
-                logger.debug(
+                _loguru_logger.debug(
                     f"Embedding client initialized: {self.embedding_client.get_model_info()}"
                 )
             except Exception as e:
-                logger.warning(
+                _loguru_logger.warning(
                     f"Failed to initialize embedding client: {e}. Cluster reuse disabled."
                 )
                 self.embedding_client = None
@@ -113,6 +117,10 @@ class AgenticSearch(BaseSearch):
         if not check_dependencies():
             print("Installing rga (ripgrep-all) and rg (ripgrep)...", flush=True)
             install_rga()
+
+        # Suppress noisy pypdf warnings about malformed PDF cross-references.
+        # pypdf._reader emits logging.warning() for "Ignoring wrong pointing object".
+        logging.getLogger("pypdf._reader").setLevel(logging.ERROR)
 
         # ---- Agentic (ReAct) components (lazy-initialised on first use) ----
         self._tool_registry = None
@@ -124,6 +132,28 @@ class AgenticSearch(BaseSearch):
         self.spec_path.mkdir(parents=True, exist_ok=True)
         self._spec_lock = asyncio.Lock()  # guards concurrent spec writes
     
+    def _resolve_search_paths(
+        self,
+        search_paths: Optional[Union[str, Path, List[str], List[Path]]],
+    ) -> Union[str, Path, List[str], List[Path]]:
+        """Resolve search_paths with fallback chain: arg > self.search_paths > cwd.
+
+        Args:
+            search_paths: Caller-provided paths (may be None).
+
+        Returns:
+            Non-None search paths (original type preserved when provided).
+        """
+        if search_paths is not None:
+            return search_paths
+        if self.search_paths is not None:
+            return self.search_paths
+        cwd = str(Path.cwd())
+        _loguru_logger.info(
+            f"[search_paths] No search_paths provided; using current working directory: {cwd}"
+        )
+        return [cwd]
+
     def _load_historical_knowledge(self):
         """Load historical knowledge clusters from local cache"""
         try:
@@ -590,266 +620,6 @@ class AgenticSearch(BaseSearch):
 
         return results
 
-    async def search(
-        self,
-        query: str,
-        search_paths: Union[str, Path, List[str], List[Path]],
-        *,
-        mode: Literal["DEEP", "FILENAME_ONLY"] = "DEEP",
-        images: Optional[list] = None,
-        max_depth: Optional[int] = 5,
-        top_k_files: Optional[int] = 3,
-        keyword_levels: Optional[int] = 3,
-        include: Optional[List[str]] = None,
-        exclude: Optional[List[str]] = None,
-        verbose: Optional[bool] = True,
-        grep_timeout: Optional[float] = 60.0,
-        return_cluster: Optional[bool] = False,
-    ) -> Union[str, List[Dict[str, Any]], KnowledgeCluster]:
-        """
-        Perform intelligent search with multi-level keyword extraction.
-
-        Args:
-            query: Search query string
-            search_paths: Paths to search in
-            mode: Search mode (DEEP/FILENAME_ONLY), default is DEEP
-            images: Optional image inputs
-            max_depth: Maximum directory depth to search
-            top_k_files: Number of top files to grep-retrieve
-            keyword_levels: Number of keyword granularity levels (default: 3)
-                          - Higher values provide more fallback options
-                          - Recommended: 3-5 levels
-            include: File patterns to include
-            exclude: File patterns to exclude
-            verbose: Enable verbose logging
-            grep_timeout: Timeout for grep operations
-            return_cluster: Whether to return the full knowledge cluster. Ignore if mode is `FILENAME_ONLY`.
-
-        Mode behaviors:
-            - In FILENAME_ONLY mode, performs fast filename search without LLM involvement. Returns list of matching files.
-               Format: {'filename': 'Attention_Is_All_You_Need.pdf', 'match_score': 0.8, 'matched_pattern': '.*Attention.*', 'path': '/path/to/Attention_Is_All_You_Need.pdf', 'type': 'filename_match'}
-
-            +--------------+------------------+-----------------------+------------------------+
-            | Feature      | FILENAME_ONLY    | FAST (To be designed) | DEEP (Current)         |
-            +--------------+------------------+-----------------------+------------------------+
-            | Speed        | Very Fast (<1s)  | Fast (<5s)           | Slow (5-30s)          |
-            | LLM Calls    | 0 times          | 1-2 times             | 4-5 times              |
-            | Return Type  | List[Dict]       | str / Cluster         | str / Cluster          |
-            | Use Case     | File Location    | Rapid Content Search  | Deep Knowledge Extract |
-            +--------------+------------------+-----------------------+------------------------+
-
-        Returns:
-            Search result summary string, or KnowledgeCluster if return_cluster is True, or List[Dict[str, Any]] for FILENAME_ONLY mode.
-        """
-        # Handle FILENAME_ONLY mode: fast filename search without LLM
-        if mode == "FILENAME_ONLY":
-            filename_results: List[Dict[str, Any]] = await self._search_by_filename(
-                query=query,
-                search_paths=search_paths,
-                max_depth=max_depth,
-                include=include,
-                exclude=exclude,
-                grep_timeout=grep_timeout,
-                top_k=top_k_files,
-            )
-
-            if not filename_results:
-                error_msg = f"No files found matching query: '{query}'"
-                await self._logger.warning(error_msg)
-                return None if return_cluster else error_msg
-
-            await self._logger.success(f"Retrieved {len(filename_results)} matching files")
-
-            return filename_results
-
-        # Try to reuse existing cluster based on semantic similarity
-        reused_result = await self._try_reuse_cluster(query, return_cluster=return_cluster)
-        if reused_result:
-            return reused_result
-
-        # Build request
-        text_items: List[ContentItem] = [ContentItem(type="text", text=query)]
-        image_items: List[ContentItem] = []
-        if images is not None and len(images) > 0:
-            # TODO: to be implemented
-            await self._logger.warning("Image search is not yet implemented.")
-            image_items = [
-                ContentItem(
-                    type="image_url",
-                    image_url=ImageURL(url=image_url),
-                )
-                for image_url in images
-            ]
-
-        request: Request = Request(
-            messages=[
-                Message(
-                    role="user",
-                    content=text_items + image_items,
-                ),
-            ],
-        )
-
-        # Extract multi-level keywords in one LLM call
-        await self._logger.info(f"Extracting {keyword_levels}-level query keywords.")
-
-        # Generate dynamic prompt based on keyword_levels
-        dynamic_prompt = generate_keyword_extraction_prompt(num_levels=keyword_levels)
-        keyword_extraction_prompt = dynamic_prompt.format(user_input=request.get_user_input())
-
-        resp_keywords_response = await self.llm.achat(
-            messages=[{"role": "user", "content": keyword_extraction_prompt}],
-            stream=False,
-        )
-        resp_keywords: str = resp_keywords_response.content
-        self.llm_usages.append(resp_keywords_response.usage)
-        
-        await self._logger.success(" ✓", flush=True)
-
-        # Parse N sets of keywords
-        keyword_sets: List[Dict[str, float]] = self._extract_and_validate_multi_level_keywords(
-            resp_keywords,
-            num_levels=keyword_levels
-        )
-
-        # Ensure we have keyword_levels sets (even if some are empty)
-        while len(keyword_sets) < keyword_levels:
-            keyword_sets.append({})
-
-        # Log all extracted keyword sets
-        for level_idx, keywords in enumerate(keyword_sets, start=1):
-            specificity = "General" if level_idx == 1 else "Specific" if level_idx == keyword_levels else f"Level {level_idx}"
-            await self._logger.info(f"Level {level_idx} ({specificity}) keywords: {keywords}")
-
-        # Try each keyword set in order (from general to specific) until we get results
-        # Using priority hit principle: stop as soon as we find results
-        grep_results: List[Dict[str, Any]] = []
-        query_keywords: Dict[str, float] = {}
-
-        for level_idx, keywords in enumerate(keyword_sets, start=1):
-            if not keywords:
-                await self._logger.warning(f"Level {level_idx} keywords set is empty, skipping...")
-                continue
-
-            specificity = "General" if level_idx == 1 else "Specific" if level_idx == keyword_levels else f"Level {level_idx}"
-            await self._logger.info(f"Searching with Level {level_idx} ({specificity}) keywords.")
-
-            # Perform grep search with current keyword set
-            temp_grep_results: List[Dict[str, Any]] = await self.grep_retriever.retrieve(
-                terms=list(keywords.keys()),
-                path=search_paths,
-                logic="or",
-                case_sensitive=False,
-                whole_word=False,
-                literal=False,
-                regex=True,
-                max_depth=max_depth,
-                include=None,
-                exclude=["*.pyc", "*.log"],
-                file_type=None,
-                invert_match=False,
-                count_only=False,
-                line_number=True,
-                with_filename=True,
-                rank=True,
-                rga_no_cache=False,
-                rga_cache_max_blob_len=10000000,
-                rga_cache_path=None,
-                timeout=grep_timeout,
-            )
-
-            # Merge and process results
-            temp_grep_results = self.grep_retriever.merge_results(temp_grep_results)
-            temp_grep_results = self.process_grep_results(
-                results=temp_grep_results, keywords_with_idf=keywords
-            )
-
-            # Check if we found results
-            if len(temp_grep_results) > 0:
-                await self._logger.success(f" ✓ (found {len(temp_grep_results)} files)", flush=True)
-                grep_results = temp_grep_results
-                query_keywords = keywords
-                break
-            else:
-                await self._logger.warning(" ✗ (no results, trying next level)", flush=True)
-
-        # If still no results after all attempts
-        if len(grep_results) == 0:
-            await self._logger.error(f"All {keyword_levels} keyword granularity levels failed to find results")
-
-        if verbose:
-            tmp_sep = "\n"
-            file_list = [str(r['path']) for r in grep_results[:top_k_files]]
-            await self._logger.info(f"Found {len(grep_results)} files, top {len(file_list)}:\n{tmp_sep.join(file_list)}")
-
-        if len(grep_results) == 0:
-            error_msg = f"No relevant information found for the query: {query}"
-            return None if return_cluster else error_msg
-
-        # Build knowledge cluster
-        await self._logger.info("Building knowledge cluster...")
-        cluster: KnowledgeCluster = await self.knowledge_base.build(
-            request=request,
-            retrieved_infos=grep_results,
-            keywords=query_keywords,
-            top_k_files=top_k_files,
-            top_k_snippets=5,
-            verbose=verbose,
-        )
-
-        self.llm_usages.extend(self.knowledge_base.llm_usages)
-        
-        await self._logger.success(" ✓", flush=True)
-
-        if cluster is None:
-            error_msg = f"No relevant information found for the query: {query}"
-            return None if return_cluster else error_msg
-
-        if self.verbose:
-            await self._logger.info(json.dumps(cluster.to_dict(), ensure_ascii=False, indent=2))
-
-        sep: str = "\n"
-        cluster_text_content: str = (
-            f"{cluster.name}\n\n"
-            f"{sep.join(cluster.description)}\n\n"
-            f"{cluster.content if isinstance(cluster.content, str) else sep.join(cluster.content)}"
-        )
-
-        result_sum_prompt: str = SEARCH_RESULT_SUMMARY.format(
-            user_input=request.get_user_input(),
-            text_content=cluster_text_content,
-        )
-
-        await self._logger.info("Generating search result summary...")
-        search_result_response = await self.llm.achat(
-            messages=[{"role": "user", "content": result_sum_prompt}],
-            stream=True,
-        )
-        llm_response: str = search_result_response.content
-        self.llm_usages.append(search_result_response.usage)
-        await self._logger.success(" ✓", flush=True)
-        await self._logger.success("Search completed successfully!")
-
-        # Parse LLM response to extract summary and save decision
-        search_result, should_save = self._parse_summary_response(llm_response)
-
-        # Add search results (file paths) to the cluster
-        if grep_results:
-            cluster.search_results.append(search_result)
-        
-        # Add current query to queries list with FIFO strategy
-        self._add_query_to_cluster(cluster, query)
-
-        # Save cluster based on LLM's quality evaluation
-        if should_save:
-            await self._save_cluster_with_embedding(cluster)
-        else:
-            await self._logger.info(
-                "Cluster not saved - LLM determined insufficient quality or relevance"
-            )
-
-        return cluster if return_cluster else search_result
-
     # ------------------------------------------------------------------
     # Agentic (ReAct) infrastructure — lazy initialisation
     # ------------------------------------------------------------------
@@ -921,25 +691,38 @@ class AgenticSearch(BaseSearch):
         return registry
 
     # ------------------------------------------------------------------
-    # Deep search — parallel multi-path retrieval + ReAct refinement
+    # Unified search — DEEP (parallel multi-path) or FILENAME_ONLY
     # ------------------------------------------------------------------
 
-    async def search_deep(
+    async def search(
         self,
         query: str,
-        search_paths: Union[str, Path, List[str], List[Path]],
+        search_paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
         *,
+        mode: Literal["DEEP", "FILENAME_ONLY"] = "DEEP",
         max_loops: int = 10,
         max_token_budget: int = 64000,
+        max_depth: Optional[int] = 5,
+        top_k_files: int = 3,
         enable_dir_scan: bool = True,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
         return_context: bool = False,
         return_cluster: bool = False,
-        top_k_files: int = 3,
         spec_stale_hours: float = 72.0,
-    ) -> Union[str, Tuple[str, SearchContext], KnowledgeCluster]:
-        """Perform multi-path parallel retrieval with optional ReAct refinement.
+    ) -> Union[str, Tuple[str, SearchContext], List[Dict[str, Any]], KnowledgeCluster]:
+        """Perform intelligent search with multi-mode support.
 
-        Architecture (phases execute as parallel as possible):
+        Modes:
+            +--------------+-------------------+-------------------------------------------+
+            | Mode         | Speed / LLM Calls | Description                               |
+            +--------------+-------------------+-------------------------------------------+
+            | FILENAME_ONLY| Very Fast / 0     | Pattern-based file discovery, no LLM.     |
+            | DEEP         | 5-30s / 4-6       | Parallel multi-path retrieval + ReAct     |
+            |              |                   | refinement with Monte-Carlo evidence.     |
+            +--------------+-------------------+-------------------------------------------+
+
+        DEEP architecture (phases execute as parallel as possible):
 
         ┌──────────────────────────────────────────────────────────┐
         │ Phase 0  Cluster reuse check (instant, short-circuit)    │
@@ -969,19 +752,48 @@ class AgenticSearch(BaseSearch):
 
         Args:
             query: User's search query.
-            search_paths: Directories / files to search.
-            max_loops: Maximum ReAct iterations (default: 10).
-            max_token_budget: LLM token budget per session (default: 64000).
-            enable_dir_scan: Whether to enable directory scanning.
-            return_context: If True, return (answer, SearchContext) tuple.
-            return_cluster: If True, return the full KnowledgeCluster.
+            search_paths: Directories / files to search.  Falls back to
+                ``self.search_paths`` or the current working directory.
+            mode: Search mode — ``"DEEP"`` or ``"FILENAME_ONLY"``.
+            max_loops: Maximum ReAct iterations (DEEP mode, default: 10).
+            max_token_budget: LLM token budget (DEEP mode, default: 64000).
+            max_depth: Maximum directory depth (FILENAME_ONLY mode, default: 5).
             top_k_files: Max files for evidence extraction (default: 3).
+            enable_dir_scan: Enable directory scanning tool (DEEP mode).
+            include: File patterns to include (glob, FILENAME_ONLY mode).
+            exclude: File patterns to exclude (glob, FILENAME_ONLY mode).
+            return_context: If True, return ``(answer, SearchContext)`` tuple.
+            return_cluster: If True, return the full KnowledgeCluster.
             spec_stale_hours: Hours before spec cache is stale (default: 72).
 
         Returns:
-            Final answer string, (answer, SearchContext) if return_context,
-            or KnowledgeCluster if return_cluster.
+            - ``str``: Answer summary (default).
+            - ``(str, SearchContext)``: If *return_context*.
+            - ``KnowledgeCluster``: If *return_cluster*.
+            - ``List[Dict]``: File matches in FILENAME_ONLY mode.
         """
+        # Resolve search_paths: argument > self.search_paths > cwd
+        search_paths = self._resolve_search_paths(search_paths)
+
+        # ---- FILENAME_ONLY: fast pattern-based filename search, no LLM ----
+        if mode == "FILENAME_ONLY":
+            filename_results: List[Dict[str, Any]] = await self._search_by_filename(
+                query=query,
+                search_paths=search_paths,
+                max_depth=max_depth,
+                include=include,
+                exclude=exclude,
+                top_k=top_k_files,
+            )
+            if not filename_results:
+                error_msg = f"No files found matching query: '{query}'"
+                await self._logger.warning(error_msg)
+                return None if return_cluster else error_msg
+            await self._logger.success(f"Retrieved {len(filename_results)} matching files")
+            return filename_results
+
+        # ---- DEEP mode: parallel multi-path retrieval ----
+
         # Normalize search_paths
         if isinstance(search_paths, (str, Path)):
             search_paths = [str(search_paths)]
@@ -1006,7 +818,7 @@ class AgenticSearch(BaseSearch):
                 return reused, context
             return reused
 
-        await self._logger.info(f"[search_deep] Starting multi-path retrieval for: '{query[:80]}'")
+        await self._logger.info(f"[search] Starting multi-path retrieval for: '{query[:80]}'")
 
         # ==============================================================
         # Phase 1: Parallel probing — all four paths fire concurrently
@@ -1153,9 +965,9 @@ class AgenticSearch(BaseSearch):
             self._add_query_to_cluster(cluster, query)
             asyncio.ensure_future(self._save_cluster_with_embedding(cluster))
 
-        asyncio.ensure_future(self._save_spec_context(search_paths, context))
+        asyncio.ensure_future(self._save_spec_context(search_paths, context, scan_result=scan_result))
 
-        await self._logger.success(f"[search_deep] Complete: {context.summary()}")
+        await self._logger.success(f"[search] Complete: {context.summary()}")
 
         if return_cluster and cluster:
             return cluster
@@ -1544,14 +1356,33 @@ class AgenticSearch(BaseSearch):
                 # Skip if stale
                 cached_at = datetime.fromisoformat(data.get("cached_at", "2000-01-01"))
                 if (now - cached_at).total_seconds() > stale_seconds:
-                    logger.debug(f"[SpecCache] Stale cache for {sp} (>{stale_hours}h), skipping")
+                    await self._logger.debug(f"[SpecCache] Stale cache for {sp} (>{stale_hours}h), skipping")
                     continue
 
                 summary = data.get("summary", "")
-                if summary:
-                    parts.append(f"[{sp}]\n{summary}")
+                # Append file metadata (title + preview) for richer context
+                file_meta = data.get("file_metadata", [])
+                meta_lines: List[str] = []
+                for fm in file_meta:
+                    title = fm.get("title", "")
+                    preview = fm.get("preview", "")
+                    kw = fm.get("keywords", [])
+                    line = f"  - {fm.get('filename', '?')}"
+                    if title:
+                        line += f"  [title: {title}]"
+                    if kw:
+                        line += f"  [keywords: {', '.join(kw[:5])}]"
+                    if preview:
+                        line += f"\n    preview: {preview[:200]}"
+                    meta_lines.append(line)
+
+                combined = summary or ""
+                if meta_lines:
+                    combined += "\nKnown files:\n" + "\n".join(meta_lines)
+                if combined:
+                    parts.append(f"[{sp}]\n{combined}")
             except Exception as exc:
-                logger.debug(f"[SpecCache] Failed to load {spec_file}: {exc}")
+                await self._logger.debug(f"[SpecCache] Failed to load {spec_file}: {exc}")
 
         return "\n\n".join(parts)
 
@@ -1559,17 +1390,26 @@ class AgenticSearch(BaseSearch):
         self,
         search_paths: List[str],
         context: SearchContext,
+        scan_result=None,
     ) -> None:
         """Persist spec-path context for each search path.
 
         Saves a JSON file per search-path containing: directory stats,
-        files discovered, searches performed, and a short summary.
+        files discovered, dir_scan file metadata (title, preview, keywords),
+        searches performed, and a short summary.
         Uses ``self._spec_lock`` to prevent concurrent-write corruption.
 
         Args:
             search_paths: Normalised list of path strings.
             context: Completed SearchContext from a ReAct session.
+            scan_result: Optional ScanResult from DirectoryScanner.scan().
         """
+        # Build a path→FileCandidate lookup from scan_result
+        scan_candidates: Dict[str, Any] = {}
+        if scan_result is not None:
+            for c in getattr(scan_result, "candidates", []):
+                scan_candidates[c.path] = c
+
         async with self._spec_lock:
             for sp in search_paths:
                 spec_file = self._spec_file(sp)
@@ -1590,6 +1430,37 @@ class AgenticSearch(BaseSearch):
                         for fp in files_in_path[:20]:
                             summary_lines.append(f"  - {fp}")
 
+                    # Collect dir_scan metadata for files under this search path
+                    file_metadata: List[Dict[str, Any]] = []
+                    for cpath, cand in scan_candidates.items():
+                        if cpath.startswith(sp):
+                            entry: Dict[str, Any] = {
+                                "path": cand.path,
+                                "filename": cand.filename,
+                                "extension": cand.extension,
+                                "size_bytes": cand.size_bytes,
+                                "mime_type": cand.mime_type,
+                            }
+                            if cand.title:
+                                entry["title"] = cand.title
+                            if cand.author:
+                                entry["author"] = cand.author
+                            if cand.page_count:
+                                entry["page_count"] = cand.page_count
+                            if cand.keywords:
+                                entry["keywords"] = cand.keywords
+                            if cand.preview:
+                                entry["preview"] = cand.preview[:500]
+                            if cand.encoding:
+                                entry["encoding"] = cand.encoding
+                            if cand.line_count:
+                                entry["line_count"] = cand.line_count
+                            if cand.relevance:
+                                entry["relevance"] = cand.relevance
+                            if cand.reason:
+                                entry["reason"] = cand.reason
+                            file_metadata.append(entry)
+
                     data = {
                         "search_path": sp,
                         "cached_at": datetime.now().isoformat(),
@@ -1598,6 +1469,7 @@ class AgenticSearch(BaseSearch):
                         "files_read": files_in_path,
                         "search_history": searches,
                         "summary": "\n".join(summary_lines),
+                        "file_metadata": file_metadata,
                         "retrieval_logs": [
                             log.to_dict() for log in context.retrieval_logs
                         ],
@@ -1611,7 +1483,10 @@ class AgenticSearch(BaseSearch):
                     )
                     tmp_path.replace(spec_file)
 
-                    logger.debug(f"[SpecCache] Saved spec for {sp} -> {spec_file.name}")
+                    await self._logger.debug(
+                        f"[SpecCache] Saved spec for {sp} -> {spec_file.name} "
+                        f"({len(file_metadata)} file entries)"
+                    )
 
                 except Exception as exc:
-                    logger.warning(f"[SpecCache] Failed to save spec for {sp}: {exc}")
+                    await self._logger.warning(f"[SpecCache] Failed to save spec for {sp}: {exc}")

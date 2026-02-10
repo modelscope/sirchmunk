@@ -8,7 +8,8 @@ code and document search capabilities as MCP tools.
 Uses FastMCP for simplified MCP server implementation.
 """
 
-__version__ = "0.1.0"
+from sirchmunk.version import __version__
+
 __author__ = "ModelScope Contributors"
 
 from .server import create_server, run_stdio_server, run_http_server

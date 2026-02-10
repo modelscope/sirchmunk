@@ -28,10 +28,9 @@ router = APIRouter(prefix="/api/v1", tags=["search"])
 class SearchRequest(BaseModel):
     """Request model for search endpoint."""
     query: str = Field(..., description="Search query or question")
-    search_paths: List[str] = Field(
-        ...,
-        min_length=1,
-        description="Paths to search (directories or files). At least one path is required."
+    search_paths: Optional[List[str]] = Field(
+        default=None,
+        description="Paths to search (directories or files). Falls back to configured default or cwd."
     )
     mode: Literal["DEEP", "FILENAME_ONLY"] = Field(
         default="DEEP",
@@ -45,9 +44,17 @@ class SearchRequest(BaseModel):
         default=None,
         description="Number of top files to return"
     )
-    keyword_levels: Optional[int] = Field(
+    max_loops: Optional[int] = Field(
         default=None,
-        description="Number of keyword granularity levels"
+        description="Maximum ReAct iterations (DEEP mode)"
+    )
+    max_token_budget: Optional[int] = Field(
+        default=None,
+        description="LLM token budget (DEEP mode)"
+    )
+    enable_dir_scan: bool = Field(
+        default=True,
+        description="Enable directory scanning (DEEP mode)"
     )
     include_patterns: Optional[List[str]] = Field(
         default=None,
@@ -147,9 +154,10 @@ async def execute_search(request: SearchRequest) -> SearchResponse:
         
         # Build search kwargs
         search_kwargs = {
-            "input": request.query,
+            "query": request.query,
             "search_paths": search_paths,
             "mode": request.mode,
+            "enable_dir_scan": request.enable_dir_scan,
             "return_cluster": request.return_cluster,
         }
         
@@ -158,8 +166,10 @@ async def execute_search(request: SearchRequest) -> SearchResponse:
             search_kwargs["max_depth"] = request.max_depth
         if request.top_k_files is not None:
             search_kwargs["top_k_files"] = request.top_k_files
-        if request.keyword_levels is not None:
-            search_kwargs["keyword_levels"] = request.keyword_levels
+        if request.max_loops is not None:
+            search_kwargs["max_loops"] = request.max_loops
+        if request.max_token_budget is not None:
+            search_kwargs["max_token_budget"] = request.max_token_budget
         if request.include_patterns:
             search_kwargs["include"] = request.include_patterns
         if request.exclude_patterns:

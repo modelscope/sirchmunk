@@ -1,18 +1,10 @@
 {
   "mcpServers": {
     "sirchmunk": {
-      "command": "sirchmunk-mcp",
-      "args": ["serve"],
+      "command": "sirchmunk",
+      "args": ["mcp", "serve"],
       "env": {
-        "LLM_BASE_URL": "https://api.openai.com/v1",
-        "LLM_API_KEY": "your-api-key",
-        "LLM_MODEL_NAME": "gpt-5.2",
-        "SIRCHMUNK_WORK_PATH": "~/.sirchmunk",
-        "SIRCHMUNK_VERBOSE": "false",
-        "SIRCHMUNK_ENABLE_CLUSTER_REUSE": "true",
-        "CLUSTER_SIM_THRESHOLD": "0.85",
-        "CLUSTER_SIM_TOP_K": "3",
-        "MCP_LOG_LEVEL": "INFO"
+        "SIRCHMUNK_SEARCH_PATHS": ""
       }
     }
   }

@@ -2,7 +2,7 @@
 
 // When NEXT_BUILD_STATIC=true, produce a fully static export (HTML/CSS/JS)
 // that can be served by any static file server (including FastAPI StaticFiles).
-// This is used by `sirchmunk init --ui` and `sirchmunk serve --ui`.
+// This is used by `sirchmunk web init` and `sirchmunk web serve`.
 const isStaticExport = process.env.NEXT_BUILD_STATIC === "true";
 
 const nextConfig = {

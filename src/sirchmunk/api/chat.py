@@ -580,9 +580,7 @@ async def _chat_rag(
         search_result = await search_engine.search(
             query=message,
             search_paths=search_paths,
-            max_depth=5,
             top_k_files=3,
-            verbose=True
         )
 
         # Calculate the llm usage
@@ -733,9 +731,7 @@ async def _chat_rag_web_search(
         rag_result = await search_engine.search(
             query=message,
             search_paths=search_paths,
-            max_depth=5,
             top_k_files=3,
-            verbose=True
         )
 
         for rag_usage in search_engine.llm_usages:

@@ -1,0 +1,4 @@
+mcp>=1.15.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+aiofiles>=23.0.0

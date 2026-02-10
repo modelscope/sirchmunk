@@ -42,46 +42,51 @@ def create_server(config: Config) -> FastMCP:
     )
     
     logger.info(
-        f"Creating MCP server: {config.mcp.server_name} v{config.mcp.server_version}"
+        f"Creating MCP server: {config.mcp.server_name}"
     )
     
     # Register tools using decorators
     @mcp.tool()
     async def sirchmunk_search(
         query: str,
-        search_paths: List[str],
+        search_paths: Optional[List[str]] = None,
         mode: str = "DEEP",
         max_depth: int = 5,
         top_k_files: int = 3,
-        keyword_levels: int = 3,
+        max_loops: int = 10,
+        max_token_budget: int = 64000,
+        enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         return_cluster: bool = False,
     ) -> str:
         """Intelligent code and document search with multi-mode support.
-        
+
         DEEP mode provides comprehensive knowledge extraction with full context analysis.
         FILENAME_ONLY mode performs fast filename pattern matching without content search.
-        
+
         Args:
             query: Search query or question (e.g., 'How does authentication work?')
-            search_paths: Paths to search in (files or directories)
+            search_paths: Paths to search in (files or directories).
+                Optional — falls back to configured SIRCHMUNK_SEARCH_PATHS or cwd.
             mode: Search mode - DEEP (comprehensive, 10-30s) or FILENAME_ONLY (fast, <1s)
             max_depth: Maximum directory depth to search (1-20, default: 5)
             top_k_files: Number of top files to return (1-20, default: 3)
-            keyword_levels: Keyword granularity levels for DEEP mode (1-5, default: 3)
+            max_loops: Maximum ReAct iterations for DEEP mode (1-20, default: 10)
+            max_token_budget: Token budget for DEEP mode (default: 64000)
+            enable_dir_scan: Enable directory scanning tool (DEEP mode, default: True)
             include: File patterns to include (glob, e.g., ['*.py', '*.md'])
             exclude: File patterns to exclude (glob, e.g., ['*.pyc', '*.log'])
             return_cluster: Return full KnowledgeCluster object (DEEP mode only)
-        
+
         Returns:
             Search results as formatted text
         """
         if _service is None:
             return "Error: Service not initialized"
-        
+
         logger.info(f"sirchmunk_search: mode={mode}, query='{query[:50]}...'")
-        
+
         try:
             result = await _service.searcher.search(
                 query=query,
@@ -89,74 +94,32 @@ def create_server(config: Config) -> FastMCP:
                 mode=mode,
                 max_depth=max_depth,
                 top_k_files=top_k_files,
-                keyword_levels=keyword_levels,
+                max_loops=max_loops,
+                max_token_budget=max_token_budget,
+                enable_dir_scan=enable_dir_scan,
                 include=include,
                 exclude=exclude,
                 return_cluster=return_cluster,
             )
-            
+
             if result is None:
                 return f"No results found for query: {query}"
-            
+
             if isinstance(result, str):
                 return result
-            
+
             if isinstance(result, list):
                 # FILENAME_ONLY mode returns list of file matches
                 return _format_filename_results(result, query)
-            
+
             if hasattr(result, "__str__"):
                 return str(result)
-            
+
             return str(result)
-        
+
         except Exception as e:
             logger.error(f"Search failed: {e}", exc_info=True)
             return f"Search failed: {str(e)}"
-    
-    @mcp.tool()
-    async def sirchmunk_search_deep(
-        query: str,
-        search_paths: List[str],
-        max_loops: int = 10,
-        max_token_budget: int = 64000,
-        enable_dir_scan: bool = True,
-    ) -> str:
-        """Multi-hop agentic search using a ReAct reasoning loop.
-
-        The LLM autonomously decides which tools to call (keyword search,
-        file read, knowledge cache, directory scan) across multiple
-        iterations until it has enough evidence to answer.  Best for
-        complex, multi-faceted questions that require cross-document
-        reasoning.  No pre-built index required.
-
-        Args:
-            query: Natural-language question or information need
-            search_paths: Directories to search in
-            max_loops: Maximum ReAct iterations (1-20, default: 10)
-            max_token_budget: Token budget for retrieval content (default: 64000)
-            enable_dir_scan: Enable directory scanning tool (default: True)
-
-        Returns:
-            Synthesized answer with evidence from multiple sources
-        """
-        if _service is None:
-            return "Error: Service not initialized"
-
-        logger.info(f"sirchmunk_search_deep: query='{query[:50]}...'")
-
-        try:
-            result = await _service.searcher.search_deep(
-                query=query,
-                search_paths=search_paths,
-                max_loops=max_loops,
-                max_token_budget=max_token_budget,
-                enable_dir_scan=enable_dir_scan,
-            )
-            return result if isinstance(result, str) else str(result)
-        except Exception as e:
-            logger.error(f"Deep search failed: {e}", exc_info=True)
-            return f"Deep search failed: {str(e)}"
 
     @mcp.tool()
     async def sirchmunk_scan_dir(

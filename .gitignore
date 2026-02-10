@@ -143,7 +143,9 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-src/sirchmunk_mcp/.mcp_env
+# Sirchmunk env files
+.env
+*.mcp_env
 
 # Spyder project settings
 .spyderproject
