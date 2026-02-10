@@ -102,7 +102,7 @@ class SirchmunkConfig(BaseModel):
         default_factory=lambda: Path.home() / ".sirchmunk",
         description="Working directory for Sirchmunk data"
     )
-    search_paths: Optional[list] = Field(
+    paths: Optional[list] = Field(
         default=None,
         description="Default search paths (directories or files). "
                     "Falls back to current working directory when None."
@@ -237,19 +237,19 @@ class Config(BaseModel):
         
         # Parse SIRCHMUNK_SEARCH_PATHS (supports English comma, Chinese comma,
         # or os.pathsep as delimiters)
-        raw_search_paths = os.getenv("SIRCHMUNK_SEARCH_PATHS", "").strip()
-        parsed_search_paths: Optional[list] = None
-        if raw_search_paths:
+        raw_paths = os.getenv("SIRCHMUNK_SEARCH_PATHS", "").strip()
+        parsed_paths: Optional[list] = None
+        if raw_paths:
             # Split by English comma, Chinese comma (，), or os.pathsep
             _sep_pattern = r"[,，" + re.escape(os.pathsep) + r"]"
-            parsed_search_paths = [
-                p.strip() for p in re.split(_sep_pattern, raw_search_paths) if p.strip()
+            parsed_paths = [
+                p.strip() for p in re.split(_sep_pattern, raw_paths) if p.strip()
             ] or None
 
         # Sirchmunk configuration
         sirchmunk_config = SirchmunkConfig(
             work_path=Path(os.getenv("SIRCHMUNK_WORK_PATH", str(Path.home() / ".sirchmunk"))),
-            search_paths=parsed_search_paths,
+            paths=parsed_paths,
             verbose=os.getenv("SIRCHMUNK_VERBOSE", "false").lower() == "true",
             enable_cluster_reuse=os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true",
             cluster_similarity=ClusterSimilarityConfig(

@@ -27,10 +27,10 @@ class DirScanTool(BaseTool):
     def __init__(
         self,
         scanner: DirectoryScanner,
-        search_paths: Union[str, List[str]],
+        paths: Union[str, List[str]],
     ) -> None:
         self._scanner = scanner
-        self._search_paths = search_paths if isinstance(search_paths, list) else [search_paths]
+        self._paths = paths if isinstance(paths, list) else [paths]
         self._cached_result: Optional[ScanResult] = None
 
     @property
@@ -76,7 +76,7 @@ class DirScanTool(BaseTool):
         try:
             # Cache scan results (filesystem walk is expensive)
             if self._cached_result is None:
-                self._cached_result = await self._scanner.scan(self._search_paths)
+                self._cached_result = await self._scanner.scan(self._paths)
 
             # Rank with LLM
             result = await self._scanner.rank(

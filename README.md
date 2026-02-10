@@ -194,7 +194,7 @@ async def main():
     
     result: str = await searcher.search(
         query="How does transformer attention work?",
-        search_paths=["/path/to/documents"],
+        paths=["/path/to/documents"],
     )
     
     print(result)
@@ -429,7 +429,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "How does authentication work?",
-    "search_paths": ["/path/to/project"],
+    "paths": ["/path/to/project"],
     "mode": "DEEP"
   }'
 
@@ -438,7 +438,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "config",
-    "search_paths": ["/path/to/project"],
+    "paths": ["/path/to/project"],
     "mode": "FILENAME_ONLY"
   }'
 
@@ -447,7 +447,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "database connection pooling",
-    "search_paths": ["/path/to/project/src"],
+    "paths": ["/path/to/project/src"],
     "mode": "DEEP",
     "max_depth": 10,
     "top_k_files": 20,
@@ -475,7 +475,7 @@ response = requests.post(
     "http://localhost:8584/api/v1/search",
     json={
         "query": "How does authentication work?",
-        "search_paths": ["/path/to/project"],
+        "paths": ["/path/to/project"],
         "mode": "DEEP"
     },
     timeout=300  # DEEP mode may take a while
@@ -498,7 +498,7 @@ async def search():
             "http://localhost:8584/api/v1/search",
             json={
                 "query": "find all API endpoints",
-                "search_paths": ["/path/to/project"],
+                "paths": ["/path/to/project"],
                 "mode": "DEEP"
             }
         )
@@ -519,7 +519,7 @@ const response = await fetch("http://localhost:8584/api/v1/search", {
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
     query: "How does authentication work?",
-    search_paths: ["/path/to/project"],
+    paths: ["/path/to/project"],
     mode: "DEEP"
   })
 });
@@ -538,7 +538,7 @@ if (data.success) {
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `query` | `string` | *required* | Search query or question |
-| `search_paths` | `string[]` | *required* | Directories or files to search (min 1) |
+| `paths` | `string[]` | *required* | Directories or files to search (min 1) |
 | `mode` | `string` | `"DEEP"` | `DEEP` or `FILENAME_ONLY` |
 | `max_depth` | `int` | `null` | Maximum directory depth |
 | `top_k_files` | `int` | `null` | Number of top files to return |
@@ -585,7 +585,7 @@ Simply specify the path in your search query:
 ```python
 result = await searcher.search(
     query="Your question",
-    search_paths=["/path/to/folder", "/path/to/file.pdf"]
+    paths=["/path/to/folder", "/path/to/file.pdf"]
 )
 ```
 

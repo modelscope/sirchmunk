@@ -26,7 +26,7 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
         "FILENAME_ONLY mode performs fast filename pattern matching without content search.\n\n"
         "Args:\n"
         "    query: Search query or question (e.g., 'How does authentication work?')\n"
-        "    search_paths: Paths to search in (files or directories)\n"
+        "    paths: Paths to search in (files or directories)\n"
         "    mode: Search mode - DEEP (comprehensive, 10-30s) or FILENAME_ONLY (fast, <1s)\n"
         "    max_depth: Maximum directory depth to search (1-20, default: 5)\n"
         "    top_k_files: Number of top files to return (1-20, default: 3)\n"
@@ -44,7 +44,7 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
                 "type": "string",
                 "description": "Search query or question (e.g., 'How does authentication work?')",
             },
-            "search_paths": {
+            "paths": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
@@ -190,7 +190,7 @@ async def handle_sirchmunk_search(
     """
     # Extract required arguments
     query = arguments.get("query")
-    search_paths = arguments.get("search_paths")  # Optional; falls back to configured default
+    paths = arguments.get("paths")  # Optional; falls back to configured default
     
     if not query:
         raise ValueError("Missing required argument: query")
@@ -212,7 +212,7 @@ async def handle_sirchmunk_search(
         # Perform search
         result = await service.search(
             query=query,
-            search_paths=search_paths,
+            paths=paths,
             mode=mode,
             max_depth=max_depth,
             top_k_files=top_k_files,

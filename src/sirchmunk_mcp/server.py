@@ -49,7 +49,7 @@ def create_server(config: Config) -> FastMCP:
     @mcp.tool()
     async def sirchmunk_search(
         query: str,
-        search_paths: Optional[List[str]] = None,
+        paths: Optional[List[str]] = None,
         mode: str = "DEEP",
         max_depth: int = 5,
         top_k_files: int = 3,
@@ -67,7 +67,7 @@ def create_server(config: Config) -> FastMCP:
 
         Args:
             query: Search query or question (e.g., 'How does authentication work?')
-            search_paths: Paths to search in (files or directories).
+            paths: Paths to search in (files or directories).
                 Optional — falls back to configured SIRCHMUNK_SEARCH_PATHS or cwd.
             mode: Search mode - DEEP (comprehensive, 10-30s) or FILENAME_ONLY (fast, <1s)
             max_depth: Maximum directory depth to search (1-20, default: 5)
@@ -90,7 +90,7 @@ def create_server(config: Config) -> FastMCP:
         try:
             result = await _service.searcher.search(
                 query=query,
-                search_paths=search_paths,
+                paths=paths,
                 mode=mode,
                 max_depth=max_depth,
                 top_k_files=top_k_files,
@@ -124,20 +124,20 @@ def create_server(config: Config) -> FastMCP:
     @mcp.tool()
     async def sirchmunk_scan_dir(
         query: str,
-        search_paths: List[str],
+        paths: List[str],
         max_depth: int = 8,
         max_files: int = 500,
         top_k: int = 20,
     ) -> str:
         """Scan directories to discover and rank document candidates.
 
-        Performs a fast recursive scan of search_paths to collect file
+        Performs a fast recursive scan of paths to collect file
         metadata (title, size, type, keywords, preview), then uses the
         LLM to rank the most promising candidates for the query.
 
         Args:
             query: Search query to rank files by relevance
-            search_paths: Root directories to scan
+            paths: Root directories to scan
             max_depth: Maximum recursion depth (1-20, default: 8)
             max_files: Maximum files to scan (default: 500)
             top_k: Number of top candidates for LLM ranking (default: 20)
@@ -160,7 +160,7 @@ def create_server(config: Config) -> FastMCP:
             )
             result = await scanner.scan_and_rank(
                 query=query,
-                search_paths=search_paths,
+                paths=paths,
                 top_k=top_k,
             )
 

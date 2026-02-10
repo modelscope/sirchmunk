@@ -191,7 +191,7 @@ async def main():
     
     result: str = await agent_search.search(
         query="How does transformer attention work?",
-        search_paths=["/path/to/documents"],
+        paths=["/path/to/documents"],
     )
     
     print(result)
@@ -427,7 +427,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "认证是如何工作的？",
-    "search_paths": ["/path/to/project"],
+    "paths": ["/path/to/project"],
     "mode": "DEEP"
   }'
 
@@ -436,7 +436,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "config",
-    "search_paths": ["/path/to/project"],
+    "paths": ["/path/to/project"],
     "mode": "FILENAME_ONLY"
   }'
 
@@ -445,7 +445,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "数据库连接池",
-    "search_paths": ["/path/to/project/src"],
+    "paths": ["/path/to/project/src"],
     "mode": "DEEP",
     "max_depth": 10,
     "top_k_files": 20,
@@ -473,7 +473,7 @@ response = requests.post(
     "http://localhost:8584/api/v1/search",
     json={
         "query": "认证是如何工作的？",
-        "search_paths": ["/path/to/project"],
+        "paths": ["/path/to/project"],
         "mode": "DEEP"
     },
     timeout=300  # DEEP 模式可能耗时较长
@@ -496,7 +496,7 @@ async def search():
             "http://localhost:8584/api/v1/search",
             json={
                 "query": "查找所有 API 端点",
-                "search_paths": ["/path/to/project"],
+                "paths": ["/path/to/project"],
                 "mode": "DEEP"
             }
         )
@@ -517,7 +517,7 @@ const response = await fetch("http://localhost:8584/api/v1/search", {
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
     query: "认证是如何工作的？",
-    search_paths: ["/path/to/project"],
+    paths: ["/path/to/project"],
     mode: "DEEP"
   })
 });
@@ -536,7 +536,7 @@ if (data.success) {
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `query` | `string` | *必填* | 搜索查询或问题 |
-| `search_paths` | `string[]` | *必填* | 搜索的目录或文件（至少 1 个） |
+| `paths` | `string[]` | *必填* | 搜索的目录或文件（至少 1 个） |
 | `mode` | `string` | `"DEEP"` | `DEEP` 或 `FILENAME_ONLY` |
 | `max_depth` | `int` | `null` | 最大目录深度 |
 | `top_k_files` | `int` | `null` | 返回的文件数量 |
@@ -583,7 +583,7 @@ Sirchmunk 采用 **无索引** 方法：
 ```python
 result = await search.search(
     query="Your question",
-    search_paths=["/path/to/folder", "/path/to/file.pdf"]
+    paths=["/path/to/folder", "/path/to/file.pdf"]
 )
 ```
 

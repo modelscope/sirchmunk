@@ -28,7 +28,7 @@ router = APIRouter(prefix="/api/v1", tags=["search"])
 class SearchRequest(BaseModel):
     """Request model for search endpoint."""
     query: str = Field(..., description="Search query or question")
-    search_paths: Optional[List[str]] = Field(
+    paths: Optional[List[str]] = Field(
         default=None,
         description="Paths to search (directories or files). Falls back to configured default or cwd."
     )
@@ -148,14 +148,14 @@ async def execute_search(request: SearchRequest) -> SearchResponse:
     try:
         searcher = _get_search_instance()
         
-        search_paths = request.search_paths
+        paths = request.paths
         
-        logger.info(f"Executing search: query='{request.query}', mode={request.mode}, paths={search_paths}")
+        logger.info(f"Executing search: query='{request.query}', mode={request.mode}, paths={paths}")
         
         # Build search kwargs
         search_kwargs = {
             "query": request.query,
-            "search_paths": search_paths,
+            "paths": paths,
             "mode": request.mode,
             "enable_dir_scan": request.enable_dir_scan,
             "return_cluster": request.return_cluster,

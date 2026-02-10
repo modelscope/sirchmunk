@@ -73,7 +73,7 @@ MCP Inspector is up and running at:
 Press `Ctrl+C` to stop.
 
 **How to use**:
-- Connect -> Tools -> List Tools -> `sirchmunk_search` -> Input parameters (`query` and `search_paths`) -> Run Tool
+- Connect -> Tools -> List Tools -> `sirchmunk_search` -> Input parameters (`query` and `paths`) -> Run Tool
 - Check the response for search results.
 
 ---
@@ -189,7 +189,7 @@ User: "Search for transformer attention implementation in my project"
 Claude: [Using sirchmunk_search tool]
 {
   "query": "transformer attention implementation",
-  "search_paths": ["/path/to/project"],
+  "paths": ["/path/to/project"],
   "mode": "DEEP",
   "top_k_files": 3
 }
@@ -205,7 +205,7 @@ User: "Find all test files in the project"
 Claude: [Using sirchmunk_search tool]
 {
   "query": "test",
-  "search_paths": ["/path/to/project"],
+  "paths": ["/path/to/project"],
   "mode": "FILENAME_ONLY"
 }
 
@@ -238,7 +238,7 @@ Intelligent code and document search.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `query` | string | Yes | - | Search query or question |
-| `search_paths` | array | No | configured/cwd | Paths to search in |
+| `paths` | array | No | configured/cwd | Paths to search in |
 | `mode` | string | No | "DEEP" | DEEP / FILENAME_ONLY |
 | `max_depth` | integer | No | 5 | Directory search depth |
 | `top_k_files` | integer | No | 3 | Files to return |

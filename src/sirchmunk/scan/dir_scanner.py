@@ -2,7 +2,7 @@
 """
 Recursive directory pre-scanner with LLM-driven candidate discovery.
 
-Performs a breadth-first scan of ``search_paths`` to collect comprehensive
+Performs a breadth-first scan of ``paths`` to collect comprehensive
 file metadata (title, size, type, author, page-count, keywords, content
 preview), and optionally reads full content of small files.  The LLM then
 ranks the most promising document candidates for a given query.
@@ -252,7 +252,7 @@ class DirectoryScanner:
 
     async def scan(
         self,
-        search_paths: Union[str, Path, List[str], List[Path]],
+        paths: Union[str, Path, List[str], List[Path]],
     ) -> ScanResult:
         """Phase 1: Recursively walk directories and extract file metadata.
 
@@ -261,21 +261,21 @@ class DirectoryScanner:
         Small files additionally have their full content loaded.
 
         Args:
-            search_paths: One or more root directories to scan.
+            paths: One or more root directories to scan.
 
         Returns:
             ScanResult with populated ``candidates`` list.
         """
-        if isinstance(search_paths, (str, Path)):
-            search_paths = [search_paths]
-        search_paths = [Path(p).resolve() for p in search_paths]
+        if isinstance(paths, (str, Path)):
+            paths = [paths]
+        paths = [Path(p).resolve() for p in paths]
 
         t_start = datetime.now()
         result = ScanResult()
 
         # Collect all file paths
         all_files: List[Path] = []
-        for root in search_paths:
+        for root in paths:
             if root.is_file():
                 all_files.append(root)
                 continue
@@ -362,20 +362,20 @@ class DirectoryScanner:
     async def scan_and_rank(
         self,
         query: str,
-        search_paths: Union[str, Path, List[str], List[Path]],
+        paths: Union[str, Path, List[str], List[Path]],
         top_k: int = 20,
     ) -> ScanResult:
         """Convenience: run both scan and rank phases.
 
         Args:
             query: User's search query.
-            search_paths: Directories to scan.
+            paths: Directories to scan.
             top_k: Number of candidates for LLM ranking.
 
         Returns:
             ScanResult with both ``candidates`` and ``ranked_candidates``.
         """
-        result = await self.scan(search_paths)
+        result = await self.scan(paths)
         return await self.rank(query, result, top_k=top_k)
 
     # ---- Filesystem walking ----

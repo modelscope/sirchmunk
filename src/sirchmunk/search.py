@@ -40,7 +40,7 @@ class AgenticSearch(BaseSearch):
         self,
         llm: Optional[OpenAIChat] = None,
         work_path: Optional[Union[str, Path]] = None,
-        search_paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
+        paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
         verbose: bool = False,
         log_callback: LogCallback = None,
         reuse_knowledge: bool = True,
@@ -49,13 +49,13 @@ class AgenticSearch(BaseSearch):
         super().__init__(**kwargs)
 
         # Normalise and store default search paths
-        if search_paths is not None:
-            if isinstance(search_paths, (str, Path)):
-                self.search_paths: Optional[List[str]] = [str(Path(search_paths).expanduser().resolve())]
+        if paths is not None:
+            if isinstance(paths, (str, Path)):
+                self.paths: Optional[List[str]] = [str(Path(paths).expanduser().resolve())]
             else:
-                self.search_paths = [str(Path(p).expanduser().resolve()) for p in search_paths]
+                self.paths = [str(Path(p).expanduser().resolve()) for p in paths]
         else:
-            self.search_paths = None
+            self.paths = None
 
         work_path = work_path or SIRCHMUNK_WORK_PATH
         # Ensure path is expanded (handle ~ and environment variables)
@@ -132,25 +132,25 @@ class AgenticSearch(BaseSearch):
         self.spec_path.mkdir(parents=True, exist_ok=True)
         self._spec_lock = asyncio.Lock()  # guards concurrent spec writes
     
-    def _resolve_search_paths(
+    def _resolve_paths(
         self,
-        search_paths: Optional[Union[str, Path, List[str], List[Path]]],
+        paths: Optional[Union[str, Path, List[str], List[Path]]],
     ) -> Union[str, Path, List[str], List[Path]]:
-        """Resolve search_paths with fallback chain: arg > self.search_paths > cwd.
+        """Resolve paths with fallback chain: arg > self.paths > cwd.
 
         Args:
-            search_paths: Caller-provided paths (may be None).
+            paths: Caller-provided paths (may be None).
 
         Returns:
             Non-None search paths (original type preserved when provided).
         """
-        if search_paths is not None:
-            return search_paths
-        if self.search_paths is not None:
-            return self.search_paths
+        if paths is not None:
+            return paths
+        if self.paths is not None:
+            return self.paths
         cwd = str(Path.cwd())
         _loguru_logger.info(
-            f"[search_paths] No search_paths provided; using current working directory: {cwd}"
+            f"[paths] No paths provided; using current working directory: {cwd}"
         )
         return [cwd]
 
@@ -337,7 +337,7 @@ class AgenticSearch(BaseSearch):
     async def _search_by_filename(
         self,
         query: str,
-        search_paths: Union[str, Path, List[str], List[Path]],
+        paths: Union[str, Path, List[str], List[Path]],
         max_depth: Optional[int] = 5,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
@@ -349,7 +349,7 @@ class AgenticSearch(BaseSearch):
         
         Args:
             query: Search query (used as filename pattern)
-            search_paths: Paths to search in
+            paths: Paths to search in
             max_depth: Maximum directory depth
             include: File patterns to include
             exclude: File patterns to exclude
@@ -398,7 +398,7 @@ class AgenticSearch(BaseSearch):
             await self._logger.debug(f"Calling retrieve_by_filename with {len(patterns)} patterns")
             results = await self.grep_retriever.retrieve_by_filename(
                 patterns=patterns,
-                path=search_paths,
+                path=paths,
                 case_sensitive=False,
                 max_depth=max_depth,
                 include=include,
@@ -626,16 +626,16 @@ class AgenticSearch(BaseSearch):
 
     def _ensure_tool_registry(
         self,
-        search_paths: List[str],
+        paths: List[str],
         enable_dir_scan: bool = True,
     ) -> "ToolRegistry":
         """Build (or rebuild) the tool registry for the given search paths.
 
         The registry is cached on ``self._tool_registry`` and re-created
-        only when ``search_paths`` change (detected via sorted hash).
+        only when ``paths`` change (detected via sorted hash).
 
         Args:
-            search_paths: Normalised list of path strings.
+            paths: Normalised list of path strings.
             enable_dir_scan: Whether to include the directory-scan tool.
 
         Returns:
@@ -649,7 +649,7 @@ class AgenticSearch(BaseSearch):
         )
 
         # Cache key: sorted canonical paths
-        cache_key = tuple(sorted(search_paths))
+        cache_key = tuple(sorted(paths))
         if (
             self._tool_registry is not None
             and getattr(self, "_tool_registry_key", None) == cache_key
@@ -665,7 +665,7 @@ class AgenticSearch(BaseSearch):
         registry.register(
             KeywordSearchTool(
                 retriever=self.grep_retriever,
-                search_paths=search_paths,
+                paths=paths,
                 max_depth=5,
                 max_results=10,
             )
@@ -683,7 +683,7 @@ class AgenticSearch(BaseSearch):
                 self._dir_scanner = DirectoryScanner(llm=self.llm, max_files=500)
             registry.register(DirScanTool(
                 scanner=self._dir_scanner,
-                search_paths=search_paths,
+                paths=paths,
             ))
 
         self._tool_registry = registry
@@ -697,7 +697,7 @@ class AgenticSearch(BaseSearch):
     async def search(
         self,
         query: str,
-        search_paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
+        paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
         *,
         mode: Literal["DEEP", "FILENAME_ONLY"] = "DEEP",
         max_loops: int = 10,
@@ -752,8 +752,8 @@ class AgenticSearch(BaseSearch):
 
         Args:
             query: User's search query.
-            search_paths: Directories / files to search.  Falls back to
-                ``self.search_paths`` or the current working directory.
+            paths: Directories / files to search.  Falls back to
+                ``self.paths`` or the current working directory.
             mode: Search mode — ``"DEEP"`` or ``"FILENAME_ONLY"``.
             max_loops: Maximum ReAct iterations (DEEP mode, default: 10).
             max_token_budget: LLM token budget (DEEP mode, default: 64000).
@@ -772,14 +772,14 @@ class AgenticSearch(BaseSearch):
             - ``KnowledgeCluster``: If *return_cluster*.
             - ``List[Dict]``: File matches in FILENAME_ONLY mode.
         """
-        # Resolve search_paths: argument > self.search_paths > cwd
-        search_paths = self._resolve_search_paths(search_paths)
+        # Resolve paths: argument > self.paths > cwd
+        paths = self._resolve_paths(paths)
 
         # ---- FILENAME_ONLY: fast pattern-based filename search, no LLM ----
         if mode == "FILENAME_ONLY":
             filename_results: List[Dict[str, Any]] = await self._search_by_filename(
                 query=query,
-                search_paths=search_paths,
+                paths=paths,
                 max_depth=max_depth,
                 include=include,
                 exclude=exclude,
@@ -794,11 +794,11 @@ class AgenticSearch(BaseSearch):
 
         # ---- DEEP mode: parallel multi-path retrieval ----
 
-        # Normalize search_paths
-        if isinstance(search_paths, (str, Path)):
-            search_paths = [str(search_paths)]
+        # Normalize paths
+        if isinstance(paths, (str, Path)):
+            paths = [str(paths)]
         else:
-            search_paths = [str(p) for p in search_paths]
+            paths = [str(p) for p in paths]
 
         context = SearchContext(
             max_token_budget=max_token_budget,
@@ -828,9 +828,9 @@ class AgenticSearch(BaseSearch):
 
         phase1_results = await asyncio.gather(
             self._probe_keywords(query),
-            self._probe_dir_scan(query, search_paths, enable_dir_scan),
+            self._probe_dir_scan(query, paths, enable_dir_scan),
             self._probe_knowledge_cache(query),
-            self._load_spec_context(search_paths, stale_hours=spec_stale_hours),
+            self._load_spec_context(paths, stale_hours=spec_stale_hours),
             return_exceptions=True,
         )
 
@@ -865,7 +865,7 @@ class AgenticSearch(BaseSearch):
         # Path A: keyword search via rga (depends on extracted keywords)
         if initial_keywords:
             phase2_tasks.append(
-                self._retrieve_by_keywords(initial_keywords, search_paths)
+                self._retrieve_by_keywords(initial_keywords, paths)
             )
         else:
             phase2_tasks.append(self._async_noop([]))
@@ -928,7 +928,7 @@ class AgenticSearch(BaseSearch):
             await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
             answer, context = await self._react_refinement(
                 query=query,
-                search_paths=search_paths,
+                paths=paths,
                 initial_keywords=initial_keywords,
                 spec_context=spec_context,
                 enable_dir_scan=enable_dir_scan,
@@ -965,7 +965,7 @@ class AgenticSearch(BaseSearch):
             self._add_query_to_cluster(cluster, query)
             asyncio.ensure_future(self._save_cluster_with_embedding(cluster))
 
-        asyncio.ensure_future(self._save_spec_context(search_paths, context, scan_result=scan_result))
+        asyncio.ensure_future(self._save_spec_context(paths, context, scan_result=scan_result))
 
         await self._logger.success(f"[search] Complete: {context.summary()}")
 
@@ -1010,7 +1010,7 @@ class AgenticSearch(BaseSearch):
     async def _probe_dir_scan(
         self,
         query: str,
-        search_paths: List[str],
+        paths: List[str],
         enable: bool = True,
     ):
         """Scan directories for file metadata (filesystem only, no LLM).
@@ -1027,7 +1027,7 @@ class AgenticSearch(BaseSearch):
             self._dir_scanner = DirectoryScanner(llm=self.llm, max_files=500)
 
         await self._logger.info("[Probe:DirScan] Scanning directories...")
-        scan_result = await self._dir_scanner.scan(search_paths)
+        scan_result = await self._dir_scanner.scan(paths)
         await self._logger.info(
             f"[Probe:DirScan] Found {scan_result.total_files} files "
             f"in {scan_result.total_dirs} dirs ({scan_result.scan_duration_ms:.0f}ms)"
@@ -1074,7 +1074,7 @@ class AgenticSearch(BaseSearch):
     async def _retrieve_by_keywords(
         self,
         keywords: List[str],
-        search_paths: List[str],
+        paths: List[str],
     ) -> List[str]:
         """Run keyword search via rga and return discovered file paths.
 
@@ -1084,7 +1084,7 @@ class AgenticSearch(BaseSearch):
 
         tool = KeywordSearchTool(
             retriever=self.grep_retriever,
-            search_paths=search_paths,
+            paths=paths,
             max_depth=5,
             max_results=20,
         )
@@ -1223,7 +1223,7 @@ class AgenticSearch(BaseSearch):
     async def _react_refinement(
         self,
         query: str,
-        search_paths: List[str],
+        paths: List[str],
         initial_keywords: List[str],
         spec_context: str,
         enable_dir_scan: bool,
@@ -1237,7 +1237,7 @@ class AgenticSearch(BaseSearch):
         """
         from sirchmunk.agentic.react_agent import ReActSearchAgent
 
-        registry = self._ensure_tool_registry(search_paths, enable_dir_scan)
+        registry = self._ensure_tool_registry(paths, enable_dir_scan)
         agent = ReActSearchAgent(
             llm=self.llm,
             tool_registry=registry,
@@ -1323,7 +1323,7 @@ class AgenticSearch(BaseSearch):
 
     async def _load_spec_context(
         self,
-        search_paths: List[str],
+        paths: List[str],
         *,
         stale_hours: float = 72.0,
     ) -> str:
@@ -1334,7 +1334,7 @@ class AgenticSearch(BaseSearch):
         Stale files (older than ``stale_hours``) are silently ignored.
 
         Args:
-            search_paths: Normalised list of path strings.
+            paths: Normalised list of path strings.
             stale_hours: Maximum age of the cache in hours before it is
                 considered stale and skipped (default: 72).
 
@@ -1345,7 +1345,7 @@ class AgenticSearch(BaseSearch):
         now = datetime.now()
         stale_seconds = stale_hours * 3600
 
-        for sp in search_paths:
+        for sp in paths:
             spec_file = self._spec_file(sp)
             if not spec_file.exists():
                 continue
@@ -1388,7 +1388,7 @@ class AgenticSearch(BaseSearch):
 
     async def _save_spec_context(
         self,
-        search_paths: List[str],
+        paths: List[str],
         context: SearchContext,
         scan_result=None,
     ) -> None:
@@ -1400,7 +1400,7 @@ class AgenticSearch(BaseSearch):
         Uses ``self._spec_lock`` to prevent concurrent-write corruption.
 
         Args:
-            search_paths: Normalised list of path strings.
+            paths: Normalised list of path strings.
             context: Completed SearchContext from a ReAct session.
             scan_result: Optional ScanResult from DirectoryScanner.scan().
         """
@@ -1411,7 +1411,7 @@ class AgenticSearch(BaseSearch):
                 scan_candidates[c.path] = c
 
         async with self._spec_lock:
-            for sp in search_paths:
+            for sp in paths:
                 spec_file = self._spec_file(sp)
                 try:
                     # Collect relevant info for this specific path

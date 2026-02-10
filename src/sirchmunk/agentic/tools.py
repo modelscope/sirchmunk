@@ -134,13 +134,13 @@ class KeywordSearchTool(BaseTool):
     def __init__(
         self,
         retriever: GrepRetriever,
-        search_paths: Union[str, Path, List[str], List[Path]],
+        paths: Union[str, Path, List[str], List[Path]],
         max_depth: int = 5,
         max_results: int = 10,
         max_snippet_lines: int = 5,
     ) -> None:
         self._retriever = retriever
-        self._search_paths = search_paths
+        self._paths = paths
         self._max_depth = max_depth
         self._max_results = max_results
         self._max_snippet_lines = max_snippet_lines
@@ -196,7 +196,7 @@ class KeywordSearchTool(BaseTool):
         async def _single(term: str) -> List[Dict[str, Any]]:
             return await self._retriever.retrieve(
                 terms=term,
-                path=self._search_paths,
+                path=self._paths,
                 logic="or",
                 case_sensitive=False,
                 literal=literal,
@@ -236,7 +236,7 @@ class KeywordSearchTool(BaseTool):
 
         raw = await self._retriever.retrieve(
             terms=pattern,
-            path=self._search_paths,
+            path=self._paths,
             logic="or",
             case_sensitive=False,
             literal=False,

@@ -440,13 +440,13 @@ def cmd_search(args: argparse.Namespace) -> int:
             _load_env_file(env_file)
 
         query = args.query
-        search_paths = args.paths or [os.getcwd()]
+        paths = args.paths or [os.getcwd()]
 
         if args.api:
             # Client mode: call API server
             return _search_via_api(
                 query=query,
-                search_paths=search_paths,
+                paths=paths,
                 api_url=args.api_url,
                 mode=args.mode,
                 output_format=args.output,
@@ -455,7 +455,7 @@ def cmd_search(args: argparse.Namespace) -> int:
             # Local mode: direct search
             return asyncio.run(_search_local(
                 query=query,
-                search_paths=search_paths,
+                paths=paths,
                 mode=args.mode,
                 output_format=args.output,
                 verbose=args.verbose,
@@ -472,7 +472,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 async def _search_local(
     query: str,
-    search_paths: list,
+    paths: list,
     mode: str = "DEEP",
     output_format: str = "text",
     verbose: bool = False,
@@ -481,7 +481,7 @@ async def _search_local(
 
     Args:
         query: Search query
-        search_paths: Paths to search
+        paths: Paths to search
         mode: Search mode (DEEP, FILENAME_ONLY)
         output_format: Output format (text, json)
         verbose: Enable verbose output
@@ -521,13 +521,13 @@ async def _search_local(
     if not verbose:
         print(f"  Searching: {query}")
         print(f"   Mode: {mode}")
-        print(f"   Paths: {', '.join(search_paths)}")
+        print(f"   Paths: {', '.join(paths)}")
         print()
 
     # Execute search
     result = await searcher.search(
         query=query,
-        search_paths=search_paths,
+        paths=paths,
         mode=mode,
         return_cluster=output_format == "json",
     )
@@ -554,7 +554,7 @@ async def _search_local(
 
 def _search_via_api(
     query: str,
-    search_paths: list,
+    paths: list,
     api_url: str = "http://localhost:8584",
     mode: str = "DEEP",
     output_format: str = "text",
@@ -563,7 +563,7 @@ def _search_via_api(
 
     Args:
         query: Search query
-        search_paths: Paths to search
+        paths: Paths to search
         api_url: API server URL
         mode: Search mode
         output_format: Output format
@@ -588,7 +588,7 @@ def _search_via_api(
             f"{api_url}/api/v1/search",
             json={
                 "query": query,
-                "search_paths": search_paths,
+                "paths": paths,
                 "mode": mode,
             },
             timeout=300,  # 5 minute timeout for long searches

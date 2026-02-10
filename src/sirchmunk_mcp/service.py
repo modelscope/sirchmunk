@@ -105,7 +105,7 @@ class SirchmunkService:
             self.searcher = AgenticSearch(
                 llm=llm,
                 work_path=self.config.sirchmunk.work_path,
-                search_paths=self.config.sirchmunk.search_paths,
+                paths=self.config.sirchmunk.paths,
                 verbose=False,  # Disable verbose in stdio mode to prevent stdout pollution
                 reuse_knowledge=self.config.sirchmunk.enable_cluster_reuse,
                 cluster_sim_threshold=self.config.sirchmunk.cluster_similarity.threshold,
@@ -117,7 +117,7 @@ class SirchmunkService:
     async def search(
         self,
         query: str,
-        search_paths: Optional[Union[str, List[str]]] = None,
+        paths: Optional[Union[str, List[str]]] = None,
         mode: str = "DEEP",
         max_depth: Optional[int] = None,
         top_k_files: Optional[int] = None,
@@ -135,7 +135,7 @@ class SirchmunkService:
         
         Args:
             query: Search query or question to find relevant documents
-            search_paths: Paths to search in (files or directories).
+            paths: Paths to search in (files or directories).
                 Optional — falls back to configured default or cwd.
             mode: Search mode (DEEP, FILENAME_ONLY)
             max_depth: Maximum directory depth to search
@@ -162,16 +162,16 @@ class SirchmunkService:
         if mode not in ("DEEP", "FILENAME_ONLY"):
             raise ValueError(f"Invalid mode: {mode}. Must be DEEP or FILENAME_ONLY")
         
-        # Normalize search_paths
-        if isinstance(search_paths, str):
-            search_paths = [search_paths]
+        # Normalize paths
+        if isinstance(paths, str):
+            paths = [paths]
         
         # Validate search paths if provided
-        if search_paths:
-            for path in search_paths:
-                path_obj = Path(path)
+        if paths:
+            for p in paths:
+                path_obj = Path(p)
                 if not path_obj.exists():
-                    logger.warning(f"Search path does not exist: {path}")
+                    logger.warning(f"Search path does not exist: {p}")
         
         # Apply defaults from configuration
         max_depth = max_depth or self.config.sirchmunk.search_defaults.max_depth
@@ -179,14 +179,14 @@ class SirchmunkService:
         
         logger.info(
             f"Starting search: mode={mode}, query='{query[:50]}...', "
-            f"paths={len(search_paths) if search_paths else 'default'}, max_depth={max_depth}"
+            f"paths={len(paths) if paths else 'default'}, max_depth={max_depth}"
         )
         
         try:
             # Build kwargs (only pass params that are set)
             kwargs: Dict[str, Any] = {
                 "query": query,
-                "search_paths": search_paths,
+                "paths": paths,
                 "mode": mode,
                 "max_depth": max_depth,
                 "top_k_files": top_k_files,

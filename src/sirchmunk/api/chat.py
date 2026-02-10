@@ -263,7 +263,7 @@ manager = ChatConnectionManager()
 # Search-related models and functions
 class SearchRequest(BaseModel):
     query: str
-    search_paths: Union[str, List[str]]  # Expects absolute file/directory paths from user's local filesystem
+    paths: Union[str, List[str]]  # Expects absolute file/directory paths from user's local filesystem
     mode: Optional[str] = "DEEP"
     max_depth: Optional[int] = 5
     top_k_files: Optional[int] = 3
@@ -571,15 +571,15 @@ async def _chat_rag(
         # Create search instance with log callback
         search_engine = get_search_instance(log_callback=search_log_callback)
 
-        search_paths = [path.strip() for path in kb_name.split(",")]
-        await search_log_callback("info", f"📂 Parsed search paths: {search_paths}", "\n", False)
+        paths = [path.strip() for path in kb_name.split(",")]
+        await search_log_callback("info", f"📂 Parsed search paths: {paths}", "\n", False)
 
         # Execute RAG search
-        print(f"[MODE 2] RAG search with query: {message}, paths: {search_paths}")
+        print(f"[MODE 2] RAG search with query: {message}, paths: {paths}")
         
         search_result = await search_engine.search(
             query=message,
-            search_paths=search_paths,
+            paths=paths,
             top_k_files=3,
         )
 
@@ -723,14 +723,14 @@ async def _chat_rag_web_search(
         search_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
 
         search_engine = get_search_instance(log_callback=search_log_callback)
-        search_paths = [path.strip() for path in kb_name.split(",")]
-        await search_log_callback("info", f"📂 RAG search paths: {search_paths}", "\n", False)
+        paths = [path.strip() for path in kb_name.split(",")]
+        await search_log_callback("info", f"📂 RAG search paths: {paths}", "\n", False)
 
-        print(f"[MODE 4] RAG search with query: {message}, paths: {search_paths}")
+        print(f"[MODE 4] RAG search with query: {message}, paths: {paths}")
         
         rag_result = await search_engine.search(
             query=message,
-            search_paths=search_paths,
+            paths=paths,
             top_k_files=3,
         )
 
