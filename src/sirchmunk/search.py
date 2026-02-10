@@ -288,9 +288,12 @@ class AgenticSearch(BaseSearch):
             cluster.queries = cluster.queries[-self.max_queries_per_cluster:]
     
     async def _save_cluster_with_embedding(self, cluster: KnowledgeCluster) -> None:
-        """
-        Save knowledge cluster to persistent storage and compute embedding.
-        
+        """Save knowledge cluster to persistent storage, compute embedding, and flush to parquet.
+
+        The final ``force_sync()`` ensures the embedding vector is written to
+        the parquet file immediately so that subsequent searches (even across
+        process restarts) can find it via ``search_similar_clusters``.
+
         Args:
             cluster: KnowledgeCluster to save
         """
@@ -306,33 +309,41 @@ class AgenticSearch(BaseSearch):
             except Exception as update_error:
                 await self._logger.warning(f"Failed to save knowledge cluster: {update_error}")
                 return
-        
+
         # Compute and store embedding for the cluster
         if self.embedding_client:
             try:
                 from sirchmunk.utils.embedding_util import compute_text_hash
-                
+
                 # Combine queries for embedding
                 combined_text = self.knowledge_storage.combine_cluster_fields(
                     cluster.queries
                 )
                 text_hash = compute_text_hash(combined_text)
-                
+
                 # Compute embedding
                 embedding_vector = (await self.embedding_client.embed([combined_text]))[0]
-                
+
                 # Store embedding
                 await self.knowledge_storage.store_embedding(
                     cluster_id=cluster.id,
                     embedding_vector=embedding_vector,
                     embedding_model=self.embedding_client.model_id,
-                    embedding_text_hash=text_hash
+                    embedding_text_hash=text_hash,
                 )
-                
+
                 await self._logger.debug(f"Computed and stored embedding for cluster {cluster.id}")
-            
+
             except Exception as e:
                 await self._logger.warning(f"Failed to compute embedding for cluster {cluster.id}: {e}")
+
+        # Flush DuckDB → parquet immediately so embedding data is persisted.
+        # Without this, the daemon sync (60 s interval) or atexit hook might
+        # run before the embedding is written, leaving NULL in the parquet.
+        try:
+            self.knowledge_storage.force_sync()
+        except Exception as e:
+            await self._logger.warning(f"Parquet force_sync failed: {e}")
     
     async def _search_by_filename(
         self,
@@ -959,13 +970,21 @@ class AgenticSearch(BaseSearch):
                 context.add_llm_tokens(total_tok, usage=usage)
 
         # ==============================================================
-        # Phase 5: Persistence (non-blocking)
+        # Phase 5: Persistence
         # ==============================================================
+        phase5_tasks = []
         if cluster:
             self._add_query_to_cluster(cluster, query)
-            asyncio.ensure_future(self._save_cluster_with_embedding(cluster))
+            phase5_tasks.append(self._save_cluster_with_embedding(cluster))
 
-        asyncio.ensure_future(self._save_spec_context(paths, context, scan_result=scan_result))
+        phase5_tasks.append(self._save_spec_context(paths, context, scan_result=scan_result))
+
+        # Await all persistence tasks concurrently so that embeddings are
+        # fully written to DuckDB before search() returns.  Previous
+        # fire-and-forget (ensure_future) caused a race where the process
+        # could exit before store_embedding completed, leaving parquet
+        # with NULL embedding vectors.
+        await asyncio.gather(*phase5_tasks, return_exceptions=True)
 
         await self._logger.success(f"[search] Complete: {context.summary()}")
 

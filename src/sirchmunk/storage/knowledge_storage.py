@@ -100,6 +100,13 @@ class KnowledgeStorage:
     def _load_from_parquet(self):
         """Load knowledge clusters from parquet file into DuckDB.
 
+        Uses an explicit ``CREATE TABLE`` with the canonical schema followed
+        by ``INSERT … SELECT`` so that DuckDB column types (especially
+        ``FLOAT[384]`` for embedding vectors) are preserved exactly.  A plain
+        ``CREATE TABLE AS SELECT * FROM read_parquet(…)`` would infer
+        variable-length ``FLOAT[]`` from Parquet's list encoding, breaking
+        ``list_cosine_similarity`` which requires matching fixed-size types.
+
         Also records the file's modification time so that
         ``_check_and_reload()`` can detect external changes later.
         """
@@ -108,8 +115,13 @@ class KnowledgeStorage:
             if pq.exists():
                 # Drop existing table first to avoid conflicts
                 self.db.drop_table(self.table_name, if_exists=True)
-                # Load parquet file into DuckDB table
-                self.db.import_from_parquet(self.table_name, self.parquet_file, create_table=True)
+                # Create table with explicit schema (preserves FLOAT[384])
+                self._create_table()
+                # Insert data from parquet — DuckDB casts to the declared types
+                self.db.execute(
+                    f"INSERT INTO {self.table_name} "
+                    f"SELECT * FROM read_parquet('{self.parquet_file}')"
+                )
                 count = self.db.get_table_count(self.table_name)
                 # Record mtime for stale-detection
                 self._parquet_loaded_mtime = pq.stat().st_mtime
@@ -468,6 +480,7 @@ class KnowledgeStorage:
             KnowledgeCluster if found, None otherwise
         """
         try:
+            self._check_and_reload()
             row = self.db.fetch_one(
                 f"SELECT * FROM {self.table_name} WHERE id = ?",
                 [cluster_id]
@@ -631,6 +644,7 @@ class KnowledgeStorage:
             List of matching KnowledgeCluster objects
         """
         try:
+            self._check_and_reload()
             # Fuzzy search using LIKE with wildcards
             search_pattern = f"%{query}%"
 
@@ -1010,6 +1024,9 @@ class KnowledgeStorage:
             List of similar clusters with metadata and similarity scores
         """
         try:
+            # Pick up any external parquet changes first
+            self._check_and_reload()
+
             # Verify query embedding dimension
             if len(query_embedding) != 384:
                 logger.error(
@@ -1017,11 +1034,26 @@ class KnowledgeStorage:
                 )
                 return []
 
+            # Quick check: are there any rows with non-NULL embeddings?
+            emb_count_row = self.db.fetch_one(
+                f"SELECT COUNT(*) FROM {self.table_name} "
+                f"WHERE embedding_vector IS NOT NULL"
+            )
+            emb_count = emb_count_row[0] if emb_count_row else 0
+            if emb_count == 0:
+                logger.debug("No clusters with embedding vectors found")
+                return []
+
             # DuckDB cosine similarity query
+            # Explicit cast on both sides ensures type parity regardless of
+            # how the table was created (fresh schema vs parquet import).
             query = f"""
             SELECT
                 id, name, description, confidence, hotness,
-                list_cosine_similarity(embedding_vector, ?::FLOAT[384]) AS similarity
+                list_cosine_similarity(
+                    embedding_vector::FLOAT[384],
+                    ?::FLOAT[384]
+                ) AS similarity
             FROM {self.table_name}
             WHERE embedding_vector IS NOT NULL
             ORDER BY similarity DESC
@@ -1034,7 +1066,7 @@ class KnowledgeStorage:
             filtered_results = []
             for row in results:
                 similarity = row[5]
-                if similarity >= similarity_threshold:
+                if similarity is not None and similarity >= similarity_threshold:
                     filtered_results.append({
                         "id": row[0],
                         "name": row[1],
@@ -1044,16 +1076,16 @@ class KnowledgeStorage:
                         "similarity": similarity
                     })
 
-            if filtered_results:
-                logger.debug(
-                    f"Found {len(filtered_results)} similar clusters "
-                    f"(threshold: {similarity_threshold})"
-                )
+            logger.debug(
+                f"Similarity search: {emb_count} embedded clusters, "
+                f"{len(results)} candidates, {len(filtered_results)} above "
+                f"threshold {similarity_threshold}"
+            )
 
             return filtered_results
 
         except Exception as e:
-            logger.error(f"Failed to search similar clusters: {e}")
+            logger.error(f"Failed to search similar clusters: {e}", exc_info=True)
             return []
 
     # ------------------------------------------------------------------ #
