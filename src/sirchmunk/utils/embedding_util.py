@@ -3,7 +3,6 @@
 Local Embedding Utility
 Provides embedding computation using SentenceTransformer models loaded from ModelScope
 """
-
 import asyncio
 import hashlib
 import warnings
@@ -63,12 +62,12 @@ class EmbeddingUtil:
             f"Loaded embedding model: {model_id} "
             f"(device={self.device}, dim={self.dimension})"
         )
-    
+
     @staticmethod
     def _load_model(model_id: str, cache_dir: Optional[str] = None) -> str:
         """
         Load the embedding model from ModelScope or Hugging Face.
-        
+
         Args:
             model_id: Model identifier
             cache_dir: Optional cache directory for model files
@@ -78,7 +77,7 @@ class EmbeddingUtil:
         """
         try:
             from modelscope import snapshot_download
-            
+
             model_dir = snapshot_download(
                 model_id=model_id,
                 cache_dir=cache_dir,
@@ -89,13 +88,13 @@ class EmbeddingUtil:
             )
             logger.debug(f"Model loaded successfully: {model_dir}")
             return model_dir
-        
+
         except Exception as e:
             logger.error(f"Failed to load model {model_id}: {e}")
             raise RuntimeError(
                 f"Model loading failed. Please check network or model_id. Error: {e}"
             )
-    
+
     def _warmup(self):
         """Warm up model with dummy inference to avoid first-call latency"""
         try:
@@ -205,7 +204,6 @@ def compute_text_hash(text: str) -> str:
 if __name__ == '__main__':
 
     # Example usage
-    import asyncio
 
     async def main():
         embed_util = EmbeddingUtil()
