@@ -42,78 +42,133 @@ def create_server(config: Config) -> FastMCP:
     )
     
     logger.info(
-        f"Creating MCP server: {config.mcp.server_name} v{config.mcp.server_version}"
+        f"Creating MCP server: {config.mcp.server_name}"
     )
     
     # Register tools using decorators
     @mcp.tool()
     async def sirchmunk_search(
         query: str,
-        search_paths: List[str],
+        paths: Optional[List[str]] = None,
         mode: str = "DEEP",
         max_depth: int = 5,
         top_k_files: int = 3,
-        keyword_levels: int = 3,
+        max_loops: int = 10,
+        max_token_budget: int = 64000,
+        enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         return_cluster: bool = False,
     ) -> str:
         """Intelligent code and document search with multi-mode support.
-        
+
         DEEP mode provides comprehensive knowledge extraction with full context analysis.
         FILENAME_ONLY mode performs fast filename pattern matching without content search.
-        
+
         Args:
             query: Search query or question (e.g., 'How does authentication work?')
-            search_paths: Paths to search in (files or directories)
+            paths: Paths to search in (files or directories).
+                Optional — falls back to configured SIRCHMUNK_SEARCH_PATHS or cwd.
             mode: Search mode - DEEP (comprehensive, 10-30s) or FILENAME_ONLY (fast, <1s)
             max_depth: Maximum directory depth to search (1-20, default: 5)
             top_k_files: Number of top files to return (1-20, default: 3)
-            keyword_levels: Keyword granularity levels for DEEP mode (1-5, default: 3)
+            max_loops: Maximum ReAct iterations for DEEP mode (1-20, default: 10)
+            max_token_budget: Token budget for DEEP mode (default: 64000)
+            enable_dir_scan: Enable directory scanning tool (DEEP mode, default: True)
             include: File patterns to include (glob, e.g., ['*.py', '*.md'])
             exclude: File patterns to exclude (glob, e.g., ['*.pyc', '*.log'])
             return_cluster: Return full KnowledgeCluster object (DEEP mode only)
-        
+
         Returns:
             Search results as formatted text
         """
         if _service is None:
             return "Error: Service not initialized"
-        
+
         logger.info(f"sirchmunk_search: mode={mode}, query='{query[:50]}...'")
-        
+
         try:
             result = await _service.searcher.search(
                 query=query,
-                search_paths=search_paths,
+                paths=paths,
                 mode=mode,
                 max_depth=max_depth,
                 top_k_files=top_k_files,
-                keyword_levels=keyword_levels,
+                max_loops=max_loops,
+                max_token_budget=max_token_budget,
+                enable_dir_scan=enable_dir_scan,
                 include=include,
                 exclude=exclude,
                 return_cluster=return_cluster,
             )
-            
+
             if result is None:
                 return f"No results found for query: {query}"
-            
+
             if isinstance(result, str):
                 return result
-            
+
             if isinstance(result, list):
                 # FILENAME_ONLY mode returns list of file matches
                 return _format_filename_results(result, query)
-            
+
             if hasattr(result, "__str__"):
                 return str(result)
-            
+
             return str(result)
-        
+
         except Exception as e:
             logger.error(f"Search failed: {e}", exc_info=True)
             return f"Search failed: {str(e)}"
-    
+
+    @mcp.tool()
+    async def sirchmunk_scan_dir(
+        query: str,
+        paths: List[str],
+        max_depth: int = 8,
+        max_files: int = 500,
+        top_k: int = 20,
+    ) -> str:
+        """Scan directories to discover and rank document candidates.
+
+        Performs a fast recursive scan of paths to collect file
+        metadata (title, size, type, keywords, preview), then uses the
+        LLM to rank the most promising candidates for the query.
+
+        Args:
+            query: Search query to rank files by relevance
+            paths: Root directories to scan
+            max_depth: Maximum recursion depth (1-20, default: 8)
+            max_files: Maximum files to scan (default: 500)
+            top_k: Number of top candidates for LLM ranking (default: 20)
+
+        Returns:
+            Ranked list of file candidates with relevance scores
+        """
+        if _service is None:
+            return "Error: Service not initialized"
+
+        logger.info(f"sirchmunk_scan_dir: query='{query[:50]}...'")
+
+        try:
+            from sirchmunk.scan.dir_scanner import DirectoryScanner
+
+            scanner = DirectoryScanner(
+                llm=_service.searcher.llm,
+                max_depth=max_depth,
+                max_files=max_files,
+            )
+            result = await scanner.scan_and_rank(
+                query=query,
+                paths=paths,
+                top_k=top_k,
+            )
+
+            return _format_scan_results(result, query)
+        except Exception as e:
+            logger.error(f"Dir scan failed: {e}", exc_info=True)
+            return f"Directory scan failed: {str(e)}"
+
     @mcp.tool()
     async def sirchmunk_get_cluster(cluster_id: str) -> str:
         """Retrieve a previously saved knowledge cluster by its ID.
@@ -178,6 +233,43 @@ def create_server(config: Config) -> FastMCP:
             return f"Failed to list clusters: {str(e)}"
     
     return mcp
+
+
+def _format_scan_results(result, query: str) -> str:
+    """Format DirectoryScanner results for MCP output.
+
+    Args:
+        result: ScanResult from DirectoryScanner
+        query: Original query
+
+    Returns:
+        Formatted markdown string
+    """
+    lines = [
+        "# Directory Scan Results",
+        "",
+        f"**Query**: `{query}`",
+        f"**Files scanned**: {result.total_files}",
+        f"**Directories traversed**: {result.total_dirs}",
+        f"**Scan time**: {result.scan_duration_ms:.0f}ms",
+        f"**Rank time**: {result.rank_duration_ms:.0f}ms",
+        "",
+    ]
+
+    for i, c in enumerate(result.ranked_candidates, 1):
+        tag = f"[{c.relevance}]" if c.relevance else "[?]"
+        lines.append(f"## {i}. {tag} {c.filename}")
+        lines.append(f"- **Path**: `{c.path}`")
+        lines.append(f"- **Type**: {c.extension} | **Size**: {c._human_size()}")
+        if c.title:
+            lines.append(f"- **Title**: {c.title}")
+        if c.reason:
+            lines.append(f"- **Reason**: {c.reason}")
+        if c.keywords:
+            lines.append(f"- **Keywords**: {', '.join(c.keywords[:5])}")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def _format_filename_results(results: List[Dict[str, Any]], query: str) -> str:

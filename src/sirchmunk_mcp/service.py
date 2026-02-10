@@ -9,7 +9,6 @@ managing initialization, configuration, and session state.
 from __future__ import annotations
 
 import contextlib
-import io
 import logging
 import os
 import sys
@@ -28,19 +27,26 @@ logger = logging.getLogger(__name__)
 @contextlib.contextmanager
 def suppress_stdout():
     """Context manager to suppress stdout output.
-    
+
     Used during initialization to prevent third-party libraries
     (ModelScope, transformers, etc.) from printing to stdout,
     which would break MCP stdio protocol.
+
+    Uses ``os.devnull`` instead of ``io.StringIO`` because many libraries
+    (modelscope, tqdm, rich, …) expect ``sys.stdout`` to be a real file
+    object with ``.fileno()``, ``.isatty()`` etc.  ``StringIO`` lacks
+    these, causing cryptic errors like ``int('ERROR')`` inside modelscope.
     """
     # Check if we're in stdio MCP mode (stdout should be protected)
     if os.environ.get("MCP_TRANSPORT") == "stdio":
         old_stdout = sys.stdout
-        sys.stdout = io.StringIO()
+        devnull = open(os.devnull, "w")
+        sys.stdout = devnull
         try:
             yield
         finally:
             sys.stdout = old_stdout
+            devnull.close()
     else:
         yield
 
@@ -105,6 +111,7 @@ class SirchmunkService:
             self.searcher = AgenticSearch(
                 llm=llm,
                 work_path=self.config.sirchmunk.work_path,
+                paths=self.config.sirchmunk.paths,
                 verbose=False,  # Disable verbose in stdio mode to prevent stdout pollution
                 reuse_knowledge=self.config.sirchmunk.enable_cluster_reuse,
                 cluster_sim_threshold=self.config.sirchmunk.cluster_similarity.threshold,
@@ -116,29 +123,32 @@ class SirchmunkService:
     async def search(
         self,
         query: str,
-        search_paths: Union[str, List[str]],
+        paths: Optional[Union[str, List[str]]] = None,
         mode: str = "DEEP",
         max_depth: Optional[int] = None,
         top_k_files: Optional[int] = None,
-        keyword_levels: Optional[int] = None,
+        max_loops: Optional[int] = None,
+        max_token_budget: Optional[int] = None,
+        enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         return_cluster: bool = False,
     ) -> Union[str, List[Dict[str, Any]], KnowledgeCluster, None]:
         """Search and retrieve various types of raw documents using AgenticSearch.
         
-        This method performs intelligent search across code, documentation, and 
-        other text-based documents. It directly retrieves and analyzes raw content
-        from multiple file types including source code, markdown files, PDFs, 
-        text files, and other document formats supported by ripgrep-all.
+        Supports DEEP mode (parallel multi-path + ReAct refinement) and
+        FILENAME_ONLY mode (fast filename pattern matching, no LLM).
         
         Args:
             query: Search query or question to find relevant documents
-            search_paths: Paths to search in (files or directories)
+            paths: Paths to search in (files or directories).
+                Optional — falls back to configured default or cwd.
             mode: Search mode (DEEP, FILENAME_ONLY)
             max_depth: Maximum directory depth to search
             top_k_files: Number of top files to return
-            keyword_levels: Number of keyword granularity levels (DEEP mode)
+            max_loops: Maximum ReAct iterations (DEEP mode)
+            max_token_budget: LLM token budget (DEEP mode)
+            enable_dir_scan: Enable directory scanning (DEEP mode)
             include: File patterns to include (glob)
             exclude: File patterns to exclude (glob)
             return_cluster: Whether to return full KnowledgeCluster object
@@ -156,43 +166,47 @@ class SirchmunkService:
         
         # Validate mode
         if mode not in ("DEEP", "FILENAME_ONLY"):
-            raise ValueError(f"Invalid mode: {mode}. Must be DEEP, or FILENAME_ONLY")
+            raise ValueError(f"Invalid mode: {mode}. Must be DEEP or FILENAME_ONLY")
         
-        # Normalize search_paths
-        if isinstance(search_paths, str):
-            search_paths = [search_paths]
+        # Normalize paths
+        if isinstance(paths, str):
+            paths = [paths]
         
-        # Validate search paths
-        for path in search_paths:
-            path_obj = Path(path)
-            if not path_obj.exists():
-                logger.warning(f"Search path does not exist: {path}")
+        # Validate search paths if provided
+        if paths:
+            for p in paths:
+                path_obj = Path(p)
+                if not path_obj.exists():
+                    logger.warning(f"Search path does not exist: {p}")
         
         # Apply defaults from configuration
         max_depth = max_depth or self.config.sirchmunk.search_defaults.max_depth
         top_k_files = top_k_files or self.config.sirchmunk.search_defaults.top_k_files
-        keyword_levels = keyword_levels or self.config.sirchmunk.search_defaults.keyword_levels
         
         logger.info(
             f"Starting search: mode={mode}, query='{query[:50]}...', "
-            f"paths={len(search_paths)}, max_depth={max_depth}"
+            f"paths={len(paths) if paths else 'default'}, max_depth={max_depth}"
         )
         
         try:
-            # Perform search
-            result = await self.searcher.search(
-                query=query,
-                search_paths=search_paths,
-                mode=mode,
-                max_depth=max_depth,
-                top_k_files=top_k_files,
-                keyword_levels=keyword_levels,
-                include=include,
-                exclude=exclude,
-                verbose=self.config.sirchmunk.verbose,
-                grep_timeout=self.config.sirchmunk.search_defaults.grep_timeout,
-                return_cluster=return_cluster,
-            )
+            # Build kwargs (only pass params that are set)
+            kwargs: Dict[str, Any] = {
+                "query": query,
+                "paths": paths,
+                "mode": mode,
+                "max_depth": max_depth,
+                "top_k_files": top_k_files,
+                "enable_dir_scan": enable_dir_scan,
+                "include": include,
+                "exclude": exclude,
+                "return_cluster": return_cluster,
+            }
+            if max_loops is not None:
+                kwargs["max_loops"] = max_loops
+            if max_token_budget is not None:
+                kwargs["max_token_budget"] = max_token_budget
+
+            result = await self.searcher.search(**kwargs)
             
             logger.info(f"Search completed: mode={mode}, result_type={type(result).__name__}")
             return result

@@ -21,9 +21,21 @@ logger = logging.getLogger(__name__)
 SIRCHMUNK_SEARCH_TOOL = Tool(
     name="sirchmunk_search",
     description=(
-        "Intelligent code and document search with multi-mode support. "
-        "DEEP mode provides comprehensive knowledge extraction with full context analysis. "
-        "FILENAME_ONLY mode performs fast filename pattern matching without content search."
+        "Intelligent code and document search with multi-mode support.\n\n"
+        "DEEP mode provides comprehensive knowledge extraction with full context analysis.\n"
+        "FILENAME_ONLY mode performs fast filename pattern matching without content search.\n\n"
+        "Args:\n"
+        "    query: Search query or question (e.g., 'How does authentication work?')\n"
+        "    paths: Paths to search in (files or directories)\n"
+        "    mode: Search mode - DEEP (comprehensive, 10-30s) or FILENAME_ONLY (fast, <1s)\n"
+        "    max_depth: Maximum directory depth to search (1-20, default: 5)\n"
+        "    top_k_files: Number of top files to return (1-20, default: 3)\n"
+        "    keyword_levels: Keyword granularity levels for DEEP mode (1-5, default: 3)\n"
+        "    include: File patterns to include (glob, e.g., ['*.py', '*.md'])\n"
+        "    exclude: File patterns to exclude (glob, e.g., ['*.pyc', '*.log'])\n"
+        "    return_cluster: Return full KnowledgeCluster object (DEEP mode only)\n\n"
+        "Returns:\n"
+        "    Search results as formatted text\n"
     ),
     inputSchema={
         "type": "object",
@@ -32,10 +44,14 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
                 "type": "string",
                 "description": "Search query or question (e.g., 'How does authentication work?')",
             },
-            "search_paths": {
+            "paths": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Paths to search in (files or directories)",
+                "description": (
+                    "Paths to search in (files or directories). "
+                    "Optional — falls back to configured SIRCHMUNK_SEARCH_PATHS "
+                    "or the current working directory."
+                ),
             },
             "mode": {
                 "type": "string",
@@ -60,12 +76,22 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
                 "maximum": 20,
                 "description": "Number of top files to return",
             },
-            "keyword_levels": {
+            "max_loops": {
                 "type": "integer",
-                "default": 3,
+                "default": 10,
                 "minimum": 1,
-                "maximum": 5,
-                "description": "Keyword granularity levels (DEEP mode only, more levels = more fallback options)",
+                "maximum": 20,
+                "description": "Maximum ReAct iterations (DEEP mode only)",
+            },
+            "max_token_budget": {
+                "type": "integer",
+                "default": 64000,
+                "description": "Token budget for retrieval content (DEEP mode only)",
+            },
+            "enable_dir_scan": {
+                "type": "boolean",
+                "default": True,
+                "description": "Enable directory scanning tool (DEEP mode only)",
             },
             "include": {
                 "type": "array",
@@ -83,7 +109,7 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
                 "description": "Return full KnowledgeCluster object (DEEP mode only)",
             },
         },
-        "required": ["query", "search_paths"],
+        "required": ["query"],
     },
 )
 
@@ -164,18 +190,18 @@ async def handle_sirchmunk_search(
     """
     # Extract required arguments
     query = arguments.get("query")
-    search_paths = arguments.get("search_paths")
+    paths = arguments.get("paths")  # Optional; falls back to configured default
     
     if not query:
         raise ValueError("Missing required argument: query")
-    if not search_paths:
-        raise ValueError("Missing required argument: search_paths")
     
     # Extract optional arguments with defaults
     mode = arguments.get("mode", "DEEP")
     max_depth = arguments.get("max_depth")
     top_k_files = arguments.get("top_k_files")
-    keyword_levels = arguments.get("keyword_levels")
+    max_loops = arguments.get("max_loops")
+    max_token_budget = arguments.get("max_token_budget")
+    enable_dir_scan = arguments.get("enable_dir_scan", True)
     include = arguments.get("include")
     exclude = arguments.get("exclude")
     return_cluster = arguments.get("return_cluster", False)
@@ -186,11 +212,13 @@ async def handle_sirchmunk_search(
         # Perform search
         result = await service.search(
             query=query,
-            search_paths=search_paths,
+            paths=paths,
             mode=mode,
             max_depth=max_depth,
             top_k_files=top_k_files,
-            keyword_levels=keyword_levels,
+            max_loops=max_loops,
+            max_token_budget=max_token_budget,
+            enable_dir_scan=enable_dir_scan,
             include=include,
             exclude=exclude,
             return_cluster=return_cluster,

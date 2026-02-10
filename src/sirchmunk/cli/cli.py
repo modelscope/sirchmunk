@@ -1,18 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """
-Command-line interface for Sirchmunk.
-
-Provides commands for server management, initialization, configuration,
-and search operations.
+Unified command-line interface for Sirchmunk.
 
 Usage:
-    sirchmunk init              - Initialize Sirchmunk working directory
-    sirchmunk init --ui         - Initialize with WebUI frontend build
-    sirchmunk config            - Show or generate configuration
+    sirchmunk init              - Initialize working directory + generate .env
     sirchmunk serve             - Start the API server (backend only)
-    sirchmunk serve --ui        - Start with embedded WebUI (single port)
-    sirchmunk serve --ui --dev  - Start with Next.js dev server (dual port)
     sirchmunk search            - Perform a search query
+    sirchmunk web init          - Build WebUI frontend (requires Node.js)
+    sirchmunk web serve         - Start API + WebUI (single port)
+    sirchmunk web serve --dev   - Start API + Next.js dev server (dual port)
+    sirchmunk mcp serve         - Start the MCP server (stdio/http)
+    sirchmunk mcp version       - Show MCP-related version info
 """
 
 import argparse
@@ -30,6 +28,10 @@ from sirchmunk.version import __version__
 logger = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
 def _get_default_work_path() -> Path:
     """Get the default work path for Sirchmunk."""
     return Path(os.getenv("SIRCHMUNK_WORK_PATH", str(Path.home() / ".sirchmunk")))
@@ -46,16 +48,16 @@ def _setup_logging(log_level: str = "INFO"):
 
 def _load_env_file(env_file: Path) -> bool:
     """Load environment variables from .env file.
-    
+
     Args:
         env_file: Path to .env file
-        
+
     Returns:
         True if file was loaded, False otherwise
     """
     if not env_file.exists():
         return False
-    
+
     try:
         from dotenv import load_dotenv
         load_dotenv(env_file, override=False)
@@ -77,593 +79,18 @@ def _load_env_file(env_file: Path) -> bool:
             return False
 
 
-def cmd_init(args: argparse.Namespace) -> int:
-    """Initialize Sirchmunk working directory.
-    
-    Creates the work directory structure, checks dependencies, generates
-    initial configuration, and optionally builds the WebUI frontend.
-    
-    Args:
-        args: Command-line arguments (supports --ui flag)
-        
-    Returns:
-        Exit code (0 for success, non-zero for failure)
-    """
-    import shutil
-    
-    try:
-        work_path = Path(args.work_path).expanduser().resolve()
-        build_ui = getattr(args, "ui", False)
-        
-        print("=" * 60)
-        print("  Sirchmunk Initialization")
-        print("=" * 60)
-        print()
-        print(f"Work path: {work_path}")
-        if build_ui:
-            print(f"WebUI build: enabled")
-        print()
-        
-        # Create directory structure
-        print("Creating directory structure...")
-        directories = [
-            work_path,
-            work_path / "data",
-            work_path / "logs",
-            work_path / ".cache",
-            work_path / ".cache" / "models",
-            work_path / ".cache" / "knowledge",
-            work_path / ".cache" / "history",
-            work_path / ".cache" / "settings",
-        ]
-        
-        for directory in directories:
-            directory.mkdir(parents=True, exist_ok=True)
-        print("  ✓ Created work directory and subdirectories")
-        
-        # Generate default .env file if not exists
-        env_file = work_path / ".env"
-        if not env_file.exists():
-            _generate_env_file(env_file)
-            print(f"  ✓ Generated {env_file}")
-        else:
-            print(f"  • Skipped {env_file} (already exists)")
-        
-        # Check dependencies
-        print()
-        print("Checking dependencies...")
-        
-        # Check ripgrep-all
-        if shutil.which("rga"):
-            print("  ✓ ripgrep-all (rga) is installed")
-        else:
-            print("  ✗ ripgrep-all (rga) is not installed")
-            print("    Installing ripgrep-all...")
-            try:
-                from sirchmunk.utils.install_rga import install_rga
-                install_rga()
-                print("  ✓ ripgrep-all installed successfully")
-            except Exception as e:
-                print(f"  ✗ Failed to install ripgrep-all: {e}")
-                print("    Please install manually: https://github.com/phiresky/ripgrep-all")
-        
-        # Check ripgrep
-        if shutil.which("rg"):
-            print("  ✓ ripgrep (rg) is installed")
-        else:
-            print("  ✗ ripgrep (rg) is not installed")
-            print("    Please install: https://github.com/BurntSushi/ripgrep")
-        
-        # Check Python packages
-        try:
-            import fastapi
-            print("  ✓ FastAPI is installed")
-        except ImportError:
-            print("  ✗ FastAPI not found")
-            print("    Install with: pip install fastapi")
-        
-        try:
-            import uvicorn
-            print("  ✓ uvicorn is installed")
-        except ImportError:
-            print("  ✗ uvicorn not found")
-            print("    Install with: pip install uvicorn")
-        
-        # Check environment variables
-        print()
-        print("Checking environment variables...")
-        
-        # Load env file first
-        _load_env_file(env_file)
-        
-        llm_api_key = os.getenv("LLM_API_KEY")
-        if llm_api_key:
-            masked_key = llm_api_key[:8] + "..." if len(llm_api_key) > 8 else "***"
-            print(f"  ✓ LLM_API_KEY is set ({masked_key})")
-        else:
-            print("  ✗ LLM_API_KEY is not set")
-            print(f"    Set it in {env_file}")
-        
-        llm_model = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
-        print(f"  • LLM_MODEL_NAME: {llm_model}")
-        
-        llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-        print(f"  • LLM_BASE_URL: {llm_base_url}")
-        
-        # Pre-download embedding model
-        print()
-        print("Downloading embedding model...")
-        print("  (This may take a few minutes on first run)")
-        try:
-            from sirchmunk.utils.embedding_util import EmbeddingUtil
-            
-            model_cache_dir = str(work_path / ".cache" / "models")
-            model_dir = EmbeddingUtil.preload_model(
-                cache_dir=model_cache_dir,
-            )
-            print(f"  ✓ Embedding model downloaded: {model_dir}")
-        except Exception as e:
-            print(f"  ✗ Failed to download embedding model: {e}")
-            print("    Model will be downloaded on first search.")
-        
-        # Build WebUI frontend (optional, requires Node.js)
-        if build_ui:
-            print()
-            print("Building WebUI frontend...")
-            from sirchmunk.cli.web_launcher import (
-                check_node_installed,
-                build_frontend,
-                has_static_build,
-            )
-            
-            if not check_node_installed():
-                print("  ✗ Node.js / npm is required to build the WebUI.")
-                print("    Install from: https://nodejs.org/")
-                print("    You can skip this step and run 'sirchmunk serve' without --ui.")
-            else:
-                success = build_frontend(work_path=work_path)
-                if success:
-                    print("  ✓ WebUI built successfully")
-                else:
-                    print("  ✗ WebUI build failed. You can retry with 'sirchmunk init --ui'.")
-        
-        print()
-        print("=" * 60)
-        print("✅ Initialization complete!")
-        print("=" * 60)
-        print()
-        print("Next steps:")
-        print(f"  1. Edit {env_file} to configure LLM_API_KEY")
-        if build_ui:
-            print("  2. Run 'sirchmunk serve --ui' to start with WebUI (single port)")
-        else:
-            print("  2. Run 'sirchmunk serve' to start the API server")
-            print("     (or 'sirchmunk init --ui' to build WebUI first)")
-        print("  3. Run 'sirchmunk search \"your query\"' to perform searches")
-        print()
-        
-        return 0
-        
-    except Exception as e:
-        logger.error(f"Initialization failed: {e}", exc_info=True)
-        print(f"❌ Initialization failed: {e}")
-        return 1
-
-
-def cmd_config(args: argparse.Namespace) -> int:
-    """Show or generate configuration.
-    
-    Args:
-        args: Command-line arguments
-        
-    Returns:
-        Exit code (0 for success, non-zero for failure)
-    """
-    try:
-        work_path = _get_default_work_path().expanduser().resolve()
-        
-        if args.generate:
-            # Generate .env file
-            work_path.mkdir(parents=True, exist_ok=True)
-            env_file = work_path / ".env"
-            
-            if env_file.exists() and not args.force:
-                print(f"⚠️  {env_file} already exists.")
-                print("   Use --force to overwrite.")
-                return 1
-            
-            _generate_env_file(env_file)
-            print(f"✅ Generated {env_file}")
-            print()
-            print("Edit this file to configure your LLM settings:")
-            print(f"  {env_file}")
-            return 0
-        
-        # Show current configuration
-        print("=" * 60)
-        print("Sirchmunk Configuration")
-        print("=" * 60)
-        print()
-        
-        # Load env file if exists
-        env_file = work_path / ".env"
-        if env_file.exists():
-            _load_env_file(env_file)
-            print(f"📄 Config file: {env_file}")
-        else:
-            print(f"📄 Config file: Not found ({env_file})")
-            print("   Run 'sirchmunk config --generate' to create one.")
-        
-        print()
-        print("Current Settings:")
-        print(f"  SIRCHMUNK_WORK_PATH: {os.getenv('SIRCHMUNK_WORK_PATH', '~/.sirchmunk (default)')}")
-        print(f"  LLM_BASE_URL: {os.getenv('LLM_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1 (default)')}")
-        print(f"  LLM_API_KEY: {'***' + os.getenv('LLM_API_KEY', '')[-4:] if os.getenv('LLM_API_KEY') else 'Not set'}")
-        print(f"  LLM_MODEL_NAME: {os.getenv('LLM_MODEL_NAME', 'qwen3-max (default)')}")
-        print()
-        
-        return 0
-        
-    except Exception as e:
-        logger.error(f"Config command failed: {e}", exc_info=True)
-        print(f"❌ Error: {e}")
-        return 1
-
-
-def cmd_serve(args: argparse.Namespace) -> int:
-    """Start the Sirchmunk server.
-    
-    Supports three modes:
-    - Backend only (default): Starts the FastAPI API server
-    - Production UI (--ui): Serves pre-built WebUI + API on a single port
-    - Development UI (--ui --dev): Runs backend + Next.js dev server (dual port)
-    
-    Args:
-        args: Command-line arguments
-        
-    Returns:
-        Exit code (0 for success, non-zero for failure)
-    """
-    try:
-        # Load environment
-        work_path = _get_default_work_path().expanduser().resolve()
-        env_file = work_path / ".env"
-        if env_file.exists():
-            _load_env_file(env_file)
-        
-        serve_ui = getattr(args, "ui", False)
-        dev_mode = getattr(args, "dev", False)
-        
-        # Development mode: dual-port subprocess orchestration
-        if serve_ui and dev_mode:
-            return _serve_dev_mode(args, work_path)
-        
-        # Production UI mode: validate static build exists
-        if serve_ui:
-            from sirchmunk.cli.web_launcher import has_static_build
-            if not has_static_build(work_path):
-                print("❌ WebUI static build not found.")
-                print("   Build it first with: sirchmunk init --ui")
-                print("   Or use --dev for development mode: sirchmunk serve --ui --dev")
-                return 1
-            # Set environment variable so main.py mounts static files
-            os.environ["SIRCHMUNK_SERVE_UI"] = "true"
-        
-        # Import uvicorn here to avoid slow startup
-        try:
-            import uvicorn
-        except ImportError:
-            print("❌ uvicorn is not installed.")
-            print("   Install it with: pip install uvicorn")
-            return 1
-        
-        print("=" * 60)
-        print(f"Sirchmunk Server v{__version__}")
-        print("=" * 60)
-        print()
-        # Display host: use "localhost" for URLs when binding to 0.0.0.0
-        display_host = "localhost" if args.host in ("0.0.0.0", "::") else args.host
-        
-        print(f"  Host:   {args.host}")
-        print(f"  Port:   {args.port}")
-        print(f"  Reload: {args.reload}")
-        print(f"  WebUI:  {'enabled (single port)' if serve_ui else 'disabled'}")
-        print()
-        if serve_ui:
-            print(f"  🌐 WebUI: http://{display_host}:{args.port}/")
-        print(f"  📡 API:   http://{display_host}:{args.port}/api/v1/")
-        print(f"  📖 Docs:  http://{display_host}:{args.port}/docs")
-        print(f"  ❤️  Health: http://{display_host}:{args.port}/health")
-        print()
-        print("Press Ctrl+C to stop the server.")
-        print("=" * 60)
-        print()
-        
-        uvicorn.run(
-            "sirchmunk.api.main:app",
-            host=args.host,
-            port=args.port,
-            reload=args.reload,
-            log_level=args.log_level.lower(),
-        )
-        
-        return 0
-        
-    except KeyboardInterrupt:
-        print("\n✅ Server stopped.")
-        return 0
-    except Exception as e:
-        logger.error(f"Server failed: {e}", exc_info=True)
-        print(f"❌ Server error: {e}")
-        return 1
-
-
-def _serve_dev_mode(args: argparse.Namespace, work_path: Path) -> int:
-    """Start in development mode with dual-port frontend + backend.
-    
-    Launches the FastAPI backend and Next.js dev server as child processes,
-    providing hot-reload for both frontend and backend development.
-    
-    Args:
-        args: Command-line arguments
-        work_path: Resolved Sirchmunk work path
-        
-    Returns:
-        Exit code
-    """
-    from sirchmunk.cli.web_launcher import (
-        check_node_installed,
-        find_web_source_dir,
-        serve_with_ui_dev,
-    )
-    
-    if not check_node_installed():
-        print("❌ Node.js / npm is required for development mode.")
-        print("   Install from: https://nodejs.org/")
-        return 1
-    
-    web_dir = find_web_source_dir()
-    if web_dir is None:
-        print("❌ Cannot locate web/ source directory.")
-        print("   Set SIRCHMUNK_WEB_DIR environment variable.")
-        return 1
-    
-    frontend_port = getattr(args, "frontend_port", 8585)
-    
-    print("=" * 60)
-    print(f"Sirchmunk Dev Server v{__version__}")
-    print("=" * 60)
-    print()
-    print(f"  Mode:     Development (hot-reload)")
-    print(f"  Backend:  {args.host}:{args.port}")
-    print(f"  Frontend: localhost:{frontend_port}")
-    print(f"  Web source: {web_dir}")
-    print()
-    
-    serve_with_ui_dev(
-        host=args.host,
-        backend_port=args.port,
-        frontend_port=frontend_port,
-        log_level=args.log_level.lower(),
-    )
-    
-    return 0
-
-
-def cmd_search(args: argparse.Namespace) -> int:
-    """Perform a search query.
-    
-    Can operate in two modes:
-    - Local mode (default): Direct search using AgenticSearch
-    - Client mode (--api): Call the API server
-    
-    Args:
-        args: Command-line arguments
-        
-    Returns:
-        Exit code (0 for success, non-zero for failure)
-    """
-    try:
-        # Load environment
-        work_path = _get_default_work_path().expanduser().resolve()
-        env_file = work_path / ".env"
-        if env_file.exists():
-            _load_env_file(env_file)
-        
-        query = args.query
-        search_paths = args.paths or [os.getcwd()]
-        
-        if args.api:
-            # Client mode: call API server
-            return _search_via_api(
-                query=query,
-                search_paths=search_paths,
-                api_url=args.api_url,
-                mode=args.mode,
-                output_format=args.output,
-            )
-        else:
-            # Local mode: direct search
-            return asyncio.run(_search_local(
-                query=query,
-                search_paths=search_paths,
-                mode=args.mode,
-                output_format=args.output,
-                verbose=args.verbose,
-            ))
-        
-    except KeyboardInterrupt:
-        print("\n⚠️ Search cancelled.")
-        return 130
-    except Exception as e:
-        logger.error(f"Search failed: {e}", exc_info=True)
-        print(f"❌ Search error: {e}")
-        return 1
-
-
-async def _search_local(
-    query: str,
-    search_paths: list,
-    mode: str = "DEEP",
-    output_format: str = "text",
-    verbose: bool = False,
-) -> int:
-    """Execute search locally using AgenticSearch.
-    
-    Args:
-        query: Search query
-        search_paths: Paths to search
-        mode: Search mode (DEEP, FILENAME_ONLY)
-        output_format: Output format (text, json)
-        verbose: Enable verbose output
-        
-    Returns:
-        Exit code
-    """
-    from sirchmunk.search import AgenticSearch
-    from sirchmunk.llm.openai_chat import OpenAIChat
-    
-    # Read LLM config from environment at runtime (after .env is loaded)
-    # Don't use constants module values as they are loaded at import time
-    llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-    llm_api_key = os.getenv("LLM_API_KEY", "")
-    llm_model_name = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
-    
-    # Validate API key
-    if not llm_api_key:
-        print("❌ LLM_API_KEY is not set.")
-        print("   Configure it in ~/.sirchmunk/.env or set the environment variable.")
-        return 1
-    
-    # Create LLM client
-    llm = OpenAIChat(
-        base_url=llm_base_url,
-        api_key=llm_api_key,
-        model=llm_model_name,
-    )
-    
-    # Create search instance
-    work_path = _get_default_work_path()
-    searcher = AgenticSearch(
-        llm=llm,
-        work_path=str(work_path),
-        verbose=verbose,
-    )
-    
-    if not verbose:
-        print(f"🔍 Searching: {query}")
-        print(f"   Mode: {mode}")
-        print(f"   Paths: {', '.join(search_paths)}")
-        print()
-    
-    # Execute search
-    result = await searcher.search(
-        query=query,
-        search_paths=search_paths,
-        mode=mode,
-        return_cluster=output_format == "json",
-    )
-    
-    # Output result
-    if output_format == "json":
-        if hasattr(result, "to_dict"):
-            output = json.dumps(result.to_dict(), indent=2, ensure_ascii=False)
-        else:
-            output = json.dumps({"result": result}, indent=2, ensure_ascii=False)
-        print(output)
-    else:
-        if result:
-            print("=" * 60)
-            print("Search Results")
-            print("=" * 60)
-            print()
-            print(result)
-        else:
-            print("No results found.")
-    
-    return 0
-
-
-def _search_via_api(
-    query: str,
-    search_paths: list,
-    api_url: str = "http://localhost:8584",
-    mode: str = "DEEP",
-    output_format: str = "text",
-) -> int:
-    """Execute search via API server.
-    
-    Args:
-        query: Search query
-        search_paths: Paths to search
-        api_url: API server URL
-        mode: Search mode
-        output_format: Output format
-        
-    Returns:
-        Exit code
-    """
-    try:
-        import requests
-    except ImportError:
-        print("❌ requests library is not installed.")
-        print("   Install it with: pip install requests")
-        return 1
-    
-    print(f"🔍 Searching via API: {api_url}")
-    print(f"   Query: {query}")
-    print(f"   Mode: {mode}")
-    print()
-    
-    try:
-        response = requests.post(
-            f"{api_url}/api/v1/search",
-            json={
-                "query": query,
-                "search_paths": search_paths,
-                "mode": mode,
-            },
-            timeout=300,  # 5 minute timeout for long searches
-        )
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        if output_format == "json":
-            print(json.dumps(data, indent=2, ensure_ascii=False))
-        else:
-            if data.get("success"):
-                print("=" * 60)
-                print("Search Results")
-                print("=" * 60)
-                print()
-                print(data.get("data", {}).get("summary", "No results found."))
-            else:
-                print(f"❌ Search failed: {data.get('error', 'Unknown error')}")
-                return 1
-        
-        return 0
-        
-    except requests.exceptions.ConnectionError:
-        print(f"❌ Cannot connect to API server at {api_url}")
-        print("   Make sure the server is running: sirchmunk serve")
-        return 1
-    except requests.exceptions.Timeout:
-        print("❌ Request timed out.")
-        return 1
-    except Exception as e:
-        print(f"❌ API error: {e}")
-        return 1
-
-
 def _generate_env_file(env_file: Path):
     """Generate a default .env configuration file.
-    
+
+    The single .env is shared by both the web API server and the MCP server.
+
     Args:
         env_file: Path to write the .env file
     """
-    content = """# ===== Sirchmunk Configuration =====
-# Generated by: sirchmunk config --generate
+    content = """\
+# ===== Sirchmunk Configuration =====
+# Generated by: sirchmunk init
+# Shared by Web API server and MCP server.
 
 # ===== LLM Settings =====
 # LLM API base URL (OpenAI-compatible endpoint)
@@ -674,6 +101,9 @@ LLM_API_KEY=
 
 # LLM model name
 LLM_MODEL_NAME=gpt-5.2
+
+# LLM request timeout in seconds
+LLM_TIMEOUT=60.0
 
 # ===== Sirchmunk Settings =====
 # Working directory for data and cache
@@ -689,7 +119,7 @@ DEFAULT_MAX_DEPTH=5
 # Number of top files to return
 DEFAULT_TOP_K_FILES=3
 
-# Number of keyword granularity levels
+# Number of keyword granularity levels (1-5)
 DEFAULT_KEYWORD_LEVELS=3
 
 # Grep operation timeout in seconds
@@ -707,18 +137,844 @@ CLUSTER_SIM_TOP_K=3
 
 # Maximum queries per cluster (FIFO)
 MAX_QUERIES_PER_CLUSTER=5
+
+# ===== MCP Server Settings =====
+# MCP server name
+MCP_SERVER_NAME=sirchmunk
+
+# Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+MCP_LOG_LEVEL=INFO
+
+# MCP transport protocol (stdio or http)
+MCP_TRANSPORT=stdio
+
+# ===== HTTP Transport Settings (only used when MCP_TRANSPORT=http) =====
+# Host for HTTP transport
+MCP_HOST=localhost
+
+# Port for HTTP transport
+MCP_PORT=8080
 """
-    
+
     with open(env_file, "w") as f:
         f.write(content)
 
 
-def cmd_version(args: argparse.Namespace) -> int:
-    """Show version information.
-    
+def _check_env_vars(env_file: Path):
+    """Validate and display critical environment variables.
+
+    Args:
+        env_file: Path to the env file (for user-facing messages)
+    """
+    _env_checks = {
+        "LLM_API_KEY": ("LLM API key", True),
+        "LLM_BASE_URL": ("LLM base URL", False),
+        "LLM_MODEL_NAME": ("LLM model name", False),
+    }
+    for key, (label, required) in _env_checks.items():
+        val = os.getenv(key, "").strip()
+        if val and val != "your-api-key":
+            masked = val[:8] + "..." if len(val) > 8 else val
+            print(f"  ✓ {key} = {masked}")
+        elif required:
+            print(f"  ✗ {key} is not configured  ({label})")
+            print(f"    Set it in {env_file} or as an environment variable")
+        else:
+            print(f"  - {key} not set, using default  ({label})")
+
+
+# ------------------------------------------------------------------
+# sirchmunk init
+# ------------------------------------------------------------------
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Initialize Sirchmunk working directory.
+
+    Creates the work directory structure, checks dependencies, generates
+    initial .env configuration, and downloads the embedding model.
+
     Args:
         args: Command-line arguments
-        
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    import shutil
+
+    try:
+        work_path = Path(args.work_path).expanduser().resolve()
+
+        print("=" * 60)
+        print("  Sirchmunk Initialization")
+        print("=" * 60)
+        print()
+        print(f"Work path: {work_path}")
+        print()
+
+        # Create directory structure
+        print("Creating directory structure...")
+        directories = [
+            work_path,
+            work_path / "data",
+            work_path / "logs",
+            work_path / ".cache",
+            work_path / ".cache" / "models",
+            work_path / ".cache" / "knowledge",
+            work_path / ".cache" / "history",
+            work_path / ".cache" / "settings",
+        ]
+
+        for directory in directories:
+            directory.mkdir(parents=True, exist_ok=True)
+        print("  ✓ Created work directory and subdirectories")
+
+        # Generate default .env file if not exists
+        env_file = work_path / ".env"
+        if not env_file.exists():
+            _generate_env_file(env_file)
+            print(f"  ✓ Generated {env_file}")
+        else:
+            print(f"  • Skipped {env_file} (already exists)")
+
+        # Check dependencies
+        print()
+        print("Checking dependencies...")
+
+        # Check ripgrep-all
+        if shutil.which("rga"):
+            print("  ✓ ripgrep-all (rga) is installed")
+        else:
+            print("  ✗ ripgrep-all (rga) is not installed")
+            print("    Installing ripgrep-all...")
+            try:
+                from sirchmunk.utils.install_rga import install_rga
+                install_rga()
+                print("  ✓ ripgrep-all installed successfully")
+            except Exception as e:
+                print(f"  ✗ Failed to install ripgrep-all: {e}")
+                print("    Please install manually: https://github.com/phiresky/ripgrep-all")
+
+        # Check ripgrep
+        if shutil.which("rg"):
+            print("  ✓ ripgrep (rg) is installed")
+        else:
+            print("  ✗ ripgrep (rg) is not installed")
+            print("    Please install: https://github.com/BurntSushi/ripgrep")
+
+        # Check environment variables
+        print()
+        print("Checking environment variables...")
+        _load_env_file(env_file)
+
+        llm_api_key = os.getenv("LLM_API_KEY")
+        if llm_api_key:
+            masked_key = llm_api_key[:8] + "..." if len(llm_api_key) > 8 else "***"
+            print(f"  ✓ LLM_API_KEY is set ({masked_key})")
+        else:
+            print("  ✗ LLM_API_KEY is not set")
+            print(f"    Set it in {env_file}")
+
+        llm_model = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
+        print(f"  • LLM_MODEL_NAME: {llm_model}")
+
+        llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+        print(f"  • LLM_BASE_URL: {llm_base_url}")
+
+        # Pre-download embedding model
+        print()
+        print("Downloading embedding model...")
+        print("  (This may take a few minutes on first run)")
+        try:
+            from sirchmunk.utils.embedding_util import EmbeddingUtil
+
+            model_cache_dir = str(work_path / ".cache" / "models")
+            model_dir = EmbeddingUtil.preload_model(
+                cache_dir=model_cache_dir,
+            )
+            print(f"  ✓ Embedding model downloaded: {model_dir}")
+        except Exception as e:
+            print(f"  ✗ Failed to download embedding model: {e}")
+            print("    Model will be downloaded on first search.")
+
+        # Check MCP package
+        try:
+            import importlib.metadata
+            mcp_version = importlib.metadata.version("mcp")
+            print(f"  ✓ MCP package installed (v{mcp_version})")
+        except Exception:
+            print("  • MCP package not installed (optional)")
+            print("    Install with: pip install sirchmunk[mcp]")
+
+        # Generate MCP client config example
+        mcp_config_file = work_path / "mcp_config.json"
+        if not mcp_config_file.exists():
+            mcp_config_content = """\
+{
+  "mcpServers": {
+    "sirchmunk": {
+      "command": "sirchmunk",
+      "args": ["mcp", "serve"],
+      "env": {
+        "SIRCHMUNK_SEARCH_PATHS": ""
+      }
+    }
+  }
+}
+"""
+            mcp_config_file.write_text(mcp_config_content)
+            print(f"  ✓ Generated MCP client config: {mcp_config_file}")
+        else:
+            print(f"  • Skipped {mcp_config_file} (already exists)")
+
+        print()
+        print("=" * 60)
+        print("  Initialization complete!")
+        print("=" * 60)
+        print()
+        print("Next steps:")
+        print(f"  1. Edit {env_file} to configure LLM_API_KEY")
+        print("  2. Run 'sirchmunk serve' to start the API server")
+        print("  3. Run 'sirchmunk search \"your query\"' to perform searches")
+        print("  4. Run 'sirchmunk web init' to build WebUI (optional, requires Node.js)")
+        print(f"  5. For MCP: copy {mcp_config_file} to your MCP client config")
+        print("     - Cursor: ~/.cursor/mcp.json")
+        print("     - Claude Desktop: ~/Library/Application Support/Claude/claude_desktop_config.json")
+        print()
+
+        return 0
+
+    except Exception as e:
+        logger.error(f"Initialization failed: {e}", exc_info=True)
+        print(f"  Initialization failed: {e}")
+        return 1
+
+
+# ------------------------------------------------------------------
+# sirchmunk serve (Web API)
+# ------------------------------------------------------------------
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Start the Sirchmunk backend API server.
+
+    Args:
+        args: Command-line arguments
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    try:
+        # Load environment
+        work_path = _get_default_work_path().expanduser().resolve()
+        env_file = work_path / ".env"
+        if env_file.exists():
+            _load_env_file(env_file)
+
+        # Import uvicorn here to avoid slow startup
+        try:
+            import uvicorn
+        except ImportError:
+            print("  uvicorn is not installed.")
+            print("   Install it with: pip install uvicorn")
+            return 1
+
+        print("=" * 60)
+        print(f"  Sirchmunk Server v{__version__}")
+        print("=" * 60)
+        print()
+        # Display host: use "localhost" for URLs when binding to 0.0.0.0
+        display_host = "localhost" if args.host in ("0.0.0.0", "::") else args.host
+
+        print(f"  Host:   {args.host}")
+        print(f"  Port:   {args.port}")
+        print(f"  Reload: {args.reload}")
+        print()
+        print(f"  API:   http://{display_host}:{args.port}/api/v1/")
+        print(f"  Docs:  http://{display_host}:{args.port}/docs")
+        print(f"  Health: http://{display_host}:{args.port}/health")
+        print()
+        print("Press Ctrl+C to stop the server.")
+        print("=" * 60)
+        print()
+
+        uvicorn.run(
+            "sirchmunk.api.main:app",
+            host=args.host,
+            port=args.port,
+            reload=args.reload,
+            log_level=args.log_level.lower(),
+        )
+
+        return 0
+
+    except KeyboardInterrupt:
+        print("\n  Server stopped.")
+        return 0
+    except Exception as e:
+        logger.error(f"Server failed: {e}", exc_info=True)
+        print(f"  Server error: {e}")
+        return 1
+
+
+# ------------------------------------------------------------------
+# sirchmunk search
+# ------------------------------------------------------------------
+
+def cmd_search(args: argparse.Namespace) -> int:
+    """Perform a search query.
+
+    Can operate in two modes:
+    - Local mode (default): Direct search using AgenticSearch
+    - Client mode (--api): Call the API server
+
+    Args:
+        args: Command-line arguments
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    try:
+        # Load environment
+        work_path = _get_default_work_path().expanduser().resolve()
+        env_file = work_path / ".env"
+        if env_file.exists():
+            _load_env_file(env_file)
+
+        query = args.query
+        paths = args.paths or [os.getcwd()]
+
+        if args.api:
+            # Client mode: call API server
+            return _search_via_api(
+                query=query,
+                paths=paths,
+                api_url=args.api_url,
+                mode=args.mode,
+                output_format=args.output,
+            )
+        else:
+            # Local mode: direct search
+            return asyncio.run(_search_local(
+                query=query,
+                paths=paths,
+                mode=args.mode,
+                output_format=args.output,
+                verbose=args.verbose,
+            ))
+
+    except KeyboardInterrupt:
+        print("\n  Search cancelled.")
+        return 130
+    except Exception as e:
+        logger.error(f"Search failed: {e}", exc_info=True)
+        print(f"  Search error: {e}")
+        return 1
+
+
+async def _search_local(
+    query: str,
+    paths: list,
+    mode: str = "DEEP",
+    output_format: str = "text",
+    verbose: bool = False,
+) -> int:
+    """Execute search locally using AgenticSearch.
+
+    Args:
+        query: Search query
+        paths: Paths to search
+        mode: Search mode (DEEP, FILENAME_ONLY)
+        output_format: Output format (text, json)
+        verbose: Enable verbose output
+
+    Returns:
+        Exit code
+    """
+    from sirchmunk.search import AgenticSearch
+    from sirchmunk.llm.openai_chat import OpenAIChat
+
+    # Read LLM config from environment at runtime (after .env is loaded)
+    llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+    llm_api_key = os.getenv("LLM_API_KEY", "")
+    llm_model_name = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
+
+    # Validate API key
+    if not llm_api_key:
+        print("  LLM_API_KEY is not set.")
+        print("   Configure it in ~/.sirchmunk/.env or set the environment variable.")
+        return 1
+
+    # Create LLM client
+    llm = OpenAIChat(
+        base_url=llm_base_url,
+        api_key=llm_api_key,
+        model=llm_model_name,
+    )
+
+    # Create search instance
+    work_path = _get_default_work_path()
+    searcher = AgenticSearch(
+        llm=llm,
+        work_path=str(work_path),
+        verbose=verbose,
+    )
+
+    if not verbose:
+        print(f"  Searching: {query}")
+        print(f"   Mode: {mode}")
+        print(f"   Paths: {', '.join(paths)}")
+        print()
+
+    # Execute search
+    result = await searcher.search(
+        query=query,
+        paths=paths,
+        mode=mode,
+        return_cluster=output_format == "json",
+    )
+
+    # Output result
+    if output_format == "json":
+        if hasattr(result, "to_dict"):
+            output = json.dumps(result.to_dict(), indent=2, ensure_ascii=False)
+        else:
+            output = json.dumps({"result": result}, indent=2, ensure_ascii=False)
+        print(output)
+    else:
+        if result:
+            print("=" * 60)
+            print("Search Results")
+            print("=" * 60)
+            print()
+            print(result)
+        else:
+            print("No results found.")
+
+    return 0
+
+
+def _search_via_api(
+    query: str,
+    paths: list,
+    api_url: str = "http://localhost:8584",
+    mode: str = "DEEP",
+    output_format: str = "text",
+) -> int:
+    """Execute search via API server.
+
+    Args:
+        query: Search query
+        paths: Paths to search
+        api_url: API server URL
+        mode: Search mode
+        output_format: Output format
+
+    Returns:
+        Exit code
+    """
+    try:
+        import requests
+    except ImportError:
+        print("  requests library is not installed.")
+        print("   Install it with: pip install requests")
+        return 1
+
+    print(f"  Searching via API: {api_url}")
+    print(f"   Query: {query}")
+    print(f"   Mode: {mode}")
+    print()
+
+    try:
+        response = requests.post(
+            f"{api_url}/api/v1/search",
+            json={
+                "query": query,
+                "paths": paths,
+                "mode": mode,
+            },
+            timeout=300,  # 5 minute timeout for long searches
+        )
+        response.raise_for_status()
+
+        data = response.json()
+
+        if output_format == "json":
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+        else:
+            if data.get("success"):
+                print("=" * 60)
+                print("Search Results")
+                print("=" * 60)
+                print()
+                print(data.get("data", {}).get("summary", "No results found."))
+            else:
+                print(f"  Search failed: {data.get('error', 'Unknown error')}")
+                return 1
+
+        return 0
+
+    except requests.exceptions.ConnectionError:
+        print(f"  Cannot connect to API server at {api_url}")
+        print("   Make sure the server is running: sirchmunk serve")
+        return 1
+    except requests.exceptions.Timeout:
+        print("  Request timed out.")
+        return 1
+    except Exception as e:
+        print(f"  API error: {e}")
+        return 1
+
+
+# ------------------------------------------------------------------
+# sirchmunk web init
+# ------------------------------------------------------------------
+
+def cmd_web_init(args: argparse.Namespace) -> int:
+    """Build the WebUI frontend static assets.
+
+    Requires Node.js 18+ and npm. The built assets are stored in the work
+    directory so that ``sirchmunk web serve`` can serve them on a single port.
+
+    Args:
+        args: Command-line arguments
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    try:
+        from sirchmunk.cli.web_launcher import (
+            check_node_installed,
+            build_frontend,
+        )
+
+        work_path = Path(
+            getattr(args, "work_path", None) or str(_get_default_work_path())
+        ).expanduser().resolve()
+
+        print("=" * 60)
+        print("  Sirchmunk WebUI Build")
+        print("=" * 60)
+        print()
+        print(f"Work path: {work_path}")
+        print()
+
+        if not check_node_installed():
+            print("  ✗ Node.js / npm is required to build the WebUI.")
+            print("    Install from: https://nodejs.org/")
+            return 1
+
+        print("Building WebUI frontend...")
+        success = build_frontend(work_path=work_path)
+        if success:
+            print("  ✓ WebUI built successfully")
+            print()
+            print("Next steps:")
+            print("  Run 'sirchmunk web serve' to start API + WebUI (single port)")
+            return 0
+        else:
+            print("  ✗ WebUI build failed.")
+            return 1
+
+    except Exception as e:
+        logger.error(f"WebUI build failed: {e}", exc_info=True)
+        print(f"  WebUI build error: {e}")
+        return 1
+
+
+# ------------------------------------------------------------------
+# sirchmunk web serve
+# ------------------------------------------------------------------
+
+def cmd_web_serve(args: argparse.Namespace) -> int:
+    """Start the Sirchmunk server with WebUI.
+
+    In normal mode (default), serves the pre-built WebUI + API on a single
+    port.  In development mode (``--dev``), launches the FastAPI backend and
+    a Next.js dev server as child processes for hot-reload.
+
+    Args:
+        args: Command-line arguments
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    try:
+        # Load environment
+        work_path = _get_default_work_path().expanduser().resolve()
+        env_file = work_path / ".env"
+        if env_file.exists():
+            _load_env_file(env_file)
+
+        dev_mode = getattr(args, "dev", False)
+
+        # Development mode: dual-port subprocess orchestration
+        if dev_mode:
+            return _serve_dev_mode(args, work_path)
+
+        # Production UI mode: validate static build exists
+        from sirchmunk.cli.web_launcher import has_static_build
+        if not has_static_build(work_path):
+            print("  WebUI static build not found.")
+            print("   Build it first with: sirchmunk web init")
+            print("   Or use development mode: sirchmunk web serve --dev")
+            return 1
+        # Set environment variable so main.py mounts static files
+        os.environ["SIRCHMUNK_SERVE_UI"] = "true"
+
+        # Import uvicorn here to avoid slow startup
+        try:
+            import uvicorn
+        except ImportError:
+            print("  uvicorn is not installed.")
+            print("   Install it with: pip install uvicorn")
+            return 1
+
+        print("=" * 60)
+        print(f"  Sirchmunk Server + WebUI v{__version__}")
+        print("=" * 60)
+        print()
+        display_host = "localhost" if args.host in ("0.0.0.0", "::") else args.host
+
+        print(f"  Host:   {args.host}")
+        print(f"  Port:   {args.port}")
+        print(f"  Reload: {args.reload}")
+        print(f"  WebUI:  enabled (single port)")
+        print()
+        print(f"  WebUI: http://{display_host}:{args.port}/")
+        print(f"  API:   http://{display_host}:{args.port}/api/v1/")
+        print(f"  Docs:  http://{display_host}:{args.port}/docs")
+        print(f"  Health: http://{display_host}:{args.port}/health")
+        print()
+        print("Press Ctrl+C to stop the server.")
+        print("=" * 60)
+        print()
+
+        uvicorn.run(
+            "sirchmunk.api.main:app",
+            host=args.host,
+            port=args.port,
+            reload=args.reload,
+            log_level=args.log_level.lower(),
+        )
+
+        return 0
+
+    except KeyboardInterrupt:
+        print("\n  Server stopped.")
+        return 0
+    except Exception as e:
+        logger.error(f"Server failed: {e}", exc_info=True)
+        print(f"  Server error: {e}")
+        return 1
+
+
+def _serve_dev_mode(args: argparse.Namespace, work_path: Path) -> int:
+    """Start in development mode with dual-port frontend + backend.
+
+    Launches the FastAPI backend and Next.js dev server as child processes,
+    providing hot-reload for both frontend and backend development.
+
+    Args:
+        args: Command-line arguments
+        work_path: Resolved Sirchmunk work path
+
+    Returns:
+        Exit code
+    """
+    from sirchmunk.cli.web_launcher import (
+        check_node_installed,
+        find_web_source_dir,
+        serve_with_ui_dev,
+    )
+
+    if not check_node_installed():
+        print("  Node.js / npm is required for development mode.")
+        print("   Install from: https://nodejs.org/")
+        return 1
+
+    web_dir = find_web_source_dir()
+    if web_dir is None:
+        print("  Cannot locate web/ source directory.")
+        print("   Set SIRCHMUNK_WEB_DIR environment variable.")
+        return 1
+
+    frontend_port = getattr(args, "frontend_port", 8585)
+
+    print("=" * 60)
+    print(f"  Sirchmunk Dev Server v{__version__}")
+    print("=" * 60)
+    print()
+    print(f"  Mode:     Development (hot-reload)")
+    print(f"  Backend:  {args.host}:{args.port}")
+    print(f"  Frontend: localhost:{frontend_port}")
+    print(f"  Web source: {web_dir}")
+    print()
+
+    serve_with_ui_dev(
+        host=args.host,
+        backend_port=args.port,
+        frontend_port=frontend_port,
+        log_level=args.log_level.lower(),
+    )
+
+    return 0
+
+
+# ------------------------------------------------------------------
+# sirchmunk mcp serve
+# ------------------------------------------------------------------
+
+def _setup_stdio_safe_environment():
+    """Configure environment for safe stdio MCP communication.
+
+    In MCP stdio mode, stdout is reserved exclusively for JSON-RPC messages.
+    Any non-JSON output to stdout will break the protocol.
+    """
+    os.environ["MODELSCOPE_LOG_LEVEL"] = "ERROR"
+    os.environ["MODELSCOPE_CACHE"] = os.path.expanduser("~/.sirchmunk/.cache/models")
+    os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+    os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    import warnings
+    warnings.filterwarnings("ignore")
+
+
+def cmd_mcp_serve(args: argparse.Namespace) -> int:
+    """Run the MCP server.
+
+    Args:
+        args: Command-line arguments
+
+    Returns:
+        Exit code
+    """
+    try:
+        # Override transport from command-line if specified
+        if args.transport:
+            os.environ["MCP_TRANSPORT"] = args.transport
+
+        if args.host:
+            os.environ["MCP_HOST"] = args.host
+
+        if args.port:
+            os.environ["MCP_PORT"] = str(args.port)
+
+        # Determine transport mode early (before loading config triggers imports)
+        transport = args.transport or os.environ.get("MCP_TRANSPORT", "stdio")
+
+        # Set up safe environment BEFORE any sirchmunk imports for stdio mode
+        if transport == "stdio":
+            os.environ["MCP_TRANSPORT"] = "stdio"
+            _setup_stdio_safe_environment()
+
+        # Load .env before importing config (so env vars are available)
+        work_path = _get_default_work_path().expanduser().resolve()
+        env_file = work_path / ".env"
+        if env_file.exists():
+            _load_env_file(env_file)
+
+        # Load configuration (may trigger sirchmunk imports)
+        from sirchmunk_mcp.config import Config
+        from sirchmunk_mcp.server import run_stdio_server, run_http_server
+
+        config = Config.from_env()
+
+        # Configure logging - MUST use stderr for stdio transport
+        log_level = args.log_level or config.mcp.log_level
+        logging.basicConfig(
+            level=getattr(logging, log_level.upper()),
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            stream=sys.stderr,
+        )
+
+        logger.info(f"Sirchmunk MCP Server v{__version__}")
+        logger.info(f"Transport: {config.mcp.transport}")
+
+        # Run server
+        if config.mcp.transport == "stdio":
+            # Check if running in interactive terminal
+            if sys.stdin.isatty():
+                print()
+                print("=" * 60)
+                print("  Sirchmunk MCP Server - STDIO Mode")
+                print("=" * 60)
+                print()
+                print("  STDIO mode is designed to be launched by an MCP client")
+                print("  (e.g., Claude Desktop, Cursor IDE), not run directly")
+                print("  in an interactive terminal.")
+                print()
+                print("  Options:")
+                print("  1. Configure your MCP client to launch this server")
+                print("  2. Use HTTP mode: sirchmunk mcp serve --transport http")
+                print()
+                print("=" * 60)
+                print()
+
+                try:
+                    response = input("Continue anyway? (y/N): ").strip().lower()
+                    if response != 'y':
+                        print("Server not started. Use an MCP client to launch this server.")
+                        return 0
+                    print()
+                    print("Starting server... Press Ctrl+C to stop.")
+                    print()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nServer not started.")
+                    return 0
+
+            asyncio.run(run_stdio_server(config))
+        elif config.mcp.transport == "http":
+            asyncio.run(run_http_server(config))
+        else:
+            logger.error(f"Unknown transport: {config.mcp.transport}")
+            return 1
+
+        return 0
+
+    except KeyboardInterrupt:
+        logger.info("Server stopped by user")
+        return 0
+
+    except Exception as e:
+        logger.error(f"MCP server error: {e}", exc_info=True)
+        return 1
+
+
+# ------------------------------------------------------------------
+# sirchmunk mcp version
+# ------------------------------------------------------------------
+
+def cmd_mcp_version(args: argparse.Namespace) -> int:
+    """Show MCP-related version information.
+
+    Args:
+        args: Command-line arguments
+
+    Returns:
+        Exit code
+    """
+    print(f"sirchmunk {__version__}")
+
+    try:
+        import importlib.metadata
+        mcp_ver = importlib.metadata.version("mcp")
+        print(f"mcp {mcp_ver}")
+    except Exception:
+        print("mcp (not installed)")
+
+    return 0
+
+
+# ------------------------------------------------------------------
+# sirchmunk version
+# ------------------------------------------------------------------
+
+def cmd_version(args: argparse.Namespace) -> int:
+    """Show version information.
+
+    Args:
+        args: Command-line arguments
+
     Returns:
         Exit code
     """
@@ -726,9 +982,13 @@ def cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------------------
+# Parser construction
+# ------------------------------------------------------------------
+
 def create_parser() -> argparse.ArgumentParser:
     """Create the argument parser for the CLI.
-    
+
     Returns:
         Configured argument parser
     """
@@ -736,187 +996,179 @@ def create_parser() -> argparse.ArgumentParser:
         prog="sirchmunk",
         description="Sirchmunk: Agentic Search for raw data intelligence",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog="""\
 Examples:
-  sirchmunk init                    Initialize Sirchmunk
-  sirchmunk init --ui               Initialize with WebUI build
-  sirchmunk config --generate       Generate configuration file
+  sirchmunk init                    Initialize Sirchmunk (incl. MCP config)
   sirchmunk serve                   Start API server (backend only)
-  sirchmunk serve --ui              Start with WebUI (single port)
-  sirchmunk serve --ui --dev        Start with Next.js dev server
   sirchmunk search "find auth"      Search in current directory
   sirchmunk search "bug" ./src      Search in specific path
-  sirchmunk search "api" --mode FILENAME_ONLY
-                                    Quick filename search
+  sirchmunk web init                Build WebUI frontend (requires Node.js)
+  sirchmunk web serve               Start API + WebUI (single port)
+  sirchmunk web serve --dev         Start API + Next.js dev server
+  sirchmunk mcp serve               Start MCP server (stdio)
+  sirchmunk mcp serve --transport http
+                                    Start MCP server (HTTP)
         """,
     )
-    
+
     parser.add_argument(
         "-V", "--version",
         action="store_true",
         help="Show version and exit",
     )
-    
+
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
-    
+
     # === init command ===
     init_parser = subparsers.add_parser(
         "init",
         help="Initialize Sirchmunk working directory",
-        description="Create directory structure and generate initial configuration.",
+        description="Create directory structure, generate .env config, download models.",
     )
     init_parser.add_argument(
         "--work-path",
         default=str(_get_default_work_path()),
         help="Working directory path (default: ~/.sirchmunk)",
     )
-    init_parser.add_argument(
-        "--ui",
-        action="store_true",
-        help="Build WebUI frontend (requires Node.js/npm)",
-    )
     init_parser.set_defaults(func=cmd_init)
-    
-    # === config command ===
-    config_parser = subparsers.add_parser(
-        "config",
-        help="Show or generate configuration",
-        description="Display current configuration or generate a new .env file.",
-    )
-    config_parser.add_argument(
-        "--generate", "-g",
-        action="store_true",
-        help="Generate .env configuration file",
-    )
-    config_parser.add_argument(
-        "--force", "-f",
-        action="store_true",
-        help="Overwrite existing configuration file",
-    )
-    config_parser.set_defaults(func=cmd_config)
-    
-    # === serve command ===
+
+    # === serve command (backend API only) ===
     serve_parser = subparsers.add_parser(
         "serve",
-        help="Start the Sirchmunk server",
-        description=(
-            "Launch the Sirchmunk server. By default, starts the backend API only. "
-            "Use --ui to serve the pre-built WebUI on the same port. "
-            "Use --ui --dev for development mode with hot-reload (requires Node.js)."
-        ),
+        help="Start the Sirchmunk backend API server",
+        description="Launch the Sirchmunk backend API server.",
     )
-    serve_parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="Host to bind (default: 0.0.0.0)",
-    )
-    serve_parser.add_argument(
-        "--port", "-p",
-        type=int,
-        default=8584,
-        help="Port to listen on (default: 8584)",
-    )
-    serve_parser.add_argument(
-        "--ui",
-        action="store_true",
-        help="Enable WebUI (single-port mode with pre-built static files)",
-    )
-    serve_parser.add_argument(
-        "--dev",
-        action="store_true",
-        help="Development mode: run Next.js dev server with hot-reload (requires --ui)",
-    )
-    serve_parser.add_argument(
-        "--frontend-port",
-        type=int,
-        default=8585,
-        help="Frontend port for dev mode (default: 8585, only with --ui --dev)",
-    )
-    serve_parser.add_argument(
-        "--reload",
-        action="store_true",
-        help="Enable backend auto-reload for development",
-    )
-    serve_parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO)",
-    )
+    serve_parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
+    serve_parser.add_argument("--port", "-p", type=int, default=8584, help="Port (default: 8584)")
+    serve_parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
+    serve_parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     serve_parser.set_defaults(func=cmd_serve)
-    
+
     # === search command ===
     search_parser = subparsers.add_parser(
         "search",
         help="Perform a search query",
         description="Search documents and code using AgenticSearch.",
     )
-    search_parser.add_argument(
-        "query",
-        help="Search query or question",
-    )
-    search_parser.add_argument(
-        "paths",
-        nargs="*",
-        help="Paths to search (default: current directory)",
-    )
-    search_parser.add_argument(
-        "--mode", "-m",
-        default="DEEP",
-        choices=["DEEP", "FILENAME_ONLY"],
-        help="Search mode: DEEP (comprehensive analysis) or FILENAME_ONLY (fast file discovery)",
-    )
-    search_parser.add_argument(
-        "--output", "-o",
-        default="text",
-        choices=["text", "json"],
-        help="Output format (default: text)",
-    )
-    search_parser.add_argument(
-        "--api",
-        action="store_true",
-        help="Use API server instead of local search",
-    )
-    search_parser.add_argument(
-        "--api-url",
-        default="http://localhost:8584",
-        help="API server URL (default: http://localhost:8584)",
-    )
-    search_parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Enable verbose output",
-    )
+    search_parser.add_argument("query", help="Search query or question")
+    search_parser.add_argument("paths", nargs="*", help="Paths to search (default: current directory)")
+    search_parser.add_argument("--mode", "-m", default="DEEP", choices=["DEEP", "FILENAME_ONLY"])
+    search_parser.add_argument("--output", "-o", default="text", choices=["text", "json"])
+    search_parser.add_argument("--api", action="store_true", help="Use API server instead of local search")
+    search_parser.add_argument("--api-url", default="http://localhost:8584", help="API server URL")
+    search_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
     search_parser.set_defaults(func=cmd_search)
-    
-    # === version command ===
-    version_parser = subparsers.add_parser(
-        "version",
-        help="Show version information",
+
+    # === web command group ===
+    web_parser = subparsers.add_parser(
+        "web",
+        help="WebUI management (build, serve)",
+        description="Build and serve the Sirchmunk WebUI frontend.",
     )
+    web_subparsers = web_parser.add_subparsers(dest="web_command", help="Web sub-commands")
+
+    # sirchmunk web init
+    web_init_parser = web_subparsers.add_parser(
+        "init",
+        help="Build WebUI frontend",
+        description="Build the WebUI frontend static assets (requires Node.js 18+).",
+    )
+    web_init_parser.add_argument("--work-path", help="Working directory (default: ~/.sirchmunk)")
+    web_init_parser.set_defaults(func=cmd_web_init)
+
+    # sirchmunk web serve
+    web_serve_parser = web_subparsers.add_parser(
+        "serve",
+        help="Start API server with WebUI",
+        description=(
+            "Start the Sirchmunk server with embedded WebUI. "
+            "Use --dev for development mode with hot-reload (requires Node.js)."
+        ),
+    )
+    web_serve_parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
+    web_serve_parser.add_argument("--port", "-p", type=int, default=8584, help="Port (default: 8584)")
+    web_serve_parser.add_argument("--dev", action="store_true", help="Development mode with hot-reload")
+    web_serve_parser.add_argument("--frontend-port", type=int, default=8585, help="Frontend port for dev mode")
+    web_serve_parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
+    web_serve_parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    web_serve_parser.set_defaults(func=cmd_web_serve)
+
+    # === mcp command group ===
+    mcp_parser = subparsers.add_parser(
+        "mcp",
+        help="MCP server management",
+        description="Manage the Sirchmunk MCP (Model Context Protocol) server.",
+    )
+    mcp_subparsers = mcp_parser.add_subparsers(dest="mcp_command", help="MCP sub-commands")
+
+    # sirchmunk mcp serve
+    mcp_serve_parser = mcp_subparsers.add_parser(
+        "serve",
+        help="Start MCP server",
+        description="Run the MCP server with stdio or HTTP transport.",
+    )
+    mcp_serve_parser.add_argument("--transport", choices=["stdio", "http"], help="Transport (default: stdio)")
+    mcp_serve_parser.add_argument("--host", help="Host for HTTP transport (default: localhost)")
+    mcp_serve_parser.add_argument("--port", type=int, help="Port for HTTP transport (default: 8080)")
+    mcp_serve_parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    mcp_serve_parser.set_defaults(func=cmd_mcp_serve)
+
+    # sirchmunk mcp version
+    mcp_version_parser = mcp_subparsers.add_parser(
+        "version",
+        help="Show MCP version information",
+    )
+    mcp_version_parser.set_defaults(func=cmd_mcp_version)
+
+    # === version command ===
+    version_parser = subparsers.add_parser("version", help="Show version information")
     version_parser.set_defaults(func=cmd_version)
-    
+
     return parser
 
+
+# ------------------------------------------------------------------
+# Entry point
+# ------------------------------------------------------------------
 
 def run_cmd():
     """Main entry point for the CLI."""
     parser = create_parser()
     args = parser.parse_args()
-    
+
     # Handle --version flag
     if args.version:
         print(f"sirchmunk {__version__}")
         sys.exit(0)
-    
+
     # Handle no command
     if not args.command:
         parser.print_help()
         sys.exit(0)
-    
+
+    # Handle `sirchmunk web` without sub-command
+    if args.command == "web" and not getattr(args, "web_command", None):
+        for action in parser._subparsers._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                web_parser = action.choices.get("web")
+                if web_parser:
+                    web_parser.print_help()
+                    break
+        sys.exit(0)
+
+    # Handle `sirchmunk mcp` without sub-command
+    if args.command == "mcp" and not getattr(args, "mcp_command", None):
+        for action in parser._subparsers._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                mcp_parser = action.choices.get("mcp")
+                if mcp_parser:
+                    mcp_parser.print_help()
+                    break
+        sys.exit(0)
+
     # Setup logging
     _setup_logging()
-    
+
     # Execute command
     if hasattr(args, "func"):
         sys.exit(args.func(args))

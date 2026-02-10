@@ -138,7 +138,7 @@
 
 * 🚀 **2026.2.5**: 发布 **v0.0.2** — MCP 支持、CLI 命令行 & 知识持久化！
   - **MCP 集成**：完整支持 [Model Context Protocol](https://modelcontextprotocol.io)，与 Claude Desktop 和 Cursor IDE 无缝协作。
-  - **CLI 命令行**：全新 `sirchmunk` 命令行工具，支持 `init`、`config`、`serve` 和 `search` 命令。
+  - **CLI 命令行**：全新 `sirchmunk` 命令行工具，支持 `init`、`serve`、`search`、`web` 和 `mcp` 命令。
   - **KnowledgeCluster 持久化**：基于 DuckDB 存储，支持 Parquet 导出，高效管理知识聚类。
   - **知识复用**：基于语义相似度的知识聚类检索，通过 embedding 向量加速搜索。
 
@@ -191,7 +191,7 @@ async def main():
     
     result: str = await agent_search.search(
         query="How does transformer attention work?",
-        search_paths=["/path/to/documents"],
+        paths=["/path/to/documents"],
     )
     
     print(result)
@@ -226,21 +226,8 @@ uv pip install "sirchmunk[web]"
 # 使用默认设置初始化 Sirchmunk，默认工作路径为 `~/.sirchmunk/`
 sirchmunk init
 
-# 初始化并构建 WebUI 前端（需要 Node.js 18+）
-sirchmunk init --ui
-
 # 或者，也可以使用自定义工作路径初始化
 sirchmunk init --work-path /path/to/workspace
-```
-
-#### 配置
-
-```bash
-# 显示当前配置
-sirchmunk config
-
-# 如需要，可重新生成配置文件 (默认配置文件路径，~/.sirchmunk/.env)
-sirchmunk config --generate
 ```
 
 #### 启动服务器
@@ -248,12 +235,6 @@ sirchmunk config --generate
 ```bash
 # 仅启动后端 API 服务器
 sirchmunk serve
-
-# 单端口模式：同时提供 API 和 WebUI（需先执行 sirchmunk init --ui）
-sirchmunk serve --ui
-
-# 开发模式：后端 + Next.js 开发服务器，支持热重载
-sirchmunk serve --ui --dev
 
 # 自定义主机和端口
 sirchmunk serve --host 0.0.0.0 --port 8000
@@ -282,13 +263,14 @@ sirchmunk search "查询" --api --api-url http://localhost:8584
 
 | 命令 | 说明 |
 |------|------|
-| `sirchmunk init` | 初始化工作目录和配置 |
-| `sirchmunk init --ui` | 初始化并构建 WebUI 前端 |
-| `sirchmunk config` | 显示或生成配置 |
+| `sirchmunk init` | 初始化工作目录、.env 及 MCP 配置 |
 | `sirchmunk serve` | 仅启动后端 API 服务器 |
-| `sirchmunk serve --ui` | 单端口模式，内嵌 WebUI |
-| `sirchmunk serve --ui --dev` | 开发模式，Next.js 热重载 |
 | `sirchmunk search` | 执行搜索查询 |
+| `sirchmunk web init` | 构建 WebUI 前端（需要 Node.js 18+） |
+| `sirchmunk web serve` | 启动 API + WebUI（单端口） |
+| `sirchmunk web serve --dev` | 开发模式，Next.js 热重载 |
+| `sirchmunk mcp serve` | 启动 MCP 服务器（stdio/HTTP） |
+| `sirchmunk mcp version` | 显示 MCP 版本信息 |
 | `sirchmunk version` | 显示版本信息 |
 
 ---
@@ -300,18 +282,46 @@ Sirchmunk 提供 [Model Context Protocol (MCP)](https://modelcontextprotocol.io)
 ### 快速开始
 
 ```bash
-# 安装 MCP 包
-pip install sirchmunk-mcp
+# 安装（含 MCP 支持）
+pip install sirchmunk[mcp]
 
-# 初始化和配置
-sirchmunk-mcp init
-sirchmunk-mcp config --generate
+# 初始化（生成 .env 和 mcp_config.json）
+sirchmunk init
 
-# 编辑 ~/.sirchmunk/.mcp_env 配置 LLM API Key
+# 编辑 ~/.sirchmunk/.env 配置 LLM API Key
 
 # 使用 MCP Inspector 测试
-npx @modelcontextprotocol/inspector sirchmunk-mcp serve
+npx @modelcontextprotocol/inspector sirchmunk mcp serve
 ```
+
+### `mcp_config.json` 配置
+
+运行 `sirchmunk init` 后会生成 `~/.sirchmunk/mcp_config.json` 文件。将其复制到你的 MCP 客户端配置目录即可。
+
+**示例：**
+
+```json
+{
+  "mcpServers": {
+    "sirchmunk": {
+      "command": "sirchmunk",
+      "args": ["mcp", "serve"],
+      "env": {
+        "SIRCHMUNK_SEARCH_PATHS": "/path/to/your_docs,/another/path"
+      }
+    }
+  }
+}
+```
+
+| 参数 | 说明 |
+|---|---|
+| `command` | 启动 MCP 服务器的命令。如果在虚拟环境中运行，请使用完整路径（如 `/path/to/venv/bin/sirchmunk`）。 |
+| `args` | 命令参数。`["mcp", "serve"]` 以 stdio 模式启动 MCP 服务器。 |
+| `env.SIRCHMUNK_SEARCH_PATHS` | 默认文档搜索目录（逗号分隔）。同时支持英文逗号 `,` 和中文逗号 `，` 作为分隔符。设置后，若工具调用时未提供 `paths` 参数，将使用这些路径作为默认值。 |
+
+> **提示**：MCP Inspector 非常适合在连接 AI 助手之前测试集成是否正常。
+> 在 MCP Inspector 中：**Connect** → **Tools** → **List Tools** → `sirchmunk_search` → 输入参数（`query` 和 `paths`，如 `["/path/to/your_docs"]`）→ **Run Tool**。
 
 ### 特性
 
@@ -342,11 +352,11 @@ Web UI 专为快速、透明的工作流设计：对话、知识分析、系统�
 一次构建前端，随后通过单端口同时提供 API 和 WebUI — 运行时无需 Node.js。
 
 ```bash
-# 初始化并构建 WebUI（构建时需要 Node.js 18+）
-sirchmunk init --ui
+# 构建 WebUI 前端（构建时需要 Node.js 18+）
+sirchmunk web init
 
 # 启动含内嵌 WebUI 的服务器
-sirchmunk serve --ui
+sirchmunk web serve
 ```
 
 **访问地址：** http://localhost:8584（API + WebUI 同端口）
@@ -357,7 +367,7 @@ sirchmunk serve --ui
 
 ```bash
 # 启动后端 + Next.js 开发服务器
-sirchmunk serve --ui --dev
+sirchmunk web serve --dev
 ```
 
 **访问地址：**
@@ -423,7 +433,7 @@ python scripts/stop_web.py
 
 ## 🔗 HTTP 客户端访问（Search API）
 
-服务器启动后（`sirchmunk serve` 或 `sirchmunk serve --ui`），Search API 可通过任何 HTTP 客户端访问。
+服务器启动后（`sirchmunk serve` 或 `sirchmunk web serve`），Search API 可通过任何 HTTP 客户端访问。
 
 <details>
 <summary><b>API 端点</b></summary>
@@ -446,7 +456,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "认证是如何工作的？",
-    "search_paths": ["/path/to/project"],
+    "paths": ["/path/to/project"],
     "mode": "DEEP"
   }'
 
@@ -455,7 +465,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "config",
-    "search_paths": ["/path/to/project"],
+    "paths": ["/path/to/project"],
     "mode": "FILENAME_ONLY"
   }'
 
@@ -464,7 +474,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "数据库连接池",
-    "search_paths": ["/path/to/project/src"],
+    "paths": ["/path/to/project/src"],
     "mode": "DEEP",
     "max_depth": 10,
     "top_k_files": 20,
@@ -492,7 +502,7 @@ response = requests.post(
     "http://localhost:8584/api/v1/search",
     json={
         "query": "认证是如何工作的？",
-        "search_paths": ["/path/to/project"],
+        "paths": ["/path/to/project"],
         "mode": "DEEP"
     },
     timeout=300  # DEEP 模式可能耗时较长
@@ -515,7 +525,7 @@ async def search():
             "http://localhost:8584/api/v1/search",
             json={
                 "query": "查找所有 API 端点",
-                "search_paths": ["/path/to/project"],
+                "paths": ["/path/to/project"],
                 "mode": "DEEP"
             }
         )
@@ -536,7 +546,7 @@ const response = await fetch("http://localhost:8584/api/v1/search", {
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
     query: "认证是如何工作的？",
-    search_paths: ["/path/to/project"],
+    paths: ["/path/to/project"],
     mode: "DEEP"
   })
 });
@@ -555,7 +565,7 @@ if (data.success) {
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `query` | `string` | *必填* | 搜索查询或问题 |
-| `search_paths` | `string[]` | *必填* | 搜索的目录或文件（至少 1 个） |
+| `paths` | `string[]` | *必填* | 搜索的目录或文件（至少 1 个） |
 | `mode` | `string` | `"DEEP"` | `DEEP` 或 `FILENAME_ONLY` |
 | `max_depth` | `int` | `null` | 最大目录深度 |
 | `top_k_files` | `int` | `null` | 返回的文件数量 |
@@ -602,7 +612,7 @@ Sirchmunk 采用 **无索引** 方法：
 ```python
 result = await search.search(
     query="Your question",
-    search_paths=["/path/to/folder", "/path/to/file.pdf"]
+    paths=["/path/to/folder", "/path/to/file.pdf"]
 )
 ```
 

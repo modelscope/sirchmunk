@@ -52,7 +52,7 @@ from .monitor import router as monitor_router
 from .search import router as search_router
 
 # Determine whether to serve the WebUI static files.
-# Set by `sirchmunk serve --ui` via environment variable.
+# Set by `sirchmunk web serve` via environment variable.
 _serve_ui = os.getenv("SIRCHMUNK_SERVE_UI") == "true"
 _static_dir = _work_path / ".cache" / "web_static"
 _ui_available = _serve_ui and _static_dir.is_dir() and (_static_dir / "index.html").exists()

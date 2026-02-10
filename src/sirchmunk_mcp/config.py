@@ -7,6 +7,7 @@ configuration files, and default values.
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -101,6 +102,11 @@ class SirchmunkConfig(BaseModel):
         default_factory=lambda: Path.home() / ".sirchmunk",
         description="Working directory for Sirchmunk data"
     )
+    paths: Optional[list] = Field(
+        default=None,
+        description="Default search paths (directories or files). "
+                    "Falls back to current working directory when None."
+    )
     verbose: bool = Field(
         default=False,
         description="Enable verbose logging"
@@ -131,10 +137,6 @@ class MCPServerConfig(BaseModel):
     server_name: str = Field(
         default="sirchmunk",
         description="MCP server name"
-    )
-    server_version: str = Field(
-        default="0.1.0",
-        description="MCP server version"
     )
     log_level: str = Field(
         default="INFO",
@@ -188,13 +190,14 @@ class Config(BaseModel):
     def from_env(cls) -> "Config":
         """Load configuration from environment variables.
         
-        Automatically loads .mcp_env file from work_path (~/.sirchmunk/.mcp_env by default).
+        Automatically loads .env file from work_path (~/.sirchmunk/.env by default).
         
         Environment variables:
             LLM_BASE_URL: LLM API base URL
             LLM_API_KEY: LLM API key (required)
             LLM_MODEL_NAME: LLM model name
             SIRCHMUNK_WORK_PATH: Sirchmunk working directory
+            SIRCHMUNK_SEARCH_PATHS: Default search paths (comma-separated)
             SIRCHMUNK_VERBOSE: Enable verbose logging
             SIRCHMUNK_ENABLE_CLUSTER_REUSE: Enable cluster reuse
             CLUSTER_SIM_THRESHOLD: Similarity threshold
@@ -205,7 +208,6 @@ class Config(BaseModel):
             GREP_TIMEOUT: Grep operation timeout
             MAX_QUERIES_PER_CLUSTER: Max queries per cluster
             MCP_SERVER_NAME: MCP server name
-            MCP_SERVER_VERSION: MCP server version
             MCP_LOG_LEVEL: Logging level
             MCP_TRANSPORT: MCP transport protocol
             MCP_HOST: MCP server host (HTTP mode)
@@ -217,10 +219,10 @@ class Config(BaseModel):
         Raises:
             ValueError: If required configuration is missing or invalid
         """
-        # Load .mcp_env from work_path (default: ~/.sirchmunk/.mcp_env)
+        # Load .env from work_path (default: ~/.sirchmunk/.env)
         work_path = Path(os.getenv("SIRCHMUNK_WORK_PATH", str(Path.home() / ".sirchmunk")))
         work_path = work_path.expanduser().resolve()
-        env_file = work_path / ".mcp_env"
+        env_file = work_path / ".env"
         
         if env_file.exists():
             load_dotenv(env_file, override=False)
@@ -233,9 +235,21 @@ class Config(BaseModel):
             timeout=float(os.getenv("LLM_TIMEOUT", "60.0")),
         )
         
+        # Parse SIRCHMUNK_SEARCH_PATHS (supports English comma, Chinese comma,
+        # or os.pathsep as delimiters)
+        raw_paths = os.getenv("SIRCHMUNK_SEARCH_PATHS", "").strip()
+        parsed_paths: Optional[list] = None
+        if raw_paths:
+            # Split by English comma, Chinese comma (，), or os.pathsep
+            _sep_pattern = r"[,，" + re.escape(os.pathsep) + r"]"
+            parsed_paths = [
+                p.strip() for p in re.split(_sep_pattern, raw_paths) if p.strip()
+            ] or None
+
         # Sirchmunk configuration
         sirchmunk_config = SirchmunkConfig(
             work_path=Path(os.getenv("SIRCHMUNK_WORK_PATH", str(Path.home() / ".sirchmunk"))),
+            paths=parsed_paths,
             verbose=os.getenv("SIRCHMUNK_VERBOSE", "false").lower() == "true",
             enable_cluster_reuse=os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true",
             cluster_similarity=ClusterSimilarityConfig(
@@ -254,7 +268,6 @@ class Config(BaseModel):
         # MCP server configuration
         mcp_config = MCPServerConfig(
             server_name=os.getenv("MCP_SERVER_NAME", "sirchmunk"),
-            server_version=os.getenv("MCP_SERVER_VERSION", "0.1.0"),
             log_level=os.getenv("MCP_LOG_LEVEL", "INFO"),
             transport=os.getenv("MCP_TRANSPORT", "stdio"),
             host=os.getenv("MCP_HOST", "localhost"),

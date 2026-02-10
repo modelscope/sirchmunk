@@ -8,7 +8,7 @@ authors = [
   {name = "ModelScope Team"},
   {email = "contact@modelscope.cn"}
 ]
-keywords = ["LLM", "Agentic Search", "Embedding-Free", "RAG", "Indexless", "Self-evolving", "Real-time Intelligence", "Multi-modal"]
+keywords = ["LLM", "Agentic Search", "Embedding-Free", "RAG", "Indexless", "Self-evolving", "Real-time Intelligence", "Multi-modal", "MCP"]
 requires-python = ">=3.10"
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -44,10 +44,12 @@ version = {attr = "sirchmunk.version.__version__"}
 dependencies = {file = ["requirements/core.txt"]}
 
 [tool.setuptools.dynamic.optional-dependencies]
+mcp = {file = ["requirements/mcp.txt"]}
 web = {file = ["requirements/web.txt"]}
-docs     = {file = ["requirements/docs.txt"]}
-tests         = {file = ["requirements/tests.txt"]}
+docs = {file = ["requirements/docs.txt"]}
+tests = {file = ["requirements/tests.txt"]}
 all = {file = [
+  "requirements/mcp.txt",
   "requirements/web.txt",
   "requirements/docs.txt",
   "requirements/tests.txt",

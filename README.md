@@ -141,7 +141,7 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 * 🚀 **Feb 5, 2026**: Release **v0.0.2** — MCP Support, CLI Commands & Knowledge Persistence!
   - **MCP Integration**: Full [Model Context Protocol](https://modelcontextprotocol.io) support, works seamlessly with Claude Desktop and Cursor IDE.
-  - **CLI Commands**: New `sirchmunk` CLI with `init`, `config`, `serve`, and `search` commands.
+  - **CLI Commands**: New `sirchmunk` CLI with `init`, `serve`, `search`, `web`, and `mcp` commands.
   - **KnowledgeCluster Persistence**: DuckDB-powered storage with Parquet export for efficient knowledge management.
   - **Knowledge Reuse**: Semantic similarity-based cluster retrieval for faster searches via embedding vectors.
 
@@ -194,7 +194,7 @@ async def main():
     
     result: str = await searcher.search(
         query="How does transformer attention work?",
-        search_paths=["/path/to/documents"],
+        paths=["/path/to/documents"],
     )
     
     print(result)
@@ -228,21 +228,8 @@ uv pip install "sirchmunk[web]"
 # Initialize Sirchmunk with default settings (Default work path: `~/.sirchmunk/`)
 sirchmunk init
 
-# Initialize with WebUI frontend build (requires Node.js 18+)
-sirchmunk init --ui
-
 # Alternatively, initialize with custom work path
 sirchmunk init --work-path /path/to/workspace
-```
-
-#### Configure
-
-```bash
-# Show current configuration
-sirchmunk config
-
-# Regenerate configuration file if needed (Default config file: ~/.sirchmunk/.env)
-sirchmunk config --generate
 ```
 
 #### Start Server
@@ -250,12 +237,6 @@ sirchmunk config --generate
 ```bash
 # Start backend API server only
 sirchmunk serve
-
-# Start with WebUI on a single port (requires prior `sirchmunk init --ui`)
-sirchmunk serve --ui
-
-# Development mode: backend + Next.js dev server with hot-reload
-sirchmunk serve --ui --dev
 
 # Custom host and port
 sirchmunk serve --host 0.0.0.0 --port 8000
@@ -284,13 +265,14 @@ sirchmunk search "query" --api --api-url http://localhost:8584
 
 | Command | Description |
 |---------|-------------|
-| `sirchmunk init` | Initialize working directory and configuration |
-| `sirchmunk init --ui` | Initialize with WebUI frontend build |
-| `sirchmunk config` | Show or generate configuration |
-| `sirchmunk serve` | Start the API server (backend only) |
-| `sirchmunk serve --ui` | Start with embedded WebUI (single port) |
-| `sirchmunk serve --ui --dev` | Start with Next.js dev server (hot-reload) |
+| `sirchmunk init` | Initialize working directory, .env, and MCP config |
+| `sirchmunk serve` | Start the backend API server |
 | `sirchmunk search` | Perform search queries |
+| `sirchmunk web init` | Build WebUI frontend (requires Node.js 18+) |
+| `sirchmunk web serve` | Start API + WebUI (single port) |
+| `sirchmunk web serve --dev` | Start API + Next.js dev server (hot-reload) |
+| `sirchmunk mcp serve` | Start the MCP server (stdio/HTTP) |
+| `sirchmunk mcp version` | Show MCP version information |
 | `sirchmunk version` | Show version information |
 
 ---
@@ -302,18 +284,46 @@ Sirchmunk provides a [Model Context Protocol (MCP)](https://modelcontextprotocol
 ### Quick Start
 
 ```bash
-# Install MCP package
-pip install sirchmunk-mcp
+# Install with MCP support
+pip install sirchmunk[mcp]
 
-# Initialize and configure
-sirchmunk-mcp init
-sirchmunk-mcp config --generate
+# Initialize (generates .env and mcp_config.json)
+sirchmunk init
 
-# Edit ~/.sirchmunk/.mcp_env with your LLM API key
+# Edit ~/.sirchmunk/.env with your LLM API key
 
 # Test with MCP Inspector
-npx @modelcontextprotocol/inspector sirchmunk-mcp serve
+npx @modelcontextprotocol/inspector sirchmunk mcp serve
 ```
+
+### `mcp_config.json` Configuration
+
+After running `sirchmunk init`, a `~/.sirchmunk/mcp_config.json` file is generated. Copy it to your MCP client configuration directory.
+
+**Example:**
+
+```json
+{
+  "mcpServers": {
+    "sirchmunk": {
+      "command": "sirchmunk",
+      "args": ["mcp", "serve"],
+      "env": {
+        "SIRCHMUNK_SEARCH_PATHS": "/path/to/your_docs,/another/path"
+      }
+    }
+  }
+}
+```
+
+| Parameter | Description |
+|---|---|
+| `command` | The command to start the MCP server. Use full path (e.g. `/path/to/venv/bin/sirchmunk`) if running in a virtual environment. |
+| `args` | Command arguments. `["mcp", "serve"]` starts the MCP server in stdio mode. |
+| `env.SIRCHMUNK_SEARCH_PATHS` | Default document search directories (comma-separated). Supports both English `,` and Chinese `，` as delimiters. When set, these paths are used as default if no `paths` parameter is provided during tool invocation. |
+
+> **Tip**: MCP Inspector is a great way to test the integration before connecting to your AI assistant.
+> In MCP Inspector: **Connect** → **Tools** → **List Tools** → `sirchmunk_search` → Input parameters (`query` and `paths`, e.g. `["/path/to/your_docs"]`) → **Run Tool**.
 
 ### Features
 
@@ -344,11 +354,11 @@ The web UI is built for fast, transparent workflows: chat, knowledge analytics, 
 Build the frontend once, then serve everything from a single port — no Node.js needed at runtime.
 
 ```bash
-# Initialize with WebUI build (requires Node.js 18+ at build time)
-sirchmunk init --ui
+# Build WebUI frontend (requires Node.js 18+ at build time)
+sirchmunk web init
 
 # Start server with embedded WebUI
-sirchmunk serve --ui
+sirchmunk web serve
 ```
 
 **Access:** http://localhost:8584 (API + WebUI on the same port)
@@ -359,7 +369,7 @@ For frontend development with hot-reload:
 
 ```bash
 # Start backend + Next.js dev server
-sirchmunk serve --ui --dev
+sirchmunk web serve --dev
 ```
 
 **Access:**
@@ -425,7 +435,7 @@ All persistent data is stored in the configured `SIRCHMUNK_WORK_PATH` (default: 
 
 ## 🔗 HTTP Client Access (Search API)
 
-When the server is running (`sirchmunk serve` or `sirchmunk serve --ui`), the Search API is accessible via any HTTP client.
+When the server is running (`sirchmunk serve` or `sirchmunk web serve`), the Search API is accessible via any HTTP client.
 
 <details>
 <summary><b>API Endpoints</b></summary>
@@ -448,7 +458,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "How does authentication work?",
-    "search_paths": ["/path/to/project"],
+    "paths": ["/path/to/project"],
     "mode": "DEEP"
   }'
 
@@ -457,7 +467,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "config",
-    "search_paths": ["/path/to/project"],
+    "paths": ["/path/to/project"],
     "mode": "FILENAME_ONLY"
   }'
 
@@ -466,7 +476,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "database connection pooling",
-    "search_paths": ["/path/to/project/src"],
+    "paths": ["/path/to/project/src"],
     "mode": "DEEP",
     "max_depth": 10,
     "top_k_files": 20,
@@ -494,7 +504,7 @@ response = requests.post(
     "http://localhost:8584/api/v1/search",
     json={
         "query": "How does authentication work?",
-        "search_paths": ["/path/to/project"],
+        "paths": ["/path/to/project"],
         "mode": "DEEP"
     },
     timeout=300  # DEEP mode may take a while
@@ -517,7 +527,7 @@ async def search():
             "http://localhost:8584/api/v1/search",
             json={
                 "query": "find all API endpoints",
-                "search_paths": ["/path/to/project"],
+                "paths": ["/path/to/project"],
                 "mode": "DEEP"
             }
         )
@@ -538,7 +548,7 @@ const response = await fetch("http://localhost:8584/api/v1/search", {
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
     query: "How does authentication work?",
-    search_paths: ["/path/to/project"],
+    paths: ["/path/to/project"],
     mode: "DEEP"
   })
 });
@@ -557,7 +567,7 @@ if (data.success) {
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `query` | `string` | *required* | Search query or question |
-| `search_paths` | `string[]` | *required* | Directories or files to search (min 1) |
+| `paths` | `string[]` | *required* | Directories or files to search (min 1) |
 | `mode` | `string` | `"DEEP"` | `DEEP` or `FILENAME_ONLY` |
 | `max_depth` | `int` | `null` | Maximum directory depth |
 | `top_k_files` | `int` | `null` | Number of top files to return |
@@ -604,7 +614,7 @@ Simply specify the path in your search query:
 ```python
 result = await searcher.search(
     query="Your question",
-    search_paths=["/path/to/folder", "/path/to/file.pdf"]
+    paths=["/path/to/folder", "/path/to/file.pdf"]
 )
 ```
 

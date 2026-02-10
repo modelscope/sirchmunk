@@ -6,7 +6,7 @@
 //   2. Empty string → same-origin mode (static export served by FastAPI)
 //   3. Fallback: auto-detect from window.location (runtime)
 //
-// When built with `sirchmunk init --ui`, NEXT_PUBLIC_API_BASE is set to ""
+// When built with `sirchmunk web init`, NEXT_PUBLIC_API_BASE is set to ""
 // so all API calls are relative to the current origin (single-port mode).
 export const API_BASE_URL: string = (() => {
   // Env var is embedded at build time by Next.js
