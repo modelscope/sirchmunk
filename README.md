@@ -296,6 +296,35 @@ sirchmunk init
 npx @modelcontextprotocol/inspector sirchmunk mcp serve
 ```
 
+### `mcp_config.json` Configuration
+
+After running `sirchmunk init`, a `~/.sirchmunk/mcp_config.json` file is generated. Copy it to your MCP client configuration directory.
+
+**Example:**
+
+```json
+{
+  "mcpServers": {
+    "sirchmunk": {
+      "command": "sirchmunk",
+      "args": ["mcp", "serve"],
+      "env": {
+        "SIRCHMUNK_SEARCH_PATHS": "/path/to/your_docs,/another/path"
+      }
+    }
+  }
+}
+```
+
+| Parameter | Description |
+|---|---|
+| `command` | The command to start the MCP server. Use full path (e.g. `/path/to/venv/bin/sirchmunk`) if running in a virtual environment. |
+| `args` | Command arguments. `["mcp", "serve"]` starts the MCP server in stdio mode. |
+| `env.SIRCHMUNK_SEARCH_PATHS` | Default document search directories (comma-separated). Supports both English `,` and Chinese `，` as delimiters. When set, these paths are used as default if no `paths` parameter is provided during tool invocation. |
+
+> **Tip**: MCP Inspector is a great way to test the integration before connecting to your AI assistant.
+> In MCP Inspector: **Connect** → **Tools** → **List Tools** → `sirchmunk_search` → Input parameters (`query` and `paths`, e.g. `["/path/to/your_docs"]`) → **Run Tool**.
+
 ### Features
 
 - **Multi-Mode Search**: DEEP mode for comprehensive analysis, FILENAME_ONLY for fast file discovery

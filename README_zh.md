@@ -294,6 +294,35 @@ sirchmunk init
 npx @modelcontextprotocol/inspector sirchmunk mcp serve
 ```
 
+### `mcp_config.json` 配置
+
+运行 `sirchmunk init` 后会生成 `~/.sirchmunk/mcp_config.json` 文件。将其复制到你的 MCP 客户端配置目录即可。
+
+**示例：**
+
+```json
+{
+  "mcpServers": {
+    "sirchmunk": {
+      "command": "sirchmunk",
+      "args": ["mcp", "serve"],
+      "env": {
+        "SIRCHMUNK_SEARCH_PATHS": "/path/to/your_docs,/another/path"
+      }
+    }
+  }
+}
+```
+
+| 参数 | 说明 |
+|---|---|
+| `command` | 启动 MCP 服务器的命令。如果在虚拟环境中运行，请使用完整路径（如 `/path/to/venv/bin/sirchmunk`）。 |
+| `args` | 命令参数。`["mcp", "serve"]` 以 stdio 模式启动 MCP 服务器。 |
+| `env.SIRCHMUNK_SEARCH_PATHS` | 默认文档搜索目录（逗号分隔）。同时支持英文逗号 `,` 和中文逗号 `，` 作为分隔符。设置后，若工具调用时未提供 `paths` 参数，将使用这些路径作为默认值。 |
+
+> **提示**：MCP Inspector 非常适合在连接 AI 助手之前测试集成是否正常。
+> 在 MCP Inspector 中：**Connect** → **Tools** → **List Tools** → `sirchmunk_search` → 输入参数（`query` 和 `paths`，如 `["/path/to/your_docs"]`）→ **Run Tool**。
+
 ### 特性
 
 - **多模式搜索**：DEEP 模式进行全面分析，FILENAME_ONLY 模式快速发现文件

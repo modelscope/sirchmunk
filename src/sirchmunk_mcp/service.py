@@ -9,7 +9,6 @@ managing initialization, configuration, and session state.
 from __future__ import annotations
 
 import contextlib
-import io
 import logging
 import os
 import sys
@@ -28,19 +27,26 @@ logger = logging.getLogger(__name__)
 @contextlib.contextmanager
 def suppress_stdout():
     """Context manager to suppress stdout output.
-    
+
     Used during initialization to prevent third-party libraries
     (ModelScope, transformers, etc.) from printing to stdout,
     which would break MCP stdio protocol.
+
+    Uses ``os.devnull`` instead of ``io.StringIO`` because many libraries
+    (modelscope, tqdm, rich, …) expect ``sys.stdout`` to be a real file
+    object with ``.fileno()``, ``.isatty()`` etc.  ``StringIO`` lacks
+    these, causing cryptic errors like ``int('ERROR')`` inside modelscope.
     """
     # Check if we're in stdio MCP mode (stdout should be protected)
     if os.environ.get("MCP_TRANSPORT") == "stdio":
         old_stdout = sys.stdout
-        sys.stdout = io.StringIO()
+        devnull = open(os.devnull, "w")
+        sys.stdout = devnull
         try:
             yield
         finally:
             sys.stdout = old_stdout
+            devnull.close()
     else:
         yield
 

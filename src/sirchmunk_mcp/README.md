@@ -73,7 +73,10 @@ MCP Inspector is up and running at:
 Press `Ctrl+C` to stop.
 
 **How to use**:
-- Connect -> Tools -> List Tools -> `sirchmunk_search` -> Input parameters (`query` and `paths`) -> Run Tool
+- Connect -> Tools -> List Tools -> `sirchmunk_search` -> Input parameters -> Run Tool
+- Example input parameters:
+  - `query`: `"transformer attention implementation"`
+  - `paths`: `["/path/to/your_docs"]`
 - Check the response for search results.
 
 ---
@@ -113,6 +116,47 @@ It will be installed automatically during initialization, but you can install it
 
 ---
 
+## `mcp_config.json` Configuration
+
+After running `sirchmunk init`, a `~/.sirchmunk/mcp_config.json` file is generated. Copy it to your MCP client configuration directory.
+
+**Example:**
+
+```json
+{
+  "mcpServers": {
+    "sirchmunk": {
+      "command": "sirchmunk",
+      "args": ["mcp", "serve"],
+      "env": {
+        "SIRCHMUNK_SEARCH_PATHS": "/path/to/your_docs,/another/path"
+      }
+    }
+  }
+}
+```
+
+### Parameter Reference
+
+| Parameter | Description |
+|---|---|
+| `command` | The command to start the MCP server. Use full path (e.g. `/path/to/venv/bin/sirchmunk`) if running in a virtual environment. |
+| `args` | Command arguments. `["mcp", "serve"]` starts the MCP server in stdio mode. |
+| `env.SIRCHMUNK_SEARCH_PATHS` | Default document search directories (comma-separated). Supports both English `,` and Chinese `，` as delimiters. When set, these paths are used as default if no `paths` parameter is provided during tool invocation. |
+
+Other optional `env` variables that can be set inline:
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_API_KEY` | *(from `~/.sirchmunk/.env`)* | LLM API key. Only needed here if you want to override the `.env` value. |
+| `LLM_MODEL_NAME` | `gpt-5.2` | LLM model name. |
+| `SIRCHMUNK_WORK_PATH` | `~/.sirchmunk` | Working directory for data and cache. |
+| `MCP_LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
+
+> **Note**: Environment variables set in `env` override those from `~/.sirchmunk/.env`. You generally only need `SIRCHMUNK_SEARCH_PATHS` here; other variables are configured during `sirchmunk init`.
+
+---
+
 ## Integration with Claude Code / Claude Desktop
 
 ### Cursor IDE
@@ -126,8 +170,7 @@ Edit `~/.cursor/mcp.json`:
       "command": "sirchmunk",
       "args": ["mcp", "serve"],
       "env": {
-        "LLM_API_KEY": "your-api-key",
-        "LLM_MODEL_NAME": "gpt-5.2"
+        "SIRCHMUNK_SEARCH_PATHS": "/path/to/your_docs"
       }
     }
   }
@@ -149,9 +192,7 @@ Edit the configuration file:
       "command": "sirchmunk",
       "args": ["mcp", "serve"],
       "env": {
-        "LLM_API_KEY": "your-api-key",
-        "LLM_MODEL_NAME": "gpt-5.2",
-        "SIRCHMUNK_WORK_PATH": "~/.sirchmunk",
+        "SIRCHMUNK_SEARCH_PATHS": "/path/to/your_docs",
         "MCP_LOG_LEVEL": "INFO"
       }
     }
@@ -167,7 +208,9 @@ Edit the configuration file:
     "sirchmunk": {
       "command": "/path/to/sirchmunk-env/bin/sirchmunk",
       "args": ["mcp", "serve"],
-      "env": { ... }
+      "env": {
+        "SIRCHMUNK_SEARCH_PATHS": "/path/to/your_docs"
+      }
     }
   }
 }
