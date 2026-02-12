@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from sirchmunk import AgenticSearch
 from .config import Config
 
 if TYPE_CHECKING:
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+_search_progress_logger = logging.getLogger("sirchmunk.search")
 
 
 @contextlib.contextmanager
@@ -49,6 +52,30 @@ def suppress_stdout():
             devnull.close()
     else:
         yield
+
+
+def _mcp_log_callback(level: str, message: str, end: str = "\n", flush: bool = False) -> None:
+    """Bridge AgenticSearch log messages to Python ``logging`` (→ stderr).
+
+    This callback is passed to :class:`AgenticSearch` so that every search
+    progress message (Phase 1, Phase 2, …) is routed through the standard
+    Python logging system.  In MCP stdio mode, the ``logging`` handlers write
+    to *stderr*, keeping stdout clean for JSON-RPC messages while making
+    search progress visible to the MCP client.
+
+    Args:
+        level: Log level name (e.g. ``"info"``, ``"warning"``).
+        message: The log message text.
+        end: Line ending (unused — Python logging adds its own newline).
+        flush: Whether the caller requested an immediate flush.
+    """
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    _search_progress_logger.log(log_level, message.rstrip("\n"))
+    # Explicit flush so MCP clients (Cursor, Claude Desktop) see output
+    # immediately rather than waiting for the stream buffer to fill.
+    if flush:
+        for handler in logging.getLogger().handlers:
+            handler.flush()
 
 
 class SirchmunkService:
@@ -105,20 +132,37 @@ class SirchmunkService:
             model=self.config.llm.model_name,
         )
         
-        # Create AgenticSearch instance with stdout suppression
-        # AgenticSearch may load embedding models which print progress
+        # Create AgenticSearch instance with stdout suppression.
+        # Pass _mcp_log_callback so that search progress messages are
+        # routed through Python logging → stderr, making them visible
+        # to MCP clients (e.g. Cursor).
         with suppress_stdout():
             self.searcher = AgenticSearch(
                 llm=llm,
                 work_path=self.config.sirchmunk.work_path,
                 paths=self.config.sirchmunk.paths,
-                verbose=False,  # Disable verbose in stdio mode to prevent stdout pollution
+                verbose=self.config.sirchmunk.verbose,
+                log_callback=_mcp_log_callback,
                 reuse_knowledge=self.config.sirchmunk.enable_cluster_reuse,
                 cluster_sim_threshold=self.config.sirchmunk.cluster_similarity.threshold,
                 cluster_sim_top_k=self.config.sirchmunk.cluster_similarity.top_k,
             )
         
         logger.info("AgenticSearch instance created")
+        
+        if self.searcher.embedding_client is not None:
+            info = self.searcher.embedding_client.get_model_info()
+            logger.info(
+                f"Embedding client ready: model={info.get('model_id')}, "
+                f"dim={info.get('dimension')}, device={info.get('device')}"
+            )
+        else:
+            logger.warning(
+                "Embedding client is NOT available. Knowledge cluster embeddings "
+                "will NOT be computed or stored. To enable, ensure "
+                "sentence-transformers, torch, and modelscope are installed, "
+                "and SIRCHMUNK_ENABLE_CLUSTER_REUSE is not set to 'false'."
+            )
     
     async def search(
         self,

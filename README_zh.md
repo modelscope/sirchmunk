@@ -14,9 +14,10 @@
 [![OpenAI](https://img.shields.io/badge/OpenAI-API-412991?style=flat-square&logo=openai&logoColor=white)](https://github.com/openai/openai-python)
 [![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square)](https://github.com/kreuzberg-dev/kreuzberg)
 [![MCP](https://img.shields.io/badge/MCP-Python_SDK-8B5CF6?style=flat-square&logo=python&logoColor=white)](https://github.com/modelcontextprotocol/python-sdk)
+[![Documentation](https://img.shields.io/badge/Documentation-官方文档-4285F4?style=flat-square&logo=readthedocs&logoColor=white)](https://modelscope.github.io/sirchmunk-web/)
 
 
-[**快速开始**](#-快速开始) · [**核心特性**](#-核心特性) · [**Web UI**](#-web-ui) · [**工作原理**](#-工作原理) · [**FAQ**](#-faq)
+[**快速开始**](#-快速开始) · [**核心特性**](#-核心特性) · [**MCP 服务器**](#-mcp-服务器) · [**Web UI**](#️-web-ui) · [**工作原理**](#️-工作原理) · [**FAQ**](#-faq)
 
 [English](README.md)
 
