@@ -67,10 +67,15 @@ def _mcp_log_callback(level: str, message: str, end: str = "\n", flush: bool = F
         level: Log level name (e.g. ``"info"``, ``"warning"``).
         message: The log message text.
         end: Line ending (unused — Python logging adds its own newline).
-        flush: Whether the caller requested an immediate flush (unused here).
+        flush: Whether the caller requested an immediate flush.
     """
     log_level = getattr(logging, level.upper(), logging.INFO)
     _search_progress_logger.log(log_level, message.rstrip("\n"))
+    # Explicit flush so MCP clients (Cursor, Claude Desktop) see output
+    # immediately rather than waiting for the stream buffer to fill.
+    if flush:
+        for handler in logging.getLogger().handlers:
+            handler.flush()
 
 
 class SirchmunkService:

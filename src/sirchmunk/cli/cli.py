@@ -879,12 +879,19 @@ def cmd_mcp_serve(args: argparse.Namespace) -> int:
 
         config = Config.from_env()
 
-        # Configure logging - MUST use stderr for stdio transport
+        # Configure logging - MUST use stderr for stdio transport.
+        # ``force=True`` is critical: the sirchmunk_mcp imports above
+        # transitively import third-party libraries (modelscope, transformers,
+        # etc.) that may have already configured the root logger.  Without
+        # ``force``, ``basicConfig()`` silently becomes a no-op and NO
+        # StreamHandler(stderr) is installed, causing all log messages from
+        # the search pipeline (_mcp_log_callback) to be silently dropped.
         log_level = args.log_level or config.mcp.log_level
         logging.basicConfig(
             level=getattr(logging, log_level.upper()),
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
             stream=sys.stderr,
+            force=True,
         )
 
         logger.info(f"Sirchmunk MCP Server v{__version__}")

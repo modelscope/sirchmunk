@@ -137,7 +137,9 @@ def create_server(config: Config) -> FastMCP:
             logger.error(f"Search failed: {e}", exc_info=True)
             return f"Search failed: {str(e)}"
 
-    @mcp.tool()
+    # NOTE: sirchmunk_scan_dir is intentionally NOT registered as an MCP tool
+    # (removed @mcp.tool() to avoid external exposure).  The implementation is
+    # kept for internal use by the service layer.
     async def sirchmunk_scan_dir(
         query: str,
         paths: List[str],
@@ -191,7 +193,9 @@ def create_server(config: Config) -> FastMCP:
             logger.error(f"Dir scan failed: {e}", exc_info=True)
             return f"Directory scan failed: {str(e)}"
 
-    @mcp.tool()
+    # NOTE: sirchmunk_get_cluster is intentionally NOT registered as an MCP tool
+    # (removed @mcp.tool() to avoid external exposure).  The implementation is
+    # kept for internal use by the service layer.
     async def sirchmunk_get_cluster(cluster_id: str) -> str:
         """Retrieve a cached knowledge cluster from a previous local file search.
 
@@ -224,7 +228,9 @@ def create_server(config: Config) -> FastMCP:
             logger.error(f"Get cluster failed: {e}", exc_info=True)
             return f"Failed to retrieve cluster: {str(e)}"
     
-    @mcp.tool()
+    # NOTE: sirchmunk_list_clusters is intentionally NOT registered as an MCP tool
+    # (removed @mcp.tool() to avoid external exposure).  The implementation is
+    # kept for internal use by the service layer.
     async def sirchmunk_list_clusters(
         limit: int = 10,
         sort_by: str = "last_modified",
@@ -441,10 +447,16 @@ async def main() -> None:
     Loads configuration and starts the appropriate transport server.
     """
     # Configure logging — explicit stderr to keep stdout clean for MCP JSON-RPC.
+    # ``force=True`` is required because third-party libraries imported at
+    # module level (modelscope, transformers, etc.) may have already added
+    # handlers to the root logger, which causes ``basicConfig()`` to silently
+    # become a no-op.  With ``force``, existing handlers are removed and a
+    # fresh StreamHandler(stderr) is guaranteed.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         stream=sys.stderr,
+        force=True,
     )
     
     try:
