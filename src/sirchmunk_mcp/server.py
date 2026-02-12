@@ -8,6 +8,7 @@ as MCP tools following the Model Context Protocol specification.
 
 import asyncio
 import logging
+import sys
 from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -71,10 +72,6 @@ def create_server(config: Config) -> FastMCP:
         - Search raw data files that other tools cannot parse
         - Answer questions about content in local files or codebases
         - Locate specific files by name or content pattern
-
-        DO NOT USE THIS TOOL FOR:
-        - Web searches or internet queries (use a web search tool instead)
-        - Searching within a single already-open file (use IDE search instead)
 
         Modes:
         - DEEP: Comprehensive search with LLM-powered analysis. Reads file contents,
@@ -443,10 +440,11 @@ async def main() -> None:
     
     Loads configuration and starts the appropriate transport server.
     """
-    # Configure logging
+    # Configure logging — explicit stderr to keep stdout clean for MCP JSON-RPC.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        stream=sys.stderr,
     )
     
     try:

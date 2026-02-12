@@ -103,14 +103,21 @@ class AgenticSearch(BaseSearch):
                 self.embedding_client = EmbeddingUtil(
                     cache_dir=str(self.work_path / ".cache" / "models")
                 )
-                _loguru_logger.debug(
+                _loguru_logger.info(
                     f"Embedding client initialized: {self.embedding_client.get_model_info()}"
                 )
             except Exception as e:
-                _loguru_logger.warning(
-                    f"Failed to initialize embedding client: {e}. Cluster reuse disabled."
+                _loguru_logger.error(
+                    f"Failed to initialize embedding client: {e}. "
+                    "Knowledge cluster embeddings will NOT be stored. "
+                    "Ensure sentence-transformers, torch, and modelscope are installed."
                 )
                 self.embedding_client = None
+        else:
+            _loguru_logger.info(
+                "Knowledge reuse disabled (reuse_knowledge=False). "
+                "Embeddings will not be computed."
+            )
 
         if not check_dependencies():
             print("Installing rga (ripgrep-all) and rg (ripgrep)...", flush=True)
@@ -322,10 +329,18 @@ class AgenticSearch(BaseSearch):
                     embedding_text_hash=text_hash,
                 )
 
-                await self._logger.debug(f"Computed and stored embedding for cluster {cluster.id}")
+                await self._logger.info(
+                    f"Stored embedding for cluster {cluster.id} "
+                    f"(dim={len(embedding_vector)}, model={self.embedding_client.model_id})"
+                )
 
             except Exception as e:
                 await self._logger.warning(f"Failed to compute embedding for cluster {cluster.id}: {e}")
+        else:
+            await self._logger.warning(
+                f"Embedding client not available — skipping embedding for cluster {cluster.id}. "
+                "Ensure sentence-transformers, torch, and modelscope are installed."
+            )
 
         # Flush DuckDB → parquet immediately so embedding data is persisted.
         # Without this, the daemon sync (60 s interval) or atexit hook might

@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 SIRCHMUNK_SEARCH_TOOL = Tool(
     name="sirchmunk_search",
     description=(
+        "Tool name: sirchmunk:sirchmunk_search. "
         "Search local files, documents, and raw data on disk. "
         "Supports 100+ file formats including PDF, Word, Excel, PowerPoint, CSV, JSON, YAML, "
         "Markdown, HTML, source code, images (OCR), archives (zip/tar/gz), emails (eml/msg), "
@@ -31,9 +32,6 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
         "- Search raw data files that other tools cannot parse\n"
         "- Answer questions about content in local files or codebases\n"
         "- Locate specific files by name or content pattern\n\n"
-        "DO NOT USE THIS TOOL FOR:\n"
-        "- Web searches or internet queries\n"
-        "- Searching within a single already-open file\n\n"
         "Modes:\n"
         "- DEEP: Comprehensive search with LLM-powered analysis. Reads file contents, "
         "extracts evidence via Monte Carlo sampling, and synthesizes an answer. (10-30s)\n"
