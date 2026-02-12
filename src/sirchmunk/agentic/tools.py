@@ -151,12 +151,7 @@ class KeywordSearchTool(BaseTool):
         self._max_snippet_lines = max_snippet_lines
         self._include = include
         # Merge caller-provided excludes with sensible defaults (deduped)
-        merged_exclude = list(self._DEFAULT_EXCLUDE)
-        if exclude:
-            for pat in exclude:
-                if pat not in merged_exclude:
-                    merged_exclude.append(pat)
-        self._exclude = merged_exclude
+        self._exclude = list(set(self._DEFAULT_EXCLUDE) | set(exclude or []))
 
     @property
     def name(self) -> str:

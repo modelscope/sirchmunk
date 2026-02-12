@@ -555,7 +555,7 @@ class AgenticSearch(BaseSearch):
             KeywordSearchTool(
                 retriever=self.grep_retriever,
                 paths=paths,
-                max_depth=max_depth or 5,
+                max_depth=max_depth if max_depth is not None else 5,
                 max_results=10,
                 include=include,
                 exclude=exclude,
@@ -1001,7 +1001,7 @@ class AgenticSearch(BaseSearch):
         tool = KeywordSearchTool(
             retriever=self.grep_retriever,
             paths=paths,
-            max_depth=max_depth or 5,
+            max_depth=max_depth if max_depth is not None else 5,
             max_results=20,
             include=include,
             exclude=exclude,
