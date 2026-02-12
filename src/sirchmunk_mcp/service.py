@@ -112,7 +112,7 @@ class SirchmunkService:
                 llm=llm,
                 work_path=self.config.sirchmunk.work_path,
                 paths=self.config.sirchmunk.paths,
-                verbose=False,  # Disable verbose in stdio mode to prevent stdout pollution
+                verbose=self.config.sirchmunk.verbose,
                 reuse_knowledge=self.config.sirchmunk.enable_cluster_reuse,
                 cluster_sim_threshold=self.config.sirchmunk.cluster_similarity.threshold,
                 cluster_sim_top_k=self.config.sirchmunk.cluster_similarity.top_k,

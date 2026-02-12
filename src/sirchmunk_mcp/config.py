@@ -108,7 +108,7 @@ class SirchmunkConfig(BaseModel):
                     "Falls back to current working directory when None."
     )
     verbose: bool = Field(
-        default=False,
+        default=True,
         description="Enable verbose logging"
     )
     enable_cluster_reuse: bool = Field(
@@ -250,7 +250,7 @@ class Config(BaseModel):
         sirchmunk_config = SirchmunkConfig(
             work_path=Path(os.getenv("SIRCHMUNK_WORK_PATH", str(Path.home() / ".sirchmunk"))),
             paths=parsed_paths,
-            verbose=os.getenv("SIRCHMUNK_VERBOSE", "false").lower() == "true",
+            verbose=os.getenv("SIRCHMUNK_VERBOSE", "true").lower() == "true",
             enable_cluster_reuse=os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true",
             cluster_similarity=ClusterSimilarityConfig(
                 threshold=float(os.getenv("CLUSTER_SIM_THRESHOLD", "0.85")),

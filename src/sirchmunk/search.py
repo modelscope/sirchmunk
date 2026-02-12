@@ -39,7 +39,7 @@ class AgenticSearch(BaseSearch):
         llm: Optional[OpenAIChat] = None,
         work_path: Optional[Union[str, Path]] = None,
         paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
-        verbose: bool = False,
+        verbose: bool = True,
         log_callback: LogCallback = None,
         reuse_knowledge: bool = True,
         **kwargs,
