@@ -18,19 +18,17 @@ from sirchmunk.llm.prompts import (
 )
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.schema.knowledge import KnowledgeCluster
-from sirchmunk.schema.request import ContentItem, ImageURL, Message, Request
+from sirchmunk.schema.request import ContentItem, Message, Request
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
 from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME, SIRCHMUNK_WORK_PATH
 from sirchmunk.utils.deps import check_dependencies
-from sirchmunk.utils.file_utils import get_fast_hash
 from sirchmunk.utils import create_logger, LogCallback
 from loguru import logger as _loguru_logger
 from sirchmunk.utils.install_rga import install_rga
 from sirchmunk.utils.utils import (
     KeywordValidation,
     extract_fields,
-    log_tf_norm_penalty,
 )
 
 
@@ -124,7 +122,6 @@ class AgenticSearch(BaseSearch):
 
         # ---- Agentic (ReAct) components (lazy-initialised on first use) ----
         self._tool_registry = None
-        self._react_agent = None
         self._dir_scanner = None
 
         # ---- Spec-path cache for per-search-path context ----
@@ -224,25 +221,18 @@ class AgenticSearch(BaseSearch):
             if self.embedding_client:
                 try:
                     from sirchmunk.utils.embedding_util import compute_text_hash
-                    
+
                     combined_text = self.knowledge_storage.combine_cluster_fields(
                         existing_cluster.queries
                     )
                     text_hash = compute_text_hash(combined_text)
                     embedding_vector = (await self.embedding_client.embed([combined_text]))[0]
-                    
-                    # Update embedding fields in database without triggering save
-                    self.knowledge_storage.db.execute(
-                        f"""
-                        UPDATE {self.knowledge_storage.table_name}
-                        SET 
-                            embedding_vector = ?::FLOAT[384],
-                            embedding_model = ?,
-                            embedding_timestamp = CURRENT_TIMESTAMP,
-                            embedding_text_hash = ?
-                        WHERE id = ?
-                        """,
-                        [embedding_vector, self.embedding_client.model_id, text_hash, existing_cluster.id]
+
+                    await self.knowledge_storage.store_embedding(
+                        cluster_id=existing_cluster.id,
+                        embedding_vector=embedding_vector,
+                        embedding_model=self.embedding_client.model_id,
+                        embedding_text_hash=text_hash,
                     )
                     await self._logger.debug(f"Updated embedding for cluster {existing_cluster.id}")
                 except Exception as emb_error:
@@ -459,38 +449,6 @@ class AgenticSearch(BaseSearch):
         return summary, should_save
 
     @staticmethod
-    def _extract_and_validate_keywords(llm_resp: str) -> dict:
-        """
-        Extract and validate keywords with IDF scores from LLM response.
-        """
-        res: Dict[str, float] = {}
-
-        # Extract JSON-like content within <KEYWORDS></KEYWORDS> tags
-        tag: str = "KEYWORDS"
-        keywords_json: Optional[str, None] = extract_fields(
-            content=llm_resp,
-            tags=[tag],
-        ).get(tag.lower(), None)
-
-        if not keywords_json:
-            return res
-
-        # Try to parse as dict format
-        try:
-            res = json.loads(keywords_json)
-        except json.JSONDecodeError:
-            try:
-                res = ast.literal_eval(keywords_json)
-            except Exception as e:
-                return {}
-
-        # Validate using Pydantic model
-        try:
-            return KeywordValidation(root=res).model_dump()
-        except Exception as e:
-            return {}
-
-    @staticmethod
     def _extract_and_validate_multi_level_keywords(
         llm_resp: str,
         num_levels: int = 3
@@ -540,97 +498,6 @@ class AgenticSearch(BaseSearch):
 
         return keyword_sets
 
-    @staticmethod
-    def fast_deduplicate_by_content(data: List[dict]):
-        """
-        Deduplicates results based on content fingerprints.
-        Keeps the document with the highest total_score for each unique content.
-
-        Args:
-            data: sorted grep results by 'total_score' field.
-
-        Returns:
-            deduplicated grep results.
-        """
-        unique_fingerprints = set()
-        deduplicated_results = []
-
-        for item in data:
-            path = item["path"]
-
-            # 2. Generate a fast fingerprint instead of full MD5
-            fingerprint = get_fast_hash(path)
-
-            # 3. Add to results only if this content hasn't been seen yet
-            if fingerprint and fingerprint not in unique_fingerprints:
-                unique_fingerprints.add(fingerprint)
-                deduplicated_results.append(item)
-
-        return deduplicated_results
-
-    def process_grep_results(
-        self, results: List[Dict[str, Any]], keywords_with_idf: Dict[str, float]
-    ) -> List[Dict[str, Any]]:
-        """
-        Process grep results to calculate total scores for doc and scores for lines based on keywords with IDF.
-
-        Args:
-            results: List of grep result dictionaries.
-            keywords_with_idf: Dictionary of keywords with their corresponding IDF scores.
-
-        Returns:
-            Processed and sorted list of grep result dictionaries.
-        """
-        results = [
-            res
-            for res in results
-            if res.get("total_matches", 0) >= len(keywords_with_idf)
-        ]
-
-        for grep_res in results:
-            keywords_tf_in_doc: Dict[str, int] = {
-                k.lower(): 0 for k, v in keywords_with_idf.items()
-            }
-            matches = grep_res.get("matches", [])
-            for match_item in matches:
-                keywords_tf_in_line: Dict[str, int] = {
-                    k.lower(): 0 for k, v in keywords_with_idf.items()
-                }
-                submatches = match_item.get("data", {}).get("submatches", [])
-                for submatch_item in submatches:
-                    hit_word: str = submatch_item["match"]["text"].lower()
-                    if hit_word in keywords_tf_in_doc:
-                        keywords_tf_in_doc[hit_word] += 1
-                    if hit_word in keywords_tf_in_line:
-                        keywords_tf_in_line[hit_word] += 1
-                match_item_score: float = 0.0
-                for w, idf in keywords_with_idf.items():
-                    match_item_score += idf * log_tf_norm_penalty(
-                        keywords_tf_in_line.get(w.lower(), 0)
-                    )
-                match_item["score"] = (
-                    match_item["score"]
-                    * match_item_score
-                    * log_tf_norm_penalty(
-                        count=len(match_item["data"]["lines"]["text"]),
-                        ideal_range=(50, 200),
-                    )
-                )
-            # Calculate total score for current document
-            total_score: float = 0.0
-            for w, idf in keywords_with_idf.items():
-                total_score += idf * log_tf_norm_penalty(
-                    keywords_tf_in_doc.get(w.lower(), 0)
-                )
-
-            grep_res["total_score"] = total_score
-            matches.sort(key=lambda x: x["score"], reverse=True)
-
-        results.sort(key=lambda x: x["total_score"], reverse=True)
-        results = self.fast_deduplicate_by_content(results)
-
-        return results
-
     # ------------------------------------------------------------------
     # Agentic (ReAct) infrastructure — lazy initialisation
     # ------------------------------------------------------------------
@@ -639,6 +506,9 @@ class AgenticSearch(BaseSearch):
         self,
         paths: List[str],
         enable_dir_scan: bool = True,
+        max_depth: Optional[int] = 5,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
     ) -> "ToolRegistry":
         """Build (or rebuild) the tool registry for the given search paths.
 
@@ -648,6 +518,9 @@ class AgenticSearch(BaseSearch):
         Args:
             paths: Normalised list of path strings.
             enable_dir_scan: Whether to include the directory-scan tool.
+            max_depth: Maximum directory depth for keyword search.
+            include: File patterns to include (glob).
+            exclude: File patterns to exclude (glob).
 
         Returns:
             Ready-to-use ToolRegistry.
@@ -659,8 +532,13 @@ class AgenticSearch(BaseSearch):
             ToolRegistry,
         )
 
-        # Cache key: sorted canonical paths
-        cache_key = tuple(sorted(paths))
+        # Cache key: paths + filter params (all affect tool behaviour)
+        cache_key = (
+            tuple(sorted(paths)),
+            max_depth,
+            tuple(include) if include else None,
+            tuple(exclude) if exclude else None,
+        )
         if (
             self._tool_registry is not None
             and getattr(self, "_tool_registry_key", None) == cache_key
@@ -677,8 +555,10 @@ class AgenticSearch(BaseSearch):
             KeywordSearchTool(
                 retriever=self.grep_retriever,
                 paths=paths,
-                max_depth=5,
+                max_depth=max_depth if max_depth is not None else 5,
                 max_results=10,
+                include=include,
+                exclude=exclude,
             )
         )
 
@@ -756,7 +636,7 @@ class AgenticSearch(BaseSearch):
         │  └─ If evidence sufficient → LLM summary                 │
         │     Else → ReAct loop for adaptive follow-up             │
         ├──────────────────────────────────────────────────────────┤
-        │ Phase 5  Persistence (non-blocking):                     │
+        │ Phase 5  Persistence (concurrent, awaited):                │
         │  ├─ Save cluster + embeddings                            │
         │  └─ Save spec-path cache                                 │
         └──────────────────────────────────────────────────────────┘
@@ -768,11 +648,14 @@ class AgenticSearch(BaseSearch):
             mode: Search mode — ``"DEEP"`` or ``"FILENAME_ONLY"``.
             max_loops: Maximum ReAct iterations (DEEP mode, default: 10).
             max_token_budget: LLM token budget (DEEP mode, default: 64000).
-            max_depth: Maximum directory depth (FILENAME_ONLY mode, default: 5).
+            max_depth: Maximum directory depth for file search (default: 5).
+                Used in both FILENAME_ONLY and DEEP modes.
             top_k_files: Max files for evidence extraction (default: 3).
             enable_dir_scan: Enable directory scanning tool (DEEP mode).
-            include: File patterns to include (glob, FILENAME_ONLY mode).
-            exclude: File patterns to exclude (glob, FILENAME_ONLY mode).
+            include: File glob patterns to include (e.g. ``["*.py", "*.md"]``).
+                Used in both FILENAME_ONLY and DEEP modes.
+            exclude: File glob patterns to exclude (e.g. ``["*.log"]``).
+                Used in both FILENAME_ONLY and DEEP modes.
             return_context: If True, return ``(answer, SearchContext)`` tuple.
             return_cluster: If True, return the full KnowledgeCluster.
             spec_stale_hours: Hours before spec cache is stale (default: 72).
@@ -839,7 +722,7 @@ class AgenticSearch(BaseSearch):
 
         phase1_results = await asyncio.gather(
             self._probe_keywords(query),
-            self._probe_dir_scan(query, paths, enable_dir_scan),
+            self._probe_dir_scan(paths, enable_dir_scan),
             self._probe_knowledge_cache(query),
             self._load_spec_context(paths, stale_hours=spec_stale_hours),
             return_exceptions=True,
@@ -876,7 +759,12 @@ class AgenticSearch(BaseSearch):
         # Path A: keyword search via rga (depends on extracted keywords)
         if initial_keywords:
             phase2_tasks.append(
-                self._retrieve_by_keywords(initial_keywords, paths)
+                self._retrieve_by_keywords(
+                    initial_keywords, paths,
+                    max_depth=max_depth,
+                    include=include,
+                    exclude=exclude,
+                )
             )
         else:
             phase2_tasks.append(self._async_noop([]))
@@ -945,6 +833,9 @@ class AgenticSearch(BaseSearch):
                 enable_dir_scan=enable_dir_scan,
                 max_loops=max_loops,
                 max_token_budget=max_token_budget,
+                max_depth=max_depth,
+                include=include,
+                exclude=exclude,
             )
 
             # Try building cluster from ReAct discoveries
@@ -1028,11 +919,14 @@ class AgenticSearch(BaseSearch):
 
     async def _probe_dir_scan(
         self,
-        query: str,
         paths: List[str],
         enable: bool = True,
     ):
         """Scan directories for file metadata (filesystem only, no LLM).
+
+        Args:
+            paths: Normalised list of path strings to scan.
+            enable: Whether directory scanning is enabled.
 
         Returns:
             ScanResult or None if disabled / no scanner.
@@ -1094,6 +988,9 @@ class AgenticSearch(BaseSearch):
         self,
         keywords: List[str],
         paths: List[str],
+        max_depth: Optional[int] = 5,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
     ) -> List[str]:
         """Run keyword search via rga and return discovered file paths.
 
@@ -1104,8 +1001,10 @@ class AgenticSearch(BaseSearch):
         tool = KeywordSearchTool(
             retriever=self.grep_retriever,
             paths=paths,
-            max_depth=5,
+            max_depth=max_depth if max_depth is not None else 5,
             max_results=20,
+            include=include,
+            exclude=exclude,
         )
         ctx = SearchContext()  # lightweight context for this probe
         result_text, meta = await tool.execute(context=ctx, keywords=keywords)
@@ -1248,6 +1147,9 @@ class AgenticSearch(BaseSearch):
         enable_dir_scan: bool,
         max_loops: int,
         max_token_budget: int,
+        max_depth: Optional[int] = 5,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
     ) -> Tuple[str, SearchContext]:
         """Fall back to ReAct loop when parallel probing yields insufficient evidence.
 
@@ -1256,7 +1158,12 @@ class AgenticSearch(BaseSearch):
         """
         from sirchmunk.agentic.react_agent import ReActSearchAgent
 
-        registry = self._ensure_tool_registry(paths, enable_dir_scan)
+        registry = self._ensure_tool_registry(
+            paths, enable_dir_scan,
+            max_depth=max_depth,
+            include=include,
+            exclude=exclude,
+        )
         agent = ReActSearchAgent(
             llm=self.llm,
             tool_registry=registry,
@@ -1315,8 +1222,10 @@ class AgenticSearch(BaseSearch):
 
         # Fallback: lightweight cluster from answer text
         try:
+            # Use deterministic hash (Python's hash() varies across processes)
+            _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
             cluster = KnowledgeCluster(
-                id=f"R{abs(hash(query)) % 100000:05d}",
+                id=f"R{_digest}",
                 name=query[:60],
                 description=[f"ReAct deep search result for: {query}"],
                 content=answer,
