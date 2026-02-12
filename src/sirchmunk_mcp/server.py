@@ -60,27 +60,46 @@ def create_server(config: Config) -> FastMCP:
         exclude: Optional[List[str]] = None,
         return_cluster: bool = False,
     ) -> str:
-        """Intelligent code and document search with multi-mode support.
+        """Search local files, documents, and raw data on disk. Supports 100+ file formats
+        including PDF, Word, Excel, PowerPoint, CSV, JSON, YAML, Markdown, HTML, source code,
+        images (OCR), archives (zip/tar/gz), emails (eml/msg), eBooks (epub), Jupyter notebooks,
+        and more — no pre-indexing or embedding required.
 
-        DEEP mode provides comprehensive knowledge extraction with full context analysis.
-        FILENAME_ONLY mode performs fast filename pattern matching without content search.
+        USE THIS TOOL WHEN YOU NEED TO:
+        - Search through local files and directories on disk
+        - Find information inside documents (PDF, DOCX, XLSX, PPTX, etc.)
+        - Search raw data files that other tools cannot parse
+        - Answer questions about content in local files or codebases
+        - Locate specific files by name or content pattern
+
+        DO NOT USE THIS TOOL FOR:
+        - Web searches or internet queries (use a web search tool instead)
+        - Searching within a single already-open file (use IDE search instead)
+
+        Modes:
+        - DEEP: Comprehensive search with LLM-powered analysis. Reads file contents,
+          extracts evidence via Monte Carlo sampling, and synthesizes an answer. (10-30s)
+        - FILENAME_ONLY: Fast filename pattern matching across directories. (<1s)
 
         Args:
-            query: Search query or question (e.g., 'How does authentication work?')
-            paths: Paths to search in (files or directories).
+            query: Natural language question or search keywords.
+                Examples: 'How does authentication work?', 'database schema migration',
+                'find all config files related to logging'
+            paths: Local filesystem paths to search (files or directories).
+                Examples: ['/home/user/projects'], ['./src', './docs'], ['/data/reports']
                 Optional — falls back to configured SIRCHMUNK_SEARCH_PATHS or cwd.
-            mode: Search mode - DEEP (comprehensive, 10-30s) or FILENAME_ONLY (fast, <1s)
+            mode: Search mode - DEEP (comprehensive content analysis) or FILENAME_ONLY (fast file discovery)
             max_depth: Maximum directory depth to search (1-20, default: 5)
-            top_k_files: Number of top files to return (1-20, default: 3)
-            max_loops: Maximum ReAct iterations for DEEP mode (1-20, default: 10)
+            top_k_files: Number of top files to analyze (1-20, default: 3)
+            max_loops: Maximum ReAct agent iterations for adaptive retrieval (1-20, default: 10)
             max_token_budget: Token budget for DEEP mode (default: 64000)
-            enable_dir_scan: Enable directory scanning tool (DEEP mode, default: True)
-            include: File patterns to include (glob, e.g., ['*.py', '*.md'])
-            exclude: File patterns to exclude (glob, e.g., ['*.pyc', '*.log'])
-            return_cluster: Return full KnowledgeCluster object (DEEP mode only)
+            enable_dir_scan: Enable directory scanning for file discovery (DEEP mode, default: True)
+            include: File patterns to include (glob, e.g., ['*.py', '*.md', '*.pdf'])
+            exclude: File patterns to exclude (glob, e.g., ['*.pyc', '*.log', 'node_modules'])
+            return_cluster: Return full KnowledgeCluster object with evidences (DEEP mode only)
 
         Returns:
-            Search results as formatted text
+            Search results as formatted text with source references
         """
         if _service is None:
             return "Error: Service not initialized"
@@ -129,21 +148,27 @@ def create_server(config: Config) -> FastMCP:
         max_files: int = 500,
         top_k: int = 20,
     ) -> str:
-        """Scan directories to discover and rank document candidates.
+        """Scan local directories to discover and rank files by relevance to a query.
 
-        Performs a fast recursive scan of paths to collect file
-        metadata (title, size, type, keywords, preview), then uses the
-        LLM to rank the most promising candidates for the query.
+        Recursively scans local filesystem paths to collect file metadata (title, size,
+        type, author, page count, keywords, content preview), then uses an LLM to rank
+        the most promising file candidates. Useful for exploring unfamiliar directories
+        or finding relevant documents before performing a deep content search.
+
+        USE THIS TOOL WHEN YOU NEED TO:
+        - Explore what files exist in a local directory
+        - Find relevant documents in a large folder structure
+        - Get a ranked overview of file candidates before deep search
 
         Args:
-            query: Search query to rank files by relevance
-            paths: Root directories to scan
+            query: Natural language question or topic to rank files by relevance
+            paths: Local filesystem directory paths to scan (e.g., ['/home/user/docs'])
             max_depth: Maximum recursion depth (1-20, default: 8)
-            max_files: Maximum files to scan (default: 500)
+            max_files: Maximum number of files to scan (default: 500)
             top_k: Number of top candidates for LLM ranking (default: 20)
 
         Returns:
-            Ranked list of file candidates with relevance scores
+            Ranked list of local file candidates with relevance scores and metadata
         """
         if _service is None:
             return "Error: Service not initialized"
@@ -171,16 +196,19 @@ def create_server(config: Config) -> FastMCP:
 
     @mcp.tool()
     async def sirchmunk_get_cluster(cluster_id: str) -> str:
-        """Retrieve a previously saved knowledge cluster by its ID.
-        
-        Knowledge clusters are automatically saved during DEEP mode searches
-        and contain rich information including evidences, patterns, and constraints.
-        
+        """Retrieve a cached knowledge cluster from a previous local file search.
+
+        Knowledge clusters are automatically created and saved when sirchmunk_search
+        runs in DEEP mode. Each cluster contains structured evidence extracted from
+        local files — including source-linked snippets, synthesized analysis, design
+        patterns, and confidence scores. Use this to recall previous search results
+        without re-searching.
+
         Args:
-            cluster_id: Knowledge cluster ID (e.g., 'C1007')
-        
+            cluster_id: Knowledge cluster ID (e.g., 'C1a2b3c4d5')
+
         Returns:
-            Full cluster information or error message
+            Full cluster information with evidences, patterns, and analysis
         """
         if _service is None:
             return "Error: Service not initialized"
@@ -204,16 +232,19 @@ def create_server(config: Config) -> FastMCP:
         limit: int = 10,
         sort_by: str = "last_modified",
     ) -> str:
-        """List all saved knowledge clusters with optional filtering and sorting.
-        
-        Useful for discovering previously searched topics and reusing knowledge.
-        
+        """List cached knowledge clusters from previous local file searches.
+
+        Shows all knowledge clusters that were automatically created by sirchmunk_search.
+        Each cluster represents a past search result with its query history, confidence
+        score, and evidence count. Use this to discover what has already been searched
+        and avoid redundant searches.
+
         Args:
             limit: Maximum number of clusters to return (1-100, default: 10)
-            sort_by: Sort field - hotness, confidence, or last_modified (default)
-        
+            sort_by: Sort field - hotness (query frequency), confidence (quality), or last_modified (default)
+
         Returns:
-            List of cluster metadata
+            List of cluster metadata with IDs, names, queries, and scores
         """
         if _service is None:
             return "Error: Service not initialized"
