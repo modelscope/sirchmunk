@@ -21,34 +21,40 @@ logger = logging.getLogger(__name__)
 SIRCHMUNK_SEARCH_TOOL = Tool(
     name="sirchmunk_search",
     description=(
-        "Intelligent code and document search with multi-mode support.\n\n"
-        "DEEP mode provides comprehensive knowledge extraction with full context analysis.\n"
-        "FILENAME_ONLY mode performs fast filename pattern matching without content search.\n\n"
-        "Args:\n"
-        "    query: Search query or question (e.g., 'How does authentication work?')\n"
-        "    paths: Paths to search in (files or directories)\n"
-        "    mode: Search mode - DEEP (comprehensive, 10-30s) or FILENAME_ONLY (fast, <1s)\n"
-        "    max_depth: Maximum directory depth to search (1-20, default: 5)\n"
-        "    top_k_files: Number of top files to return (1-20, default: 3)\n"
-        "    keyword_levels: Keyword granularity levels for DEEP mode (1-5, default: 3)\n"
-        "    include: File patterns to include (glob, e.g., ['*.py', '*.md'])\n"
-        "    exclude: File patterns to exclude (glob, e.g., ['*.pyc', '*.log'])\n"
-        "    return_cluster: Return full KnowledgeCluster object (DEEP mode only)\n\n"
-        "Returns:\n"
-        "    Search results as formatted text\n"
+        "Tool name: sirchmunk:sirchmunk_search. "
+        "Search local files, documents, and raw data on disk. "
+        "Supports 100+ file formats including PDF, Word, Excel, PowerPoint, CSV, JSON, YAML, "
+        "Markdown, HTML, source code, images (OCR), archives (zip/tar/gz), emails (eml/msg), "
+        "eBooks (epub), Jupyter notebooks, and more — no pre-indexing or embedding required.\n\n"
+        "USE THIS TOOL WHEN YOU NEED TO:\n"
+        "- Search through local files and directories on disk\n"
+        "- Find information inside documents (PDF, DOCX, XLSX, PPTX, etc.)\n"
+        "- Search raw data files that other tools cannot parse\n"
+        "- Answer questions about content in local files or codebases\n"
+        "- Locate specific files by name or content pattern\n\n"
+        "Modes:\n"
+        "- DEEP: Comprehensive search with LLM-powered analysis. Reads file contents, "
+        "extracts evidence via Monte Carlo sampling, and synthesizes an answer. (10-30s)\n"
+        "- FILENAME_ONLY: Fast filename pattern matching across directories. (<1s)\n"
     ),
     inputSchema={
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Search query or question (e.g., 'How does authentication work?')",
+                "description": (
+                    "Natural language question or search keywords. "
+                    "Examples: 'How does authentication work?', "
+                    "'database schema migration', "
+                    "'find all config files related to logging'"
+                ),
             },
             "paths": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Paths to search in (files or directories). "
+                    "Local filesystem paths to search (files or directories). "
+                    "Examples: ['/home/user/projects'], ['./src', './docs'], ['/data/reports']. "
                     "Optional — falls back to configured SIRCHMUNK_SEARCH_PATHS "
                     "or the current working directory."
                 ),
@@ -58,8 +64,8 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
                 "enum": ["DEEP", "FILENAME_ONLY"],
                 "default": "DEEP",
                 "description": (
-                    "Search mode: DEEP (comprehensive analysis, 10-30s), "
-                    "FILENAME_ONLY (file discovery, <1s)"
+                    "Search mode: DEEP (comprehensive content analysis with LLM, 10-30s), "
+                    "FILENAME_ONLY (fast file discovery by name pattern, <1s)"
                 ),
             },
             "max_depth": {
@@ -74,14 +80,14 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
                 "default": 3,
                 "minimum": 1,
                 "maximum": 20,
-                "description": "Number of top files to return",
+                "description": "Number of top files to analyze and return",
             },
             "max_loops": {
                 "type": "integer",
                 "default": 10,
                 "minimum": 1,
                 "maximum": 20,
-                "description": "Maximum ReAct iterations (DEEP mode only)",
+                "description": "Maximum ReAct agent iterations for adaptive retrieval (DEEP mode only)",
             },
             "max_token_budget": {
                 "type": "integer",
@@ -91,22 +97,28 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
             "enable_dir_scan": {
                 "type": "boolean",
                 "default": True,
-                "description": "Enable directory scanning tool (DEEP mode only)",
+                "description": "Enable directory scanning for file discovery (DEEP mode only)",
             },
             "include": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "File patterns to include (glob, e.g., ['*.py', '*.md'])",
+                "description": (
+                    "File patterns to include (glob). "
+                    "Examples: ['*.py', '*.md', '*.pdf', '*.docx']"
+                ),
             },
             "exclude": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "File patterns to exclude (glob, e.g., ['*.pyc', '*.log'])",
+                "description": (
+                    "File patterns to exclude (glob). "
+                    "Examples: ['*.pyc', '*.log', 'node_modules', '.git']"
+                ),
             },
             "return_cluster": {
                 "type": "boolean",
                 "default": False,
-                "description": "Return full KnowledgeCluster object (DEEP mode only)",
+                "description": "Return full KnowledgeCluster object with evidences and patterns (DEEP mode only)",
             },
         },
         "required": ["query"],
@@ -117,16 +129,19 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
 SIRCHMUNK_GET_CLUSTER_TOOL = Tool(
     name="sirchmunk_get_cluster",
     description=(
-        "Retrieve a previously saved knowledge cluster by its ID. "
-        "Knowledge clusters are automatically saved during DEEP mode searches "
-        "and contain rich information including evidences, patterns, and constraints."
+        "Retrieve a cached knowledge cluster from a previous local file search. "
+        "Knowledge clusters are automatically created and saved when sirchmunk_search "
+        "runs in DEEP mode. Each cluster contains structured evidence extracted from "
+        "local files — including source-linked snippets, synthesized analysis, design "
+        "patterns, and confidence scores. Use this to recall previous search results "
+        "without re-searching."
     ),
     inputSchema={
         "type": "object",
         "properties": {
             "cluster_id": {
                 "type": "string",
-                "description": "Knowledge cluster ID (e.g., 'C1007')",
+                "description": "Knowledge cluster ID (e.g., 'C1a2b3c4d5')",
             },
         },
         "required": ["cluster_id"],
@@ -137,8 +152,11 @@ SIRCHMUNK_GET_CLUSTER_TOOL = Tool(
 SIRCHMUNK_LIST_CLUSTERS_TOOL = Tool(
     name="sirchmunk_list_clusters",
     description=(
-        "List all saved knowledge clusters with optional filtering and sorting. "
-        "Useful for discovering previously searched topics and reusing knowledge."
+        "List cached knowledge clusters from previous local file searches. "
+        "Shows all knowledge clusters that were automatically created by sirchmunk_search. "
+        "Each cluster represents a past search result with its query history, confidence "
+        "score, and evidence count. Use this to discover what has already been searched "
+        "and avoid redundant searches."
     ),
     inputSchema={
         "type": "object",

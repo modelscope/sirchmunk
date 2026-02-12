@@ -131,6 +131,9 @@ class KeywordSearchTool(BaseTool):
     fallback regex search is attempted with escaped metacharacters.
     """
 
+    # Default patterns that should always be excluded from keyword search
+    _DEFAULT_EXCLUDE: List[str] = ["*.pyc", "*.log", "__pycache__"]
+
     def __init__(
         self,
         retriever: GrepRetriever,
@@ -138,12 +141,17 @@ class KeywordSearchTool(BaseTool):
         max_depth: int = 5,
         max_results: int = 10,
         max_snippet_lines: int = 5,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
     ) -> None:
         self._retriever = retriever
         self._paths = paths
         self._max_depth = max_depth
         self._max_results = max_results
         self._max_snippet_lines = max_snippet_lines
+        self._include = include
+        # Merge caller-provided excludes with sensible defaults (deduped)
+        self._exclude = list(set(self._DEFAULT_EXCLUDE) | set(exclude or []))
 
     @property
     def name(self) -> str:
@@ -202,7 +210,8 @@ class KeywordSearchTool(BaseTool):
                 literal=literal,
                 regex=regex,
                 max_depth=self._max_depth,
-                exclude=["*.pyc", "*.log", "__pycache__"],
+                include=self._include,
+                exclude=self._exclude,
                 timeout=30.0,
             )
 
@@ -242,7 +251,8 @@ class KeywordSearchTool(BaseTool):
             literal=False,
             regex=True,
             max_depth=self._max_depth,
-            exclude=["*.pyc", "*.log", "__pycache__"],
+            include=self._include,
+            exclude=self._exclude,
             timeout=30.0,
         )
         return self._retriever.merge_results(raw, limit=self._max_results)
