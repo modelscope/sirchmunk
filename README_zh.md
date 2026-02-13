@@ -135,6 +135,14 @@
 
 ---
 
+
+|  WeChat Group
+|:-------------------------:
+|  <img src="assets/pic/wechat.jpg" width="200" height="200">
+
+---
+
+
 ## 🎉 News
 
 * 🚀 **2026.2.5**: 发布 **v0.0.2** — MCP 支持、CLI 命令行 & 知识持久化！

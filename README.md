@@ -138,6 +138,13 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 ---
 
 
+|  WeChat Group
+|:-------------------------:
+|  <img src="assets/pic/wechat.jpg" width="200" height="200">
+
+---
+
+
 ## 🎉 News
 
 * 🚀 **Feb 5, 2026**: Release **v0.0.2** — MCP Support, CLI Commands & Knowledge Persistence!
