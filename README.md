@@ -147,6 +147,13 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 ## 🎉 News
 
+* 🚀 **Feb 12, 2026**: Sirchmunk v0.0.3: Upgraded MCP Integration & Core Search Algorithms
+  - **MCP Boost**: Enhanced Model Context Protocol support with updated setup guides.
+  - **Granular Search**: Added glob pattern (include/exclude) support; auto-filters temp/cache files.
+  - **New Docs**: Deep dives into "Monte Carlo Evidence Sampling" and "Self-Evolving Knowledge Clusters."
+  - **System Stability**: Refactored search pipeline and implemented SHA256 deterministic IDs for Knowledge Clusters.
+
+
 * 🚀 **Feb 5, 2026**: Release **v0.0.2** — MCP Support, CLI Commands & Knowledge Persistence!
   - **MCP Integration**: Full [Model Context Protocol](https://modelcontextprotocol.io) support, works seamlessly with Claude Desktop and Cursor IDE.
   - **CLI Commands**: New `sirchmunk` CLI with `init`, `serve`, `search`, `web`, and `mcp` commands.

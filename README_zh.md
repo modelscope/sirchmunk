@@ -145,6 +145,14 @@
 
 ## 🎉 News
 
+* 🚀 **2026.2.12**: **Sirchmunk v0.0.3 发布：核心搜索算法与 MCP 集成双升级**
+
+  - **MCP 增强**：深度优化 Model Context Protocol 集成及配置文档。
+  - **搜索精细化**：搜索工具支持 Glob 模式过滤，默认自动排除缓存与日志文件。
+  - **算法文档**：新增“蒙特卡洛证据采样”与“自进化知识簇”核心原理深度解析。
+  - **架构稳定性**：重构搜索管线（AgenticSearch.search），引入 SHA256 确定性 ID 确保知识簇一致性。
+
+
 * 🚀 **2026.2.5**: 发布 **v0.0.2** — MCP 支持、CLI 命令行 & 知识持久化！
   - **MCP 集成**：完整支持 [Model Context Protocol](https://modelcontextprotocol.io)，与 Claude Desktop 和 Cursor IDE 无缝协作。
   - **CLI 命令行**：全新 `sirchmunk` 命令行工具，支持 `init`、`serve`、`search`、`web` 和 `mcp` 命令。
