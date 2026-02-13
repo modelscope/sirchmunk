@@ -140,7 +140,7 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 |  WeChat Group
 |:-------------------------:
-|  <img src="asset/ms-agent.jpg" width="200" height="200">
+|  <img src="assets/pic/wechat.jpg" width="200" height="200">
 
 ---
 
