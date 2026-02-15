@@ -14,12 +14,10 @@
 [![OpenAI](https://img.shields.io/badge/OpenAI-API-412991?style=flat-square&logo=openai&logoColor=white)](https://github.com/openai/openai-python)
 [![Kreuzberg](https://img.shields.io/badge/Kreuzberg-Text_Extraction-4CAF50?style=flat-square)](https://github.com/kreuzberg-dev/kreuzberg)
 [![MCP](https://img.shields.io/badge/MCP-Python_SDK-8B5CF6?style=flat-square&logo=python&logoColor=white)](https://github.com/modelcontextprotocol/python-sdk)
-[![Documentation](https://img.shields.io/badge/Documentation-Official-4285F4?style=flat-square&logo=readthedocs&logoColor=white)](https://modelscope.github.io/sirchmunk-web/)
 
+📖 **[Documentation](https://modelscope.github.io/sirchmunk-web/)**
 
 [**Quick Start**](#-quick-start) · [**Key Features**](#-key-features) · [**MCP Server**](#-mcp-server) · [**Web UI**](#️-web-ui) · [**How it Works**](#️-how-it-works) · [**FAQ**](#-faq)
-
-[🇨🇳 中文](README_zh.md)
 
 </div>
 
@@ -29,6 +27,11 @@
 ⚡ **Indexless Retrieval** &nbsp;•&nbsp; 🔄 **Self-Evolving Knowledge Base** &nbsp;•&nbsp; 💬 **Real-time Chat**
 
 </div>
+
+<br>
+
+[English](README.md) | [中文](README_zh.md)
+
 
 ---
 
