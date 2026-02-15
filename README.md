@@ -19,8 +19,6 @@
 
 [**Quick Start**](#-quick-start) · [**Key Features**](#-key-features) · [**MCP Server**](#-mcp-server) · [**Web UI**](#️-web-ui) · [**How it Works**](#️-how-it-works) · [**FAQ**](#-faq)
 
-[🇨🇳 中文](README_zh.md)
-
 </div>
 
 <div align="center">
@@ -29,6 +27,11 @@
 ⚡ **Indexless Retrieval** &nbsp;•&nbsp; 🔄 **Self-Evolving Knowledge Base** &nbsp;•&nbsp; 💬 **Real-time Chat**
 
 </div>
+
+<br>
+
+[English](README.md) | [中文](README_zh.md)
+
 
 ---
 
