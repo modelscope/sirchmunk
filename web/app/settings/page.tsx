@@ -11,6 +11,8 @@ import {
   Check,
   AlertCircle,
   Key,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import { apiUrl } from "@/lib/api";
 import { getTranslation, type Language } from "@/lib/i18n";
@@ -53,6 +55,7 @@ export default function SettingsPage() {
   // Edit states
   const [editedUI, setEditedUI] = useState<UISettings | null>(null);
   const [editedEnv, setEditedEnv] = useState<Record<string, string>>({});
+  const [sensitiveVisible, setSensitiveVisible] = useState<Record<string, boolean>>({});
 
   // Fetch settings
   useEffect(() => {
@@ -72,7 +75,6 @@ export default function SettingsPage() {
         setData(result.data);
         setEditedUI(result.data.ui);
         
-        // Initialize edited env with current values
         const envValues: Record<string, string> = {};
         Object.entries(result.data.environment || {}).forEach(([key, info]: [string, any]) => {
           if (key === "WORK_PATH") return;
@@ -386,13 +388,35 @@ export default function SettingsPage() {
                       </span>
                     </div>
 
+                    {info.sensitive ? (
+                      <div className="relative">
+                        <input
+                          type={sensitiveVisible[key] ? "text" : "password"}
+                          value={editedEnv[key] || ""}
+                          onChange={(e) => setEditedEnv({ ...editedEnv, [key]: e.target.value })}
+                          placeholder={info.value && info.value !== "" ? t("Configured (enter new value to update)") : `Default: ${info.default}`}
+                          className="w-full px-3 py-2 pr-10 border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setSensitiveVisible({ ...sensitiveVisible, [key]: !sensitiveVisible[key] })}
+                          className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 transition-colors"
+                          title={sensitiveVisible[key] ? t("Hide") : t("Show")}
+                        >
+                          {sensitiveVisible[key]
+                            ? <EyeOff className="w-4 h-4" />
+                            : <Eye className="w-4 h-4" />}
+                        </button>
+                      </div>
+                    ) : (
                       <input
-                      type={info.sensitive ? "password" : "text"}
-                      value={editedEnv[key] || ""}
-                      onChange={(e) => setEditedEnv({ ...editedEnv, [key]: e.target.value })}
-                      placeholder={`Default: ${info.default}`}
-                      className="w-full px-3 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    />
+                        type="text"
+                        value={editedEnv[key] || ""}
+                        onChange={(e) => setEditedEnv({ ...editedEnv, [key]: e.target.value })}
+                        placeholder={`Default: ${info.default}`}
+                        className="w-full px-3 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                    )}
                         </div>
                 ))}
                             </div>
