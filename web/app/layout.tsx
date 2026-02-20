@@ -1,13 +1,21 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+import localFont from "next/font/local";
 import "./globals.css";
 import Sidebar from "@/components/Sidebar";
 import { GlobalProvider } from "@/context/GlobalContext";
 import ThemeScript from "@/components/ThemeScript";
 
-// Use Inter font with swap display for better loading
-const font = Inter({
-  subsets: ["latin"],
+const font = localFont({
+  src: [
+    {
+      path: "./fonts/InterLatin-wght-normal.woff2",
+      style: "normal",
+    },
+    {
+      path: "./fonts/InterLatinExt-wght-normal.woff2",
+      style: "normal",
+    },
+  ],
   display: "swap",
   fallback: ["system-ui", "sans-serif"],
 });
