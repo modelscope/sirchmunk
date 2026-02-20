@@ -148,8 +148,8 @@ def get_current_env_variables() -> Dict[str, Any]:
             "category": "llm"
         },
         "LLM_API_KEY": {
-            "value": "***" if llm_api_key else "",
-            "default": "***" if os.getenv("LLM_API_KEY") else "",
+            "value": llm_api_key,
+            "default": "",
             "description": "API key for LLM service",
             "category": "llm",
             "sensitive": True
@@ -247,10 +247,11 @@ async def save_settings(request: SaveSettingsRequest):
                 saved_items.append("language")
         
         # Save environment variables
+        _SENSITIVE_MASK = "***"
         if request.environment:
             env_updates = {}
             for key, value in request.environment.items():
-                if value:  # Only save non-empty values
+                if value and value != _SENSITIVE_MASK:
                     # Save to SettingsStorage (DuckDB) for immediate use
                     settings_storage.save_env_variable(
                         key,
