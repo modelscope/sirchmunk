@@ -105,6 +105,13 @@ LLM_MODEL_NAME=gpt-5.2
 # LLM request timeout in seconds
 LLM_TIMEOUT=60.0
 
+# ===== UI Settings =====
+# WebUI theme (light/dark)
+UI_THEME=light
+
+# WebUI language (en/zh)
+UI_LANGUAGE=en
+
 # ===== Sirchmunk Settings =====
 # Working directory for data and cache
 SIRCHMUNK_WORK_PATH=~/.sirchmunk

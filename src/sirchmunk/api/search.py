@@ -80,49 +80,54 @@ class SearchResponse(BaseModel):
 # === Cached Search Instance ===
 
 _search_instance: Optional[AgenticSearch] = None
+_search_config: Optional[tuple] = None
 
 
 def _get_search_instance() -> AgenticSearch:
     """Get or create AgenticSearch instance.
-    
-    Uses lazy initialization and caches the instance for reuse.
-    Reads LLM configuration dynamically from os.getenv() (includes .env values)
-    so that settings changed via WebUI or .env file are picked up.
-    
+
+    Caches the instance but automatically recreates it when the LLM
+    configuration (detected via os.environ) changes, so that settings
+    modified through the WebUI take effect without a server restart.
+
     Returns:
         AgenticSearch instance
-        
+
     Raises:
         HTTPException: If LLM API key is not configured
     """
-    global _search_instance
-    
-    if _search_instance is None:
-        # Read LLM config dynamically (os.getenv includes .env loaded at startup)
-        api_key = os.getenv("LLM_API_KEY", "")
-        base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-        model_name = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
+    global _search_instance, _search_config
 
-        if not api_key:
-            raise HTTPException(
-                status_code=500,
-                detail="LLM_API_KEY is not configured. Set it in your environment or .env file."
-            )
-        
-        llm = OpenAIChat(
-            base_url=base_url,
-            api_key=api_key,
-            model=model_name,
+    api_key = os.getenv("LLM_API_KEY", "")
+    base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+    model_name = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
+
+    current_config = (api_key, base_url, model_name)
+
+    if _search_instance is not None and current_config == _search_config:
+        return _search_instance
+
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="LLM_API_KEY is not configured. Set it in your environment or .env file."
         )
-        
-        _search_instance = AgenticSearch(
-            llm=llm,
-            work_path=DEFAULT_SIRCHMUNK_WORK_PATH,
-            verbose=False,
-        )
-        
-        logger.info("AgenticSearch instance created for API")
-    
+
+    llm = OpenAIChat(
+        base_url=base_url,
+        api_key=api_key,
+        model=model_name,
+    )
+
+    _search_instance = AgenticSearch(
+        llm=llm,
+        work_path=DEFAULT_SIRCHMUNK_WORK_PATH,
+        verbose=False,
+    )
+    _search_config = current_config
+
+    logger.info("AgenticSearch instance created for API")
+
     return _search_instance
 
 
