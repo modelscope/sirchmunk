@@ -1,0 +1,64 @@
+name: Build Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      workflow_name:
+        description: "A descriptive name for this build run"
+        required: true
+        default: "build"
+      sirchmunk_branch:
+        description: "Sirchmunk branch to build from"
+        required: true
+        default: "main"
+      image_type:
+        description: "Image type to build (cpu)"
+        required: true
+        default: "cpu"
+      sirchmunk_version:
+        description: "Version label for the image tag"
+        required: true
+        default: "latest"
+      python_version:
+        description: "Python version for the base image"
+        required: false
+        default: "3.12"
+      node_version:
+        description: "Node.js version for the frontend build"
+        required: false
+        default: "20"
+
+run-name: Docker-${{ inputs.sirchmunk_branch }}-${{ inputs.image_type }}-${{ inputs.workflow_name }}-py${{ inputs.python_version }}-by-@${{ github.actor }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.sirchmunk_branch }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ github.event.inputs.python_version }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker Image
+        env:
+          DOCKER_REGISTRY: ghcr.io/${{ github.repository }}
+        run: |
+          python docker/build_image.py \
+            --image_type ${{ github.event.inputs.image_type }} \
+            --python_version ${{ github.event.inputs.python_version }} \
+            --node_version ${{ github.event.inputs.node_version }} \
+            --sirchmunk_version ${{ github.event.inputs.sirchmunk_version }} \
+            --sirchmunk_branch ${{ github.event.inputs.sirchmunk_branch }}

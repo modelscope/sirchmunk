@@ -1,0 +1,38 @@
+## ---------------------------------------------------------------------------
+## Sirchmunk Docker Compose
+##
+## Usage:
+##   # Option 1: Build via build_image.py (recommended)
+##   cd <project-root>
+##   python docker/build_image.py                   # build image
+##   docker compose -f docker/docker-compose.yml up -d
+##
+##   # Option 2: Generate Dockerfile + compose build
+##   python docker/build_image.py --dry_run 1       # generates ./Dockerfile
+##   docker compose -f docker/docker-compose.yml up -d --build
+## ---------------------------------------------------------------------------
+
+services:
+  sirchmunk:
+    image: sirchmunk:ubuntu-py3.12-latest-cpu
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: sirchmunk
+    ports:
+      - "8584:8584"
+    volumes:
+      # Persist all data (history, knowledge, models, .env) across restarts
+      - sirchmunk_data:/data/sirchmunk
+      # Mount local search paths (add your own paths here)
+      # - /path/to/your/docs:/mnt/docs:ro
+    environment:
+      - SIRCHMUNK_WORK_PATH=/data/sirchmunk
+      # LLM configuration (override via .env file or here)
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com/v1}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-gpt-5.2}
+    restart: unless-stopped
+
+volumes:
+  sirchmunk_data:

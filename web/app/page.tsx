@@ -23,6 +23,7 @@ import {
   ChevronDown,
   Folder,
   Plus,
+  Square,
 } from "lucide-react";
 import Link from "next/link";
 import Image from "next/image";
@@ -65,6 +66,7 @@ export default function HomePage() {
     chatState,
     setChatState,
     sendChatMessage,
+    stopChatMessage,
     newChatSession,
     settings,
   } = useGlobal();
@@ -554,17 +556,23 @@ export default function HomePage() {
                 onKeyDown={handleKeyDown}
                 disabled={chatState.isLoading}
               />
-              <button
-                onClick={handleSend}
-                disabled={chatState.isLoading || !inputMessage.trim()}
-                className="absolute right-2 top-2 bottom-2 aspect-square bg-blue-600 text-white rounded-xl flex items-center justify-center hover:bg-blue-700 disabled:opacity-50 disabled:hover:bg-blue-600 transition-all shadow-md shadow-blue-500/20"
-              >
-                {chatState.isLoading ? (
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                ) : (
+              {chatState.isLoading ? (
+                <button
+                  onClick={stopChatMessage}
+                  className="absolute right-2 top-2 bottom-2 aspect-square bg-red-500 text-white rounded-xl flex items-center justify-center hover:bg-red-600 transition-all shadow-md shadow-red-500/20"
+                  title={t("Stop generating")}
+                >
+                  <Square className="w-4 h-4 fill-current" />
+                </button>
+              ) : (
+                <button
+                  onClick={handleSend}
+                  disabled={!inputMessage.trim()}
+                  className="absolute right-2 top-2 bottom-2 aspect-square bg-blue-600 text-white rounded-xl flex items-center justify-center hover:bg-blue-700 disabled:opacity-50 disabled:hover:bg-blue-600 transition-all shadow-md shadow-blue-500/20"
+                >
                   <Send className="w-5 h-5" />
-                )}
-              </button>
+                </button>
+              )}
 
               {/* Search Suggestions Dropdown */}
               {showSuggestions && searchSuggestions.length > 0 && (
@@ -922,17 +930,23 @@ export default function HomePage() {
                 onKeyDown={handleKeyDown}
                 disabled={chatState.isLoading}
               />
-              <button
-                onClick={handleSend}
-                disabled={chatState.isLoading || !inputMessage.trim()}
-                className="absolute right-2 top-2 bottom-2 aspect-square bg-blue-600 text-white rounded-lg flex items-center justify-center hover:bg-blue-700 disabled:opacity-50 disabled:hover:bg-blue-600 transition-all"
-              >
-                {chatState.isLoading ? (
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                ) : (
+              {chatState.isLoading ? (
+                <button
+                  onClick={stopChatMessage}
+                  className="absolute right-2 top-2 bottom-2 aspect-square bg-red-500 text-white rounded-lg flex items-center justify-center hover:bg-red-600 transition-all"
+                  title={t("Stop generating")}
+                >
+                  <Square className="w-4 h-4 fill-current" />
+                </button>
+              ) : (
+                <button
+                  onClick={handleSend}
+                  disabled={!inputMessage.trim()}
+                  className="absolute right-2 top-2 bottom-2 aspect-square bg-blue-600 text-white rounded-lg flex items-center justify-center hover:bg-blue-700 disabled:opacity-50 disabled:hover:bg-blue-600 transition-all"
+                >
                   <Send className="w-5 h-5" />
-                )}
-              </button>
+                </button>
+              )}
             </div>
           </div>
         </>
