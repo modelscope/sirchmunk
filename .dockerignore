@@ -1,0 +1,36 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist
+build
+.eggs
+.tox
+.venv
+venv
+
+# Node
+web/node_modules
+web/.next
+web/out
+
+# IDE
+.vscode
+.idea
+.cursor
+*.swp
+*.swo
+
+# Docker (don't exclude docker/ -- needed for entrypoint.sh)
+
+# Test & docs
+tests/
+docs/
+
+# Misc
+*.log

@@ -164,6 +164,7 @@ interface GlobalContextType {
   chatState: ChatState;
   setChatState: React.Dispatch<React.SetStateAction<ChatState>>;
   sendChatMessage: (message: string) => void;
+  stopChatMessage: () => void;
   loadChatSession: (sessionId: string) => void;
   clearChatHistory: () => void;
   newChatSession: () => void;
@@ -868,6 +869,30 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
     };
   };
 
+  const stopChatMessage = () => {
+    if (chatWs.current) {
+      chatWs.current.close();
+      chatWs.current = null;
+    }
+    setChatState((prev) => {
+      const messages = [...prev.messages];
+      const lastMessage = messages[messages.length - 1];
+      if (lastMessage?.role === "assistant" && lastMessage?.isStreaming) {
+        messages[messages.length - 1] = {
+          ...lastMessage,
+          isStreaming: false,
+          content: lastMessage.content || "(stopped)",
+        };
+      }
+      return {
+        ...prev,
+        messages,
+        isLoading: false,
+        currentStage: null,
+      };
+    });
+  };
+
   const loadChatSession = async (sessionId: string) => {
     try {
       const response = await fetch(
@@ -950,6 +975,7 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
         chatState,
         setChatState,
         sendChatMessage,
+        stopChatMessage,
         loadChatSession,
         clearChatHistory,
         newChatSession,

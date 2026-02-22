@@ -101,6 +101,7 @@ export const translations = {
     "From Knowledge Base": "From Knowledge Base",
     "From Web": "From Web",
     "New Chat": "New Chat",
+    "Stop generating": "Stop generating",
 
     // History Page
     "Chat History": "Chat History",
@@ -208,6 +209,7 @@ export const translations = {
     "From Knowledge Base": "来自知识库",
     "From Web": "来自网络",
     "New Chat": "新对话",
+    "Stop generating": "停止生成",
 
     // History Page
     "Chat History": "聊天历史",
