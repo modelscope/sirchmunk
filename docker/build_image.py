@@ -181,9 +181,12 @@ class Builder:
         print(f"[build_image] Generated {dest}")
 
     def build(self) -> int:
-        return os.system(
+        ret = os.system(
             f"docker build --platform linux/amd64 -t {self.local_image()} -f Dockerfile ."
         )
+        if ret == 0:
+            os.system(f"docker tag {self.local_image()} sirchmunk:latest")
+        return ret
 
     def push(self) -> int:
         tag = self.image_tag()

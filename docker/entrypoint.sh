@@ -43,15 +43,28 @@ MCPEOF
 fi
 
 # Apply environment variable overrides into .env
+# Uses Python for safe replacement — avoids sed delimiter issues with
+# special characters (/, &, |, \) that may appear in URLs or API keys.
 for var in LLM_BASE_URL LLM_API_KEY LLM_MODEL_NAME LLM_TIMEOUT \
            UI_THEME UI_LANGUAGE SIRCHMUNK_VERBOSE; do
     val="${!var}"
     if [ -n "$val" ]; then
-        if grep -q "^${var}=" "$WORK_PATH/.env" 2>/dev/null; then
-            sed -i "s|^${var}=.*|${var}=${val}|" "$WORK_PATH/.env"
-        else
-            echo "${var}=${val}" >> "$WORK_PATH/.env"
-        fi
+        python3 -c "
+import sys, pathlib
+key, val, p = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
+lines = p.read_text().splitlines(True) if p.exists() else []
+found = False
+out = []
+for line in lines:
+    if line.startswith(key + '='):
+        out.append(key + '=' + val + '\n')
+        found = True
+    else:
+        out.append(line)
+if not found:
+    out.append(key + '=' + val + '\n')
+p.write_text(''.join(out))
+" "$var" "$val" "$WORK_PATH/.env"
     fi
 done
 

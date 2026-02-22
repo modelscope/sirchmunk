@@ -14,7 +14,7 @@
 
 services:
   sirchmunk:
-    image: sirchmunk:ubuntu22.04-py312-latest
+    image: ${SIRCHMUNK_IMAGE:-sirchmunk:latest}
     build:
       context: ..
       dockerfile: Dockerfile

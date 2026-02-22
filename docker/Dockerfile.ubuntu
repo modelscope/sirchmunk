@@ -48,19 +48,17 @@ RUN curl -fsSL {github_proxy}https://github.com/phiresky/ripgrep-all/releases/do
 
 WORKDIR /app
 
-# Install ALL Python dependencies (core + web + mcp + docs + tests)
+# Install Python dependencies (core + web + mcp — no docs/tests in production)
 COPY requirements/ requirements/
 RUN pip install --no-cache-dir {pip_index_args}\
     -r requirements/core.txt \
     -r requirements/web.txt \
-    -r requirements/mcp.txt \
-    -r requirements/docs.txt \
-    -r requirements/tests.txt
+    -r requirements/mcp.txt
 
-# Copy source code and install (with [all] extras)
+# Copy source code and install
 COPY src/ src/
 COPY pyproject.toml setup.cfg* README.md ./
-RUN pip install --no-cache-dir {pip_index_args}-e ".[all]"
+RUN pip install --no-cache-dir {pip_index_args}-e ".[mcp,web]"
 
 # Copy config
 COPY config/ config/
