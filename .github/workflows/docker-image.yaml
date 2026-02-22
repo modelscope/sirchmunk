@@ -49,24 +49,6 @@ jobs:
         with:
           ref: ${{ github.event.inputs.sirchmunk_branch }}
 
-      - name: Login to ACR (cn-beijing)
-        run: |
-          echo "${{ secrets.ACR_PASSWORD }}" | \
-            docker login --username=${{ secrets.ACR_USERNAME }} \
-              --password-stdin modelscope-registry.cn-beijing.cr.aliyuncs.com
-
-      - name: Login to ACR (cn-hangzhou)
-        run: |
-          echo "${{ secrets.ACR_PASSWORD }}" | \
-            docker login --username=${{ secrets.ACR_USERNAME }} \
-              --password-stdin modelscope-registry.cn-hangzhou.cr.aliyuncs.com
-
-      - name: Login to ACR (us-west-1)
-        run: |
-          echo "${{ secrets.ACR_PASSWORD }}" | \
-            docker login --username=${{ secrets.ACR_USERNAME }} \
-              --password-stdin modelscope-registry.us-west-1.cr.aliyuncs.com
-
       - name: Build and Push Docker Image
         run: |
           VERSION_ARG=""
