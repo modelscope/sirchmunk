@@ -204,7 +204,7 @@ async def save_settings(request: SaveSettingsRequest):
         # Save environment variables
         if request.environment:
             for key, value in request.environment.items():
-                if value:
+                if value and value != "***":
                     env_updates[key] = str(value)
                     saved_items.append(key)
 
