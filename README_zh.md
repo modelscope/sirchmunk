@@ -531,10 +531,8 @@ KnowledgeCluster 是一个丰富标注的对象，完整记录了单次搜索周
   ├── .cache/
     ├── history/              # 聊天会话历史（DuckDB）
     │   └── chat_history.db
-    ├── knowledge/            # 知识聚类（Parquet）
-    │   └── knowledge_clusters.parquet
-    └── settings/             # 用户设置（DuckDB）
-        └── settings.db
+    └── knowledge/            # 知识聚类（Parquet）
+        └── knowledge_clusters.parquet
 
 ```
 

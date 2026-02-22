@@ -531,10 +531,8 @@ All persistent data is stored in the configured `SIRCHMUNK_WORK_PATH` (default: 
   ├── .cache/
     ├── history/              # Chat session history (DuckDB)
     │   └── chat_history.db
-    ├── knowledge/            # Knowledge clusters (Parquet)
-    │   └── knowledge_clusters.parquet
-    └── settings/             # User settings (DuckDB)
-        └── settings.db
+    └── knowledge/            # Knowledge clusters (Parquet)
+        └── knowledge_clusters.parquet
 
 ```
 

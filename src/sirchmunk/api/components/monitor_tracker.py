@@ -382,16 +382,6 @@ class MonitorTracker:
                     "exists": True,
                 }
             
-            # Check settings database
-            settings_db = cache_path / "settings" / "settings.db"
-            if settings_db.exists():
-                size_mb = settings_db.stat().st_size / (1024 ** 2)
-                storage_info["databases"]["settings"] = {
-                    "path": str(settings_db),
-                    "size_mb": round(size_mb, 2),
-                    "exists": True,
-                }
-            
             # Calculate total cache size
             total_size = 0
             if cache_path.exists():

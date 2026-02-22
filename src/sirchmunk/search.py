@@ -4,6 +4,7 @@ import ast
 import hashlib
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +22,7 @@ from sirchmunk.schema.knowledge import KnowledgeCluster
 from sirchmunk.schema.request import ContentItem, Message, Request
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
-from sirchmunk.utils.constants import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME, SIRCHMUNK_WORK_PATH
+from sirchmunk.utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH
 from sirchmunk.utils.deps import check_dependencies
 from sirchmunk.utils import create_logger, LogCallback
 from loguru import logger as _loguru_logger
@@ -55,14 +56,15 @@ class AgenticSearch(BaseSearch):
         else:
             self.paths = None
 
-        work_path = work_path or SIRCHMUNK_WORK_PATH
-        # Ensure path is expanded (handle ~ and environment variables)
+        _env_work = os.getenv("SIRCHMUNK_WORK_PATH")
+        default_wp = os.path.expanduser(_env_work) if _env_work else DEFAULT_SIRCHMUNK_WORK_PATH
+        work_path = work_path or default_wp
         self.work_path: Path = Path(work_path).expanduser().resolve()
 
         self.llm: OpenAIChat = llm or OpenAIChat(
-            base_url=LLM_BASE_URL,
-            api_key=LLM_API_KEY,
-            model=LLM_MODEL_NAME,
+            base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
+            api_key=os.getenv("LLM_API_KEY", ""),
+            model=os.getenv("LLM_MODEL_NAME", "gpt-5.2"),
             log_callback=log_callback,
         )
 

@@ -19,7 +19,6 @@ import threading
 from sirchmunk.search import AgenticSearch
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.api.components.history_storage import HistoryStorage
-from sirchmunk.api.components.settings_storage import SettingsStorage
 from sirchmunk.api.components.monitor_tracker import llm_usage_tracker
 
 
@@ -35,13 +34,6 @@ router = APIRouter(prefix="/api/v1", tags=["chat", "search"])
 
 # Initialize persistent history storage
 history_storage = HistoryStorage()
-
-# Initialize settings storage for LLM configuration (with error handling)
-try:
-    settings_storage = SettingsStorage()
-except Exception as e:
-    print(f"[WARNING] Failed to initialize SettingsStorage: {e}")
-    settings_storage = None
 
 # In-memory cache for active sessions (for backward compatibility)
 chat_sessions = {}
@@ -270,28 +262,10 @@ class SearchRequest(BaseModel):
 
 
 def get_envs() -> Dict[str, Any]:
-    """
-    Get LLM configuration with priority resolution.
-
-    Priority: SettingsStorage (WebUI) > os.getenv() (includes .env) > defaults
-    """
-    # Try to get from settings storage first (highest priority: user WebUI overrides)
-    if settings_storage is not None:
-        base_url = settings_storage.get_env_variable("LLM_BASE_URL", "")
-        api_key = settings_storage.get_env_variable("LLM_API_KEY", "")
-        model_name = settings_storage.get_env_variable("LLM_MODEL_NAME", "")
-    else:
-        base_url = ""
-        api_key = ""
-        model_name = ""
-
-    # Fallback to os.getenv() which includes .env values loaded at startup
-    if not base_url:
-        base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-    if not api_key:
-        api_key = os.getenv("LLM_API_KEY", "")
-    if not model_name:
-        model_name = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
+    """Get LLM configuration from os.environ (backed by .env)."""
+    base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+    api_key = os.getenv("LLM_API_KEY", "")
+    model_name = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
 
     print(f"[ENV CONFIG] base_url={base_url}, model_name={model_name}, api_key={'***' if api_key else '(not set)'}")
 
@@ -306,7 +280,7 @@ def get_search_instance(log_callback=None):
     """
     Get configured search instance with optional log callback.
     
-    Creates OpenAIChat instance with settings from DuckDB (priority) or environment variables (fallback).
+    Creates OpenAIChat instance with settings from environment variables (.env).
     
     Args:
         log_callback: Optional callback for logging

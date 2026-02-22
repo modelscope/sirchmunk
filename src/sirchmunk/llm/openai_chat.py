@@ -81,10 +81,39 @@ class OpenAIChat:
         self._logger = create_logger(log_callback=log_callback, enable_async=False)
         self._logger_async = create_logger(log_callback=log_callback, enable_async=True)
 
+    def _build_request_kwargs(
+            self,
+            stream: bool,
+            enable_thinking: Optional[bool],
+            **kwargs,
+    ) -> Dict[str, Any]:
+        """Merge instance-level and call-level kwargs for the API request.
+
+        Precedence (highest wins): call-level kwargs > instance-level self._kwargs.
+        ``extra_body`` dicts are deep-merged so that fields from both levels coexist.
+        """
+        request_kwargs = {**self._kwargs, **kwargs}
+
+        extra_body = {
+            **(self._kwargs.get("extra_body") or {}),
+            **(kwargs.get("extra_body") or {}),
+        }
+        if enable_thinking is not None:
+            extra_body["enable_thinking"] = enable_thinking
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+
+        if stream and "stream_options" not in request_kwargs:
+            request_kwargs["stream_options"] = {"include_usage": True}
+
+        return request_kwargs
+
     def chat(
             self,
             messages: List[Dict[str, Any]],
             stream: bool = True,
+            enable_thinking: Optional[bool] = False,
+            **kwargs,
     ) -> OpenAIChatResponse:
         """
         Generate a chat completion synchronously.
@@ -92,14 +121,15 @@ class OpenAIChat:
         Args:
             messages (List[Dict[str, Any]]): A list of messages for the chat.
             stream (bool): Whether to stream the response.
+            enable_thinking (Optional[bool]): Whether to enable model thinking/reasoning.
+                Sent via ``extra_body``. Defaults to False. Pass None to omit.
+            **kwargs: Additional keyword arguments merged with instance-level kwargs
+                and forwarded to the OpenAI API. Call-level kwargs take precedence.
 
         Returns:
             OpenAIChatResponse: The structured response containing content, usage, etc.
         """
-        # Ensure we try to get usage metrics even in streaming mode if supported by the API version
-        request_kwargs = self._kwargs.copy()
-        if stream and "stream_options" not in request_kwargs:
-            request_kwargs["stream_options"] = {"include_usage": True}
+        request_kwargs = self._build_request_kwargs(stream, enable_thinking, **kwargs)
 
         resp = self._client.chat.completions.create(
             model=self._model, messages=messages, stream=stream, **request_kwargs
@@ -168,6 +198,8 @@ class OpenAIChat:
             self,
             messages: List[Dict[str, Any]],
             stream: bool = True,
+            enable_thinking: Optional[bool] = False,
+            **kwargs,
     ) -> OpenAIChatResponse:
         """
         Generate a chat completion asynchronously.
@@ -175,14 +207,15 @@ class OpenAIChat:
         Args:
             messages (List[Dict[str, Any]]): A list of messages for the chat.
             stream (bool): Whether to stream the response.
+            enable_thinking (Optional[bool]): Whether to enable model thinking/reasoning.
+                Sent via ``extra_body``. Defaults to False. Pass None to omit.
+            **kwargs: Additional keyword arguments merged with instance-level kwargs
+                and forwarded to the OpenAI API. Call-level kwargs take precedence.
 
         Returns:
             OpenAIChatResponse: The structured response containing content, usage, etc.
         """
-        # Ensure we try to get usage metrics even in streaming mode
-        request_kwargs = self._kwargs.copy()
-        if stream and "stream_options" not in request_kwargs:
-            request_kwargs["stream_options"] = {"include_usage": True}
+        request_kwargs = self._build_request_kwargs(stream, enable_thinking, **kwargs)
 
         resp = await self._async_client.chat.completions.create(
             model=self._model, messages=messages, stream=stream, **request_kwargs
