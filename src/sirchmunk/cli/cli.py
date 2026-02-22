@@ -191,8 +191,144 @@ def _check_env_vars(env_file: Path):
 
 
 # ------------------------------------------------------------------
-# sirchmunk init
+# sirchmunk init  (core logic + CLI command)
 # ------------------------------------------------------------------
+
+def _run_base_init(work_path: Path) -> int:
+    """Core initialization logic shared by ``sirchmunk init`` and ``sirchmunk web init``.
+
+    Creates the work directory structure, generates .env, checks dependencies,
+    validates environment variables, downloads the embedding model, and
+    generates the MCP client config.
+
+    Args:
+        work_path: Resolved working directory path
+
+    Returns:
+        0 on success, non-zero on failure
+    """
+    import shutil
+
+    print(f"Work path: {work_path}")
+    print()
+
+    # Create directory structure
+    print("Creating directory structure...")
+    directories = [
+        work_path,
+        work_path / "data",
+        work_path / "logs",
+        work_path / ".cache",
+        work_path / ".cache" / "models",
+        work_path / ".cache" / "knowledge",
+        work_path / ".cache" / "history",
+        work_path / ".cache" / "settings",
+    ]
+
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
+    print("  ✓ Created work directory and subdirectories")
+
+    # Generate default .env file if not exists
+    env_file = work_path / ".env"
+    if not env_file.exists():
+        _generate_env_file(env_file)
+        print(f"  ✓ Generated {env_file}")
+    else:
+        print(f"  • Skipped {env_file} (already exists)")
+
+    # Check dependencies
+    print()
+    print("Checking dependencies...")
+
+    # Check ripgrep-all
+    if shutil.which("rga"):
+        print("  ✓ ripgrep-all (rga) is installed")
+    else:
+        print("  ✗ ripgrep-all (rga) is not installed")
+        print("    Installing ripgrep-all...")
+        try:
+            from sirchmunk.utils.install_rga import install_rga
+            install_rga()
+            print("  ✓ ripgrep-all installed successfully")
+        except Exception as e:
+            print(f"  ✗ Failed to install ripgrep-all: {e}")
+            print("    Please install manually: https://github.com/phiresky/ripgrep-all")
+
+    # Check ripgrep
+    if shutil.which("rg"):
+        print("  ✓ ripgrep (rg) is installed")
+    else:
+        print("  ✗ ripgrep (rg) is not installed")
+        print("    Please install: https://github.com/BurntSushi/ripgrep")
+
+    # Check environment variables
+    print()
+    print("Checking environment variables...")
+    _load_env_file(env_file)
+
+    llm_api_key = os.getenv("LLM_API_KEY")
+    if llm_api_key:
+        masked_key = llm_api_key[:8] + "..." if len(llm_api_key) > 8 else "***"
+        print(f"  ✓ LLM_API_KEY is set ({masked_key})")
+    else:
+        print("  ✗ LLM_API_KEY is not set")
+        print(f"    Set it in {env_file}")
+
+    llm_model = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
+    print(f"  • LLM_MODEL_NAME: {llm_model}")
+
+    llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+    print(f"  • LLM_BASE_URL: {llm_base_url}")
+
+    # Pre-download embedding model
+    print()
+    print("Downloading embedding model...")
+    print("  (This may take a few minutes on first run)")
+    try:
+        from sirchmunk.utils.embedding_util import EmbeddingUtil
+
+        model_cache_dir = str(work_path / ".cache" / "models")
+        model_dir = EmbeddingUtil.preload_model(
+            cache_dir=model_cache_dir,
+        )
+        print(f"  ✓ Embedding model downloaded: {model_dir}")
+    except Exception as e:
+        print(f"  ✗ Failed to download embedding model: {e}")
+        print("    Model will be downloaded on first search.")
+
+    # Check MCP package
+    try:
+        import importlib.metadata
+        mcp_version = importlib.metadata.version("mcp")
+        print(f"  ✓ MCP package installed (v{mcp_version})")
+    except Exception:
+        print("  • MCP package not installed (optional)")
+        print("    Install with: pip install sirchmunk[mcp]")
+
+    # Generate MCP client config example
+    mcp_config_file = work_path / "mcp_config.json"
+    if not mcp_config_file.exists():
+        mcp_config_content = """\
+{
+  "mcpServers": {
+    "sirchmunk": {
+      "command": "sirchmunk",
+      "args": ["mcp", "serve"],
+      "env": {
+        "SIRCHMUNK_SEARCH_PATHS": ""
+      }
+    }
+  }
+}
+"""
+        mcp_config_file.write_text(mcp_config_content)
+        print(f"  ✓ Generated MCP client config: {mcp_config_file}")
+    else:
+        print(f"  • Skipped {mcp_config_file} (already exists)")
+
+    return 0
+
 
 def cmd_init(args: argparse.Namespace) -> int:
     """Initialize Sirchmunk working directory.
@@ -206,8 +342,6 @@ def cmd_init(args: argparse.Namespace) -> int:
     Returns:
         Exit code (0 for success, non-zero for failure)
     """
-    import shutil
-
     try:
         work_path = Path(args.work_path).expanduser().resolve()
 
@@ -215,123 +349,13 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("  Sirchmunk Initialization")
         print("=" * 60)
         print()
-        print(f"Work path: {work_path}")
-        print()
 
-        # Create directory structure
-        print("Creating directory structure...")
-        directories = [
-            work_path,
-            work_path / "data",
-            work_path / "logs",
-            work_path / ".cache",
-            work_path / ".cache" / "models",
-            work_path / ".cache" / "knowledge",
-            work_path / ".cache" / "history",
-            work_path / ".cache" / "settings",
-        ]
+        rc = _run_base_init(work_path)
+        if rc != 0:
+            return rc
 
-        for directory in directories:
-            directory.mkdir(parents=True, exist_ok=True)
-        print("  ✓ Created work directory and subdirectories")
-
-        # Generate default .env file if not exists
         env_file = work_path / ".env"
-        if not env_file.exists():
-            _generate_env_file(env_file)
-            print(f"  ✓ Generated {env_file}")
-        else:
-            print(f"  • Skipped {env_file} (already exists)")
-
-        # Check dependencies
-        print()
-        print("Checking dependencies...")
-
-        # Check ripgrep-all
-        if shutil.which("rga"):
-            print("  ✓ ripgrep-all (rga) is installed")
-        else:
-            print("  ✗ ripgrep-all (rga) is not installed")
-            print("    Installing ripgrep-all...")
-            try:
-                from sirchmunk.utils.install_rga import install_rga
-                install_rga()
-                print("  ✓ ripgrep-all installed successfully")
-            except Exception as e:
-                print(f"  ✗ Failed to install ripgrep-all: {e}")
-                print("    Please install manually: https://github.com/phiresky/ripgrep-all")
-
-        # Check ripgrep
-        if shutil.which("rg"):
-            print("  ✓ ripgrep (rg) is installed")
-        else:
-            print("  ✗ ripgrep (rg) is not installed")
-            print("    Please install: https://github.com/BurntSushi/ripgrep")
-
-        # Check environment variables
-        print()
-        print("Checking environment variables...")
-        _load_env_file(env_file)
-
-        llm_api_key = os.getenv("LLM_API_KEY")
-        if llm_api_key:
-            masked_key = llm_api_key[:8] + "..." if len(llm_api_key) > 8 else "***"
-            print(f"  ✓ LLM_API_KEY is set ({masked_key})")
-        else:
-            print("  ✗ LLM_API_KEY is not set")
-            print(f"    Set it in {env_file}")
-
-        llm_model = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
-        print(f"  • LLM_MODEL_NAME: {llm_model}")
-
-        llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-        print(f"  • LLM_BASE_URL: {llm_base_url}")
-
-        # Pre-download embedding model
-        print()
-        print("Downloading embedding model...")
-        print("  (This may take a few minutes on first run)")
-        try:
-            from sirchmunk.utils.embedding_util import EmbeddingUtil
-
-            model_cache_dir = str(work_path / ".cache" / "models")
-            model_dir = EmbeddingUtil.preload_model(
-                cache_dir=model_cache_dir,
-            )
-            print(f"  ✓ Embedding model downloaded: {model_dir}")
-        except Exception as e:
-            print(f"  ✗ Failed to download embedding model: {e}")
-            print("    Model will be downloaded on first search.")
-
-        # Check MCP package
-        try:
-            import importlib.metadata
-            mcp_version = importlib.metadata.version("mcp")
-            print(f"  ✓ MCP package installed (v{mcp_version})")
-        except Exception:
-            print("  • MCP package not installed (optional)")
-            print("    Install with: pip install sirchmunk[mcp]")
-
-        # Generate MCP client config example
         mcp_config_file = work_path / "mcp_config.json"
-        if not mcp_config_file.exists():
-            mcp_config_content = """\
-{
-  "mcpServers": {
-    "sirchmunk": {
-      "command": "sirchmunk",
-      "args": ["mcp", "serve"],
-      "env": {
-        "SIRCHMUNK_SEARCH_PATHS": ""
-      }
-    }
-  }
-}
-"""
-            mcp_config_file.write_text(mcp_config_content)
-            print(f"  ✓ Generated MCP client config: {mcp_config_file}")
-        else:
-            print(f"  • Skipped {mcp_config_file} (already exists)")
 
         print()
         print("=" * 60)
@@ -636,10 +660,11 @@ def _search_via_api(
 # ------------------------------------------------------------------
 
 def cmd_web_init(args: argparse.Namespace) -> int:
-    """Build the WebUI frontend static assets.
+    """Initialize Sirchmunk and build the WebUI frontend.
 
-    Requires Node.js 18+ and npm. The built assets are stored in the work
-    directory so that ``sirchmunk web serve`` can serve them on a single port.
+    Performs the full base initialization (identical to ``sirchmunk init``),
+    then builds the WebUI frontend static assets.  Requires Node.js 18+
+    and npm.
 
     Args:
         args: Command-line arguments
@@ -658,10 +683,20 @@ def cmd_web_init(args: argparse.Namespace) -> int:
         ).expanduser().resolve()
 
         print("=" * 60)
-        print("  Sirchmunk WebUI Build")
+        print("  Sirchmunk WebUI Initialization")
         print("=" * 60)
         print()
-        print(f"Work path: {work_path}")
+
+        # ---- Phase 1: base init (same as `sirchmunk init`) ----
+        rc = _run_base_init(work_path)
+        if rc != 0:
+            return rc
+
+        # ---- Phase 2: WebUI frontend build ----
+        print()
+        print("-" * 60)
+        print("  WebUI Frontend Build")
+        print("-" * 60)
         print()
 
         if not check_node_installed():
@@ -673,17 +708,27 @@ def cmd_web_init(args: argparse.Namespace) -> int:
         success = build_frontend(work_path=work_path)
         if success:
             print("  ✓ WebUI built successfully")
-            print()
-            print("Next steps:")
-            print("  Run 'sirchmunk web serve' to start API + WebUI (single port)")
-            return 0
         else:
             print("  ✗ WebUI build failed.")
             return 1
 
+        env_file = work_path / ".env"
+
+        print()
+        print("=" * 60)
+        print("  Initialization complete!")
+        print("=" * 60)
+        print()
+        print("Next steps:")
+        print(f"  1. Edit {env_file} to configure LLM_API_KEY")
+        print("  2. Run 'sirchmunk web serve' to start API + WebUI (single port)")
+        print()
+
+        return 0
+
     except Exception as e:
-        logger.error(f"WebUI build failed: {e}", exc_info=True)
-        print(f"  WebUI build error: {e}")
+        logger.error(f"WebUI initialization failed: {e}", exc_info=True)
+        print(f"  WebUI initialization error: {e}")
         return 1
 
 
