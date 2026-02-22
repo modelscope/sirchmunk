@@ -13,6 +13,9 @@ Usage:
     # Build locally
     python docker/build_image.py --image_type cpu
 
+    # Build with Chinese mirror acceleration
+    python docker/build_image.py --mirror cn
+
     # Build and push to a registry
     DOCKER_REGISTRY=ghcr.io/modelscope/sirchmunk \
         python docker/build_image.py --image_type cpu
@@ -23,13 +26,28 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional
 
 DOCKER_REGISTRY = os.environ.get("DOCKER_REGISTRY", "sirchmunk")
 TIMESTAMP = datetime.now().strftime("%Y%m%d%H%M%S")
 
 # Resolve repository root (one level up from this script)
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+# ---------------------------------------------------------------------------
+# Mirror configuration for China mainland
+# ---------------------------------------------------------------------------
+
+MIRROR_PROFILES: Dict[str, Dict[str, str]] = {
+    "cn": {
+        "docker_prefix": "docker.m.daocloud.io/library/",
+        "pip_index_url": "https://mirrors.aliyun.com/pypi/simple/",
+        "pip_trusted_host": "mirrors.aliyun.com",
+        "npm_registry": "https://registry.npmmirror.com",
+        "github_proxy": "https://ghfast.top/",
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +59,7 @@ class Builder:
 
     # Default versions — subclasses may override via ``init_args``.
     DEFAULTS = {
-        "python_version": "3.13",
+        "python_version": "3.12",
         "node_version": "20",
         "rg_version": "14.1.1",
         "rga_version": "v1.0.0-alpha.5",
@@ -51,6 +69,9 @@ class Builder:
     def __init__(self, args: Any, dry_run: bool = False):
         self.args = self._init_args(args)
         self.dry_run = dry_run
+        self.mirror: Optional[Dict[str, str]] = MIRROR_PROFILES.get(
+            getattr(args, "mirror", None) or ""
+        )
 
     # ------------------------------------------------------------------
 
@@ -68,6 +89,26 @@ class Builder:
     def _template_path(self) -> Path:
         return REPO_ROOT / "docker" / "Dockerfile.ubuntu"
 
+    def _mirror_replacements(self) -> dict:
+        """Return mirror-related placeholder values."""
+        if self.mirror:
+            pip_args = (
+                f"-i {self.mirror['pip_index_url']} "
+                f"--trusted-host {self.mirror['pip_trusted_host']} "
+            )
+            npm_cmd = f"RUN npm config set registry {self.mirror['npm_registry']}\n"
+            github_proxy = self.mirror["github_proxy"]
+        else:
+            pip_args = ""
+            npm_cmd = ""
+            github_proxy = ""
+
+        return {
+            "pip_index_args": pip_args,
+            "npm_mirror_cmd": npm_cmd,
+            "github_proxy": github_proxy,
+        }
+
     def _replacements(self) -> dict:
         """Return placeholder → value mapping for the Dockerfile template."""
         raise NotImplementedError
@@ -75,7 +116,8 @@ class Builder:
     def generate_dockerfile(self) -> str:
         """Read the template and substitute all ``{placeholder}`` tokens."""
         content = self._template_path().read_text()
-        for key, value in self._replacements().items():
+        replacements = {**self._replacements(), **self._mirror_replacements()}
+        for key, value in replacements.items():
             content = content.replace(f"{{{key}}}", value)
         return content
 
@@ -103,7 +145,7 @@ class Builder:
 
     def build(self) -> int:
         return os.system(
-            f"docker build -t {self.image()} -f Dockerfile ."
+            f"docker build --platform linux/amd64 -t {self.image()} -f Dockerfile ."
         )
 
     def push(self) -> int:
@@ -114,6 +156,9 @@ class Builder:
     # ------------------------------------------------------------------
 
     def __call__(self) -> None:
+        if self.mirror:
+            print(f"[build_image] Using mirror profile: {self.args.mirror}")
+
         content = self.generate_dockerfile()
         self._save_dockerfile(content)
 
@@ -151,9 +196,10 @@ class CPUImageBuilder(Builder):
 
     def _replacements(self) -> dict:
         a = self.args
+        prefix = self.mirror["docker_prefix"] if self.mirror else ""
         return {
-            "node_image": f"node:{a.node_version}-slim",
-            "python_image": f"python:{a.python_version}-slim",
+            "node_image": f"{prefix}node:{a.node_version}-slim",
+            "python_image": f"{prefix}python:{a.python_version}-slim",
             "rg_version": a.rg_version,
             "rga_version": a.rga_version,
             "port": a.port,
@@ -174,7 +220,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image_type", default="cpu", choices=["cpu"],
                     help="Image type to build (default: cpu)")
     p.add_argument("--python_version", default=None,
-                    help="Python base image version (default: 3.13)")
+                    help="Python base image version (default: 3.12)")
     p.add_argument("--node_version", default=None,
                     help="Node.js base image version (default: 20)")
     p.add_argument("--rg_version", default=None,
@@ -187,6 +233,8 @@ def parse_args() -> argparse.Namespace:
                     help="Version label for the image tag")
     p.add_argument("--sirchmunk_branch", default="main",
                     help="Git branch being built (for CI traceability)")
+    p.add_argument("--mirror", default=None, choices=list(MIRROR_PROFILES.keys()),
+                    help="Use mirror sources for China mainland (cn)")
     p.add_argument("--dry_run", type=int, default=0,
                     help="1 = generate Dockerfile only, skip docker build")
     return p.parse_args()

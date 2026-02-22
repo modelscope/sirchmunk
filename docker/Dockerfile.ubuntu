@@ -11,7 +11,7 @@ FROM {node_image} AS frontend-builder
 
 WORKDIR /build/web
 COPY web/package.json web/package-lock.json* ./
-RUN npm ci --prefer-offline
+{npm_mirror_cmd}RUN npm ci --prefer-offline
 
 COPY web/ ./
 
@@ -35,11 +35,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install ripgrep
-RUN curl -fsSL https://github.com/BurntSushi/ripgrep/releases/download/{rg_version}/ripgrep_{rg_version}-1_amd64.deb \
+RUN curl -fsSL {github_proxy}https://github.com/BurntSushi/ripgrep/releases/download/{rg_version}/ripgrep_{rg_version}-1_amd64.deb \
         -o /tmp/rg.deb && dpkg -i /tmp/rg.deb && rm /tmp/rg.deb
 
 # Install ripgrep-all
-RUN curl -fsSL https://github.com/phiresky/ripgrep-all/releases/download/{rga_version}/ripgrep_all-{rga_version}-x86_64-unknown-linux-musl.tar.gz \
+RUN curl -fsSL {github_proxy}https://github.com/phiresky/ripgrep-all/releases/download/{rga_version}/ripgrep_all-{rga_version}-x86_64-unknown-linux-musl.tar.gz \
         -o /tmp/rga.tar.gz \
     && tar -xzf /tmp/rga.tar.gz -C /tmp \
     && cp /tmp/ripgrep_all-*/rga /usr/local/bin/ \
@@ -50,7 +50,7 @@ WORKDIR /app
 
 # Install ALL Python dependencies (core + web + mcp + docs + tests)
 COPY requirements/ requirements/
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir {pip_index_args}\
     -r requirements/core.txt \
     -r requirements/web.txt \
     -r requirements/mcp.txt \
@@ -60,7 +60,7 @@ RUN pip install --no-cache-dir \
 # Copy source code and install (with [all] extras)
 COPY src/ src/
 COPY pyproject.toml setup.cfg* README.md ./
-RUN pip install --no-cache-dir -e ".[all]"
+RUN pip install --no-cache-dir {pip_index_args}-e ".[all]"
 
 # Copy config
 COPY config/ config/

@@ -32,7 +32,7 @@ run-name: Docker-${{ inputs.sirchmunk_branch }}-${{ inputs.image_type }}-${{ inp
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
       - name: Checkout repository

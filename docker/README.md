@@ -8,7 +8,7 @@ docker/
 ├── build_image.py       # Build script (renders template → builds image)
 ├── entrypoint.sh        # Container entrypoint (dir setup, .env init)
 ├── docker-compose.yml   # Compose file for one-command deployment
-├── .env.example         # Template for Compose environment variables
+├── .env         # Template for Compose environment variables
 └── README.md
 ```
 
@@ -24,7 +24,7 @@ The build follows the [modelscope docker pattern](https://github.com/modelscope/
 # From the project root directory:
 
 # 1. Create your .env file
-cp config/.env.example docker/.env
+cp config/env.example docker/.env
 # Edit docker/.env and set LLM_API_KEY
 
 # 2. Build the image
@@ -56,6 +56,25 @@ DOCKER_REGISTRY=ghcr.io/modelscope/sirchmunk \
 # Full options
 python docker/build_image.py --help
 ```
+
+### China Mainland Mirror Acceleration (中国大陆镜像加速)
+
+Docker Hub、GitHub Releases、PyPI、npm 在中国大陆可能无法直接访问。使用 `--mirror cn` 自动切换为国内镜像源：
+
+```bash
+python docker/build_image.py --mirror cn
+```
+
+该选项会自动配置：
+
+| 服务 | 镜像源 |
+|---|---|
+| Docker 基础镜像 (python/node) | `docker.m.daocloud.io` (DaoCloud) |
+| PyPI (pip install) | `mirrors.aliyun.com` (阿里云) |
+| npm (node packages) | `registry.npmmirror.com` (淘宝) |
+| GitHub Releases (rg/rga) | `ghfast.top` (GitHub 加速) |
+
+> **注意**: 镜像源由第三方维护，可能存在不稳定的情况。如果某个源不可用，可以修改 `build_image.py` 中的 `MIRROR_PROFILES["cn"]` 字典替换为其他可用源。
 
 ### Builder Classes
 
