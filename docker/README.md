@@ -5,18 +5,35 @@
 ```
 docker/
 ├── Dockerfile.ubuntu    # Dockerfile template with {placeholder} tokens
-├── build_image.py       # Build script (renders template → builds image)
-├── entrypoint.sh        # Container entrypoint (dir setup, .env init)
+├── build_image.py       # Build script (renders template → builds image → multi-registry push)
+├── entrypoint.sh        # Container entrypoint (dir setup, .env init, model copy)
 ├── docker-compose.yml   # Compose file for one-command deployment
-├── .env         # Template for Compose environment variables
+├── .env.example         # Template for Compose environment variables
 └── README.md
 ```
 
 The build follows the [modelscope docker pattern](https://github.com/modelscope/modelscope/tree/master/docker):
 
 1. `Dockerfile.ubuntu` is a **template** with placeholders like `{python_image}`, `{rg_version}`, etc.
-2. `build_image.py` reads the template, substitutes all placeholders with concrete values, writes a final `Dockerfile` at the project root, and runs `docker build`.
-3. The GitHub Actions workflow (`.github/workflows/docker-image.yaml`) calls `build_image.py` for CI builds.
+2. `build_image.py` reads the template, substitutes all placeholders, writes a final `Dockerfile` at the project root, builds the image, and pushes to Alibaba Cloud ACR registries.
+3. The GitHub Actions workflow (`.github/workflows/docker-image.yaml`) runs on a **self-hosted** runner (US-West Alibaba Cloud ECS) and calls `build_image.py --push`.
+
+## Image Tag Convention
+
+Follows the ModelScope naming pattern:
+
+```
+ubuntu{ubuntu_version}-py{python_tag}-{sirchmunk_version}
+```
+
+Example (with version `0.0.2`, Python 3.12):
+```
+modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
+modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
+```
+
+The `sirchmunk_version` defaults to the value in `src/sirchmunk/version.py` and can be overridden via `--sirchmunk_version`.
 
 ## Quick Start
 
@@ -27,7 +44,7 @@ The build follows the [modelscope docker pattern](https://github.com/modelscope/
 cp config/env.example docker/.env
 # Edit docker/.env and set LLM_API_KEY
 
-# 2. Build the image
+# 2. Build the image (local only, no push)
 python docker/build_image.py
 
 # 3. Start with docker compose
@@ -40,22 +57,37 @@ open http://localhost:8584
 ## Build Script Usage
 
 ```bash
-# Build CPU image (default)
-python docker/build_image.py --image_type cpu
+# Build CPU image locally (no push)
+python docker/build_image.py
+
+# Build and push to all ACR registries
+python docker/build_image.py --push
 
 # Dry-run: only generate Dockerfile, skip docker build
 python docker/build_image.py --dry_run 1
 
-# Custom Python / Node versions
-python docker/build_image.py --python_version 3.13 --node_version 22
+# Override version (instead of auto-detecting from version.py)
+python docker/build_image.py --push --sirchmunk_version 0.0.4
 
-# Build and push to a registry
-DOCKER_REGISTRY=ghcr.io/modelscope/sirchmunk \
-    python docker/build_image.py --sirchmunk_version 0.0.2
+# Custom Python / Node / Ubuntu versions
+python docker/build_image.py --python_version 3.13 --node_version 22 --ubuntu_version 24.04
+
+# Push to custom registries
+python docker/build_image.py --push --registries "my-registry.example.com/ns/sirchmunk"
 
 # Full options
 python docker/build_image.py --help
 ```
+
+### Default Push Registries
+
+When `--push` is used without `--registries`, images are pushed to:
+
+| Region | Registry |
+|---|---|
+| cn-beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk` |
+| cn-hangzhou | `modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/sirchmunk` |
+| us-west-1 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk` |
 
 ### China Mainland Mirror Acceleration (中国大陆镜像加速)
 
@@ -159,15 +191,35 @@ docker compose -f docker/docker-compose.yml down -v
 
 ## CI / GitHub Actions
 
-The workflow at `.github/workflows/docker-image.yaml` can be triggered manually
-via **Actions → Build Docker Image → Run workflow**:
+The workflow at `.github/workflows/docker-image.yaml` runs on a **self-hosted** runner (Alibaba Cloud ECS, us-west-1) and can be triggered manually via **Actions → Build Docker Image → Run workflow**.
+
+### Required Secrets
+
+| Secret | Description |
+|---|---|
+| `ACR_USERNAME` | Alibaba Cloud ACR username |
+| `ACR_PASSWORD` | Alibaba Cloud ACR password |
+
+### Workflow Inputs
 
 | Input | Default | Description |
 |---|---|---|
 | `sirchmunk_branch` | `main` | Branch to build from |
 | `image_type` | `cpu` | Image type (`cpu`) |
-| `sirchmunk_version` | `latest` | Version label for the image tag |
+| `sirchmunk_version` | *(auto from version.py)* | Version label for the image tag |
+| `ubuntu_version` | `22.04` | Ubuntu version label |
 | `python_version` | `3.12` | Python base image version |
 | `node_version` | `20` | Node.js base image version |
+| `mirror` | *(empty)* | Mirror profile (`cn` for China mainland) |
 
-The built image is pushed to `ghcr.io/<owner>/sirchmunk`.
+### Example Output
+
+Triggering the workflow with default inputs and `version.py` containing `0.0.2` will produce:
+
+```
+modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
+modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
+modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
+```
+
+Each image is also tagged with a timestamp for traceability (e.g., `ubuntu22.04-py312-0.0.2-20260212153045`).

@@ -16,9 +16,13 @@ on:
         required: true
         default: "cpu"
       sirchmunk_version:
-        description: "Version label for the image tag"
-        required: true
-        default: "latest"
+        description: "Version label for image tag (empty = auto from version.py)"
+        required: false
+        default: ""
+      ubuntu_version:
+        description: "Ubuntu version label for image tag"
+        required: false
+        default: "22.04"
       python_version:
         description: "Python version for the base image"
         required: false
@@ -27,8 +31,13 @@ on:
         description: "Node.js version for the frontend build"
         required: false
         default: "20"
+      mirror:
+        description: "Mirror profile for builds behind GFW (cn / empty)"
+        required: false
+        default: ""
 
-run-name: Docker-${{ inputs.sirchmunk_branch }}-${{ inputs.image_type }}-${{ inputs.workflow_name }}-py${{ inputs.python_version }}-by-@${{ github.actor }}
+run-name: >-
+  Docker-${{ inputs.sirchmunk_branch }}-${{ inputs.image_type }}-${{ inputs.workflow_name }}-py${{ inputs.python_version }}-by-@${{ github.actor }}
 
 jobs:
   build:
@@ -40,25 +49,42 @@ jobs:
         with:
           ref: ${{ github.event.inputs.sirchmunk_branch }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ github.event.inputs.python_version }}
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build Docker Image
-        env:
-          DOCKER_REGISTRY: ghcr.io/${{ github.repository }}
+      - name: Login to ACR (cn-beijing)
         run: |
-          python docker/build_image.py \
+          echo "${{ secrets.ACR_PASSWORD }}" | \
+            docker login --username=${{ secrets.ACR_USERNAME }} \
+              --password-stdin modelscope-registry.cn-beijing.cr.aliyuncs.com
+
+      - name: Login to ACR (cn-hangzhou)
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" | \
+            docker login --username=${{ secrets.ACR_USERNAME }} \
+              --password-stdin modelscope-registry.cn-hangzhou.cr.aliyuncs.com
+
+      - name: Login to ACR (us-west-1)
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" | \
+            docker login --username=${{ secrets.ACR_USERNAME }} \
+              --password-stdin modelscope-registry.us-west-1.cr.aliyuncs.com
+
+      - name: Build and Push Docker Image
+        run: |
+          VERSION_ARG=""
+          if [ -n "${{ github.event.inputs.sirchmunk_version }}" ]; then
+            VERSION_ARG="--sirchmunk_version ${{ github.event.inputs.sirchmunk_version }}"
+          fi
+
+          MIRROR_ARG=""
+          if [ -n "${{ github.event.inputs.mirror }}" ]; then
+            MIRROR_ARG="--mirror ${{ github.event.inputs.mirror }}"
+          fi
+
+          python3 docker/build_image.py \
             --image_type ${{ github.event.inputs.image_type }} \
+            --ubuntu_version ${{ github.event.inputs.ubuntu_version }} \
             --python_version ${{ github.event.inputs.python_version }} \
             --node_version ${{ github.event.inputs.node_version }} \
-            --sirchmunk_version ${{ github.event.inputs.sirchmunk_version }} \
-            --sirchmunk_branch ${{ github.event.inputs.sirchmunk_branch }}
+            --sirchmunk_branch ${{ github.event.inputs.sirchmunk_branch }} \
+            --push \
+            $VERSION_ARG \
+            $MIRROR_ARG

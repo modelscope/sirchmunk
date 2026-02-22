@@ -5,35 +5,46 @@ Build script for Sirchmunk Docker images.
 Design follows the modelscope/modelscope docker/build_image.py pattern:
   - A ``Builder`` base class handles Dockerfile template rendering, build and push.
   - ``CPUImageBuilder`` (default) produces a lightweight CPU-only image.
+  - Multi-registry push to Alibaba Cloud ACR (cn-beijing, cn-hangzhou, us-west-1).
 
 Usage:
-    # Dry-run (generate Dockerfile only, no docker build)
+    # Local build (no push)
+    python docker/build_image.py
+
+    # Dry-run (generate Dockerfile only)
     python docker/build_image.py --dry_run 1
 
-    # Build locally
-    python docker/build_image.py --image_type cpu
-
-    # Build with Chinese mirror acceleration
+    # Build with Chinese mirror acceleration (for China mainland networks)
     python docker/build_image.py --mirror cn
 
-    # Build and push to a registry
-    DOCKER_REGISTRY=ghcr.io/modelscope/sirchmunk \
-        python docker/build_image.py --image_type cpu
+    # Build and push to default ACR registries
+    python docker/build_image.py --push
+
+    # Build and push to custom registries
+    python docker/build_image.py --push --registries "my-registry.example.com/ns/sirchmunk"
 """
 
 import argparse
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-DOCKER_REGISTRY = os.environ.get("DOCKER_REGISTRY", "sirchmunk")
 TIMESTAMP = datetime.now().strftime("%Y%m%d%H%M%S")
 
-# Resolve repository root (one level up from this script)
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# ---------------------------------------------------------------------------
+# Default ACR registries (Alibaba Cloud Container Registry)
+# ---------------------------------------------------------------------------
+
+DEFAULT_ACR_REGISTRIES = [
+    "modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk",
+    "modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/sirchmunk",
+    "modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk",
+]
 
 # ---------------------------------------------------------------------------
 # Mirror configuration for China mainland
@@ -51,16 +62,36 @@ MIRROR_PROFILES: Dict[str, Dict[str, str]] = {
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _read_version_from_source() -> str:
+    """Read ``__version__`` from ``src/sirchmunk/version.py``."""
+    version_file = REPO_ROOT / "src" / "sirchmunk" / "version.py"
+    if not version_file.exists():
+        return "latest"
+    text = version_file.read_text()
+    m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', text)
+    return m.group(1) if m else "latest"
+
+
+def _generate_python_tag(python_version: str) -> str:
+    """``'3.12'`` → ``'py312'``, ``'3.12.1'`` → ``'py312'``."""
+    parts = python_version.split(".")[:2]
+    return "py" + "".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Base Builder
 # ---------------------------------------------------------------------------
 
 class Builder:
     """Abstract builder that renders a Dockerfile template, builds and pushes."""
 
-    # Default versions — subclasses may override via ``init_args``.
     DEFAULTS = {
         "python_version": "3.12",
         "node_version": "20",
+        "ubuntu_version": "22.04",
         "rg_version": "14.1.1",
         "rga_version": "v1.0.0-alpha.5",
         "port": "8584",
@@ -72,15 +103,24 @@ class Builder:
         self.mirror: Optional[Dict[str, str]] = MIRROR_PROFILES.get(
             getattr(args, "mirror", None) or ""
         )
-
-    # ------------------------------------------------------------------
+        self.registries: List[str] = self._resolve_registries()
 
     def _init_args(self, args: Any) -> Any:
-        """Apply default values for any args not explicitly provided."""
         for key, default in self.DEFAULTS.items():
             if not getattr(args, key, None):
                 setattr(args, key, default)
+        if not getattr(args, "sirchmunk_version", None):
+            args.sirchmunk_version = _read_version_from_source()
         return args
+
+    def _resolve_registries(self) -> List[str]:
+        """Parse --registries or fall back to default ACR list when --push."""
+        raw = getattr(self.args, "registries", None)
+        if raw:
+            return [r.strip() for r in raw.split(",") if r.strip()]
+        if getattr(self.args, "push", False):
+            return list(DEFAULT_ACR_REGISTRIES)
+        return []
 
     # ------------------------------------------------------------------
     # Template helpers
@@ -90,7 +130,6 @@ class Builder:
         return REPO_ROOT / "docker" / "Dockerfile.ubuntu"
 
     def _mirror_replacements(self) -> dict:
-        """Return mirror-related placeholder values."""
         if self.mirror:
             pip_args = (
                 f"-i {self.mirror['pip_index_url']} "
@@ -102,7 +141,6 @@ class Builder:
             pip_args = ""
             npm_cmd = ""
             github_proxy = ""
-
         return {
             "pip_index_args": pip_args,
             "npm_mirror_cmd": npm_cmd,
@@ -110,11 +148,9 @@ class Builder:
         }
 
     def _replacements(self) -> dict:
-        """Return placeholder → value mapping for the Dockerfile template."""
         raise NotImplementedError
 
     def generate_dockerfile(self) -> str:
-        """Read the template and substitute all ``{placeholder}`` tokens."""
         content = self._template_path().read_text()
         replacements = {**self._replacements(), **self._mirror_replacements()}
         for key, value in replacements.items():
@@ -122,21 +158,22 @@ class Builder:
         return content
 
     # ------------------------------------------------------------------
-    # Image tag
+    # Image tag — follows ModelScope convention
+    #   ubuntu22.04-py312-0.0.2
     # ------------------------------------------------------------------
 
     def image_tag(self) -> str:
         raise NotImplementedError
 
-    def image(self) -> str:
-        return f"{DOCKER_REGISTRY}:{self.image_tag()}"
+    def local_image(self) -> str:
+        """Local image name used during docker build."""
+        return f"sirchmunk:{self.image_tag()}"
 
     # ------------------------------------------------------------------
     # Build & push
     # ------------------------------------------------------------------
 
     def _save_dockerfile(self, content: str) -> None:
-        """Write the rendered Dockerfile to the repo root."""
         dest = REPO_ROOT / "Dockerfile"
         if dest.exists():
             dest.unlink()
@@ -145,11 +182,27 @@ class Builder:
 
     def build(self) -> int:
         return os.system(
-            f"docker build --platform linux/amd64 -t {self.image()} -f Dockerfile ."
+            f"docker build --platform linux/amd64 -t {self.local_image()} -f Dockerfile ."
         )
 
     def push(self) -> int:
-        return os.system(f"docker push {self.image()}")
+        tag = self.image_tag()
+        for registry in self.registries:
+            remote = f"{registry}:{tag}"
+            print(f"[build_image] Pushing → {remote}")
+
+            ret = os.system(f"docker tag {self.local_image()} {remote}")
+            if ret != 0:
+                return ret
+            ret = os.system(f"docker push {remote}")
+            if ret != 0:
+                return ret
+
+            ts_remote = f"{registry}:{tag}-{TIMESTAMP}"
+            os.system(f"docker tag {self.local_image()} {ts_remote}")
+            os.system(f"docker push {ts_remote}")
+
+        return 0
 
     # ------------------------------------------------------------------
     # Entrypoint
@@ -163,28 +216,26 @@ class Builder:
         self._save_dockerfile(content)
 
         if self.dry_run:
-            print(f"[build_image] Dry-run complete. Image would be: {self.image()}")
+            print(f"[build_image] Dry-run complete.")
+            print(f"[build_image] Local image: {self.local_image()}")
+            if self.registries:
+                for r in self.registries:
+                    print(f"[build_image] Push target: {r}:{self.image_tag()}")
             return
 
-        # cd to repo root so COPY paths work
         os.chdir(REPO_ROOT)
 
         ret = self.build()
         if ret != 0:
             raise RuntimeError(f"Docker build failed with exit code {ret}")
+        print(f"[build_image] Built: {self.local_image()}")
 
-        # Only push when a real registry is set
-        if DOCKER_REGISTRY != "sirchmunk":
+        if self.registries:
             ret = self.push()
             if ret != 0:
                 raise RuntimeError(f"Docker push failed with exit code {ret}")
 
-            # Tag with timestamp for traceability
-            ts_image = f"{DOCKER_REGISTRY}:{self.image_tag()}-{TIMESTAMP}"
-            os.system(f"docker tag {self.image()} {ts_image}")
-            os.system(f"docker push {ts_image}")
-
-        print(f"[build_image] Done: {self.image()}")
+        print(f"[build_image] Done: {self.local_image()}")
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +243,6 @@ class Builder:
 # ---------------------------------------------------------------------------
 
 class CPUImageBuilder(Builder):
-    """Produces a CPU-only Sirchmunk image (Python + Node frontend)."""
 
     def _replacements(self) -> dict:
         a = self.args
@@ -207,8 +257,9 @@ class CPUImageBuilder(Builder):
         }
 
     def image_tag(self) -> str:
-        ver = getattr(self.args, "sirchmunk_version", "latest")
-        return f"ubuntu-py{self.args.python_version}-{ver}-cpu"
+        a = self.args
+        py_tag = _generate_python_tag(a.python_version)
+        return f"ubuntu{a.ubuntu_version}-{py_tag}-{a.sirchmunk_version}"
 
 
 # ---------------------------------------------------------------------------
@@ -223,18 +274,24 @@ def parse_args() -> argparse.Namespace:
                     help="Python base image version (default: 3.12)")
     p.add_argument("--node_version", default=None,
                     help="Node.js base image version (default: 20)")
+    p.add_argument("--ubuntu_version", default=None,
+                    help="Ubuntu version label for image tag (default: 22.04)")
     p.add_argument("--rg_version", default=None,
                     help="ripgrep version (default: 14.1.1)")
     p.add_argument("--rga_version", default=None,
                     help="ripgrep-all version (default: v1.0.0-alpha.5)")
     p.add_argument("--port", default=None,
                     help="Exposed port (default: 8584)")
-    p.add_argument("--sirchmunk_version", default="latest",
-                    help="Version label for the image tag")
+    p.add_argument("--sirchmunk_version", default=None,
+                    help="Version label for image tag (default: auto from version.py)")
     p.add_argument("--sirchmunk_branch", default="main",
                     help="Git branch being built (for CI traceability)")
     p.add_argument("--mirror", default=None, choices=list(MIRROR_PROFILES.keys()),
                     help="Use mirror sources for China mainland (cn)")
+    p.add_argument("--push", action="store_true",
+                    help="Push to registries after build")
+    p.add_argument("--registries", default=None,
+                    help="Comma-separated registries to push to (overrides defaults)")
     p.add_argument("--dry_run", type=int, default=0,
                     help="1 = generate Dockerfile only, skip docker build")
     return p.parse_args()
