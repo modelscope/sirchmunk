@@ -36,21 +36,33 @@ docker run -d \
   -e LLM_API_KEY="your-api-key-here" \
   -e LLM_BASE_URL="https://api.openai.com/v1" \
   -e LLM_MODEL_NAME="gpt-4o" \
-  -v sirchmunk_data:/data/sirchmunk \
+  -e LLM_TIMEOUT=60.0 \
+  -e UI_THEME=light \
+  -e UI_LANGUAGE=en \
+  -e SIRCHMUNK_VERBOSE=false \
+  -v /data/sirchmunk:/data/sirchmunk \
   modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
 ```
 
-**Required parameters:**
+**Parameters:**
 
-| Parameter | Description |
-|---|---|
-| `-e LLM_API_KEY` | **(Required)** API key from your LLM provider |
-| `-e LLM_BASE_URL` | OpenAI-compatible API endpoint (default: `https://api.openai.com/v1`) |
-| `-e LLM_MODEL_NAME` | Model name (default: `gpt-5.2`) |
-| `-p 8584:8584` | Expose WebUI and API port |
-| `-v sirchmunk_data:/data/sirchmunk` | Persist data across container restarts |
+| Parameter | Required | Default | Description |
+|---|---|---|---|
+| `-e LLM_API_KEY` | **Yes** | | API key from your LLM provider |
+| `-e LLM_BASE_URL` | No | `https://api.openai.com/v1` | OpenAI-compatible API endpoint |
+| `-e LLM_MODEL_NAME` | No | `gpt-5.2` | LLM model name |
+| `-e LLM_TIMEOUT` | No | `60.0` | LLM request timeout in seconds |
+| `-e UI_THEME` | No | `light` | WebUI theme (`light` / `dark`) |
+| `-e UI_LANGUAGE` | No | `en` | WebUI language (`en` / `zh`) |
+| `-e SIRCHMUNK_VERBOSE` | No | `false` | Enable verbose logging (`true` / `false`) |
+| `-p 8584:8584` | Yes | | Expose WebUI and API port |
+| `-v /data/sirchmunk:/data/sirchmunk` | Recommended | | Persist data (models, history, knowledge) across restarts |
 
-**Optional — mount local files for search:**
+> `SIRCHMUNK_WORK_PATH` is already set to `/data/sirchmunk` inside the image. The `-v` volume mount provides persistence for this path across container restarts.
+
+**Mount local files for search:**
+
+Use `-v` to mount host directories into the container, then search them via the API or WebUI:
 
 ```bash
 docker run -d \
@@ -59,8 +71,13 @@ docker run -d \
   -e LLM_API_KEY="your-api-key-here" \
   -e LLM_BASE_URL="https://api.openai.com/v1" \
   -e LLM_MODEL_NAME="gpt-4o" \
-  -v sirchmunk_data:/data/sirchmunk \
+  -e LLM_TIMEOUT=60.0 \
+  -e UI_THEME=light \
+  -e UI_LANGUAGE=en \
+  -e SIRCHMUNK_VERBOSE=false \
+  -v /data/sirchmunk:/data/sirchmunk \
   -v /path/to/your/docs:/mnt/docs:ro \
+  -v /path/to/your/code:/mnt/code:ro \
   modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
 ```
 
@@ -80,11 +97,38 @@ curl -X POST http://localhost:8584/api/v1/search \
   }'
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `query` | string | Search query or question |
-| `paths` | list | Directories or files to search (e.g., `["/mnt/docs"]` for mounted volumes) |
-| `mode` | string | `"DEEP"` for comprehensive analysis, `"FILENAME_ONLY"` for fast file discovery |
+**API — Search via Python:**
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:8584/api/v1/search",
+    json={
+        "query": "your search question here",
+        "paths": ["/mnt/docs"],
+        "mode": "DEEP",           # "DEEP" or "FILENAME_ONLY"
+        "max_depth": 5,           # optional: max directory depth
+        "top_k_files": 3,         # optional: number of top files to return
+    },
+)
+
+result = response.json()
+if result["success"]:
+    print(result["data"])
+else:
+    print(f"Error: {result['error']}")
+```
+
+**Search API fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `query` | string | Yes | Search query or question |
+| `paths` | list | No | Directories or files to search (e.g., `["/mnt/docs"]`) |
+| `mode` | string | No | `"DEEP"` (default) for comprehensive analysis, `"FILENAME_ONLY"` for fast file discovery |
+| `max_depth` | int | No | Maximum directory depth to search |
+| `top_k_files` | int | No | Number of top files to return |
 
 ### 4. Manage the container
 
@@ -101,6 +145,6 @@ docker start sirchmunk
 # Remove container (data is preserved in the volume)
 docker rm sirchmunk
 
-# Remove data volume
-docker volume rm sirchmunk_data
+# Remove data volume (caution: deletes all persisted data)
+rm -rf /data/sirchmunk
 ```

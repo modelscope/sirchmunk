@@ -67,18 +67,17 @@ COPY config/ config/
 COPY --from=frontend-builder /build/web/out /app/web_static
 
 # ---------------------------------------------------------------------------
-# Pre-download embedding model (same as `sirchmunk init`)
-# Stored at /app/models so it can be copied to the work volume at startup.
+# Pre-download embedding model directly into the work volume path.
+# This avoids a redundant copy at container startup.
 # ---------------------------------------------------------------------------
 ENV SIRCHMUNK_WORK_PATH=/data/sirchmunk
-ENV MODELSCOPE_CACHE=/app/models
 
-RUN python -c "\
+RUN mkdir -p /data/sirchmunk/.cache/models /data/sirchmunk/.cache/web_static
+
+RUN MODELSCOPE_CACHE=/data/sirchmunk/.cache/models \
+    python -c "\
 from sirchmunk.utils.embedding_util import EmbeddingUtil; \
-EmbeddingUtil.preload_model(cache_dir='/app/models')"
-
-# Prepare work directory
-RUN mkdir -p /data/sirchmunk/.cache/web_static
+EmbeddingUtil.preload_model(cache_dir='/data/sirchmunk/.cache/models')"
 
 # Entrypoint
 COPY docker/entrypoint.sh /entrypoint.sh
