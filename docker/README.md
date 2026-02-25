@@ -40,7 +40,8 @@ docker run -d \
   -e UI_THEME=light \
   -e UI_LANGUAGE=en \
   -e SIRCHMUNK_VERBOSE=false \
-  -v /data/sirchmunk:/data/sirchmunk \
+  -v /path/to/your_work_path:/data/sirchmunk \
+  -v /path/to/your/docs:/mnt/docs:ro \
   modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
 ```
 
@@ -58,28 +59,11 @@ docker run -d \
 | `-p 8584:8584` | Yes | | Expose WebUI and API port |
 | `-v /data/sirchmunk:/data/sirchmunk` | Recommended | | Persist data (models, history, knowledge) across restarts |
 
-> `SIRCHMUNK_WORK_PATH` is already set to `/data/sirchmunk` inside the image. The `-v` volume mount provides persistence for this path across container restarts.
 
 **Mount local files for search:**
 
-Use `-v` to mount host directories into the container, then search them via the API or WebUI:
+Use `-v` to mount host directories into the container, then search them via the API or WebUI.
 
-```bash
-docker run -d \
-  --name sirchmunk \
-  -p 8584:8584 \
-  -e LLM_API_KEY="your-api-key-here" \
-  -e LLM_BASE_URL="https://api.openai.com/v1" \
-  -e LLM_MODEL_NAME="gpt-4o" \
-  -e LLM_TIMEOUT=60.0 \
-  -e UI_THEME=light \
-  -e UI_LANGUAGE=en \
-  -e SIRCHMUNK_VERBOSE=false \
-  -v /data/sirchmunk:/data/sirchmunk \
-  -v /path/to/your/docs:/mnt/docs:ro \
-  -v /path/to/your/code:/mnt/code:ro \
-  modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
-```
 
 ### 3. Use the service
 
