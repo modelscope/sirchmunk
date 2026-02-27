@@ -96,8 +96,9 @@ class AgenticSearch(BaseSearch):
         self.max_queries_per_cluster: int = 5
 
         # Initialize embedding client for cluster reuse
+        # EmbeddingUtil.__init__ returns immediately; heavy model loading
+        # runs in a background thread so it never blocks the event loop.
         self.embedding_client = None
-        # Similarity threshold for cluster reuse
         self.cluster_sim_threshold: float = kwargs.pop('cluster_sim_threshold', 0.85)
         self.cluster_sim_top_k: int = kwargs.pop('cluster_sim_top_k', 3)
         if reuse_knowledge:
@@ -108,7 +109,8 @@ class AgenticSearch(BaseSearch):
                     cache_dir=str(self.work_path / ".cache" / "models")
                 )
                 _loguru_logger.info(
-                    f"Embedding client initialized: {self.embedding_client.get_model_info()}"
+                    "Embedding client initialising in background "
+                    "(model will be ready before first search)"
                 )
             except Exception as e:
                 _loguru_logger.error(
@@ -140,6 +142,25 @@ class AgenticSearch(BaseSearch):
         self.spec_path.mkdir(parents=True, exist_ok=True)
         self._spec_lock = asyncio.Lock()  # guards concurrent spec writes
     
+    def update_log_callback(self, log_callback: LogCallback = None) -> None:
+        """Replace the per-request log callback on all sub-components.
+
+        This allows a singleton ``AgenticSearch`` instance to stream logs
+        through a different WebSocket / callback on every request without
+        having to reconstruct heavy resources (embedding model, knowledge
+        storage, etc.).
+        """
+        self._logger = create_logger(log_callback=log_callback, enable_async=True)
+
+        self.llm._logger = create_logger(log_callback=log_callback, enable_async=False)
+        self.llm._logger_async = create_logger(log_callback=log_callback, enable_async=True)
+
+        self.knowledge_base.log_callback = log_callback
+        self.knowledge_base._log = create_logger(log_callback=log_callback, enable_async=True)
+
+        # Reset per-request token accounting
+        self.llm_usages = []
+
     def _resolve_paths(
         self,
         paths: Optional[Union[str, Path, List[str], List[Path]]],
