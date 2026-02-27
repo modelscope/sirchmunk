@@ -991,14 +991,57 @@ async def get_file_picker_status():
         "success": True,
         "data": {
             "tkinter_available": TKINTER_AVAILABLE,
-            "supported_types": ["files", "directory"] if TKINTER_AVAILABLE else [],
+            "server_browser": True,
+            "supported_types": ["files", "directory"],
             "features": {
                 "multiple_files": TKINTER_AVAILABLE,
-                "directory_selection": TKINTER_AVAILABLE,
-                "absolute_paths": TKINTER_AVAILABLE
+                "directory_selection": True,
+                "absolute_paths": True
             }
         }
     }
+
+
+@router.get("/file-browser")
+async def browse_files(path: str = "/", show_hidden: bool = False):
+    """List files and directories at the given path (headless-safe alternative to Tkinter)"""
+    try:
+        abs_path = os.path.abspath(path)
+        if not os.path.exists(abs_path):
+            return {"success": False, "error": f"Path does not exist: {abs_path}"}
+        if not os.path.isdir(abs_path):
+            return {"success": False, "error": f"Path is not a directory: {abs_path}"}
+
+        items = []
+        for entry in os.scandir(abs_path):
+            if not show_hidden and entry.name.startswith('.'):
+                continue
+            try:
+                stat = entry.stat()
+                items.append({
+                    "name": entry.name,
+                    "path": entry.path,
+                    "is_dir": entry.is_dir(),
+                    "size": stat.st_size if not entry.is_dir() else None,
+                    "modified": stat.st_mtime,
+                })
+            except (PermissionError, OSError):
+                continue
+
+        items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+
+        return {
+            "success": True,
+            "data": {
+                "current_path": abs_path,
+                "parent_path": os.path.dirname(abs_path),
+                "items": items,
+            }
+        }
+    except PermissionError:
+        return {"success": False, "error": f"Permission denied: {abs_path}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 # Chat session management endpoints
 @router.get("/chat/sessions")
