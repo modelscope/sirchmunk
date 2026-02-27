@@ -132,7 +132,7 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 
 <div align="center">
-  <video controls autoplay muted loop playsinline width="100%" src="assets/video/Sirchmunk_Web.mp4"></video>
+  <video controls autoplay muted loop playsinline width="100%" src="https://github.com/user-attachments/assets/704dbc0a-3df6-436a-b7f7-fb1edefbfb8c"></video>
   <p style="font-size: 1.1em; font-weight: 600; margin-top: 8px; color: #00bcd4;">
     Access files directly to start chatting
   </p>
