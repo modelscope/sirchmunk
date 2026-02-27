@@ -15,6 +15,8 @@ from sirchmunk.learnings.knowledge_base import KnowledgeBase
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import (
     generate_keyword_extraction_prompt,
+    FAST_QUERY_ANALYSIS,
+    ROI_RESULT_SUMMARY,
     SEARCH_RESULT_SUMMARY,
 )
 from sirchmunk.retrieve.text_retriever import GrepRetriever
@@ -612,7 +614,7 @@ class AgenticSearch(BaseSearch):
         query: str,
         paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
         *,
-        mode: Literal["DEEP", "FILENAME_ONLY"] = "DEEP",
+        mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = "FAST",
         max_loops: int = 10,
         max_token_budget: int = 64000,
         max_depth: Optional[int] = 5,
@@ -631,13 +633,33 @@ class AgenticSearch(BaseSearch):
             | Mode         | Speed / LLM Calls | Description                               |
             +--------------+-------------------+-------------------------------------------+
             | FILENAME_ONLY| Very Fast / 0     | Pattern-based file discovery, no LLM.     |
+            | FAST         | 1-5s / 2          | Greedy: keyword search → read best file   |
+            |              |                   | → answer. Stops at first good evidence.   |
             | DEEP         | 5-30s / 4-6       | Parallel multi-path retrieval + ReAct     |
             |              |                   | refinement with Monte-Carlo evidence.     |
             +--------------+-------------------+-------------------------------------------+
 
+        FAST architecture (greedy early-termination):
+
+        ┌──────────────────────────────────────────────────────────┐
+        │ Step 1  LLM query analysis → keywords + file hints       │
+        │         (single call, stream=False)                      │
+        ├──────────────────────────────────────────────────────────┤
+        │ Step 2  rga keyword search → ranked file hits + snippets │
+        │         (no LLM, greedy: take first good results)        │
+        ├──────────────────────────────────────────────────────────┤
+        │ Step 3  Read top file(s) content                         │
+        │         (no LLM, early termination at top_k_files)       │
+        ├──────────────────────────────────────────────────────────┤
+        │ Step 4  LLM answer synthesis from evidence               │
+        └──────────────────────────────────────────────────────────┘
+
         DEEP architecture (phases execute as parallel as possible):
 
         ┌──────────────────────────────────────────────────────────┐
+        │ Phase 0a Direct document analysis (intent-gated,         │
+        │          short-circuit if query is doc-level operation)   │
+        ├──────────────────────────────────────────────────────────┤
         │ Phase 0  Cluster reuse check (instant, short-circuit)    │
         ├──────────────────────────────────────────────────────────┤
         │ Phase 1  Parallel probing (all concurrent):              │
@@ -667,7 +689,7 @@ class AgenticSearch(BaseSearch):
             query: User's search query.
             paths: Directories / files to search.  Falls back to
                 ``self.paths`` or the current working directory.
-            mode: Search mode — ``"DEEP"`` or ``"FILENAME_ONLY"``.
+            mode: Search mode — ``"DEEP"``, ``"FAST"``, or ``"FILENAME_ONLY"``.
             max_loops: Maximum ReAct iterations (DEEP mode, default: 10).
             max_token_budget: LLM token budget (DEEP mode, default: 64000).
             max_depth: Maximum directory depth for file search (default: 5).
@@ -708,13 +730,38 @@ class AgenticSearch(BaseSearch):
             await self._logger.success(f"Retrieved {len(filename_results)} matching files")
             return filename_results
 
-        # ---- DEEP mode: parallel multi-path retrieval ----
-
-        # Normalize paths
+        # ---- Normalize paths (shared by FAST and DEEP) ----
         if isinstance(paths, (str, Path)):
             paths = [str(paths)]
         else:
             paths = [str(p) for p in paths]
+
+        # ---- FAST mode: greedy search with early termination ----
+        if mode == "FAST":
+            answer = await self._search_fast(
+                query=query,
+                paths=paths,
+                max_depth=max_depth,
+                top_k_files=top_k_files,
+                include=include,
+                exclude=exclude,
+            )
+            if return_cluster:
+                _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
+                cluster = KnowledgeCluster(
+                    id=f"FS{_digest}",
+                    name=query[:60],
+                    description=[f"FAST search result for: {query}"],
+                    content=answer,
+                    queries=[query],
+                )
+                cluster.search_results.append(answer)
+                return cluster
+            if return_context:
+                return answer, SearchContext()
+            return answer
+
+        # ---- DEEP mode: parallel multi-path retrieval ----
 
         context = SearchContext(
             max_token_budget=max_token_budget,
@@ -724,6 +771,26 @@ class AgenticSearch(BaseSearch):
         # Snapshot self.llm_usages so we can sync only THIS call's tokens
         # into context at the end.
         _llm_usage_start = len(self.llm_usages)
+
+        # ==============================================================
+        # Phase 0a: Direct document analysis (intent-gated short-circuit)
+        # ==============================================================
+        direct = await self._try_direct_doc_analysis(query, paths)
+        if direct is not None:
+            if return_cluster:
+                _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
+                cluster = KnowledgeCluster(
+                    id=f"DQ{_digest}",
+                    name=query,
+                    description=[f"Direct document analysis for: {query}"],
+                    content=direct,
+                    queries=[query],
+                )
+                cluster.search_results.append(direct)
+                return cluster
+            if return_context:
+                return direct, context
+            return direct
 
         # ==============================================================
         # Phase 0: Cluster reuse (instant short-circuit)
@@ -909,6 +976,411 @@ class AgenticSearch(BaseSearch):
         if return_context:
             return answer, context
         return answer
+
+    # ------------------------------------------------------------------
+    # Phase 0a: Direct document analysis (intent-gated)
+    # ------------------------------------------------------------------
+
+    async def _try_direct_doc_analysis(
+        self,
+        query: str,
+        paths: List[str],
+    ) -> Optional[str]:
+        """Short-circuit for document-level queries (e.g. "请总结这篇文档").
+
+        Uses the LLM to classify query intent (language-agnostic).  When
+        a whole-document operation is detected **and** suitable files exist
+        in *paths*, their content is fed directly to the LLM — bypassing
+        the heavyweight keyword / dir-scan / evidence pipeline.
+
+        Returns:
+            LLM answer string, or None if the short-circuit does not apply.
+        """
+        from sirchmunk.doc_qa import (
+            detect_doc_intent,
+            collect_doc_files,
+            analyse_documents,
+        )
+
+        # Step 1: file gate — skip early if paths contain no loadable docs
+        doc_files = collect_doc_files(paths)
+        if not doc_files:
+            return None
+
+        # Step 2: LLM intent classification (cheap, stream=False)
+        operation = await detect_doc_intent(query, self.llm, self.llm_usages)
+        if operation is None:
+            return None
+
+        filenames = ", ".join(Path(d.path).name for d in doc_files)
+        await self._logger.info(
+            f"[DocQA] Intent '{operation}' detected — "
+            f"loading {len(doc_files)} file(s) for direct analysis: {filenames}"
+        )
+
+        # Step 3: extract, (optionally sample), and analyse
+        answer = await analyse_documents(
+            query=query,
+            doc_files=doc_files,
+            llm=self.llm,
+            llm_usages=self.llm_usages,
+        )
+
+        if answer:
+            await self._logger.success("[DocQA] Direct document analysis complete")
+        return answer
+
+    # ------------------------------------------------------------------
+    # FAST mode — greedy search with early termination
+    # ------------------------------------------------------------------
+
+    _FAST_TEXT_EXTENSIONS = {
+        ".txt", ".md", ".rst", ".csv", ".log", ".tsv",
+        ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".xml",
+        ".html", ".htm", ".sh", ".toml", ".cfg", ".ini", ".conf",
+        ".css", ".bash", ".java", ".c", ".cpp", ".h", ".go", ".rs",
+    }
+    _FAST_CONTEXT_WINDOW = 30       # ± lines around each grep hit
+    _FAST_MAX_EVIDENCE_CHARS = 15_000
+
+    async def _search_fast(
+        self,
+        query: str,
+        paths: List[str],
+        *,
+        max_depth: Optional[int] = 5,
+        top_k_files: int = 2,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+    ) -> str:
+        """Greedy search: 2 LLM calls, single best file, focused evidence.
+
+        Two-level keyword cascade extracted in one LLM call:
+        primary (compound phrase) is tried first; if it misses, fallback
+        (atomic terms) is tried.  Greedy early-termination at every step.
+
+        Architecture:
+            ┌──────────────────────────────────────────────────────────┐
+            │ Step 1  LLM → primary + fallback keywords (stream=False) │
+            │ Step 2  rga cascade: primary → fallback → filename       │
+            │ Step 3  Context sampling around grep hit lines            │
+            │ Step 4  LLM answer from focused evidence                  │
+            └──────────────────────────────────────────────────────────┘
+
+        Args:
+            query: User search query.
+            paths: Normalised list of path strings.
+            max_depth: Maximum directory depth for rga search.
+            top_k_files: Unused (kept for API compat); greedy picks 1 file.
+            include: File glob patterns to include.
+            exclude: File glob patterns to exclude.
+
+        Returns:
+            Answer string from LLM.
+        """
+        await self._logger.info(f"[FAST] Starting greedy search for: '{query[:80]}'")
+
+        # ==============================================================
+        # Step 1: LLM → 2-level keywords in one call (stream=False)
+        # ==============================================================
+        prompt = FAST_QUERY_ANALYSIS.format(user_input=query)
+        resp = await self.llm.achat(
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+        self.llm_usages.append(resp.usage)
+
+        analysis = self._parse_fast_json(resp.content)
+        primary = analysis.get("primary", [])[:2]
+        fallback = analysis.get("fallback", [])[:3]
+        file_hints = analysis.get("file_hints", [])
+
+        if not primary and not fallback:
+            await self._logger.warning("[FAST] No keywords extracted")
+            return f"Could not extract search terms from query: '{query}'"
+
+        await self._logger.info(
+            f"[FAST:Step1] Primary: {primary}, Fallback: {fallback}"
+        )
+
+        # ==============================================================
+        # Step 2: rga cascade — primary first, fallback only if needed
+        # ==============================================================
+        include_patterns = list(include or [])
+        for hint in file_hints:
+            if "*" in hint or "." in hint:
+                include_patterns.append(hint)
+
+        rga_kwargs = dict(
+            paths=paths, max_depth=max_depth,
+            include=include_patterns or None, exclude=exclude,
+        )
+
+        best_file: Optional[Dict[str, Any]] = None
+        used_level = "primary"
+
+        if primary:
+            best_file = await self._fast_find_best_file(primary, **rga_kwargs)
+
+        if not best_file and fallback:
+            used_level = "fallback"
+            await self._logger.info(
+                "[FAST:Step2] Primary miss, trying fine-grained fallback"
+            )
+            best_file = await self._fast_find_best_file(fallback, **rga_kwargs)
+
+        if not best_file:
+            await self._logger.warning("[FAST:Step2] No matching files found")
+            return f"No relevant content found for query: '{query}'"
+
+        file_path = best_file["path"]
+        match_objects = best_file["matches"]
+        await self._logger.info(
+            f"[FAST:Step2] Best file ({used_level}): {Path(file_path).name} "
+            f"({best_file['total_matches']} hits)"
+        )
+
+        # ==============================================================
+        # Step 3: Context sampling around grep hits (no LLM)
+        # ==============================================================
+        evidence = await self._fast_sample_evidence(file_path, match_objects)
+        if not evidence or len(evidence.strip()) < 20:
+            await self._logger.warning("[FAST:Step3] No usable evidence extracted")
+            return f"Found file but could not extract content for query: '{query}'"
+
+        await self._logger.info(
+            f"[FAST:Step3] Evidence: {len(evidence)} chars from {Path(file_path).name}"
+        )
+
+        # ==============================================================
+        # Step 4: LLM answer from focused evidence (single call)
+        # ==============================================================
+        answer_prompt = ROI_RESULT_SUMMARY.format(
+            user_input=query,
+            text_content=evidence,
+        )
+        answer_resp = await self.llm.achat(
+            messages=[{"role": "user", "content": answer_prompt}],
+            stream=True,
+        )
+        self.llm_usages.append(answer_resp.usage)
+
+        await self._logger.success("[FAST] Search complete (2 LLM calls)")
+        return answer_resp.content or ""
+
+    # ---- FAST helpers ----
+
+    async def _fast_find_best_file(
+        self,
+        keywords: List[str],
+        paths: List[str],
+        max_depth: Optional[int] = 5,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Search per keyword via rga and return the single best-matching file.
+
+        Returns:
+            Merged file dict (path, matches, lines, total_matches) or None.
+        """
+        all_raw: List[Dict[str, Any]] = []
+
+        for kw in keywords:
+            try:
+                results = await self.grep_retriever.retrieve(
+                    terms=kw, path=paths, literal=True, regex=False,
+                    max_depth=max_depth, include=include, exclude=exclude,
+                    timeout=15.0,
+                )
+                if results:
+                    all_raw.extend(results)
+            except Exception as exc:
+                await self._logger.debug(f"[FAST] rga literal search failed for '{kw}': {exc}")
+
+        # Fallback: escaped-regex OR (handles adapters that only work in regex mode)
+        if not all_raw and keywords:
+            try:
+                escaped = [re.escape(kw) for kw in keywords]
+                pattern = "|".join(escaped)
+                results = await self.grep_retriever.retrieve(
+                    terms=pattern, path=paths, literal=False, regex=True,
+                    max_depth=max_depth, include=include, exclude=exclude,
+                    timeout=15.0,
+                )
+                if results:
+                    all_raw.extend(results)
+            except Exception:
+                pass
+
+        # Fallback: filename search
+        if not all_raw:
+            try:
+                fn_results = await self.grep_retriever.retrieve_by_filename(
+                    patterns=[f".*{re.escape(kw)}.*" for kw in keywords],
+                    path=paths, case_sensitive=False, max_depth=max_depth,
+                    timeout=15.0,
+                )
+                if fn_results:
+                    return {
+                        "path": fn_results[0]["path"],
+                        "matches": [], "lines": [], "total_matches": 0,
+                    }
+            except Exception:
+                pass
+            return None
+
+        merged = GrepRetriever.merge_results(all_raw, limit=20)
+        if not merged:
+            return None
+
+        # Greedy: pick the file with the most matches
+        merged.sort(key=lambda f: f["total_matches"], reverse=True)
+        return merged[0]
+
+    async def _fast_sample_evidence(
+        self,
+        file_path: str,
+        match_objects: List[Dict[str, Any]],
+    ) -> str:
+        """Build focused evidence from grep hits: context windows for text
+        files, raw match snippets for binary formats.
+
+        Args:
+            file_path: Absolute path to the best file.
+            match_objects: Match event dicts from ``merge_results``.
+
+        Returns:
+            Formatted evidence string.
+        """
+        fname = Path(file_path).name
+        ext = Path(file_path).suffix.lower()
+
+        # Extract match line numbers
+        hit_lines: List[int] = []
+        for m in match_objects:
+            ln = m.get("data", {}).get("line_number")
+            if isinstance(ln, int):
+                hit_lines.append(ln)
+
+        # --- Text files: read context windows around hits ---
+        if ext in self._FAST_TEXT_EXTENSIONS and hit_lines:
+            evidence = self._read_context_windows(
+                file_path, hit_lines,
+                window=self._FAST_CONTEXT_WINDOW,
+                max_chars=self._FAST_MAX_EVIDENCE_CHARS,
+            )
+            if evidence:
+                return f"[{fname}]\n{evidence}"
+
+        # --- Non-text files or no line numbers: use grep snippets ---
+        snippets: List[str] = []
+        total = 0
+        for m in match_objects:
+            line_text = m.get("data", {}).get("lines", {}).get("text", "").rstrip()
+            if not line_text:
+                continue
+            snippets.append(line_text)
+            total += len(line_text)
+            if total >= self._FAST_MAX_EVIDENCE_CHARS:
+                break
+
+        if snippets:
+            return f"[{fname}]\n" + "\n".join(snippets)
+
+        # Last resort: try reading file head
+        return await self._fast_read_file_head(file_path)
+
+    @staticmethod
+    def _read_context_windows(
+        file_path: str,
+        hit_lines: List[int],
+        window: int = 30,
+        max_chars: int = 15_000,
+    ) -> Optional[str]:
+        """Read context windows around *hit_lines* from a text file.
+
+        Merges overlapping windows to avoid duplication.  Stops when
+        *max_chars* is reached.
+        """
+        # Merge overlapping intervals
+        intervals = sorted(set(
+            (max(1, ln - window), ln + window) for ln in hit_lines
+        ))
+        merged: List[tuple] = [intervals[0]]
+        for start, end in intervals[1:]:
+            if start <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+
+        # Read file and extract windows
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+        except Exception:
+            return None
+
+        parts: List[str] = []
+        total = 0
+        for start, end in merged:
+            s = max(0, start - 1)  # 0-indexed
+            e = min(len(all_lines), end)
+            chunk = "".join(all_lines[s:e])
+            if total + len(chunk) > max_chars:
+                remaining = max_chars - total
+                if remaining > 200:
+                    chunk = chunk[:remaining] + "\n[...truncated...]"
+                    parts.append(chunk)
+                break
+            parts.append(chunk)
+            total += len(chunk)
+
+        if not parts:
+            return None
+
+        # Join windows with separator when there are gaps
+        return "\n[...]\n".join(parts)
+
+    @staticmethod
+    async def _fast_read_file_head(
+        file_path: str, max_chars: int = 8_000,
+    ) -> str:
+        """Read the head of a file as last-resort evidence."""
+        try:
+            p = Path(file_path)
+            if p.suffix.lower() in AgenticSearch._FAST_TEXT_EXTENSIONS:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            else:
+                from sirchmunk.utils.file_utils import fast_extract
+                result = await fast_extract(file_path)
+                text = result.content if result and result.content else ""
+            if text:
+                return f"[{p.name}]\n{text[:max_chars]}"
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _parse_fast_json(text: str) -> Dict[str, Any]:
+        """Extract JSON from the FAST query analysis LLM response."""
+        text = text.strip()
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        cleaned = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+        cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
+        try:
+            return json.loads(cleaned)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return {}
 
     # ------------------------------------------------------------------
     # Phase 1 probes (each designed to run concurrently)

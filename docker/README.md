@@ -73,7 +73,7 @@ curl -X POST http://localhost:8584/api/v1/search \
   -d '{
     "query": "your search question here",
     "paths": ["/mnt/docs"],
-    "mode": "DEEP"
+    "mode": "FAST"
   }'
 ```
 
@@ -87,7 +87,7 @@ response = requests.post(
     json={
         "query": "your search question here",
         "paths": ["/mnt/docs"],
-        "mode": "DEEP",           # "DEEP" or "FILENAME_ONLY"
+        "mode": "FAST",           # "FAST" (default), "DEEP", or "FILENAME_ONLY"
         "max_depth": 5,           # optional: max directory depth
         "top_k_files": 3,         # optional: number of top files to return
     },
@@ -106,7 +106,7 @@ else:
 |---|---|---|---|
 | `query` | string | Yes | Search query or question |
 | `paths` | list | No | Directories or files to search (e.g., `["/mnt/docs"]`) |
-| `mode` | string | No | `"DEEP"` (default) for comprehensive analysis, `"FILENAME_ONLY"` for fast file discovery |
+| `mode` | string | No | `"FAST"` (default, greedy search 2-5s), `"DEEP"` (comprehensive analysis 10-30s), or `"FILENAME_ONLY"` (file discovery <1s) |
 | `max_depth` | int | No | Maximum directory depth to search |
 | `top_k_files` | int | No | Number of top files to return |
 

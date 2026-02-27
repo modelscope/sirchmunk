@@ -51,7 +51,7 @@ def create_server(config: Config) -> FastMCP:
     async def sirchmunk_search(
         query: str,
         paths: Optional[List[str]] = None,
-        mode: str = "DEEP",
+        mode: str = "FAST",
         max_depth: int = 5,
         top_k_files: int = 3,
         max_loops: int = 10,
@@ -74,6 +74,8 @@ def create_server(config: Config) -> FastMCP:
         - Locate specific files by name or content pattern
 
         Modes:
+        - FAST: Greedy search with 2-level keyword cascade and context-window sampling.
+          Finds the single best file and answers from focused evidence. (2-5s)
         - DEEP: Comprehensive search with LLM-powered analysis. Reads file contents,
           extracts evidence via Monte Carlo sampling, and synthesizes an answer. (10-30s)
         - FILENAME_ONLY: Fast filename pattern matching across directories. (<1s)
@@ -85,7 +87,7 @@ def create_server(config: Config) -> FastMCP:
             paths: Local filesystem paths to search (files or directories).
                 Examples: ['/home/user/projects'], ['./src', './docs'], ['/data/reports']
                 Optional — falls back to configured SIRCHMUNK_SEARCH_PATHS or cwd.
-            mode: Search mode - DEEP (comprehensive content analysis) or FILENAME_ONLY (fast file discovery)
+            mode: Search mode - FAST (greedy, default), DEEP (comprehensive), or FILENAME_ONLY (file discovery)
             max_depth: Maximum directory depth to search (1-20, default: 5)
             top_k_files: Number of top files to analyze (1-20, default: 3)
             max_loops: Maximum ReAct agent iterations for adaptive retrieval (1-20, default: 10)

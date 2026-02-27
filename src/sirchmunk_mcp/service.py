@@ -168,7 +168,7 @@ class SirchmunkService:
         self,
         query: str,
         paths: Optional[Union[str, List[str]]] = None,
-        mode: str = "DEEP",
+        mode: str = "FAST",
         max_depth: Optional[int] = None,
         top_k_files: Optional[int] = None,
         max_loops: Optional[int] = None,
@@ -187,7 +187,7 @@ class SirchmunkService:
             query: Search query or question to find relevant documents
             paths: Paths to search in (files or directories).
                 Optional — falls back to configured default or cwd.
-            mode: Search mode (DEEP, FILENAME_ONLY)
+            mode: Search mode (FAST, DEEP, FILENAME_ONLY)
             max_depth: Maximum directory depth to search
             top_k_files: Number of top files to return
             max_loops: Maximum ReAct iterations (DEEP mode)
@@ -209,8 +209,8 @@ class SirchmunkService:
             raise RuntimeError("Sirchmunk service is not initialized")
         
         # Validate mode
-        if mode not in ("DEEP", "FILENAME_ONLY"):
-            raise ValueError(f"Invalid mode: {mode}. Must be DEEP or FILENAME_ONLY")
+        if mode not in ("FAST", "DEEP", "FILENAME_ONLY"):
+            raise ValueError(f"Invalid mode: {mode}. Must be FAST, DEEP, or FILENAME_ONLY")
         
         # Normalize paths
         if isinstance(paths, str):

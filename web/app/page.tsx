@@ -24,6 +24,7 @@ import {
   Folder,
   Plus,
   Square,
+  Zap,
 } from "lucide-react";
 import Link from "next/link";
 import Image from "next/image";
@@ -35,6 +36,7 @@ import { useGlobal } from "@/context/GlobalContext";
 import { apiUrl } from "@/lib/api";
 import { processLatexContent } from "@/lib/latex";
 import { getTranslation, type Language } from "@/lib/i18n";
+import FileBrowser from "@/components/FileBrowser";
 
 interface KnowledgeBase {
   name: string;
@@ -58,6 +60,7 @@ interface ChatState {
   selectedKb: string;
   enableRag: boolean;
   enableWebSearch: boolean;
+  searchMode: string;
   currentStage: string | null;
 }
 
@@ -79,14 +82,18 @@ export default function HomePage() {
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(-1);
   const [showFileSelector, setShowFileSelector] = useState(false);
+  const [fileBrowserMode, setFileBrowserMode] = useState<"files" | "directory" | null>(null);
+  const [tkinterAvailable, setTkinterAvailable] = useState<boolean | null>(null);
   const [selectedPath, setSelectedPath] = useState<string>("");
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [showPathDropdown, setShowPathDropdown] = useState(false);
+  const [showModeDropdown, setShowModeDropdown] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const suggestionsRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pathDropdownRef = useRef<HTMLDivElement>(null);
+  const modeDropdownRef = useRef<HTMLDivElement>(null);
 
   // Fetch knowledge bases
   useEffect(() => {
@@ -108,6 +115,18 @@ export default function HomePage() {
       })
       .catch((err) => console.error("Failed to fetch KBs:", err));
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Check if Tkinter file picker is available (will be false in Docker)
+  useEffect(() => {
+    fetch(apiUrl("/api/v1/file-picker/status"))
+      .then((res) => res.json())
+      .then((result) => {
+        if (result.success) {
+          setTkinterAvailable(result.data.tkinter_available);
+        }
+      })
+      .catch(() => setTkinterAvailable(false));
   }, []);
 
   // Auto-scroll to bottom when new messages arrive
@@ -201,13 +220,20 @@ export default function HomePage() {
       ) {
         setShowPathDropdown(false);
       }
+
+      if (
+        modeDropdownRef.current &&
+        !modeDropdownRef.current.contains(event.target as Node)
+      ) {
+        setShowModeDropdown(false);
+      }
     };
 
-    if (showSuggestions || showPathDropdown) {
+    if (showSuggestions || showPathDropdown || showModeDropdown) {
       document.addEventListener('mousedown', handleClickOutside);
       return () => document.removeEventListener('mousedown', handleClickOutside);
     }
-  }, [showSuggestions, showPathDropdown]);
+  }, [showSuggestions, showPathDropdown, showModeDropdown]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (showSuggestions && searchSuggestions.length > 0) {
@@ -290,15 +316,39 @@ export default function HomePage() {
     <div className="h-screen flex animate-fade-in">
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0">
+      {/* Web-based File Browser (fallback when Tkinter is unavailable, e.g. Docker) */}
+      {fileBrowserMode && (
+        <FileBrowser
+          mode={fileBrowserMode}
+          t={t}
+          onSelect={(path) => {
+            setSelectedPath(path);
+            if (!selectedPaths.includes(path)) {
+              setSelectedPaths((prev) => [...prev, path]);
+            }
+            setChatState((prev) => ({
+              ...prev,
+              enableRag: true,
+              selectedKb: path,
+            }));
+            setFileBrowserMode(null);
+            setShowFileSelector(false);
+          }}
+          onCancel={() => {
+            setFileBrowserMode(null);
+          }}
+        />
+      )}
+
       {/* File Selector Modal (available in both empty and chat views) */}
-      {showFileSelector && (
+      {showFileSelector && !fileBrowserMode && (
         <div 
           className="fixed inset-0 bg-black/50 flex items-center justify-center z-[99999]"
           style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0 }}
         >
           <div className="bg-white dark:bg-slate-800 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl relative z-[100000]">
             <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100 mb-4">
-              {t("Select File or Folder")} / 选择文件或文件夹
+              {t("Select File or Folder")}
             </h3>
 
             <div className="space-y-3">
@@ -306,6 +356,10 @@ export default function HomePage() {
               <button
                 type="button"
                 onClick={async () => {
+                  if (!tkinterAvailable) {
+                    setFileBrowserMode("files");
+                    return;
+                  }
                   try {
                     const response = await fetch(apiUrl("/api/v1/file-picker"), {
                       method: "POST",
@@ -343,13 +397,17 @@ export default function HomePage() {
                 className="w-full px-4 py-3 text-sm font-medium bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 border-2 border-blue-200 dark:border-blue-700 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/50 transition-colors flex items-center justify-center gap-2"
               >
                 <FileText className="w-4 h-4" />
-                <span>{t("Single File")} / 单文件</span>
+                <span>{t("Single File")}</span>
               </button>
 
               {/* Folder Button */}
               <button
                 type="button"
                 onClick={async () => {
+                  if (!tkinterAvailable) {
+                    setFileBrowserMode("directory");
+                    return;
+                  }
                   try {
                     const response = await fetch(apiUrl("/api/v1/file-picker"), {
                       method: "POST",
@@ -387,17 +445,17 @@ export default function HomePage() {
                 className="w-full px-4 py-3 text-sm font-medium bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 border-2 border-purple-200 dark:border-purple-700 rounded-lg hover:bg-purple-100 dark:hover:bg-purple-900/50 transition-colors flex items-center justify-center gap-2"
               >
                 <Folder className="w-4 h-4" />
-                <span>{t("Folder")} / 文件夹</span>
+                <span>{t("Folder")}</span>
               </button>
 
               {/* Custom Path Input */}
               <div className="pt-2 border-t border-slate-200 dark:border-slate-700">
                 <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">
-                  {t("Custom Path")} / 自定义路径
+                  {t("Custom Path")}
                 </label>
                 <input
                   type="text"
-                  placeholder="C:\\Users\\...\\file.txt or /Users/.../file.txt"
+                  placeholder="/path/to/file or /path/to/folder"
                   value={selectedPath}
                   onChange={(e) => setSelectedPath(e.target.value)}
                   onKeyDown={(e) => {
@@ -427,7 +485,7 @@ export default function HomePage() {
                 }}
                 className="flex-1 px-4 py-2 text-slate-600 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 border border-slate-200 dark:border-slate-600 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors"
               >
-                {t("Cancel")} / 取消
+                {t("Cancel")}
               </button>
               <button
                 onClick={() => {
@@ -447,7 +505,7 @@ export default function HomePage() {
                 disabled={!selectedPath.trim()}
                 className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
-                {t("Confirm")} / 确认
+                {t("Confirm")}
               </button>
             </div>
           </div>
@@ -502,6 +560,39 @@ export default function HomePage() {
                   <Database className="w-3.5 h-3.5" />
                   {t("FileSystem")}
                 </button>
+
+                {/* Search Mode Selector */}
+                <div className="relative" ref={modeDropdownRef}>
+                  <button
+                    onClick={() => setShowModeDropdown(!showModeDropdown)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-all bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700"
+                  >
+                    <Zap className="w-3.5 h-3.5" />
+                    {t(chatState.searchMode)}
+                    <ChevronDown className="w-3 h-3" />
+                  </button>
+                  {showModeDropdown && (
+                    <div className="absolute top-full left-0 mt-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-lg z-50 min-w-[160px]">
+                      {(["FAST", "DEEP", "FILENAME_ONLY"] as const).map((mode) => (
+                        <button
+                          key={mode}
+                          onClick={() => {
+                            setChatState((prev: ChatState) => ({ ...prev, searchMode: mode }));
+                            setShowModeDropdown(false);
+                          }}
+                          className={`w-full text-left px-3 py-2 text-sm transition-colors first:rounded-t-lg last:rounded-b-lg ${
+                            chatState.searchMode === mode
+                              ? "bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300"
+                              : "text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700"
+                          }`}
+                        >
+                          <div className="font-medium">{t(mode)}</div>
+                          <div className="text-xs text-slate-400 dark:text-slate-500">{t(`${mode} Desc`)}</div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
 
                 {/* Web Search Toggle (hidden for now) */}
                 {false && (
@@ -670,6 +761,42 @@ export default function HomePage() {
                 <Database className="w-3 h-3" />
                 File
               </button>
+
+              {/* Search Mode Selector (compact) */}
+              <div className="relative">
+                <button
+                  onClick={() => setShowModeDropdown(!showModeDropdown)}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium transition-all bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700"
+                >
+                  <Zap className="w-3 h-3" />
+                  {t(chatState.searchMode)}
+                  <ChevronDown className="w-3 h-3" />
+                </button>
+                {showModeDropdown && (
+                  <div
+                    ref={modeDropdownRef}
+                    className="absolute top-full left-0 mt-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-lg z-50 min-w-[150px]"
+                  >
+                    {(["FAST", "DEEP", "FILENAME_ONLY"] as const).map((mode) => (
+                      <button
+                        key={mode}
+                        onClick={() => {
+                          setChatState((prev) => ({ ...prev, searchMode: mode }));
+                          setShowModeDropdown(false);
+                        }}
+                        className={`w-full text-left px-3 py-2 text-xs transition-colors first:rounded-t-lg last:rounded-b-lg ${
+                          chatState.searchMode === mode
+                            ? "bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300"
+                            : "text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700"
+                        }`}
+                      >
+                        <div className="font-medium">{t(mode)}</div>
+                        <div className="text-xs text-slate-400 dark:text-slate-500">{t(`${mode} Desc`)}</div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
 
               {/* Web Search Button - Temporarily hidden but functionality preserved */}
               {false && (

@@ -504,7 +504,7 @@ def cmd_search(args: argparse.Namespace) -> int:
 async def _search_local(
     query: str,
     paths: list,
-    mode: str = "DEEP",
+    mode: str = "FAST",
     output_format: str = "text",
     verbose: bool = False,
 ) -> int:
@@ -513,7 +513,7 @@ async def _search_local(
     Args:
         query: Search query
         paths: Paths to search
-        mode: Search mode (DEEP, FILENAME_ONLY)
+        mode: Search mode (FAST, DEEP, FILENAME_ONLY)
         output_format: Output format (text, json)
         verbose: Enable verbose output
 
@@ -587,7 +587,7 @@ def _search_via_api(
     query: str,
     paths: list,
     api_url: str = "http://localhost:8584",
-    mode: str = "DEEP",
+    mode: str = "FAST",
     output_format: str = "text",
 ) -> int:
     """Execute search via API server.
@@ -1111,7 +1111,7 @@ Examples:
     )
     search_parser.add_argument("query", help="Search query or question")
     search_parser.add_argument("paths", nargs="*", help="Paths to search (default: current directory)")
-    search_parser.add_argument("--mode", "-m", default="DEEP", choices=["DEEP", "FILENAME_ONLY"])
+    search_parser.add_argument("--mode", "-m", default="FAST", choices=["FAST", "DEEP", "FILENAME_ONLY"])
     search_parser.add_argument("--output", "-o", default="text", choices=["text", "json"])
     search_parser.add_argument("--api", action="store_true", help="Use API server instead of local search")
     search_parser.add_argument("--api-url", default="http://localhost:8584", help="API server URL")

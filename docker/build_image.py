@@ -41,7 +41,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # ---------------------------------------------------------------------------
 
 DEFAULT_ACR_REGISTRIES = [
-    "modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk",
+    # "modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk",    # push manually
     "modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk",
 ]
 
