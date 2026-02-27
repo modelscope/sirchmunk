@@ -132,7 +132,7 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 
 <div align="center">
-  <img src="assets/gif/Sirchmunk_Web.gif" alt="Sirchmunk WebUI" width="100%">
+  <video controls autoplay muted loop playsinline width="100%" src="https://github.com/user-attachments/assets/704dbc0a-3df6-436a-b7f7-fb1edefbfb8c"></video>
   <p style="font-size: 1.1em; font-weight: 600; margin-top: 8px; color: #00bcd4;">
     Access files directly to start chatting
   </p>
@@ -149,6 +149,12 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 
 ## 🎉 News
+
+* 🚀 **Feb 27, 2026**: Sirchmunk v0.0.4
+  - **Docker Support**: First-class Docker deployment with pre-built images for seamless containerized setup.
+  - **FAST Search Mode**: New default greedy search mode using 2-level keyword cascade and context-window sampling — significantly faster retrieval with only 2 LLM calls (2-5s vs 10-30s).
+  - **Simplified Deployment**: Streamlined CLI and Web UI configuration workflows for quicker onboarding.
+  - **Windows Compatibility**: Fixed compatibility issues for Windows environments.
 
 * 🚀 **Feb 12, 2026**: Sirchmunk v0.0.3: Upgraded MCP Integration & Core Search Algorithms
   - **MCP Boost**: Enhanced Model Context Protocol support with updated setup guides.
@@ -210,9 +216,17 @@ async def main():
     
     searcher = AgenticSearch(llm=llm)
     
+    # FAST mode (default): greedy search, 2 LLM calls, 2-5s
     result: str = await searcher.search(
         query="How does transformer attention work?",
         paths=["/path/to/documents"],
+    )
+    
+    # DEEP mode: comprehensive analysis with Monte Carlo sampling, 10-30s
+    result_deep: str = await searcher.search(
+        query="How does transformer attention work?",
+        paths=["/path/to/documents"],
+        mode="DEEP",
     )
     
     print(result)
@@ -263,11 +277,14 @@ sirchmunk serve --host 0.0.0.0 --port 8000
 #### Search
 
 ```bash
-# Search in current directory
+# Search in current directory (FAST mode by default)
 sirchmunk search "How does authentication work?"
 
 # Search in specific paths
 sirchmunk search "find all API endpoints" ./src ./docs
+
+# DEEP mode: comprehensive analysis with Monte Carlo sampling
+sirchmunk search "database architecture" --mode DEEP
 
 # Quick filename search
 sirchmunk search "config" --mode FILENAME_ONLY
@@ -345,7 +362,7 @@ After running `sirchmunk init`, a `~/.sirchmunk/mcp_config.json` file is generat
 
 ### Features
 
-- **Multi-Mode Search**: DEEP mode for comprehensive analysis, FILENAME_ONLY for fast file discovery
+- **Multi-Mode Search**: FAST mode (default, greedy 2-5s), DEEP mode for comprehensive analysis, FILENAME_ONLY for fast file discovery
 - **Knowledge Cluster Management**: Automatic extraction, storage, and reuse of knowledge
 - **Standard MCP Protocol**: Works with stdio and Streamable HTTP transports
 
@@ -450,7 +467,6 @@ response = requests.post(
     json={
         "query": "your search question here",
         "paths": ["/mnt/docs"],
-        "mode": "DEEP",
     },
 )
 print(response.json())
@@ -607,16 +623,24 @@ When the server is running (`sirchmunk serve` or `sirchmunk web serve`), the Sea
 <summary><b>cURL Examples</b></summary>
 
 ```bash
-# Basic search (DEEP mode)
+# FAST mode (default, greedy search with 2 LLM calls)
 curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "How does authentication work?",
-    "paths": ["/path/to/project"],
+    "paths": ["/path/to/project"]
+  }'
+
+# DEEP mode (comprehensive analysis with Monte Carlo sampling)
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "database connection pooling",
+    "paths": ["/path/to/project/src"],
     "mode": "DEEP"
   }'
 
-# Filename search (fast, no LLM required)
+# Filename search (no LLM required)
 curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
@@ -659,9 +683,8 @@ response = requests.post(
     json={
         "query": "How does authentication work?",
         "paths": ["/path/to/project"],
-        "mode": "DEEP"
     },
-    timeout=300  # DEEP mode may take a while
+    timeout=60
 )
 
 data = response.json()
@@ -682,7 +705,6 @@ async def search():
             json={
                 "query": "find all API endpoints",
                 "paths": ["/path/to/project"],
-                "mode": "DEEP"
             }
         )
         data = resp.json()
@@ -703,7 +725,6 @@ const response = await fetch("http://localhost:8584/api/v1/search", {
   body: JSON.stringify({
     query: "How does authentication work?",
     paths: ["/path/to/project"],
-    mode: "DEEP"
   })
 });
 
@@ -722,7 +743,7 @@ if (data.success) {
 |-----------|------|---------|-------------|
 | `query` | `string` | *required* | Search query or question |
 | `paths` | `string[]` | *required* | Directories or files to search (min 1) |
-| `mode` | `string` | `"DEEP"` | `DEEP` or `FILENAME_ONLY` |
+| `mode` | `string` | `"FAST"` | `FAST`, `DEEP`, or `FILENAME_ONLY` |
 | `max_depth` | `int` | `null` | Maximum directory depth |
 | `top_k_files` | `int` | `null` | Number of top files to return |
 | `keyword_levels` | `int` | `null` | Keyword granularity levels |
@@ -730,7 +751,7 @@ if (data.success) {
 | `exclude_patterns` | `string[]` | `null` | File glob patterns to exclude |
 | `return_cluster` | `bool` | `false` | Return full KnowledgeCluster object |
 
-> **Note:** `FILENAME_ONLY` mode does not require an LLM API key. `DEEP` mode requires a configured LLM.
+> **Note:** `FILENAME_ONLY` mode does not require an LLM API key. `FAST` and `DEEP` modes require a configured LLM.
 
 </details>
 

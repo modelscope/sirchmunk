@@ -61,10 +61,11 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
             },
             "mode": {
                 "type": "string",
-                "enum": ["DEEP", "FILENAME_ONLY"],
-                "default": "DEEP",
+                "enum": ["FAST", "DEEP", "FILENAME_ONLY"],
+                "default": "FAST",
                 "description": (
-                    "Search mode: DEEP (comprehensive content analysis with LLM, 10-30s), "
+                    "Search mode: FAST (greedy search with 2 LLM calls, 2-5s), "
+                    "DEEP (comprehensive content analysis with LLM, 10-30s), "
                     "FILENAME_ONLY (fast file discovery by name pattern, <1s)"
                 ),
             },
@@ -214,7 +215,7 @@ async def handle_sirchmunk_search(
         raise ValueError("Missing required argument: query")
     
     # Extract optional arguments with defaults
-    mode = arguments.get("mode", "DEEP")
+    mode = arguments.get("mode", "FAST")
     max_depth = arguments.get("max_depth")
     top_k_files = arguments.get("top_k_files")
     max_loops = arguments.get("max_loops")

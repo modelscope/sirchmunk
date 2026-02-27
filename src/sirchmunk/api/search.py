@@ -32,9 +32,9 @@ class SearchRequest(BaseModel):
         default=None,
         description="Paths to search (directories or files). Falls back to configured default or cwd."
     )
-    mode: Literal["DEEP", "FILENAME_ONLY"] = Field(
-        default="DEEP",
-        description="Search mode: DEEP (comprehensive analysis) or FILENAME_ONLY (fast file discovery)"
+    mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = Field(
+        default="FAST",
+        description="Search mode: FAST (greedy search, 2-5s), DEEP (comprehensive analysis, 10-30s), or FILENAME_ONLY (file discovery, <1s)"
     )
     max_depth: Optional[int] = Field(
         default=None,

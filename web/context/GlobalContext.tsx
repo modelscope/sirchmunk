@@ -132,6 +132,7 @@ interface ChatState {
   selectedKb: string;
   enableRag: boolean;
   enableWebSearch: boolean;
+  searchMode: string;
   currentStage: string | null;
 }
 
@@ -613,6 +614,7 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
     selectedKb: "",
     enableRag: false,
     enableWebSearch: false,
+    searchMode: "FAST",
     currentStage: null,
   });
   const chatWs = useRef<WebSocket | null>(null);
@@ -660,6 +662,7 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
           kb_name: chatState.selectedKb,
           enable_rag: chatState.enableRag,  // Use actual RAG state from chatState
           enable_web_search: chatState.enableWebSearch,
+          search_mode: chatState.searchMode,
         }),
       );
     };
@@ -919,6 +922,7 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
             enableRag: session.settings?.enable_rag || prev.enableRag,
             enableWebSearch:
               session.settings?.enable_web_search || prev.enableWebSearch,
+            searchMode: session.settings?.search_mode || prev.searchMode,
           }));
 
           // Update sessionId ref
