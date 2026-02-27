@@ -5,7 +5,7 @@ Build script for Sirchmunk Docker images.
 Design follows the modelscope/modelscope docker/build_image.py pattern:
   - A ``Builder`` base class handles Dockerfile template rendering, build and push.
   - ``CPUImageBuilder`` (default) produces a lightweight CPU-only image.
-  - Multi-registry push to Alibaba Cloud ACR (cn-beijing, cn-hangzhou, us-west-1).
+  - Multi-registry push to Alibaba Cloud ACR (cn-beijing, us-west-1).
 
 Usage:
     # Local build (no push)
@@ -42,7 +42,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_ACR_REGISTRIES = [
     "modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk",
-    "modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/sirchmunk",
     "modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk",
 ]
 

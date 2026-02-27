@@ -12,12 +12,6 @@ if [ -d /app/web_static ] && [ ! -f "$WORK_PATH/.cache/web_static/index.html" ];
     cp -r /app/web_static/* "$WORK_PATH/.cache/web_static/"
 fi
 
-# Copy pre-downloaded embedding model if not already present
-if [ -d /app/models ] && [ -z "$(ls -A "$WORK_PATH/.cache/models/" 2>/dev/null)" ]; then
-    echo "[entrypoint] Copying pre-downloaded embedding model..."
-    cp -r /app/models/* "$WORK_PATH/.cache/models/"
-fi
-
 # Generate default .env if not present
 if [ ! -f "$WORK_PATH/.env" ]; then
     echo "[entrypoint] Generating default .env from template..."
