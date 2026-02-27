@@ -62,7 +62,12 @@ def get_node_version() -> Optional[str]:
     """Get the installed Node.js version string, or None."""
     try:
         result = subprocess.run(
-            ["node", "--version"], capture_output=True, text=True, timeout=10
+            ["node", "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
         )
         return result.stdout.strip() if result.returncode == 0 else None
     except Exception:
@@ -172,6 +177,8 @@ def build_frontend(
             cwd=str(web_dir),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=300,
         )
         if result.returncode != 0:
@@ -202,6 +209,8 @@ def build_frontend(
             cwd=str(web_dir),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=build_env,
             timeout=600,
         )
