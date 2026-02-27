@@ -95,9 +95,12 @@ class AgenticSearch(BaseSearch):
         # Maximum number of queries to keep per cluster (FIFO strategy)
         self.max_queries_per_cluster: int = 5
 
-        # Initialize embedding client for cluster reuse
-        # EmbeddingUtil.__init__ returns immediately; heavy model loading
-        # runs in a background thread so it never blocks the event loop.
+        # Initialize embedding client for cluster reuse.
+        # EmbeddingUtil.__init__ is cheap (stores config only).  The heavy
+        # SentenceTransformer construction is deferred to start_loading(),
+        # which is called lazily on the first DEEP-mode cluster-reuse
+        # check so that FAST-mode searches never trigger model loading
+        # and never suffer from GIL contention.
         self.embedding_client = None
         self.cluster_sim_threshold: float = kwargs.pop('cluster_sim_threshold', 0.85)
         self.cluster_sim_top_k: int = kwargs.pop('cluster_sim_top_k', 3)
@@ -109,8 +112,7 @@ class AgenticSearch(BaseSearch):
                     cache_dir=str(self.work_path / ".cache" / "models")
                 )
                 _loguru_logger.info(
-                    "Embedding client initialising in background "
-                    "(model will be ready before first search)"
+                    "Embedding client created (model loading deferred until first use)"
                 )
             except Exception as e:
                 _loguru_logger.error(
@@ -210,7 +212,13 @@ class AgenticSearch(BaseSearch):
         """
         if not self.embedding_client:
             return None
-        
+
+        # Skip cluster reuse while the embedding model is still loading in
+        # its background thread; kick off loading so it's ready next time.
+        if not self.embedding_client.is_ready():
+            self.embedding_client.start_loading()
+            return None
+
         try:
             await self._logger.info("Searching for similar knowledge clusters...")
             
@@ -250,7 +258,7 @@ class AgenticSearch(BaseSearch):
             existing_cluster.last_modified = datetime.now()
             
             # Recompute embedding with new query (before update to avoid double save)
-            if self.embedding_client:
+            if self.embedding_client and self.embedding_client.is_ready():
                 try:
                     from sirchmunk.utils.embedding_util import compute_text_hash
 
@@ -337,21 +345,18 @@ class AgenticSearch(BaseSearch):
                 await self._logger.warning(f"Failed to save knowledge cluster: {update_error}")
                 return
 
-        # Compute and store embedding for the cluster
-        if self.embedding_client:
+        # Compute and store embedding for the cluster (skip if model not ready)
+        if self.embedding_client and self.embedding_client.is_ready():
             try:
                 from sirchmunk.utils.embedding_util import compute_text_hash
 
-                # Combine queries for embedding
                 combined_text = self.knowledge_storage.combine_cluster_fields(
                     cluster.queries
                 )
                 text_hash = compute_text_hash(combined_text)
 
-                # Compute embedding
                 embedding_vector = (await self.embedding_client.embed([combined_text]))[0]
 
-                # Store embedding
                 await self.knowledge_storage.store_embedding(
                     cluster_id=cluster.id,
                     embedding_vector=embedding_vector,
