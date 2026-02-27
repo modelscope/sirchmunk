@@ -638,6 +638,9 @@ class AgenticSearch(BaseSearch):
         DEEP architecture (phases execute as parallel as possible):
 
         ┌──────────────────────────────────────────────────────────┐
+        │ Phase 0a Direct document analysis (intent-gated,         │
+        │          short-circuit if query is doc-level operation)   │
+        ├──────────────────────────────────────────────────────────┤
         │ Phase 0  Cluster reuse check (instant, short-circuit)    │
         ├──────────────────────────────────────────────────────────┤
         │ Phase 1  Parallel probing (all concurrent):              │
@@ -724,6 +727,26 @@ class AgenticSearch(BaseSearch):
         # Snapshot self.llm_usages so we can sync only THIS call's tokens
         # into context at the end.
         _llm_usage_start = len(self.llm_usages)
+
+        # ==============================================================
+        # Phase 0a: Direct document analysis (intent-gated short-circuit)
+        # ==============================================================
+        direct = await self._try_direct_doc_analysis(query, paths)
+        if direct is not None:
+            if return_cluster:
+                _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
+                cluster = KnowledgeCluster(
+                    id=f"DQ{_digest}",
+                    name=query,
+                    description=[f"Direct document analysis for: {query}"],
+                    content=direct,
+                    queries=[query],
+                )
+                cluster.search_results.append(direct)
+                return cluster
+            if return_context:
+                return direct, context
+            return direct
 
         # ==============================================================
         # Phase 0: Cluster reuse (instant short-circuit)
@@ -908,6 +931,59 @@ class AgenticSearch(BaseSearch):
             return cluster
         if return_context:
             return answer, context
+        return answer
+
+    # ------------------------------------------------------------------
+    # Phase 0a: Direct document analysis (intent-gated)
+    # ------------------------------------------------------------------
+
+    async def _try_direct_doc_analysis(
+        self,
+        query: str,
+        paths: List[str],
+    ) -> Optional[str]:
+        """Short-circuit for document-level queries (e.g. "请总结这篇文档").
+
+        Uses the LLM to classify query intent (language-agnostic).  When
+        a whole-document operation is detected **and** suitable files exist
+        in *paths*, their content is fed directly to the LLM — bypassing
+        the heavyweight keyword / dir-scan / evidence pipeline.
+
+        Returns:
+            LLM answer string, or None if the short-circuit does not apply.
+        """
+        from sirchmunk.doc_qa import (
+            detect_doc_intent,
+            collect_doc_files,
+            analyse_documents,
+        )
+
+        # Step 1: file gate — skip early if paths contain no loadable docs
+        doc_files = collect_doc_files(paths)
+        if not doc_files:
+            return None
+
+        # Step 2: LLM intent classification (cheap, stream=False)
+        operation = await detect_doc_intent(query, self.llm, self.llm_usages)
+        if operation is None:
+            return None
+
+        filenames = ", ".join(Path(d.path).name for d in doc_files)
+        await self._logger.info(
+            f"[DocQA] Intent '{operation}' detected — "
+            f"loading {len(doc_files)} file(s) for direct analysis: {filenames}"
+        )
+
+        # Step 3: extract, (optionally sample), and analyse
+        answer = await analyse_documents(
+            query=query,
+            doc_files=doc_files,
+            llm=self.llm,
+            llm_usages=self.llm_usages,
+        )
+
+        if answer:
+            await self._logger.success("[DocQA] Direct document analysis complete")
         return answer
 
     # ------------------------------------------------------------------

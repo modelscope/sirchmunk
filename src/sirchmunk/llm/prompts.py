@@ -209,6 +209,46 @@ JSON format only.
 """
 
 
+DETECT_DOC_INTENT = """Classify the user query below.
+
+Determine whether the user wants to perform a **whole-document operation** on
+file(s) they have provided — for example: summarize, analyze, translate, explain,
+review, extract key points, rewrite, or any other operation that requires reading
+the entire document rather than searching for a specific piece of information.
+
+### User Query
+{user_input}
+
+### Output
+Return a single JSON object, no extra text:
+- If this is a whole-document operation:  {{"doc_level": true, "op": "<operation>"}}
+  where <operation> is one of: summarize, analyze, translate, explain, extract, review, or a short free-form verb.
+- If this is a specific search / retrieval query: {{"doc_level": false}}
+"""
+
+
+DIRECT_DOC_ANALYSIS = """
+### Role: Document Analysis Expert
+
+### Task
+Analyze the provided document(s) and respond to the user's question or instruction
+based strictly on the document content.
+
+### Constraints
+1. **Language Continuity**: The output MUST be in the **same language** as the User Input.
+2. **Format**: Use Markdown (headings, bullet points, bold text) for readability.
+3. **Faithfulness**: Base your response strictly on the provided content. Do not fabricate information.
+4. If the content has been sampled (indicated by `[...content sampled...]` markers),
+   acknowledge that your analysis is based on excerpts and may miss details.
+
+### Document Content
+{documents}
+
+### User Input
+{user_input}
+"""
+
+
 ROI_RESULT_SUMMARY = """
 ### Task
 Analyze the provided {text_content} and generate a concise summary in the form of a Markdown Briefing.
