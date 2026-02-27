@@ -119,10 +119,17 @@ def _get_search_instance() -> AgenticSearch:
         model=model_name,
     )
 
+    enable_cluster_reuse = os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true"
+    cluster_sim_threshold = float(os.getenv("CLUSTER_SIM_THRESHOLD", "0.85"))
+    cluster_sim_top_k = int(os.getenv("CLUSTER_SIM_TOP_K", "3"))
+
     _search_instance = AgenticSearch(
         llm=llm,
         work_path=DEFAULT_SIRCHMUNK_WORK_PATH,
         verbose=False,
+        reuse_knowledge=enable_cluster_reuse,
+        cluster_sim_threshold=cluster_sim_threshold,
+        cluster_sim_top_k=cluster_sim_top_k,
     )
     _search_config = current_config
 

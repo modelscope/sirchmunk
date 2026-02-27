@@ -260,7 +260,12 @@ class AgenticSearch(BaseSearch):
                 content = existing_cluster.content
                 if isinstance(content, list):
                     content = "\n".join(content)
-                return str(content) if content else "Knowledge cluster found but content is empty"
+                if not content:
+                    await self._logger.warning(
+                        f"Cluster {existing_cluster.id} has empty content, falling back to full search"
+                    )
+                    return None
+                return str(content)
         
         except Exception as e:
             await self._logger.warning(
@@ -864,6 +869,9 @@ class AgenticSearch(BaseSearch):
                     query_keywords=query_keywords,
                     top_k_files=top_k_files,
                 )
+            elif answer and not cluster.content:
+                cluster.content = answer
+                cluster.search_results.append(answer)
 
         # Sync LLM token accounting into context for accurate summary.
         # All parallel probes / builders append to self.llm_usages;
