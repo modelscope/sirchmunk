@@ -116,6 +116,13 @@ export const translations = {
     Select: "Select",
     "Failed to open file picker": "Failed to open file picker",
     "Failed to open folder picker": "Failed to open folder picker",
+    "Search Mode": "Search Mode",
+    FAST: "FAST",
+    DEEP: "DEEP",
+    FILENAME_ONLY: "FILENAME",
+    "FAST Desc": "Greedy search, fastest",
+    "DEEP Desc": "Comprehensive analysis",
+    "FILENAME_ONLY Desc": "Filename matching only",
 
     // History Page
     "Chat History": "Chat History",
@@ -238,6 +245,13 @@ export const translations = {
     Select: "选择",
     "Failed to open file picker": "无法打开文件选择器",
     "Failed to open folder picker": "无法打开文件夹选择器",
+    "Search Mode": "搜索模式",
+    FAST: "快速",
+    DEEP: "深度",
+    FILENAME_ONLY: "文件名",
+    "FAST Desc": "贪心搜索，最快",
+    "DEEP Desc": "全面分析",
+    "FILENAME_ONLY Desc": "仅文件名匹配",
 
     // History Page
     "Chat History": "聊天历史",

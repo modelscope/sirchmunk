@@ -233,7 +233,7 @@ Claude: [Using sirchmunk_search tool]
 {
   "query": "transformer attention implementation",
   "paths": ["/path/to/project"],
-  "mode": "DEEP",
+  "mode": "FAST",
   "top_k_files": 3
 }
 
@@ -282,7 +282,7 @@ Intelligent code and document search.
 |-----------|------|----------|---------|-------------|
 | `query` | string | Yes | - | Search query or question |
 | `paths` | array | No | configured/cwd | Paths to search in |
-| `mode` | string | No | "DEEP" | DEEP / FILENAME_ONLY |
+| `mode` | string | No | "FAST" | FAST / DEEP / FILENAME_ONLY |
 | `max_depth` | integer | No | 5 | Directory search depth |
 | `top_k_files` | integer | No | 3 | Files to return |
 | `max_loops` | integer | No | 10 | ReAct iterations (DEEP) |

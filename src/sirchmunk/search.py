@@ -614,7 +614,7 @@ class AgenticSearch(BaseSearch):
         query: str,
         paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
         *,
-        mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = "DEEP",
+        mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = "FAST",
         max_loops: int = 10,
         max_token_budget: int = 64000,
         max_depth: Optional[int] = 5,

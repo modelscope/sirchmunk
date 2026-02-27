@@ -256,7 +256,7 @@ manager = ChatConnectionManager()
 class SearchRequest(BaseModel):
     query: str
     paths: Union[str, List[str]]  # Expects absolute file/directory paths from user's local filesystem
-    mode: Optional[str] = "DEEP"
+    mode: Optional[str] = "FAST"
     max_depth: Optional[int] = 5
     top_k_files: Optional[int] = 3
 
@@ -536,7 +536,8 @@ async def _chat_rag(
     message: str,
     kb_name: str,
     websocket: WebSocket,
-    manager: ChatConnectionManager
+    manager: ChatConnectionManager,
+    search_mode: str = "FAST",
 ) -> tuple[str, Dict[str, Any]]:
     """
     Mode 2: Chat + RAG (enable_rag=True, enable_web_search=False)
@@ -567,6 +568,7 @@ async def _chat_rag(
         search_result = await search_engine.search(
             query=message,
             paths=paths,
+            mode=search_mode,
             top_k_files=3,
         )
 
@@ -690,7 +692,8 @@ async def _chat_rag_web_search(
     message: str,
     kb_name: str,
     websocket: WebSocket,
-    manager: ChatConnectionManager
+    manager: ChatConnectionManager,
+    search_mode: str = "FAST",
 ) -> tuple[str, Dict[str, Any]]:
     """
     Mode 4: Chat + RAG + Web Search (enable_rag=True, enable_web_search=True)
@@ -718,6 +721,7 @@ async def _chat_rag_web_search(
         rag_result = await search_engine.search(
             query=message,
             paths=paths,
+            mode=search_mode,
             top_k_files=3,
         )
 
@@ -799,10 +803,11 @@ async def chat_websocket(websocket: WebSocket):
             kb_name = request_data.get("kb_name", "")
             enable_rag = request_data.get("enable_rag", False)
             enable_web_search = request_data.get("enable_web_search", False)
+            search_mode = request_data.get("search_mode", "FAST")
 
             print(f"\n{'='*60}")
             print(f"[CHAT REQUEST] Message: {message[:50]}...")
-            print(f"[CHAT REQUEST] KB: {kb_name}, RAG: {enable_rag}, Web: {enable_web_search}")
+            print(f"[CHAT REQUEST] KB: {kb_name}, RAG: {enable_rag}, Web: {enable_web_search}, Mode: {search_mode}")
             print(f"{'='*60}\n")
             
             # Generate or use existing session ID
@@ -826,7 +831,8 @@ async def chat_websocket(websocket: WebSocket):
                     "settings": {
                         "kb_name": kb_name,
                         "enable_rag": enable_rag,
-                        "enable_web_search": enable_web_search
+                        "enable_web_search": enable_web_search,
+                        "search_mode": search_mode,
                     }
                 }
                 # Save new session to persistent storage
@@ -855,14 +861,14 @@ async def chat_websocket(websocket: WebSocket):
                 # Mode 4: Chat + RAG + Web Search
                 print(f"[MODE 4] Chat + RAG + Web Search")
                 response, sources = await _chat_rag_web_search(
-                    message, kb_name, websocket, manager
+                    message, kb_name, websocket, manager, search_mode=search_mode
                 )
                 
             elif enable_rag and not enable_web_search:
                 # Mode 2: Chat + RAG
                 print(f"[MODE 2] Chat + RAG")
                 response, sources = await _chat_rag(
-                    message, kb_name, websocket, manager
+                    message, kb_name, websocket, manager, search_mode=search_mode
                 )
                     
             elif not enable_rag and enable_web_search:

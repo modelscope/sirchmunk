@@ -130,7 +130,7 @@
 
 
 <div align="center">
-  <img src="assets/gif/Sirchmunk_Web.gif" alt="Sirchmunk WebUI" width="100%">
+  <video src="assets/video/Sirchmunk_Web.mp4" alt="Sirchmunk WebUI" width="100%" autoplay loop muted playsinline></video>
   <p style="font-size: 1.1em; font-weight: 600; margin-top: 8px; color: #00bcd4;">
     直接访问文件即可开始对话
   </p>
@@ -147,6 +147,12 @@
 
 
 ## 🎉 News
+
+* 🚀 **2026.2.27**: **Sirchmunk v0.0.4 发布**
+  - **Docker 部署支持**：提供预构建 Docker 镜像，支持容器化一键部署。
+  - **FAST 检索模式**：新增默认贪心搜索模式，采用两级关键词级联与上下文窗口采样策略，仅需 2 次 LLM 调用（2-5s vs 10-30s），大幅提升检索速度。
+  - **简化部署链路**：精简命令行与 Web 端的部署和配置流程，降低上手门槛。
+  - **Windows 兼容性修复**：修复 Windows 环境下的兼容性问题。
 
 * 🚀 **2026.2.12**: **Sirchmunk v0.0.3 发布：核心搜索算法与 MCP 集成双升级**
 
@@ -209,9 +215,17 @@ async def main():
     
     agent_search = AgenticSearch(llm=llm)
     
+    # FAST 模式（默认）：贪心搜索，2 次 LLM 调用，2-5s
     result: str = await agent_search.search(
         query="How does transformer attention work?",
         paths=["/path/to/documents"],
+    )
+    
+    # DEEP 模式：全面分析，蒙特卡洛证据采样，10-30s
+    result_deep: str = await agent_search.search(
+        query="How does transformer attention work?",
+        paths=["/path/to/documents"],
+        mode="DEEP",
     )
     
     print(result)
@@ -263,11 +277,14 @@ sirchmunk serve --host 0.0.0.0 --port 8000
 #### 搜索
 
 ```bash
-# 在当前目录搜索
+# 在当前目录搜索（默认 FAST 模式）
 sirchmunk search "认证是如何工作的？"
 
 # 在指定路径搜索
 sirchmunk search "查找所有 API 端点" ./src ./docs
+
+# DEEP 模式：蒙特卡洛证据采样全面分析
+sirchmunk search "数据库架构" --mode DEEP
 
 # 快速文件名搜索
 sirchmunk search "config" --mode FILENAME_ONLY
@@ -345,7 +362,7 @@ npx @modelcontextprotocol/inspector sirchmunk mcp serve
 
 ### 特性
 
-- **多模式搜索**：DEEP 模式进行全面分析，FILENAME_ONLY 模式快速发现文件
+- **多模式搜索**：FAST 模式（默认，贪心搜索 2-5s）、DEEP 模式（全面分析 10-30s）、FILENAME_ONLY 模式（快速文件发现）
 - **知识聚类管理**：自动提取、存储和复用知识
 - **标准 MCP 协议**：支持 stdio 和 Streamable HTTP 传输
 
@@ -450,7 +467,6 @@ response = requests.post(
     json={
         "query": "你的搜索问题",
         "paths": ["/mnt/docs"],
-        "mode": "DEEP",
     },
 )
 print(response.json())
@@ -607,12 +623,20 @@ KnowledgeCluster 是一个丰富标注的对象，完整记录了单次搜索周
 <summary><b>cURL 示例</b></summary>
 
 ```bash
-# 基础搜索（DEEP 模式）
+# FAST 模式（默认，贪心搜索，2 次 LLM 调用）
 curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "认证是如何工作的？",
-    "paths": ["/path/to/project"],
+    "paths": ["/path/to/project"]
+  }'
+
+# DEEP 模式（蒙特卡洛证据采样全面分析）
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "数据库连接池",
+    "paths": ["/path/to/project/src"],
     "mode": "DEEP"
   }'
 
@@ -659,9 +683,8 @@ response = requests.post(
     json={
         "query": "认证是如何工作的？",
         "paths": ["/path/to/project"],
-        "mode": "DEEP"
     },
-    timeout=300  # DEEP 模式可能耗时较长
+    timeout=60
 )
 
 data = response.json()
@@ -682,7 +705,6 @@ async def search():
             json={
                 "query": "查找所有 API 端点",
                 "paths": ["/path/to/project"],
-                "mode": "DEEP"
             }
         )
         data = resp.json()
@@ -703,7 +725,6 @@ const response = await fetch("http://localhost:8584/api/v1/search", {
   body: JSON.stringify({
     query: "认证是如何工作的？",
     paths: ["/path/to/project"],
-    mode: "DEEP"
   })
 });
 
@@ -722,7 +743,7 @@ if (data.success) {
 |------|------|--------|------|
 | `query` | `string` | *必填* | 搜索查询或问题 |
 | `paths` | `string[]` | *必填* | 搜索的目录或文件（至少 1 个） |
-| `mode` | `string` | `"DEEP"` | `DEEP` 或 `FILENAME_ONLY` |
+| `mode` | `string` | `"FAST"` | `FAST`、`DEEP` 或 `FILENAME_ONLY` |
 | `max_depth` | `int` | `null` | 最大目录深度 |
 | `top_k_files` | `int` | `null` | 返回的文件数量 |
 | `keyword_levels` | `int` | `null` | 关键词粒度层级 |
@@ -730,7 +751,7 @@ if (data.success) {
 | `exclude_patterns` | `string[]` | `null` | 文件 glob 匹配模式（排除） |
 | `return_cluster` | `bool` | `false` | 是否返回完整的 KnowledgeCluster 对象 |
 
-> **注意：** `FILENAME_ONLY` 模式无需 LLM API Key。`DEEP` 模式需要配置 LLM。
+> **注意：** `FILENAME_ONLY` 模式无需 LLM API Key。`FAST` 和 `DEEP` 模式需要配置 LLM。
 
 </details>
 
