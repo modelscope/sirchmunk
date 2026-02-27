@@ -6,7 +6,6 @@
 |---|---|
 | US West | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2` |
 | China Beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2` |
-| China Hangzhou | `modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2` |
 
 Image tag format: `ubuntu{ubuntu_version}-py{python_version}-{sirchmunk_version}`
 
@@ -22,9 +21,6 @@ docker pull modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchm
 
 # China Beijing
 docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
-
-# China Hangzhou
-docker pull modelscope-registry.cn-hangzhou.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
 ```
 
 ### 2. Start the service
