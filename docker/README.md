@@ -126,5 +126,5 @@ docker start sirchmunk
 docker rm sirchmunk
 
 # Remove data volume (caution: deletes all persisted data)
-rm -rf /data/sirchmunk
+rm -rf /path/to/your_work_path
 ```
