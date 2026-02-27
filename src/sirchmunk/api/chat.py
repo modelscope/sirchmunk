@@ -300,13 +300,26 @@ def get_search_instance(log_callback=None):
             log_callback=log_callback,
         )
         
-        # Create and return AgenticSearch instance with configured LLM
-        return AgenticSearch(llm=llm, log_callback=log_callback)
-    
+        # Read cluster reuse settings from environment
+        enable_cluster_reuse = os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true"
+        cluster_sim_threshold = float(os.getenv("CLUSTER_SIM_THRESHOLD", "0.85"))
+        cluster_sim_top_k = int(os.getenv("CLUSTER_SIM_TOP_K", "3"))
+
+        return AgenticSearch(
+            llm=llm,
+            log_callback=log_callback,
+            reuse_knowledge=enable_cluster_reuse,
+            cluster_sim_threshold=cluster_sim_threshold,
+            cluster_sim_top_k=cluster_sim_top_k,
+        )
+
     except Exception as e:
-        # If settings retrieval fails, fall back to default AgenticSearch initialization
         print(f"[WARNING] Please config ENVs: LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME. Error: {e}")
-        return AgenticSearch(log_callback=log_callback)
+        enable_cluster_reuse = os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true"
+        return AgenticSearch(
+            log_callback=log_callback,
+            reuse_knowledge=enable_cluster_reuse,
+        )
 
 
 _COOLDOWN_SECONDS = 1.0
