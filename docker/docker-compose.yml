@@ -24,7 +24,7 @@ services:
     volumes:
       # SIRCHMUNK_WORK_PATH is set to /data/sirchmunk inside the image.
       # Mount a host directory for persistence across restarts.
-      - /data/sirchmunk:/data/sirchmunk
+      - /path/to/sirchmunk_workspace:/data/sirchmunk
       # Mount local search paths (add your own paths here)
       # - /path/to/your/docs:/mnt/docs:ro
     environment:
