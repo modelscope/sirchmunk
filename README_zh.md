@@ -130,7 +130,7 @@
 
 
 <div align="center">
-  <video src="assets/video/Sirchmunk_Web.mp4" alt="Sirchmunk WebUI" width="100%" autoplay loop muted playsinline></video>
+  <video controls autoplay muted loop playsinline width="100%" src="assets/video/Sirchmunk_Web.mp4"></video>
   <p style="font-size: 1.1em; font-weight: 600; margin-top: 8px; color: #00bcd4;">
     直接访问文件即可开始对话
   </p>
