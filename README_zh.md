@@ -17,7 +17,7 @@
 
 📖 **[官方文档](https://modelscope.github.io/sirchmunk-web/zh/)** 
 
-[**快速开始**](#-快速开始) · [**核心特性**](#-核心特性) · [**MCP 服务器**](#-mcp-服务器) · [**Web UI**](#️-web-ui) · [**工作原理**](#️-工作原理) · [**FAQ**](#-faq)
+[**快速开始**](#-快速开始) · [**核心特性**](#-核心特性) · [**MCP 服务器**](#-mcp-服务器) · [**Web UI**](#️-web-ui) · [**Docker 部署**](#-docker-部署) · [**工作原理**](#️-工作原理) · [**FAQ**](#-faq)
 
 
 </div>
@@ -202,7 +202,7 @@ from sirchmunk.llm import OpenAIChat
 llm = OpenAIChat(
         api_key="your-api-key",
         base_url="your-base-url",   # 例如 https://api.openai.com/v1
-        model="your-model-name"     # 例如 gpt-4o
+        model="your-model-name"     # 例如 gpt-5.2
     )
 
 async def main():
@@ -408,6 +408,55 @@ python scripts/stop_web.py
 
 - 访问 `Settings` → `Envrionment Variables` 设置 LLM API Key 和其他环境变量
 
+
+---
+
+## 🐳 Docker 部署
+
+预构建的 Docker 镜像托管在阿里云容器镜像服务：
+
+| 区域 | 镜像 |
+|---|---|
+| 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
+| 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
+
+```bash
+# 拉取镜像（根据地理位置选择最近的 Registry）
+docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4
+
+# 启动服务
+docker run -d \
+  --name sirchmunk \
+  -p 8584:8584 \
+  -e LLM_API_KEY="your-api-key-here" \
+  -e LLM_BASE_URL="https://api.openai.com/v1" \
+  -e LLM_MODEL_NAME="gpt-5.2" \
+  -e LLM_TIMEOUT=60.0 \
+  -e UI_THEME=light \
+  -e UI_LANGUAGE=en \
+  -e SIRCHMUNK_VERBOSE=false \
+  -v /path/to/your_work_path:/data/sirchmunk \
+  -v /path/to/your/docs:/mnt/docs:ro \
+  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4
+```
+
+打开 http://localhost:8584 访问 WebUI，或直接调用 API：
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:8584/api/v1/search",
+    json={
+        "query": "你的搜索问题",
+        "paths": ["/mnt/docs"],
+        "mode": "DEEP",
+    },
+)
+print(response.json())
+```
+
+📖 **完整 Docker 参数和使用说明，请参阅 [docker/README.md](docker/README.md)**。
 
 ---
 
@@ -705,7 +754,7 @@ Sirchmunk 采用 **无索引** 方法：
 <summary><b>支持哪些 LLM 提供商？</b></summary>
 
 任何 OpenAI 兼容 API 端点，包括但不限于：
-- OpenAI（GPT-4、GPT-4o、GPT-3.5）
+- OpenAI（GPT-5.2, ...）
 - 通过 Ollama、llama.cpp、vLLM、SGLang 等托管的本地模型
 - 通过 API 代理接入的 Claude
 

@@ -17,7 +17,7 @@
 
 📖 **[Documentation](https://modelscope.github.io/sirchmunk-web/)**
 
-[**Quick Start**](#-quick-start) · [**Key Features**](#-key-features) · [**MCP Server**](#-mcp-server) · [**Web UI**](#️-web-ui) · [**How it Works**](#️-how-it-works) · [**FAQ**](#-faq)
+[**Quick Start**](#-quick-start) · [**Key Features**](#-key-features) · [**MCP Server**](#-mcp-server) · [**Web UI**](#️-web-ui) · [**Docker**](#-docker-deployment) · [**How it Works**](#️-how-it-works) · [**FAQ**](#-faq)
 
 </div>
 
@@ -203,7 +203,7 @@ from sirchmunk.llm import OpenAIChat
 llm = OpenAIChat(
         api_key="your-api-key",
         base_url="your-base-url",   # e.g., https://api.openai.com/v1
-        model="your-model-name"     # e.g., gpt-4o
+        model="your-model-name"     # e.g., gpt-5.2
     )
 
 async def main():
@@ -408,6 +408,55 @@ python scripts/stop_web.py
 
 - Access `Settings` → `Envrionment Variables` to configure LLM API, and other parameters.
 
+
+---
+
+## 🐳 Docker Deployment
+
+Pre-built Docker images are available on Alibaba Cloud Container Registry:
+
+| Region | Image |
+|---|---|
+| US West | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
+| China Beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
+
+```bash
+# Pull the image
+docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4
+
+# Start the service
+docker run -d \
+  --name sirchmunk \
+  -p 8584:8584 \
+  -e LLM_API_KEY="your-api-key-here" \
+  -e LLM_BASE_URL="https://api.openai.com/v1" \
+  -e LLM_MODEL_NAME="gpt-5.2" \
+  -e LLM_TIMEOUT=60.0 \
+  -e UI_THEME=light \
+  -e UI_LANGUAGE=en \
+  -e SIRCHMUNK_VERBOSE=false \
+  -v /path/to/your_work_path:/data/sirchmunk \
+  -v /path/to/your/docs:/mnt/docs:ro \
+  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4
+```
+
+Open http://localhost:8584 to access the WebUI, or call the API directly:
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:8584/api/v1/search",
+    json={
+        "query": "your search question here",
+        "paths": ["/mnt/docs"],
+        "mode": "DEEP",
+    },
+)
+print(response.json())
+```
+
+📖 **For full Docker parameters and usage, see [docker/README.md](docker/README.md)**.
 
 ---
 
@@ -705,7 +754,7 @@ Sirchmunk takes an **indexless approach**:
 <summary><b>What LLM providers are supported?</b></summary>
 
 Any OpenAI-compatible API endpoint, including (but not limited too):
-- OpenAI (GPT-4, GPT-4o, GPT-3.5)
+- OpenAI (GPT-5.2, ...)
 - Local models served via Ollama, llama.cpp, vLLM, SGLang etc.
 - Claude via API proxy
 

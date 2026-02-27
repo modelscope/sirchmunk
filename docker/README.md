@@ -4,8 +4,8 @@
 
 | Region | Image |
 |---|---|
-| US West | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2` |
-| China Beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2` |
+| US West | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
+| China Beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
 
 Image tag format: `ubuntu{ubuntu_version}-py{python_version}-{sirchmunk_version}`
 
@@ -17,10 +17,10 @@ Choose the registry closest to your location:
 
 ```bash
 # US West
-docker pull modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
+docker pull modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4
 
 # China Beijing
-docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
+docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4
 ```
 
 ### 2. Start the service
@@ -31,14 +31,14 @@ docker run -d \
   -p 8584:8584 \
   -e LLM_API_KEY="your-api-key-here" \
   -e LLM_BASE_URL="https://api.openai.com/v1" \
-  -e LLM_MODEL_NAME="gpt-4o" \
+  -e LLM_MODEL_NAME="gpt-5.2" \
   -e LLM_TIMEOUT=60.0 \
   -e UI_THEME=light \
   -e UI_LANGUAGE=en \
   -e SIRCHMUNK_VERBOSE=false \
   -v /path/to/your_work_path:/data/sirchmunk \
   -v /path/to/your/docs:/mnt/docs:ro \
-  modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.2
+  modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4
 ```
 
 **Parameters:**
