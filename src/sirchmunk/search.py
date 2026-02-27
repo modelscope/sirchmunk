@@ -1156,7 +1156,10 @@ class AgenticSearch(BaseSearch):
             best_file = await self._fast_find_best_file(fallback, **rga_kwargs)
 
         if not best_file:
-            await self._logger.warning("[FAST:Step2] No matching files found")
+            await self._logger.warning(
+                f"[FAST:Step2] No matching files found in paths: {paths}. "
+                "If files are PDFs/DOCX, ensure poppler-utils and pandoc are installed."
+            )
             return f"No relevant content found for query: '{query}'"
 
         file_path = best_file["path"]
@@ -1221,7 +1224,9 @@ class AgenticSearch(BaseSearch):
                 if results:
                     all_raw.extend(results)
             except Exception as exc:
-                await self._logger.debug(f"[FAST] rga literal search failed for '{kw}': {exc}")
+                await self._logger.warning(
+                    f"[FAST] rga literal search failed for '{kw}': {exc}"
+                )
 
         # Fallback: escaped-regex OR (handles adapters that only work in regex mode)
         if not all_raw and keywords:
@@ -1235,8 +1240,10 @@ class AgenticSearch(BaseSearch):
                 )
                 if results:
                     all_raw.extend(results)
-            except Exception:
-                pass
+            except Exception as exc:
+                await self._logger.warning(
+                    f"[FAST] rga regex search failed: {exc}"
+                )
 
         # Fallback: filename search
         if not all_raw:
@@ -1251,8 +1258,10 @@ class AgenticSearch(BaseSearch):
                         "path": fn_results[0]["path"],
                         "matches": [], "lines": [], "total_matches": 0,
                     }
-            except Exception:
-                pass
+            except Exception as exc:
+                await self._logger.warning(
+                    f"[FAST] filename search failed: {exc}"
+                )
             return None
 
         merged = GrepRetriever.merge_results(all_raw, limit=20)

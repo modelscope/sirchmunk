@@ -27,11 +27,14 @@ FROM {python_image} AS runtime
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
-# System dependencies
+# System dependencies + document processing adapters for rga
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         curl \
         git \
+        poppler-utils \
+        pandoc \
+        tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Install ripgrep
