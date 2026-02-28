@@ -276,50 +276,76 @@ def get_envs() -> Dict[str, Any]:
     )
 
 
+_chat_search_instance: Optional[AgenticSearch] = None
+_chat_search_config: Optional[tuple] = None
+_chat_search_lock = threading.Lock()
+
+
 def get_search_instance(log_callback=None):
-    """
-    Get configured search instance with optional log callback.
-    
-    Creates OpenAIChat instance with settings from environment variables (.env).
-    
+    """Get or create a cached AgenticSearch instance.
+
+    Uses double-checked locking to ensure thread-safe singleton creation
+    while keeping the fast path (reuse) lock-free.
+
+    The heavy resources (embedding model, knowledge storage) are
+    initialised only once.  Subsequent calls reuse the singleton and
+    merely swap the per-request ``log_callback`` via
+    ``update_log_callback``.
+
+    The instance is automatically recreated when the LLM configuration
+    (env vars) changes, e.g. after a settings update in the WebUI.
+
     Args:
-        log_callback: Optional callback for logging
-        
+        log_callback: Optional callback for streaming search logs
+
     Returns:
         Configured AgenticSearch instance
     """
-    # Get LLM configuration from settings storage (priority) or env variables (fallback)
+    global _chat_search_instance, _chat_search_config
+
     try:
         envs = get_envs()
-        
-        # Create OpenAI LLM instance with retrieved configuration
+    except Exception as e:
+        print(f"[WARNING] Please config ENVs: LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME. Error: {e}")
+        envs = {
+            "base_url": os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
+            "api_key": os.getenv("LLM_API_KEY", ""),
+            "model_name": os.getenv("LLM_MODEL_NAME", "gpt-5.2"),
+        }
+
+    current_config = (envs["api_key"], envs["base_url"], envs["model_name"])
+
+    # Fast path (lock-free): reuse existing instance when config unchanged
+    if _chat_search_instance is not None and current_config == _chat_search_config:
+        _chat_search_instance.update_log_callback(log_callback)
+        return _chat_search_instance
+
+    # Slow path: acquire lock and double-check before creating
+    with _chat_search_lock:
+        if _chat_search_instance is not None and current_config == _chat_search_config:
+            _chat_search_instance.update_log_callback(log_callback)
+            return _chat_search_instance
+
         llm = OpenAIChat(
             base_url=envs["base_url"],
             api_key=envs["api_key"],
             model=envs["model_name"],
             log_callback=log_callback,
         )
-        
-        # Read cluster reuse settings from environment
+
         enable_cluster_reuse = os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true"
         cluster_sim_threshold = float(os.getenv("CLUSTER_SIM_THRESHOLD", "0.85"))
         cluster_sim_top_k = int(os.getenv("CLUSTER_SIM_TOP_K", "3"))
 
-        return AgenticSearch(
+        _chat_search_instance = AgenticSearch(
             llm=llm,
             log_callback=log_callback,
             reuse_knowledge=enable_cluster_reuse,
             cluster_sim_threshold=cluster_sim_threshold,
             cluster_sim_top_k=cluster_sim_top_k,
         )
-
-    except Exception as e:
-        print(f"[WARNING] Please config ENVs: LLM_BASE_URL, LLM_API_KEY, LLM_MODEL_NAME. Error: {e}")
-        enable_cluster_reuse = os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true"
-        return AgenticSearch(
-            log_callback=log_callback,
-            reuse_knowledge=enable_cluster_reuse,
-        )
+        _chat_search_config = current_config
+        return _chat_search_instance
 
 
 _COOLDOWN_SECONDS = 1.0

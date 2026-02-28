@@ -501,6 +501,8 @@ class GrepRetriever(BaseRetriever):
         )
 
         returncode = result["returncode"]
+        stderr_str = result.get("stderr", "").strip()
+
         # Exit codes: 0 = matches found, 1 = no matches, 2 = partial errors
         # (some files failed preprocessing but results may still be present)
         if returncode in (0, 2):
@@ -515,12 +517,18 @@ class GrepRetriever(BaseRetriever):
                 return counts
             else:
                 stdout = result["stdout"]
-                return stdout if isinstance(stdout, list) else []
+                parsed = stdout if isinstance(stdout, list) else []
+                if returncode == 2 and not parsed and stderr_str:
+                    logger.warning(
+                        f"rga exit 2 with no results — preprocessing may have failed "
+                        f"(missing poppler-utils/pandoc?): {stderr_str[:300]}"
+                    )
+                return parsed
         elif returncode == 1:
             return []
         else:
             raise RuntimeError(
-                f"ripgrep-all failed (exit {returncode}): {result['stderr'].strip()}"
+                f"ripgrep-all failed (exit {returncode}): {stderr_str}"
             )
 
     @staticmethod
