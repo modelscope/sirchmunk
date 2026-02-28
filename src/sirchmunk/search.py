@@ -95,9 +95,13 @@ class AgenticSearch(BaseSearch):
         # Maximum number of queries to keep per cluster (FIFO strategy)
         self.max_queries_per_cluster: int = 5
 
-        # Initialize embedding client for cluster reuse
+        # Initialize embedding client for cluster reuse.
+        # EmbeddingUtil.__init__ is cheap (stores config only).  The heavy
+        # SentenceTransformer construction is deferred to start_loading(),
+        # which is called lazily on the first DEEP-mode cluster-reuse
+        # check so that FAST-mode searches never trigger model loading
+        # and never suffer from GIL contention.
         self.embedding_client = None
-        # Similarity threshold for cluster reuse
         self.cluster_sim_threshold: float = kwargs.pop('cluster_sim_threshold', 0.85)
         self.cluster_sim_top_k: int = kwargs.pop('cluster_sim_top_k', 3)
         if reuse_knowledge:
@@ -108,7 +112,7 @@ class AgenticSearch(BaseSearch):
                     cache_dir=str(self.work_path / ".cache" / "models")
                 )
                 _loguru_logger.info(
-                    f"Embedding client initialized: {self.embedding_client.get_model_info()}"
+                    "Embedding client created (model loading deferred until first use)"
                 )
             except Exception as e:
                 _loguru_logger.error(
@@ -140,6 +144,25 @@ class AgenticSearch(BaseSearch):
         self.spec_path.mkdir(parents=True, exist_ok=True)
         self._spec_lock = asyncio.Lock()  # guards concurrent spec writes
     
+    def update_log_callback(self, log_callback: LogCallback = None) -> None:
+        """Replace the per-request log callback on all sub-components.
+
+        This allows a singleton ``AgenticSearch`` instance to stream logs
+        through a different WebSocket / callback on every request without
+        having to reconstruct heavy resources (embedding model, knowledge
+        storage, etc.).
+        """
+        self._logger = create_logger(log_callback=log_callback, enable_async=True)
+
+        self.llm._logger = create_logger(log_callback=log_callback, enable_async=False)
+        self.llm._logger_async = create_logger(log_callback=log_callback, enable_async=True)
+
+        self.knowledge_base.log_callback = log_callback
+        self.knowledge_base._log = create_logger(log_callback=log_callback, enable_async=True)
+
+        # Reset per-request token accounting
+        self.llm_usages = []
+
     def _resolve_paths(
         self,
         paths: Optional[Union[str, Path, List[str], List[Path]]],
@@ -189,7 +212,13 @@ class AgenticSearch(BaseSearch):
         """
         if not self.embedding_client:
             return None
-        
+
+        # Skip cluster reuse while the embedding model is still loading in
+        # its background thread; kick off loading so it's ready next time.
+        if not self.embedding_client.is_ready():
+            self.embedding_client.start_loading()
+            return None
+
         try:
             await self._logger.info("Searching for similar knowledge clusters...")
             
@@ -229,7 +258,7 @@ class AgenticSearch(BaseSearch):
             existing_cluster.last_modified = datetime.now()
             
             # Recompute embedding with new query (before update to avoid double save)
-            if self.embedding_client:
+            if self.embedding_client and self.embedding_client.is_ready():
                 try:
                     from sirchmunk.utils.embedding_util import compute_text_hash
 
@@ -316,21 +345,18 @@ class AgenticSearch(BaseSearch):
                 await self._logger.warning(f"Failed to save knowledge cluster: {update_error}")
                 return
 
-        # Compute and store embedding for the cluster
-        if self.embedding_client:
+        # Compute and store embedding for the cluster (skip if model not ready)
+        if self.embedding_client and self.embedding_client.is_ready():
             try:
                 from sirchmunk.utils.embedding_util import compute_text_hash
 
-                # Combine queries for embedding
                 combined_text = self.knowledge_storage.combine_cluster_fields(
                     cluster.queries
                 )
                 text_hash = compute_text_hash(combined_text)
 
-                # Compute embedding
                 embedding_vector = (await self.embedding_client.embed([combined_text]))[0]
 
-                # Store embedding
                 await self.knowledge_storage.store_embedding(
                     cluster_id=cluster.id,
                     embedding_vector=embedding_vector,
@@ -1130,7 +1156,10 @@ class AgenticSearch(BaseSearch):
             best_file = await self._fast_find_best_file(fallback, **rga_kwargs)
 
         if not best_file:
-            await self._logger.warning("[FAST:Step2] No matching files found")
+            await self._logger.warning(
+                f"[FAST:Step2] No matching files found in paths: {paths}. "
+                "If files are PDFs/DOCX, ensure poppler-utils and pandoc are installed."
+            )
             return f"No relevant content found for query: '{query}'"
 
         file_path = best_file["path"]
@@ -1195,7 +1224,9 @@ class AgenticSearch(BaseSearch):
                 if results:
                     all_raw.extend(results)
             except Exception as exc:
-                await self._logger.debug(f"[FAST] rga literal search failed for '{kw}': {exc}")
+                await self._logger.warning(
+                    f"[FAST] rga literal search failed for '{kw}': {exc}"
+                )
 
         # Fallback: escaped-regex OR (handles adapters that only work in regex mode)
         if not all_raw and keywords:
@@ -1209,8 +1240,10 @@ class AgenticSearch(BaseSearch):
                 )
                 if results:
                     all_raw.extend(results)
-            except Exception:
-                pass
+            except Exception as exc:
+                await self._logger.warning(
+                    f"[FAST] rga regex search failed: {exc}"
+                )
 
         # Fallback: filename search
         if not all_raw:
@@ -1225,8 +1258,10 @@ class AgenticSearch(BaseSearch):
                         "path": fn_results[0]["path"],
                         "matches": [], "lines": [], "total_matches": 0,
                     }
-            except Exception:
-                pass
+            except Exception as exc:
+                await self._logger.warning(
+                    f"[FAST] filename search failed: {exc}"
+                )
             return None
 
         merged = GrepRetriever.merge_results(all_raw, limit=20)

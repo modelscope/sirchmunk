@@ -92,7 +92,7 @@ class Builder:
         "node_version": "20",
         "ubuntu_version": "22.04",
         "rg_version": "14.1.1",
-        "rga_version": "v1.0.0-alpha.5",
+        "rga_version": "v0.10.10",
         "port": "8584",
     }
 

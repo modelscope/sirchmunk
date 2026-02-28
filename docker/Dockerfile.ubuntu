@@ -27,12 +27,24 @@ FROM {python_image} AS runtime
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
 
-# System dependencies
+# System dependencies + rga adapters (see https://github.com/phiresky/ripgrep-all) + debug tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         curl \
         git \
-    && rm -rf /var/lib/apt/lists/*
+        poppler-utils \
+        pandoc \
+        tesseract-ocr \
+        ffmpeg \
+        vim \
+        less \
+        procps \
+        net-tools \
+        htop \
+    && rm -rf /var/lib/apt/lists/* \
+    && echo 'alias ll="ls -alF"' >> /etc/bash.bashrc \
+    && echo 'alias la="ls -A"' >> /etc/bash.bashrc \
+    && echo 'alias l="ls -CF"' >> /etc/bash.bashrc
 
 # Install ripgrep
 RUN curl -fsSL {github_proxy}https://github.com/BurntSushi/ripgrep/releases/download/{rg_version}/ripgrep_{rg_version}-1_amd64.deb \
