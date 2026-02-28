@@ -278,10 +278,14 @@ def get_envs() -> Dict[str, Any]:
 
 _chat_search_instance: Optional[AgenticSearch] = None
 _chat_search_config: Optional[tuple] = None
+_chat_search_lock = threading.Lock()
 
 
 def get_search_instance(log_callback=None):
     """Get or create a cached AgenticSearch instance.
+
+    Uses double-checked locking to ensure thread-safe singleton creation
+    while keeping the fast path (reuse) lock-free.
 
     The heavy resources (embedding model, knowledge storage) are
     initialised only once.  Subsequent calls reuse the singleton and
@@ -311,30 +315,37 @@ def get_search_instance(log_callback=None):
 
     current_config = (envs["api_key"], envs["base_url"], envs["model_name"])
 
+    # Fast path (lock-free): reuse existing instance when config unchanged
     if _chat_search_instance is not None and current_config == _chat_search_config:
         _chat_search_instance.update_log_callback(log_callback)
         return _chat_search_instance
 
-    llm = OpenAIChat(
-        base_url=envs["base_url"],
-        api_key=envs["api_key"],
-        model=envs["model_name"],
-        log_callback=log_callback,
-    )
+    # Slow path: acquire lock and double-check before creating
+    with _chat_search_lock:
+        if _chat_search_instance is not None and current_config == _chat_search_config:
+            _chat_search_instance.update_log_callback(log_callback)
+            return _chat_search_instance
 
-    enable_cluster_reuse = os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true"
-    cluster_sim_threshold = float(os.getenv("CLUSTER_SIM_THRESHOLD", "0.85"))
-    cluster_sim_top_k = int(os.getenv("CLUSTER_SIM_TOP_K", "3"))
+        llm = OpenAIChat(
+            base_url=envs["base_url"],
+            api_key=envs["api_key"],
+            model=envs["model_name"],
+            log_callback=log_callback,
+        )
 
-    _chat_search_instance = AgenticSearch(
-        llm=llm,
-        log_callback=log_callback,
-        reuse_knowledge=enable_cluster_reuse,
-        cluster_sim_threshold=cluster_sim_threshold,
-        cluster_sim_top_k=cluster_sim_top_k,
-    )
-    _chat_search_config = current_config
-    return _chat_search_instance
+        enable_cluster_reuse = os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true"
+        cluster_sim_threshold = float(os.getenv("CLUSTER_SIM_THRESHOLD", "0.85"))
+        cluster_sim_top_k = int(os.getenv("CLUSTER_SIM_TOP_K", "3"))
+
+        _chat_search_instance = AgenticSearch(
+            llm=llm,
+            log_callback=log_callback,
+            reuse_knowledge=enable_cluster_reuse,
+            cluster_sim_threshold=cluster_sim_threshold,
+            cluster_sim_top_k=cluster_sim_top_k,
+        )
+        _chat_search_config = current_config
+        return _chat_search_instance
 
 
 _COOLDOWN_SECONDS = 1.0
