@@ -74,29 +74,44 @@ def get_node_version() -> Optional[str]:
         return None
 
 
+def _is_valid_web_dir(path: Path) -> bool:
+    """Return True if *path* looks like a Next.js web source directory."""
+    return path.is_dir() and (path / "package.json").exists()
+
+
 def find_web_source_dir() -> Optional[Path]:
     """Locate the Next.js web source directory.
 
     Search order:
-    1. ``<project_root>/web`` (development / git clone)
-    2. ``<package_root>/../../../web`` (pip-installed package)
+    1. ``SIRCHMUNK_WEB_DIR`` environment variable (explicit override)
+    2. ``<project_root>/web`` (development / editable install)
+    3. Bundled ``sirchmunk._web`` package (pip-installed wheel)
 
     Returns:
         Path to ``web/`` directory, or None if not found
     """
-    # Strategy 1: relative to this file -> project root / web
-    pkg_root = Path(__file__).resolve().parent.parent  # src/sirchmunk
-    project_root = pkg_root.parent.parent  # workspace root
-    candidate = project_root / "web"
-    if candidate.is_dir() and (candidate / "package.json").exists():
-        return candidate
-
-    # Strategy 2: environment variable override
+    # Strategy 1: environment variable override (highest priority)
     env_web = os.getenv("SIRCHMUNK_WEB_DIR")
     if env_web:
         p = Path(env_web).expanduser().resolve()
-        if p.is_dir() and (p / "package.json").exists():
+        if _is_valid_web_dir(p):
             return p
+
+    # Strategy 2: relative to this file -> project root / web
+    pkg_root = Path(__file__).resolve().parent.parent  # sirchmunk package
+    project_root = pkg_root.parent.parent  # workspace root
+    candidate = project_root / "web"
+    if _is_valid_web_dir(candidate):
+        return candidate
+
+    # Strategy 3: bundled inside the installed package (sirchmunk._web)
+    try:
+        import sirchmunk._web as _web_pkg  # noqa: F811
+        p = Path(_web_pkg.__file__).resolve().parent
+        if _is_valid_web_dir(p):
+            return p
+    except ImportError:
+        pass
 
     return None
 
@@ -156,6 +171,29 @@ def build_frontend(
         _print("  ✗ Cannot locate web/ source directory.")
         _print("    Set SIRCHMUNK_WEB_DIR environment variable if needed.")
         return False
+
+    # When the source lives inside site-packages (pip install), copy it to
+    # a writable location so that npm install / npm run build can write
+    # node_modules / .next / out without polluting the installed package.
+    web_dir_str = str(web_dir)
+    if "site-packages" in web_dir_str or "dist-packages" in web_dir_str:
+        writable_web = work_path / ".cache" / "web_source"
+        _print(f"  Web source (bundled): {web_dir}")
+        _print(f"  Copying to writable location: {writable_web}")
+        try:
+            if writable_web.exists():
+                shutil.rmtree(writable_web)
+            shutil.copytree(
+                web_dir,
+                writable_web,
+                ignore=shutil.ignore_patterns(
+                    "node_modules", ".next", "out", "__pycache__", "*.pyc",
+                ),
+            )
+            web_dir = writable_web
+        except Exception as e:
+            _print(f"  ✗ Failed to copy bundled web source: {e}")
+            return False
 
     _print(f"  Web source: {web_dir}")
 
