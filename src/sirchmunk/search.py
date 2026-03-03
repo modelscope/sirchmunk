@@ -166,19 +166,17 @@ class AgenticSearch(BaseSearch):
     def _resolve_paths(
         self,
         paths: Optional[Union[str, Path, List[str], List[Path]]],
-    ) -> Union[str, Path, List[str], List[Path]]:
-        """Resolve paths with fallback chain: arg > self.paths > cwd.
+    ) -> List[str]:
+        """Resolve and normalise paths: arg > self.paths > cwd.
 
-        Args:
-            paths: Caller-provided paths (may be None).
-
-        Returns:
-            Non-None search paths (original type preserved when provided).
+        Always returns ``List[str]`` so callers need no further coercion.
         """
         if paths is not None:
-            return paths
+            if isinstance(paths, (str, Path)):
+                return [str(paths)]
+            return [str(p) for p in paths]
         if self.paths is not None:
-            return self.paths
+            return list(self.paths)
         cwd = str(Path.cwd())
         _loguru_logger.info(
             f"[paths] No paths provided; using current working directory: {cwd}"
@@ -195,20 +193,11 @@ class AgenticSearch(BaseSearch):
         except Exception as e:
             print(f"[WARNING] Failed to load historical knowledge: {e}")
     
-    async def _try_reuse_cluster(
-        self, 
-        query: str, 
-        return_cluster: bool = False
-    ) -> Optional[Union[str, KnowledgeCluster]]:
-        """
-        Try to reuse existing knowledge cluster based on semantic similarity.
-        
-        Args:
-            query: Search query string
-            return_cluster: Whether to return the full cluster object or just content string
-        
+    async def _try_reuse_cluster(self, query: str) -> Optional[KnowledgeCluster]:
+        """Try to reuse existing knowledge cluster based on semantic similarity.
+
         Returns:
-            Cluster content string or KnowledgeCluster object if found, None otherwise
+            KnowledgeCluster if a suitable cached cluster is found, None otherwise.
         """
         if not self.embedding_client:
             return None
@@ -281,22 +270,18 @@ class AgenticSearch(BaseSearch):
             # Single update call - saves cluster data and embedding together
             await self.knowledge_storage.update(existing_cluster)
             
+            # Validate cluster has usable content
+            content = existing_cluster.content
+            if isinstance(content, list):
+                content = "\n".join(content)
+            if not content:
+                await self._logger.warning(
+                    f"Cluster {existing_cluster.id} has empty content, falling back to full search"
+                )
+                return None
+
             await self._logger.success("Reused existing knowledge cluster")
-            
-            # Return based on return_cluster flag
-            if return_cluster:
-                return existing_cluster
-            else:
-                # Format and return cluster content as string
-                content = existing_cluster.content
-                if isinstance(content, list):
-                    content = "\n".join(content)
-                if not content:
-                    await self._logger.warning(
-                        f"Cluster {existing_cluster.id} has empty content, falling back to full search"
-                    )
-                    return None
-                return str(content)
+            return existing_cluster
         
         except Exception as e:
             await self._logger.warning(
@@ -385,6 +370,22 @@ class AgenticSearch(BaseSearch):
         except Exception as e:
             await self._logger.warning(f"Parquet force_sync failed: {e}")
     
+    @staticmethod
+    def _make_answer_cluster(
+        query: str, answer: str, prefix: str = "FS",
+    ) -> KnowledgeCluster:
+        """Create a lightweight KnowledgeCluster wrapping an answer string."""
+        _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
+        cluster = KnowledgeCluster(
+            id=f"{prefix}{_digest}",
+            name=query[:60],
+            description=[f"Search result for: {query}"],
+            content=answer,
+            queries=[query],
+        )
+        cluster.search_results.append(answer)
+        return cluster
+
     async def _search_by_filename(
         self,
         query: str,
@@ -632,7 +633,7 @@ class AgenticSearch(BaseSearch):
         return registry
 
     # ------------------------------------------------------------------
-    # Unified search — DEEP (parallel multi-path) or FILENAME_ONLY
+    # Unified search entry point
     # ------------------------------------------------------------------
 
     async def search(
@@ -659,8 +660,8 @@ class AgenticSearch(BaseSearch):
             | Mode         | Speed / LLM Calls | Description                               |
             +--------------+-------------------+-------------------------------------------+
             | FILENAME_ONLY| Very Fast / 0     | Pattern-based file discovery, no LLM.     |
-            | FAST         | 1-5s / 2          | Greedy: keyword search → read best file   |
-            |              |                   | → answer. Stops at first good evidence.   |
+            | FAST         | 1-5s / 0-2        | Greedy: cluster reuse or keyword search    |
+            |              |                   | → best file → answer. Early termination.  |
             | DEEP         | 5-30s / 4-6       | Parallel multi-path retrieval + ReAct     |
             |              |                   | refinement with Monte-Carlo evidence.     |
             +--------------+-------------------+-------------------------------------------+
@@ -668,6 +669,8 @@ class AgenticSearch(BaseSearch):
         FAST architecture (greedy early-termination):
 
         ┌──────────────────────────────────────────────────────────┐
+        │ Step 0  Cluster reuse check (instant short-circuit)       │
+        ├──────────────────────────────────────────────────────────┤
         │ Step 1  LLM query analysis → keywords + file hints       │
         │         (single call, stream=False)                      │
         ├──────────────────────────────────────────────────────────┤
@@ -736,66 +739,74 @@ class AgenticSearch(BaseSearch):
             - ``KnowledgeCluster``: If *return_cluster*.
             - ``List[Dict]``: File matches in FILENAME_ONLY mode.
         """
-        # Resolve paths: argument > self.paths > cwd
         paths = self._resolve_paths(paths)
 
-        # ---- FILENAME_ONLY: fast pattern-based filename search, no LLM ----
+        # ---- FILENAME_ONLY: pattern-based file discovery, no LLM ----
         if mode == "FILENAME_ONLY":
-            filename_results: List[Dict[str, Any]] = await self._search_by_filename(
-                query=query,
-                paths=paths,
-                max_depth=max_depth,
-                include=include,
-                exclude=exclude,
-                top_k=top_k_files,
+            results = await self._search_by_filename(
+                query=query, paths=paths, max_depth=max_depth,
+                include=include, exclude=exclude, top_k=top_k_files,
             )
-            if not filename_results:
-                error_msg = f"No files found matching query: '{query}'"
-                await self._logger.warning(error_msg)
-                return None if return_cluster else error_msg
-            await self._logger.success(f"Retrieved {len(filename_results)} matching files")
-            return filename_results
+            if not results:
+                msg = f"No files found matching query: '{query}'"
+                await self._logger.warning(msg)
+                return None if return_cluster else msg
+            await self._logger.success(f"Retrieved {len(results)} matching files")
+            return results
 
-        # ---- Normalize paths (shared by FAST and DEEP) ----
-        if isinstance(paths, (str, Path)):
-            paths = [str(paths)]
-        else:
-            paths = [str(p) for p in paths]
-
-        # ---- FAST mode: greedy search with early termination ----
+        # ---- FAST / DEEP → both produce (answer, optional cluster) ----
         if mode == "FAST":
             answer = await self._search_fast(
-                query=query,
-                paths=paths,
-                max_depth=max_depth,
-                top_k_files=top_k_files,
-                include=include,
-                exclude=exclude,
+                query=query, paths=paths, max_depth=max_depth,
+                top_k_files=top_k_files, include=include, exclude=exclude,
             )
-            if return_cluster:
-                _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
-                cluster = KnowledgeCluster(
-                    id=f"FS{_digest}",
-                    name=query[:60],
-                    description=[f"FAST search result for: {query}"],
-                    content=answer,
-                    queries=[query],
-                )
-                cluster.search_results.append(answer)
-                return cluster
-            if return_context:
-                return answer, SearchContext()
-            return answer
+            cluster: Optional[KnowledgeCluster] = None
+            context = SearchContext()
+        else:
+            answer, cluster, context = await self._search_deep(
+                query=query, paths=paths,
+                max_loops=max_loops, max_token_budget=max_token_budget,
+                max_depth=max_depth, top_k_files=top_k_files,
+                enable_dir_scan=enable_dir_scan,
+                include=include, exclude=exclude,
+                spec_stale_hours=spec_stale_hours,
+            )
 
-        # ---- DEEP mode: parallel multi-path retrieval ----
+        # ---- Unified return wrapping ----
+        if return_cluster:
+            prefix = "FS" if mode == "FAST" else "DS"
+            return cluster or self._make_answer_cluster(query, answer, prefix)
+        if return_context:
+            return answer, context
+        return answer
 
+    # ------------------------------------------------------------------
+    # DEEP mode — parallel multi-path retrieval with ReAct fallback
+    # ------------------------------------------------------------------
+
+    async def _search_deep(
+        self,
+        query: str,
+        paths: List[str],
+        *,
+        max_loops: int = 10,
+        max_token_budget: int = 64000,
+        max_depth: Optional[int] = 5,
+        top_k_files: int = 3,
+        enable_dir_scan: bool = True,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        spec_stale_hours: float = 72.0,
+    ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
+        """Parallel multi-path retrieval pipeline (Phases 0a–5).
+
+        Returns:
+            ``(answer, cluster, context)`` tuple.
+        """
         context = SearchContext(
             max_token_budget=max_token_budget,
             max_loops=max_loops,
         )
-
-        # Snapshot self.llm_usages so we can sync only THIS call's tokens
-        # into context at the end.
         _llm_usage_start = len(self.llm_usages)
 
         # ==============================================================
@@ -803,29 +814,17 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         direct = await self._try_direct_doc_analysis(query, paths)
         if direct is not None:
-            if return_cluster:
-                _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
-                cluster = KnowledgeCluster(
-                    id=f"DQ{_digest}",
-                    name=query,
-                    description=[f"Direct document analysis for: {query}"],
-                    content=direct,
-                    queries=[query],
-                )
-                cluster.search_results.append(direct)
-                return cluster
-            if return_context:
-                return direct, context
-            return direct
+            return direct, self._make_answer_cluster(query, direct, "DQ"), context
 
         # ==============================================================
         # Phase 0: Cluster reuse (instant short-circuit)
         # ==============================================================
-        reused = await self._try_reuse_cluster(query, return_cluster=return_cluster)
-        if reused:
-            if return_context:
-                return reused, context
-            return reused
+        reused = await self._try_reuse_cluster(query)
+        if reused is not None:
+            content = reused.content
+            if isinstance(content, list):
+                content = "\n".join(content)
+            return str(content), reused, context
 
         await self._logger.info(f"[search] Starting multi-path retrieval for: '{query[:80]}'")
 
@@ -833,7 +832,7 @@ class AgenticSearch(BaseSearch):
         # Phase 1: Parallel probing — all four paths fire concurrently
         # ==============================================================
         await self._logger.info("[Phase 1] Parallel probing: keywords + dir_scan + knowledge + spec_cache")
-        context.increment_loop()  # Phase 1
+        context.increment_loop()
 
         phase1_results = await asyncio.gather(
             self._probe_keywords(query),
@@ -843,13 +842,11 @@ class AgenticSearch(BaseSearch):
             return_exceptions=True,
         )
 
-        # Unpack Phase 1 results (gracefully handle failures)
         kw_result = phase1_results[0] if not isinstance(phase1_results[0], Exception) else ({}, [])
         scan_result = phase1_results[1] if not isinstance(phase1_results[1], Exception) else None
         knowledge_hits = phase1_results[2] if not isinstance(phase1_results[2], Exception) else []
         spec_context = phase1_results[3] if not isinstance(phase1_results[3], Exception) else ""
 
-        # Log any Phase 1 failures
         for i, label in enumerate(["keywords", "dir_scan", "knowledge", "spec_cache"]):
             if isinstance(phase1_results[i], Exception):
                 await self._logger.warning(f"[Phase 1] {label} probe failed: {phase1_results[i]}")
@@ -867,24 +864,20 @@ class AgenticSearch(BaseSearch):
         # Phase 2: Parallel retrieval — keyword search + dir_scan rank
         # ==============================================================
         await self._logger.info("[Phase 2] Parallel retrieval: rga keyword search + dir_scan LLM rank")
-        context.increment_loop()  # Phase 2
+        context.increment_loop()
 
         phase2_tasks = []
 
-        # Path A: keyword search via rga (depends on extracted keywords)
         if initial_keywords:
             phase2_tasks.append(
                 self._retrieve_by_keywords(
                     initial_keywords, paths,
-                    max_depth=max_depth,
-                    include=include,
-                    exclude=exclude,
+                    max_depth=max_depth, include=include, exclude=exclude,
                 )
             )
         else:
             phase2_tasks.append(self._async_noop([]))
 
-        # Path B: LLM rank of dir_scan candidates (depends on scan result)
         if scan_result is not None and enable_dir_scan:
             phase2_tasks.append(
                 self._rank_dir_scan_candidates(query, scan_result)
@@ -909,7 +902,7 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         # Phase 3: Merge file paths + build KnowledgeCluster
         # ==============================================================
-        context.increment_loop()  # Phase 3
+        context.increment_loop()
         merged_files = self._merge_file_paths(
             keyword_files=keyword_files,
             dir_scan_files=dir_scan_files,
@@ -920,56 +913,40 @@ class AgenticSearch(BaseSearch):
         cluster: Optional[KnowledgeCluster] = None
         if merged_files:
             cluster = await self._build_cluster(
-                query=query,
-                file_paths=merged_files,
-                query_keywords=query_keywords,
-                top_k_files=top_k_files,
+                query=query, file_paths=merged_files,
+                query_keywords=query_keywords, top_k_files=top_k_files,
             )
 
         # ==============================================================
         # Phase 4: Generate answer — cluster summary or ReAct refinement
         # ==============================================================
-        context.increment_loop()  # Phase 4
+        context.increment_loop()
         answer: str = ""
 
         if cluster and cluster.content:
-            # Evidence sufficient → generate summary from cluster
             await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
             answer = await self._summarise_cluster(query, cluster)
             cluster.search_results.append(answer)
         else:
-            # Evidence insufficient → fall back to ReAct agent
             await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
             answer, context = await self._react_refinement(
-                query=query,
-                paths=paths,
-                initial_keywords=initial_keywords,
-                spec_context=spec_context,
+                query=query, paths=paths,
+                initial_keywords=initial_keywords, spec_context=spec_context,
                 enable_dir_scan=enable_dir_scan,
-                max_loops=max_loops,
-                max_token_budget=max_token_budget,
-                max_depth=max_depth,
-                include=include,
-                exclude=exclude,
+                max_loops=max_loops, max_token_budget=max_token_budget,
+                max_depth=max_depth, include=include, exclude=exclude,
             )
 
-            # Try building cluster from ReAct discoveries
             if not cluster:
                 cluster = await self._build_cluster_from_context(
-                    query=query,
-                    answer=answer,
-                    context=context,
-                    query_keywords=query_keywords,
-                    top_k_files=top_k_files,
+                    query=query, answer=answer, context=context,
+                    query_keywords=query_keywords, top_k_files=top_k_files,
                 )
             elif answer and not cluster.content:
                 cluster.content = answer
                 cluster.search_results.append(answer)
 
-        # Sync LLM token accounting into context for accurate summary.
-        # All parallel probes / builders append to self.llm_usages;
-        # the ReAct agent (if used) has its own context.llm_usages.
-        # Merge both directions so context.summary() is accurate.
+        # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
         for usage in new_usages:
             if usage and isinstance(usage, dict):
@@ -985,23 +962,11 @@ class AgenticSearch(BaseSearch):
         if cluster:
             self._add_query_to_cluster(cluster, query)
             phase5_tasks.append(self._save_cluster_with_embedding(cluster))
-
         phase5_tasks.append(self._save_spec_context(paths, context, scan_result=scan_result))
-
-        # Await all persistence tasks concurrently so that embeddings are
-        # fully written to DuckDB before search() returns.  Previous
-        # fire-and-forget (ensure_future) caused a race where the process
-        # could exit before store_embedding completed, leaving parquet
-        # with NULL embedding vectors.
         await asyncio.gather(*phase5_tasks, return_exceptions=True)
 
         await self._logger.success(f"[search] Complete: {context.summary()}")
-
-        if return_cluster and cluster:
-            return cluster
-        if return_context:
-            return answer, context
-        return answer
+        return answer, cluster, context
 
     # ------------------------------------------------------------------
     # Phase 0a: Direct document analysis (intent-gated)
@@ -1087,6 +1052,8 @@ class AgenticSearch(BaseSearch):
 
         Architecture:
             ┌──────────────────────────────────────────────────────────┐
+            │ Step 0  Cluster reuse check (instant short-circuit)       │
+            ├──────────────────────────────────────────────────────────┤
             │ Step 1  LLM → primary + fallback keywords (stream=False) │
             │ Step 2  rga cascade: primary → fallback → filename       │
             │ Step 3  Context sampling around grep hit lines            │
@@ -1105,6 +1072,17 @@ class AgenticSearch(BaseSearch):
             Answer string from LLM.
         """
         await self._logger.info(f"[FAST] Starting greedy search for: '{query[:80]}'")
+
+        # ==============================================================
+        # Step 0: Cluster reuse — instant short-circuit (no LLM cost)
+        # ==============================================================
+        reused = await self._try_reuse_cluster(query)
+        if reused is not None:
+            content = reused.content
+            if isinstance(content, list):
+                content = "\n".join(content)
+            await self._logger.success("[FAST] Reused cached knowledge cluster")
+            return str(content)
 
         # ==============================================================
         # Step 1: LLM → 2-level keywords in one call (stream=False)
@@ -1754,17 +1732,7 @@ class AgenticSearch(BaseSearch):
 
         # Fallback: lightweight cluster from answer text
         try:
-            # Use deterministic hash (Python's hash() varies across processes)
-            _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
-            cluster = KnowledgeCluster(
-                id=f"R{_digest}",
-                name=query[:60],
-                description=[f"ReAct deep search result for: {query}"],
-                content=answer,
-                queries=[query],
-            )
-            cluster.search_results.append(answer)
-            return cluster
+            return self._make_answer_cluster(query, answer, prefix="R")
         except Exception:
             return None
 

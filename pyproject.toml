@@ -35,9 +35,19 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 include-package-data = true
 
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["sirchmunk*"]
+[tool.setuptools.package-data]
+"sirchmunk._web" = [
+  "*.js", "*.json", "*.css", "*.ts",
+  ".prettierrc*", ".prettierignore",
+  "next-env.d.ts",
+  "app/**", "components/**", "context/**", "hooks/**", "lib/**",
+  "public/**", "types/**",
+]
+
+[tool.setuptools.exclude-package-data]
+"sirchmunk._web" = [
+  "node_modules/**", ".next/**", "out/**", "__pycache__/**",
+]
 
 [tool.setuptools.dynamic]
 version = {attr = "sirchmunk.version.__version__"}
