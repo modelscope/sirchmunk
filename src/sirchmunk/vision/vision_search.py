@@ -95,6 +95,7 @@ class VisionSearch:
         clip_model_id: str = DEFAULT_CLIP_MODEL,
         clip_batch_size: int = 32,
         max_scan_depth: int = 10,
+        memory: Optional[AgentMemory] = None,
     ):
         self._vlm = vlm or VLMClient()
         self._work_path = work_path
@@ -123,7 +124,7 @@ class VisionSearch:
         self._verifier = BatchVerifier(self._vlm)
         self._scout_top_k = scout_top_k
 
-        self._memory = AgentMemory(
+        self._memory = memory or AgentMemory(
             db_path=os.path.join(work_path, "agent_memory.duckdb"),
         )
 

@@ -727,6 +727,7 @@ class AgenticSearch(BaseSearch):
         self._vision_search = VisionSearch(
             vlm=vlm,
             work_path=vision_work,
+            memory=self._agent_memory,
         )
         _loguru_logger.info(
             f"VisionSearch initialised (work_path={vision_work})"

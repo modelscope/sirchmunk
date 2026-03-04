@@ -17,6 +17,12 @@ from sirchmunk.schema.knowledge import KnowledgeCluster
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.search import AgenticSearch
 
+try:
+    from sirchmunk.vision.vision_search import VisionSearchResult
+    _HAS_VISION = True
+except ImportError:
+    _HAS_VISION = False
+
 
 # ------------------------------------------------------------------ #
 # Test configuration — loaded from .env.test
@@ -233,10 +239,85 @@ class TestSearchFilenameOnly(_BaseSearchTest):
 
 
 # ================================================================== #
-#  VISION DISPATCH (query_images)                                      #
+#  VISION AUTO-DETECT (text query triggers vision pipeline)            #
 # ================================================================== #
 
-class TestSearchVisionDispatch(_BaseSearchTest):
+@unittest.skipUnless(_HAS_VISION, "Vision dependencies not installed")
+class TestSearchVisionAutoDetect(_BaseSearchTest):
+    """Vision search triggered by LLM-detected image intent (COCO2017)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.vision_paths = _cfg_list("TEST_VISION_SEARCH_PATHS")
+        if not cls.vision_paths:
+            raise unittest.SkipTest(
+                "TEST_VISION_SEARCH_PATHS not configured in .env.test"
+            )
+
+    def _assert_vision_results(self, results: list):
+        """Shared assertion helper for VisionSearchResult lists."""
+        self.assertIsInstance(results, list)
+        self.assertTrue(len(results) > 0, "Expected at least one vision result")
+        for r in results:
+            self.assertIsInstance(r, VisionSearchResult)
+            self.assertTrue(
+                os.path.isfile(r.path),
+                f"Result path does not exist: {r.path}",
+            )
+            self.assertGreaterEqual(r.confidence, 0.0)
+            self.assertTrue(len(r.path) > 0)
+
+    def test_vision_fast_returns_results(self):
+        """FAST vision: COCO2017 query returns VisionSearchResult list."""
+        query = _cfg(
+            "TEST_QUERY_VISION_FAST",
+            "find photos of dogs playing outdoors",
+        )
+        result = self._run(self.searcher.search(
+            query=query,
+            paths=self.vision_paths,
+            mode="FAST",
+        ))
+        self._assert_vision_results(result)
+        for r in result:
+            self.assertEqual(r.source, "fast_pipeline")
+
+    def test_vision_deep_returns_results(self):
+        """DEEP vision: COCO2017 query returns verified VisionSearchResult."""
+        query = _cfg(
+            "TEST_QUERY_VISION_DEEP",
+            "find all images containing a red fire truck on the street",
+        )
+        result = self._run(self.searcher.search(
+            query=query,
+            paths=self.vision_paths,
+            mode="DEEP",
+        ))
+        self._assert_vision_results(result)
+
+    def test_vision_result_has_caption(self):
+        """DEEP vision results should carry VLM-generated captions."""
+        result = self._run(self.searcher.search(
+            query="find images of people riding bicycles",
+            paths=self.vision_paths,
+            mode="DEEP",
+        ))
+        self._assert_vision_results(result)
+        captioned = [r for r in result if r.caption]
+        self.assertTrue(
+            len(captioned) > 0,
+            "At least one DEEP result should have a VLM caption",
+        )
+
+
+# ================================================================== #
+#  VISION DISPATCH (explicit query_images)                             #
+# ================================================================== #
+
+@unittest.skipUnless(_HAS_VISION, "Vision dependencies not installed")
+class TestSearchVisionQueryImages(_BaseSearchTest):
+    """Vision search with explicit reference images (image-to-image)."""
 
     def setUp(self):
         if not self.query_images:
@@ -252,6 +333,23 @@ class TestSearchVisionDispatch(_BaseSearchTest):
         ))
 
         self.assertIsInstance(result, list)
+        if result:
+            self.assertIsInstance(result[0], VisionSearchResult)
+
+    def test_query_images_deep_mode(self):
+        """DEEP mode with query_images returns verified results."""
+        result = self._run(self.searcher.search(
+            query="find similar images",
+            paths=self.search_paths,
+            query_images=self.query_images,
+            mode="DEEP",
+        ))
+
+        self.assertIsInstance(result, list)
+        if result:
+            for r in result:
+                self.assertIsInstance(r, VisionSearchResult)
+                self.assertTrue(os.path.isfile(r.path))
 
 
 if __name__ == "__main__":

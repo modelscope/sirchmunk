@@ -8,6 +8,10 @@ This client uses ``httpx`` directly (rather than the ``openai`` SDK)
 because multimodal payloads require fine-grained control over the
 ``content`` array structure.
 
+Streaming is enabled by default for better timeout resilience with
+large multimodal payloads.  Callers receive the same ``VLMResponse``
+regardless of streaming mode — SSE chunks are assembled internally.
+
 Environment variables (all optional, overridden by constructor args):
     VLM_BASE_URL  – API base URL   (default: DashScope compatible endpoint)
     VLM_API_KEY   – Bearer token
@@ -18,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import mimetypes
 import os
 from dataclasses import dataclass, field
@@ -145,7 +150,7 @@ class VLMClient:
             "messages": messages,
             "max_tokens": kwargs.pop("max_tokens", self.max_tokens),
             "temperature": temperature,
-            "stream": False,
+            "stream": kwargs.pop("stream", True),
             "enable_thinking": kwargs.pop("enable_thinking", False),
         }
         body.update(kwargs)
@@ -161,30 +166,77 @@ class VLMClient:
             finish_reason=choice.get("finish_reason", ""),
         )
 
+    async def _achat_stream(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        payload: Dict[str, Any],
+    ) -> VLMResponse:
+        """Consume an SSE stream and assemble a complete VLMResponse."""
+        parts: List[str] = []
+        usage: Dict[str, int] = {}
+        model = ""
+        finish = ""
+
+        async with client.stream(
+            "POST", url, headers=self._headers(), json=payload,
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choice = (chunk.get("choices") or [{}])[0]
+                delta = choice.get("delta", {})
+                if delta.get("content"):
+                    parts.append(delta["content"])
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                if chunk.get("model"):
+                    model = chunk["model"]
+
+        return VLMResponse(
+            content="".join(parts),
+            usage=usage,
+            model=model,
+            finish_reason=finish,
+        )
+
     async def achat(
         self,
         messages: List[Dict],
         temperature: float = 0.2,
         **kwargs: Any,
     ) -> VLMResponse:
-        """Async (non-streaming) chat completion."""
+        """Async chat completion (streaming by default)."""
         payload = self._payload(messages, temperature, **kwargs)
+        is_stream = payload.get("stream", True)
         n_images = sum(
             1 for m in messages for c in (m.get("content") or [])
             if isinstance(c, dict) and c.get("type") == "image_url"
         )
         print(
             f"      [VLMClient] achat → model={self.model}, "
-            f"images={n_images}, temp={temperature}"
+            f"images={n_images}, temp={temperature}, stream={is_stream}"
         )
+        url = f"{self.base_url}/chat/completions"
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers=self._headers(),
-                json=payload,
-            )
-            resp.raise_for_status()
-            result = self._parse(resp.json())
+            if is_stream:
+                result = await self._achat_stream(client, url, payload)
+            else:
+                resp = await client.post(
+                    url, headers=self._headers(), json=payload,
+                )
+                resp.raise_for_status()
+                result = self._parse(resp.json())
             print(
                 f"      [VLMClient] achat ← {len(result.content)} chars, "
                 f"usage={result.usage}, finish={result.finish_reason}"
@@ -197,7 +249,8 @@ class VLMClient:
         temperature: float = 0.2,
         **kwargs: Any,
     ) -> VLMResponse:
-        """Synchronous chat completion."""
+        """Synchronous (non-streaming) chat completion."""
+        kwargs.setdefault("stream", False)
         payload = self._payload(messages, temperature, **kwargs)
         n_images = sum(
             1 for m in messages for c in (m.get("content") or [])
