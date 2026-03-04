@@ -20,7 +20,6 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 from sirchmunk.version import __version__
 
@@ -881,7 +880,7 @@ def _setup_stdio_safe_environment():
     In MCP stdio mode, stdout is reserved exclusively for JSON-RPC messages.
     Any non-JSON output to stdout will break the protocol.
     """
-    os.environ["MODELSCOPE_LOG_LEVEL"] = "ERROR"
+    os.environ["MODELSCOPE_LOG_LEVEL"] = str(logging.ERROR)
     os.environ["MODELSCOPE_CACHE"] = os.path.expanduser("~/.sirchmunk/.cache/models")
     os.environ["TRANSFORMERS_VERBOSITY"] = "error"
     os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"

@@ -427,16 +427,17 @@ async def run_http_server(config: Config) -> None:
     
     # Create server
     mcp = create_server(config)
-    
-    # Run with HTTP transport using uvicorn
+
     try:
         import uvicorn
-        uvicorn.run(
+        uv_config = uvicorn.Config(
             mcp.sse_app(),
             host=config.mcp.host,
             port=config.mcp.port,
             log_level="info",
         )
+        server = uvicorn.Server(uv_config)
+        await server.serve()
     except ImportError:
         raise RuntimeError(
             "HTTP transport requires uvicorn. Install with: pip install uvicorn"
@@ -448,12 +449,6 @@ async def main() -> None:
     
     Loads configuration and starts the appropriate transport server.
     """
-    # Configure logging — explicit stderr to keep stdout clean for MCP JSON-RPC.
-    # ``force=True`` is required because third-party libraries imported at
-    # module level (modelscope, transformers, etc.) may have already added
-    # handlers to the root logger, which causes ``basicConfig()`` to silently
-    # become a no-op.  With ``force``, existing handlers are removed and a
-    # fresh StreamHandler(stderr) is guaranteed.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
