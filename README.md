@@ -43,7 +43,7 @@ Intelligence pipelines built upon vector-based retrieval can be _rigid and britt
 
 ## ✨ Key Features
 
-### 1. Embedding-Free: Data in its Purest Form
+### 1. EmbeddingDB-Free: Data in its Purest Form
 
 **Sirchmunk** works directly with **raw data** -- bypassing the heavy overhead of squeezing your rich files into fixed-dimensional vectors.
 
@@ -149,6 +149,12 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 
 ## 🎉 News
+
+* 🚀 **Mar 5, 2026**: Sirchmunk v0.0.5
+  - **Breaking Change**: Unified Search API: Streamlined search() interface with a new SearchContext object and simplified parameter control (return_context).
+  - **Robust RAG Chat**: Significantly improved conversational reliability through new retry mechanisms and granular exception handling.
+  - **Stable MCP Integration**: Fixed mcp run initialization issues, ensuring seamless server deployment for Model Context Protocol users.
+  - **PyPI Web UI Fix**: Corrected Next.js source bundling to support flawless Web UI startup for standard pip install users.
 
 * 🚀 **Feb 27, 2026**: Sirchmunk v0.0.4
   - **Docker Support**: First-class Docker deployment with pre-built images for seamless containerized setup.
