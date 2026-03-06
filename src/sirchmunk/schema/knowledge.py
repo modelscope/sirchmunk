@@ -257,18 +257,11 @@ class KnowledgeCluster:
         """
         Return a concise representation for debugging.
         """
-        # Get content length
-        content_len = 0
-        if isinstance(self.content, str):
-            content_len = len(self.content)
-        elif isinstance(self.content, list):
-            content_len = sum(len(c) for c in self.content)
-        
         return (
             f"KnowledgeCluster(id={self.id!r}, name={self.name!r}, "
             f"version={self.version}, lifecycle={self.lifecycle.value}, "
-            f"evidences={len(self.evidences)}, queries={len(self.queries)}, "
-            f"content_len={content_len}, search_results={len(self.search_results)})"
+            f"evidences={self.evidences}, queries={self.queries}, "
+            f"content={self.content}, search_results={self.search_results}"
         )
 
     def __str__(self) -> str:

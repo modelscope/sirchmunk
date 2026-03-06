@@ -116,10 +116,10 @@ SIRCHMUNK_SEARCH_TOOL = Tool(
                     "Examples: ['*.pyc', '*.log', 'node_modules', '.git']"
                 ),
             },
-            "return_cluster": {
+            "return_context": {
                 "type": "boolean",
                 "default": False,
-                "description": "Return full KnowledgeCluster object with evidences and patterns (DEEP mode only)",
+                "description": "Return full SearchContext with KnowledgeCluster, answer, and pipeline telemetry",
             },
         },
         "required": ["query"],
@@ -223,7 +223,7 @@ async def handle_sirchmunk_search(
     enable_dir_scan = arguments.get("enable_dir_scan", True)
     include = arguments.get("include")
     exclude = arguments.get("exclude")
-    return_cluster = arguments.get("return_cluster", False)
+    return_context = arguments.get("return_context", False)
     
     logger.info(f"Handling sirchmunk_search: mode={mode}, query='{query[:50]}...'")
     
@@ -240,7 +240,7 @@ async def handle_sirchmunk_search(
             enable_dir_scan=enable_dir_scan,
             include=include,
             exclude=exclude,
-            return_cluster=return_cluster,
+            return_context=return_context,
         )
         
         # Format response based on result type
@@ -255,9 +255,9 @@ async def handle_sirchmunk_search(
             # FILENAME_ONLY mode: list of file matches
             response_text = _format_filename_results(result, query)
         
-        elif hasattr(result, "to_dict"):
-            # KnowledgeCluster object
-            response_text = _format_cluster(result)
+        elif hasattr(result, "answer"):
+            # SearchContext object — extract the answer
+            response_text = result.answer or str(result)
         
         else:
             response_text = str(result)

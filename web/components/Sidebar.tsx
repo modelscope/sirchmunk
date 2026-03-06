@@ -195,7 +195,7 @@ export default function Sidebar() {
                 <ChevronsLeft className="w-4 h-4" />
               </button>
               <a
-                href="https://modelscope.github.io/Sirchmunk/"
+                href="https://modelscope.github.io/sirchmunk-web"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-slate-400 hover:text-blue-500 dark:hover:text-blue-400 p-1.5 hover:bg-slate-100 dark:hover:bg-slate-700 rounded"

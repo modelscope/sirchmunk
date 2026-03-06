@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
@@ -20,7 +20,12 @@ from sirchmunk.llm.prompts import (
     SEARCH_RESULT_SUMMARY,
 )
 from sirchmunk.retrieve.text_retriever import GrepRetriever
-from sirchmunk.schema.knowledge import KnowledgeCluster
+from sirchmunk.schema.knowledge import (
+    AbstractionLevel,
+    EvidenceUnit,
+    KnowledgeCluster,
+    Lifecycle,
+)
 from sirchmunk.schema.request import ContentItem, Message, Request
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
@@ -100,11 +105,11 @@ class AgenticSearch(BaseSearch):
         self.max_queries_per_cluster: int = 5
 
         # Initialize embedding client for cluster reuse.
-        # EmbeddingUtil.__init__ is cheap (stores config only).  The heavy
-        # SentenceTransformer construction is deferred to start_loading(),
-        # which is called lazily on the first DEEP-mode cluster-reuse
-        # check so that FAST-mode searches never trigger model loading
-        # and never suffer from GIL contention.
+        # EmbeddingUtil.__init__ is cheap (stores config only).
+        # start_loading() is called immediately so the background thread
+        # can download / construct the model while the first search runs.
+        # By the time the search finishes and needs to persist the cluster
+        # embedding, the model is typically ready.
         self.embedding_client = None
         self.cluster_sim_threshold: float = kwargs.pop('cluster_sim_threshold', 0.85)
         self.cluster_sim_top_k: int = kwargs.pop('cluster_sim_top_k', 3)
@@ -115,8 +120,9 @@ class AgenticSearch(BaseSearch):
                 self.embedding_client = EmbeddingUtil(
                     cache_dir=str(self.work_path / ".cache" / "models")
                 )
+                self.embedding_client.start_loading()
                 _loguru_logger.info(
-                    "Embedding client created (model loading deferred until first use)"
+                    "Embedding client created, background model loading started"
                 )
             except Exception as e:
                 _loguru_logger.error(
@@ -159,7 +165,7 @@ class AgenticSearch(BaseSearch):
 
         # ---- Vision search (lazy-initialised on first VISION-mode call) ----
         self._vision_search = None
-    
+
     def update_log_callback(self, log_callback: LogCallback = None) -> None:
         """Replace the per-request log callback on all sub-components.
 
@@ -198,6 +204,89 @@ class AgenticSearch(BaseSearch):
             f"[paths] No paths provided; using current working directory: {cwd}"
         )
         return [cwd]
+
+    @staticmethod
+    def validate_search_paths(
+        paths: List[str],
+        *,
+        require_exists: bool = False,
+    ) -> List[str]:
+        """Sanitise and validate a list of search paths or URLs.
+
+        Performs cross-platform checks for argument-injection, null-byte
+        injection, and (optionally) filesystem existence.  Invalid entries
+        are silently dropped with a warning log so that one bad element
+        does not abort the entire search.
+
+        Args:
+            paths: Raw path/URL strings from the caller.
+            require_exists: When *True*, filesystem paths that do not
+                exist on disk are also rejected.
+
+        Returns:
+            A deduplicated list of safe paths/URLs (order-preserved).
+        """
+        from urllib.parse import urlparse
+
+        seen: set = set()
+        clean: List[str] = []
+
+        for raw in paths:
+            p = str(raw).strip()
+
+            if not p:
+                continue
+
+            # Null-byte injection
+            if "\x00" in p:
+                _loguru_logger.warning(
+                    f"[validate] Rejected path containing null byte: {p!r}"
+                )
+                continue
+
+            # Detect URLs and validate separately
+            if p.startswith(("http://", "https://", "ftp://", "ftps://")):
+                parsed = urlparse(p)
+                if not parsed.hostname:
+                    _loguru_logger.warning(
+                        f"[validate] Rejected malformed URL (no host): {p}"
+                    )
+                    continue
+                if p not in seen:
+                    seen.add(p)
+                    clean.append(p)
+                continue
+
+            # Argument-injection: paths starting with a hyphen can be
+            # misinterpreted as CLI flags by rga / ripgrep.
+            if p.startswith("-"):
+                _loguru_logger.warning(
+                    f"[validate] Rejected path starting with hyphen "
+                    f"(possible argument injection): {p}"
+                )
+                continue
+
+            # Resolve to an absolute, normalised path (handles `..`, `~`,
+            # symlinks, and mixed separators on Windows).
+            try:
+                resolved = str(Path(p).expanduser().resolve())
+            except (OSError, ValueError) as exc:
+                _loguru_logger.warning(
+                    f"[validate] Rejected unresolvable path: {p} ({exc})"
+                )
+                continue
+
+            if require_exists and not os.path.exists(resolved):
+                _loguru_logger.warning(
+                    f"[validate] Rejected non-existent path: {resolved}"
+                )
+                continue
+
+            if resolved not in seen:
+                seen.add(resolved)
+                clean.append(resolved)
+
+        return clean
 
     def _load_historical_knowledge(self):
         """Load historical knowledge clusters from local cache"""
@@ -346,8 +435,13 @@ class AgenticSearch(BaseSearch):
                 await self._logger.warning(f"Failed to save knowledge cluster: {update_error}")
                 return
 
-        # Compute and store embedding for the cluster (skip if model not ready)
-        if self.embedding_client and self.embedding_client.is_ready():
+        # Compute and store embedding for the cluster.
+        # embed() internally awaits model readiness via _ensure_model_async(),
+        # so even if the background loading thread hasn't finished yet, we
+        # block (non-blocking async) until the model is ready rather than
+        # silently skipping the embedding — which would make the cluster
+        # invisible to future similarity searches.
+        if self.embedding_client:
             try:
                 from sirchmunk.utils.embedding_util import compute_text_hash
 
@@ -373,9 +467,8 @@ class AgenticSearch(BaseSearch):
             except Exception as e:
                 await self._logger.warning(f"Failed to compute embedding for cluster {cluster.id}: {e}")
         else:
-            await self._logger.warning(
-                f"Embedding client not available — skipping embedding for cluster {cluster.id}. "
-                "Ensure sentence-transformers, torch, and modelscope are installed."
+            await self._logger.debug(
+                f"Embedding client not configured — skipping embedding for cluster {cluster.id}"
             )
 
         # Flush DuckDB → parquet immediately so embedding data is persisted.
@@ -422,19 +515,76 @@ class AgenticSearch(BaseSearch):
 
     @staticmethod
     def _make_answer_cluster(
-        query: str, answer: str, prefix: str = "FS",
+        query: str,
+        answer: str,
+        prefix: str = "FS",
+        file_paths: Optional[List[str]] = None,
     ) -> KnowledgeCluster:
-        """Create a lightweight KnowledgeCluster wrapping an answer string."""
+        """Create a fallback KnowledgeCluster wrapping an answer string.
+
+        Used when the full evidence pipeline didn't produce a cluster
+        (e.g. FAST early-termination or ReAct fallback).  Populates all
+        key attributes so callers never receive a half-empty cluster.
+        """
         _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
-        cluster = KnowledgeCluster(
+        resources = [
+            {"type": "file", "value": fp} for fp in (file_paths or [])
+        ]
+        return KnowledgeCluster(
             id=f"{prefix}{_digest}",
             name=query[:60],
             description=[f"Search result for: {query}"],
             content=answer,
             queries=[query],
+            search_results=list(file_paths or []),
+            resources=resources or None,
+            confidence=0.5,
+            abstraction_level=AbstractionLevel.TECHNIQUE,
+            hotness=0.5,
+            lifecycle=Lifecycle.EMERGING,
         )
-        cluster.search_results.append(answer)
-        return cluster
+
+    @staticmethod
+    def _build_fast_cluster(
+        query: str,
+        answer: str,
+        file_path: str,
+        evidence: str,
+        keywords: List[str],
+    ) -> KnowledgeCluster:
+        """Build a KnowledgeCluster from FAST-mode grep evidence.
+
+        Richer than ``_make_answer_cluster``: contains a real EvidenceUnit
+        sourced from the file that was actually retrieved.
+        """
+        _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
+        doc_id = hashlib.sha256(file_path.encode("utf-8")).hexdigest()[:12]
+
+        evidence_unit = EvidenceUnit(
+            doc_id=doc_id,
+            file_or_url=file_path,
+            summary=evidence[:500] if evidence else "",
+            is_found=True,
+            snippets=[evidence[:2000]] if evidence else [],
+            extracted_at=datetime.now(timezone.utc),
+        )
+
+        return KnowledgeCluster(
+            id=f"FS{_digest}",
+            name=query[:60],
+            description=[f"FAST search result for: {query}"],
+            content=answer,
+            evidences=[evidence_unit],
+            patterns=keywords[:3],
+            confidence=0.7,
+            abstraction_level=AbstractionLevel.TECHNIQUE,
+            landmark_potential=0.3,
+            hotness=0.5,
+            lifecycle=Lifecycle.EMERGING,
+            queries=[query],
+            search_results=[file_path],
+            resources=[{"type": "file", "value": file_path}],
+        )
 
     async def _search_by_filename(
         self,
@@ -791,16 +941,15 @@ class AgenticSearch(BaseSearch):
         query_images: Optional[List[Any]] = None,
         max_loops: int = 10,
         max_token_budget: int = 64000,
-        max_depth: Optional[int] = 10,
+        max_depth: Optional[int] = 8,
         top_k_files: int = 3,
         top_k: int = 10,
         enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         return_context: bool = False,
-        return_cluster: bool = False,
         spec_stale_hours: float = 72.0,
-    ) -> Union[str, Tuple[str, "SearchContext"], List[Dict[str, Any]], "KnowledgeCluster", List[Any]]:
+    ) -> Union[str, SearchContext, List[Dict[str, Any]]]:
         """Perform intelligent search with multi-mode support.
 
         Vision intent is **auto-detected** during query analysis — if the
@@ -842,6 +991,13 @@ class AgenticSearch(BaseSearch):
             exclude: File glob patterns to exclude.
             return_context: If True, return ``(answer, SearchContext)`` tuple.
             return_cluster: If True, return the full KnowledgeCluster.
+            include: File glob patterns to include (e.g. ``["*.py", "*.md"]``).
+                Used in both FILENAME_ONLY and DEEP modes.
+            exclude: File glob patterns to exclude (e.g. ``["*.log"]``).
+                Used in both FILENAME_ONLY and DEEP modes.
+            return_context: If True, return a ``SearchContext`` object
+                that carries ``answer``, ``cluster`` (KnowledgeCluster),
+                and full pipeline telemetry (LLM usage, files read, etc.).
             spec_stale_hours: Hours before spec cache is stale (default: 72).
             query_images: Reference images for vision similarity or
                 hybrid search.  Each element can be a file path ``str``,
@@ -850,12 +1006,27 @@ class AgenticSearch(BaseSearch):
                 mode.
 
         Returns:
+            - ``str``: Answer summary (default).
+            - ``SearchContext``: If *return_context* — contains ``answer``,
+              ``cluster``, and telemetry in a single object.
+            - ``List[Dict]``: File matches in FILENAME_ONLY mode.
             - ``str``: Answer summary (default for FAST/DEEP text search).
             - ``(str, SearchContext)``: If *return_context* (text search).
             - ``KnowledgeCluster``: If *return_cluster* (text search).
             - ``List[Dict]``: File matches (FILENAME_ONLY).
             - ``List[VisionSearchResult]``: Image results (vision).
         """
+        paths = self.validate_search_paths(
+            self._resolve_paths(paths),
+        )
+        if not paths:
+            msg = "No valid search paths remain after validation."
+            _loguru_logger.warning(msg)
+            if return_context:
+                ctx = SearchContext()
+                ctx.answer = msg
+                return ctx
+            return msg
         # Force vision mode when query_images are provided
         if query_images:
             paths = self._resolve_paths(paths)
@@ -879,21 +1050,17 @@ class AgenticSearch(BaseSearch):
             if not results:
                 msg = f"No files found matching query: '{query}'"
                 await self._logger.warning(msg)
-                return None if return_cluster else msg
+                return msg
             await self._logger.success(f"Retrieved {len(results)} matching files")
             return results
 
-        # ---- FAST / DEEP → intent analysis determines text vs vision ----
+        # ---- FAST / DEEP → both produce (answer, cluster, context) ----
         if mode == "FAST":
-            answer = await self._search_fast(
+            answer, cluster, context = await self._search_fast(
                 query=query, paths=paths, max_depth=max_depth,
                 top_k_files=top_k_files, top_k=top_k,
                 include=include, exclude=exclude,
             )
-            if isinstance(answer, list):
-                return answer
-            cluster: Optional[KnowledgeCluster] = None
-            context = SearchContext()
         else:
             answer, cluster, context = await self._search_deep(
                 query=query, paths=paths,
@@ -905,11 +1072,13 @@ class AgenticSearch(BaseSearch):
             )
 
         # ---- Unified return wrapping ----
-        if return_cluster:
-            prefix = "FS" if mode == "FAST" else "DS"
-            return cluster or self._make_answer_cluster(query, answer, prefix)
         if return_context:
-            return answer, context
+            prefix = "FS" if mode == "FAST" else "DS"
+            context.answer = answer
+            context.cluster = cluster or self._make_answer_cluster(
+                query, answer, prefix,
+            )
+            return context
         return answer
 
     # ------------------------------------------------------------------
@@ -1070,7 +1239,8 @@ class AgenticSearch(BaseSearch):
         if cluster and cluster.content:
             await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
             answer = await self._summarise_cluster(query, cluster)
-            cluster.search_results.append(answer)
+            if not cluster.search_results:
+                cluster.search_results = list(merged_files)
         else:
             await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
             answer, context = await self._react_refinement(
@@ -1088,7 +1258,6 @@ class AgenticSearch(BaseSearch):
                 )
             elif answer and not cluster.content:
                 cluster.content = answer
-                cluster.search_results.append(answer)
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -1193,34 +1362,18 @@ class AgenticSearch(BaseSearch):
         top_k: int = 10,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-    ) -> Union[str, List[Any]]:
+    ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Greedy search: 2 LLM calls, single best file, focused evidence.
 
         Two-level keyword cascade extracted in one LLM call:
         primary (compound phrase) is tried first; if it misses, fallback
         (atomic terms) is tried.  Greedy early-termination at every step.
 
-        Architecture:
-            ┌──────────────────────────────────────────────────────────┐
-            │ Step 0  Cluster reuse check (instant short-circuit)       │
-            ├──────────────────────────────────────────────────────────┤
-            │ Step 1  LLM → primary + fallback keywords (stream=False) │
-            │ Step 2  rga cascade: primary → fallback → filename       │
-            │ Step 3  Context sampling around grep hit lines            │
-            │ Step 4  LLM answer from focused evidence                  │
-            └──────────────────────────────────────────────────────────┘
-
-        Args:
-            query: User search query.
-            paths: Normalised list of path strings.
-            max_depth: Maximum directory depth for rga search.
-            top_k_files: Unused (kept for API compat); greedy picks 1 file.
-            include: File glob patterns to include.
-            exclude: File glob patterns to exclude.
-
         Returns:
-            Answer string from LLM.
+            ``(answer, cluster, context)`` — same triple as ``_search_deep``
+            so the caller can handle both modes uniformly.
         """
+        context = SearchContext()
         await self._logger.info(f"[FAST] Starting greedy search for: '{query[:80]}'")
 
         # ==============================================================
@@ -1232,7 +1385,7 @@ class AgenticSearch(BaseSearch):
             if isinstance(content, list):
                 content = "\n".join(content)
             await self._logger.success("[FAST] Reused cached knowledge cluster")
-            return str(content)
+            return str(content), reused, context
 
         # ==============================================================
         # Step 1: LLM → 2-level keywords in one call (stream=False)
@@ -1243,6 +1396,10 @@ class AgenticSearch(BaseSearch):
             stream=False,
         )
         self.llm_usages.append(resp.usage)
+        if resp.usage and isinstance(resp.usage, dict):
+            context.add_llm_tokens(
+                resp.usage.get("total_tokens", 0), usage=resp.usage,
+            )
 
         analysis = self._parse_fast_json(resp.content)
         primary = analysis.get("primary", [])[:2]
@@ -1272,7 +1429,8 @@ class AgenticSearch(BaseSearch):
 
         if not primary and not fallback:
             await self._logger.warning("[FAST] No keywords extracted")
-            return f"Could not extract search terms from query: '{query}'"
+            msg = f"Could not extract search terms from query: '{query}'"
+            return msg, None, context
 
         await self._logger.info(
             f"[FAST:Step1] Primary: {primary}, Fallback: {fallback}"
@@ -1281,6 +1439,7 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         # Step 2: rga cascade — primary first, fallback only if needed
         # ==============================================================
+        context.add_search(query)
         include_patterns = list(include or [])
         for hint in file_hints:
             if "*" in hint or "." in hint:
@@ -1309,7 +1468,8 @@ class AgenticSearch(BaseSearch):
                 f"[FAST:Step2] No matching files found in paths: {paths}. "
                 "If files are PDFs/DOCX, ensure poppler-utils and pandoc are installed."
             )
-            return f"No relevant content found for query: '{query}'"
+            msg = f"No relevant content found for query: '{query}'"
+            return msg, None, context
 
         file_path = best_file["path"]
         match_objects = best_file["matches"]
@@ -1322,9 +1482,12 @@ class AgenticSearch(BaseSearch):
         # Step 3: Context sampling around grep hits (no LLM)
         # ==============================================================
         evidence = await self._fast_sample_evidence(file_path, match_objects)
+        context.mark_file_read(file_path)
+
         if not evidence or len(evidence.strip()) < 20:
             await self._logger.warning("[FAST:Step3] No usable evidence extracted")
-            return f"Found file but could not extract content for query: '{query}'"
+            msg = f"Found file but could not extract content for query: '{query}'"
+            return msg, None, context
 
         await self._logger.info(
             f"[FAST:Step3] Evidence: {len(evidence)} chars from {Path(file_path).name}"
@@ -1342,6 +1505,25 @@ class AgenticSearch(BaseSearch):
             stream=True,
         )
         self.llm_usages.append(answer_resp.usage)
+        if answer_resp.usage and isinstance(answer_resp.usage, dict):
+            context.add_llm_tokens(
+                answer_resp.usage.get("total_tokens", 0), usage=answer_resp.usage,
+            )
+
+        answer = answer_resp.content or ""
+        keywords_used = primary if used_level == "primary" else fallback
+        cluster = self._build_fast_cluster(
+            query, answer, file_path, evidence, keywords_used,
+        )
+
+        # Persist the FAST cluster so it can be reused by future queries
+        self._add_query_to_cluster(cluster, query)
+        try:
+            await self._save_cluster_with_embedding(cluster)
+        except Exception as exc:
+            _loguru_logger.warning(
+                f"[FAST] Failed to save cluster with embedding: {exc}"
+            )
 
         await self._logger.success("[FAST] Search complete (2 LLM calls)")
 
@@ -1350,6 +1532,7 @@ class AgenticSearch(BaseSearch):
             hit_paths=[file_path],
         )
         return answer_resp.content or ""
+        return answer, cluster, context
 
     # ---- FAST helpers ----
 
@@ -1886,12 +2069,15 @@ class AgenticSearch(BaseSearch):
                 top_k_files=top_k_files,
             )
             if cluster:
-                cluster.search_results.append(answer)
+                if not cluster.search_results:
+                    cluster.search_results = list(discovered)
                 return cluster
 
         # Fallback: lightweight cluster from answer text
         try:
-            return self._make_answer_cluster(query, answer, prefix="R")
+            return self._make_answer_cluster(
+                query, answer, prefix="R", file_paths=discovered,
+            )
         except Exception:
             return None
 

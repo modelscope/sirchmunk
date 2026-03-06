@@ -64,9 +64,9 @@ class SearchRequest(BaseModel):
         default=None,
         description="File patterns to exclude (glob)"
     )
-    return_cluster: bool = Field(
+    return_context: bool = Field(
         default=False,
-        description="Return full KnowledgeCluster object"
+        description="Return full SearchContext with KnowledgeCluster, answer, and telemetry"
     )
 
 
@@ -170,7 +170,7 @@ async def execute_search(request: SearchRequest) -> SearchResponse:
             "paths": paths,
             "mode": request.mode,
             "enable_dir_scan": request.enable_dir_scan,
-            "return_cluster": request.return_cluster,
+            "return_context": request.return_context,
         }
         
         # Add optional parameters if provided
@@ -191,13 +191,12 @@ async def execute_search(request: SearchRequest) -> SearchResponse:
         result = await searcher.search(**search_kwargs)
         
         # Format response
-        if request.return_cluster and hasattr(result, "to_dict"):
-            # Return full cluster data
+        if request.return_context and hasattr(result, "to_dict"):
             return SearchResponse(
                 success=True,
                 data={
-                    "type": "cluster",
-                    "cluster": result.to_dict(),
+                    "type": "context",
+                    **result.to_dict(),
                 }
             )
         elif isinstance(result, list):

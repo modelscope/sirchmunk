@@ -11,6 +11,9 @@ import {
   Loader2,
   MessageSquare,
   ExternalLink,
+  ChevronDown,
+  BookOpen,
+  FileText,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
@@ -28,6 +31,7 @@ interface ChatMessage {
   sources?: {
     rag?: Array<{ kb_name: string; content: string }>;
     web?: Array<{ url: string; title?: string }>;
+    references?: Array<{ file: string; summary: string; snippets: string[] }>;
   };
 }
 
@@ -255,6 +259,46 @@ export default function ChatSessionDetail({
                           </div>
                         </div>
                       )}
+
+                    {/* References */}
+                    {msg.sources?.references && msg.sources.references.length > 0 && (
+                      <div className="mt-2 border border-slate-200 dark:border-slate-600 rounded-lg overflow-hidden">
+                        <details className="group">
+                          <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none bg-slate-50 dark:bg-slate-700/50 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors">
+                            <ChevronDown className="w-3.5 h-3.5 text-slate-400 transition-transform group-open:rotate-180" />
+                            <BookOpen className="w-3.5 h-3.5 text-amber-500" />
+                            <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                              {t("References")} ({msg.sources.references.length})
+                            </span>
+                          </summary>
+                          <div className="divide-y divide-slate-100 dark:divide-slate-600/50">
+                            {msg.sources.references.map((ref: any, i: number) => (
+                              <div key={`ref-${i}`} className="px-3 py-2 space-y-1">
+                                <div className="flex items-center gap-1.5">
+                                  <FileText className="w-3 h-3 text-blue-500 shrink-0 mt-0.5" />
+                                  <div className="min-w-0">
+                                    <span className="text-xs font-medium text-slate-700 dark:text-slate-300 block truncate">
+                                      {ref.file.split('/').pop()}
+                                    </span>
+                                    <span className="text-[10px] text-slate-400 dark:text-slate-500 block truncate select-all" title={ref.file}>
+                                      {ref.file}
+                                    </span>
+                                  </div>
+                                </div>
+                                {ref.summary && (
+                                  <p className="text-xs text-slate-600 dark:text-slate-400">{ref.summary}</p>
+                                )}
+                                {ref.snippets?.map((snippet: string, si: number) => (
+                                  <pre key={si} className="text-xs bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 px-2 py-1 rounded overflow-x-auto whitespace-pre-wrap break-words">
+                                    {snippet}
+                                  </pre>
+                                ))}
+                              </div>
+                            ))}
+                          </div>
+                        </details>
+                      </div>
+                    )}
 
                     {/* Timestamp */}
                     {msg.timestamp && (

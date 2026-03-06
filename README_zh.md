@@ -43,7 +43,7 @@
 
 ## ✨ 核心特性
 
-### 1. 无需向量嵌入和预索引：直接面向原始数据形态
+### 1. 无需向量数据库和预索引：直接面向原始数据形态
 
 **Sirchmunk** 直接处理 **原始数据** —— 无需将大量而繁杂的文件压缩为固定维度向量，或是构建为图数据库。
 
@@ -147,6 +147,12 @@
 
 
 ## 🎉 News
+
+* 🚀 **2026.3.5**: **Sirchmunk v0.0.5 发布**
+  - **破坏性变更**：统一搜索 API：重构 search() 接口的返回类型，引入 SearchContext 对象并简化返回参数控制，API 调用更简洁。
+  - **高可用 RAG 对话**：引入重试机制与细粒度异常处理，大幅提升了 RAG 聊天在复杂网络环境下的稳定性。
+  - **稳定 MCP 集成**：修复 mcp run 初始化问题，确保 MCP 协议服务器在各环境下均能顺畅启动。
+  - **PyPI 安装修复**：解决了标准 pip 安装后的 Web 源码定位问题，确保 Web UI 即装即用。
 
 * 🚀 **2026.2.27**: **Sirchmunk v0.0.4 发布**
   - **Docker 部署支持**：提供预构建 Docker 镜像，支持容器化一键部署。
@@ -661,7 +667,7 @@ curl -X POST http://localhost:8584/api/v1/search \
     "keyword_levels": 3,
     "include_patterns": ["*.py", "*.java"],
     "exclude_patterns": ["*test*", "*__pycache__*"],
-    "return_cluster": true
+    "return_context": true
   }'
 
 # 检查服务器状态
@@ -749,7 +755,7 @@ if (data.success) {
 | `keyword_levels` | `int` | `null` | 关键词粒度层级 |
 | `include_patterns` | `string[]` | `null` | 文件 glob 匹配模式（包含） |
 | `exclude_patterns` | `string[]` | `null` | 文件 glob 匹配模式（排除） |
-| `return_cluster` | `bool` | `false` | 是否返回完整的 KnowledgeCluster 对象 |
+| `return_context` | `bool` | `false` | 返回完整的 SearchContext 对象（含 KnowledgeCluster 和遥测数据） |
 
 > **注意：** `FILENAME_ONLY` 模式无需 LLM API Key。`FAST` 和 `DEEP` 模式需要配置 LLM。
 

@@ -59,7 +59,7 @@ def create_server(config: Config) -> FastMCP:
         enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-        return_cluster: bool = False,
+        return_context: bool = False,
     ) -> str:
         """Search local files, documents, and raw data on disk. Supports 100+ file formats
         including PDF, Word, Excel, PowerPoint, CSV, JSON, YAML, Markdown, HTML, source code,
@@ -95,7 +95,7 @@ def create_server(config: Config) -> FastMCP:
             enable_dir_scan: Enable directory scanning for file discovery (DEEP mode, default: True)
             include: File patterns to include (glob, e.g., ['*.py', '*.md', '*.pdf'])
             exclude: File patterns to exclude (glob, e.g., ['*.pyc', '*.log', 'node_modules'])
-            return_cluster: Return full KnowledgeCluster object with evidences (DEEP mode only)
+            return_context: Return full SearchContext with KnowledgeCluster and telemetry
 
         Returns:
             Search results as formatted text with source references
@@ -117,7 +117,7 @@ def create_server(config: Config) -> FastMCP:
                 enable_dir_scan=enable_dir_scan,
                 include=include,
                 exclude=exclude,
-                return_cluster=return_cluster,
+                return_context=return_context,
             )
 
             if result is None:
@@ -130,8 +130,9 @@ def create_server(config: Config) -> FastMCP:
                 # FILENAME_ONLY mode returns list of file matches
                 return _format_filename_results(result, query)
 
-            if hasattr(result, "__str__"):
-                return str(result)
+            # SearchContext — extract the answer text for the tool response
+            if hasattr(result, "answer"):
+                return result.answer or str(result)
 
             return str(result)
 

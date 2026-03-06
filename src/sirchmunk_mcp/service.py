@@ -176,8 +176,8 @@ class SirchmunkService:
         enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-        return_cluster: bool = False,
-    ) -> Union[str, List[Dict[str, Any]], KnowledgeCluster, None]:
+        return_context: bool = False,
+    ) -> Union[str, "SearchContext", List[Dict[str, Any]], None]:
         """Search and retrieve various types of raw documents using AgenticSearch.
         
         Supports DEEP mode (parallel multi-path + ReAct refinement) and
@@ -195,11 +195,11 @@ class SirchmunkService:
             enable_dir_scan: Enable directory scanning (DEEP mode)
             include: File patterns to include (glob)
             exclude: File patterns to exclude (glob)
-            return_cluster: Whether to return full KnowledgeCluster object
+            return_context: Whether to return full SearchContext object
         
         Returns:
-            Search results: str (summary), List[Dict] (FILENAME_ONLY), 
-            KnowledgeCluster (if return_cluster=True), or None (if no results)
+            Search results: str (summary), SearchContext (if return_context=True),
+            List[Dict] (FILENAME_ONLY), or None (if no results)
         
         Raises:
             RuntimeError: If service is not initialized
@@ -243,7 +243,7 @@ class SirchmunkService:
                 "enable_dir_scan": enable_dir_scan,
                 "include": include,
                 "exclude": exclude,
-                "return_cluster": return_cluster,
+                "return_context": return_context,
             }
             if max_loops is not None:
                 kwargs["max_loops"] = max_loops

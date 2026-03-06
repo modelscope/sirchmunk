@@ -5,10 +5,19 @@ Search context for tracking state across agentic retrieval loops.
 Provides LLM token budget enforcement, file-level deduplication, and
 structured logging of all retrieval operations within a single
 search session.
+
+When ``return_context=True`` is passed to ``AgenticSearch.search()``,
+a ``SearchContext`` is returned directly.  It carries the answer text,
+the ``KnowledgeCluster`` (when available), and all pipeline telemetry.
 """
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
+
+if TYPE_CHECKING:
+    from sirchmunk.schema.knowledge import KnowledgeCluster
 
 
 @dataclass
@@ -43,10 +52,9 @@ class SearchContext:
     Tracks LLM token consumption, file deduplication, and retrieval logs
     across multiple tool calls within one ReAct loop execution.
 
-    The **token budget** is enforced against ``total_llm_tokens`` — the
-    cumulative token count reported by the LLM API (prompt + completion).
-    This is the only reliable metric; approximate "retrieval tokens"
-    (char-count / 4) proved unreliable and have been removed.
+    When returned to callers (via ``return_context=True``), the ``answer``
+    and ``cluster`` fields carry the pipeline output so that a single
+    object provides both the result and all telemetry.
 
     Attributes:
         max_token_budget: Maximum total LLM tokens allowed per session.
@@ -58,6 +66,8 @@ class SearchContext:
         loop_count: Number of ReAct loops executed so far.
         max_loops: Maximum number of ReAct loops allowed.
         start_time: Session start timestamp.
+        answer: Final answer text produced by the search pipeline.
+        cluster: KnowledgeCluster built during the search (may be None).
     """
 
     max_token_budget: int = 64000
@@ -70,6 +80,9 @@ class SearchContext:
     search_history: List[str] = field(default_factory=list, init=False)
     loop_count: int = field(default=0, init=False)
     start_time: datetime = field(default_factory=datetime.now, init=False)
+
+    answer: str = field(default="", init=False)
+    cluster: Optional["KnowledgeCluster"] = field(default=None, init=False)
 
     # ---- Token accounting ----
 
@@ -148,15 +161,18 @@ class SearchContext:
     # ---- Serialization ----
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize context state for logging / diagnostics."""
+        """Serialize context state to a plain dict safe for ``json.dumps``."""
         return {
+            "answer": self.answer,
+            "cluster": self.cluster.to_dict() if self.cluster else None,
             "max_token_budget": self.max_token_budget,
             "max_loops": self.max_loops,
             "total_llm_tokens": self.total_llm_tokens,
             "budget_remaining": self.budget_remaining,
             "llm_call_count": len(self.llm_usages),
-            "read_file_count": len(self.read_file_ids),
-            "retrieval_log_count": len(self.retrieval_logs),
+            "llm_usages": self.llm_usages,
+            "read_file_ids": sorted(self.read_file_ids),
+            "retrieval_logs": [log.to_dict() for log in self.retrieval_logs],
             "search_history": self.search_history,
             "loop_count": self.loop_count,
             "start_time": self.start_time.isoformat(),

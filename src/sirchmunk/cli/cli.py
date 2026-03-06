@@ -559,7 +559,7 @@ async def _search_local(
         query=query,
         paths=paths,
         mode=mode,
-        return_cluster=output_format == "json",
+        return_context=output_format == "json",
     )
 
     # Output result

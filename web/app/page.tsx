@@ -88,6 +88,7 @@ export default function HomePage() {
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [showPathDropdown, setShowPathDropdown] = useState(false);
   const [showModeDropdown, setShowModeDropdown] = useState(false);
+  const [enableSuggestions, setEnableSuggestions] = useState(true);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const suggestionsRef = useRef<HTMLDivElement>(null);
@@ -169,7 +170,7 @@ export default function HomePage() {
 
   // Fetch search suggestions
   const fetchSearchSuggestions = async (query: string) => {
-    if (!chatState.enableRag || !chatState.selectedKb || query.length < 2) {
+    if (!enableSuggestions || !chatState.enableRag || !chatState.selectedKb || query.length < 2) {
       setSearchSuggestions([]);
       setShowSuggestions(false);
       return;
@@ -177,8 +178,13 @@ export default function HomePage() {
 
     try {
       const response = await fetch(
-        apiUrl(`/api/v1/search/${chatState.selectedKb}/suggestions?query=${encodeURIComponent(query)}&limit=8`)
+        apiUrl(`/api/v1/search/suggestions?kb_name=${encodeURIComponent(chatState.selectedKb)}&query=${encodeURIComponent(query)}&limit=8`)
       );
+      if (!response.ok) {
+        setSearchSuggestions([]);
+        setShowSuggestions(false);
+        return;
+      }
       const result = await response.json();
       if (result.success) {
         setSearchSuggestions(result.data);
@@ -198,7 +204,7 @@ export default function HomePage() {
       fetchSearchSuggestions(inputMessage);
     }, 200);
     return () => clearTimeout(timer);
-  }, [inputMessage, chatState.enableRag, chatState.selectedKb]);
+  }, [inputMessage, chatState.enableRag, chatState.selectedKb, enableSuggestions]);
 
   // Click outside to close suggestions and dropdown
   useEffect(() => {
@@ -274,7 +280,7 @@ export default function HomePage() {
   };
 
   const handleSuggestionClick = (suggestion: SearchSuggestion) => {
-    setInputMessage(`Search in ${suggestion.filename}: `);
+    setInputMessage(`Search in ${suggestion.display_name}: `);
     setShowSuggestions(false);
     setSelectedSuggestionIndex(-1);
     inputRef.current?.focus();
@@ -704,8 +710,8 @@ export default function HomePage() {
                           <div className="font-medium text-slate-900 dark:text-slate-100 text-sm truncate">
                             {highlightMatch(suggestion.display_name, suggestion.highlight_start, suggestion.highlight_end)}
                           </div>
-                          <div className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5">
-                            {suggestion.filename} • {suggestion.size}
+                          <div className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5" title={suggestion.filename}>
+                            {suggestion.filename}{suggestion.size ? ` • ${suggestion.size}` : ""}
                           </div>
                         </div>
                         <div className="text-xs text-slate-400 dark:text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -797,6 +803,20 @@ export default function HomePage() {
                   </div>
                 )}
               </div>
+
+              {/* Suggestions Toggle */}
+              <button
+                onClick={() => setEnableSuggestions((prev) => !prev)}
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-all ${
+                  enableSuggestions
+                    ? "bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300"
+                    : "bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400"
+                }`}
+                title={t("Toggle file suggestions while typing")}
+              >
+                <Lightbulb className="w-3 h-3" />
+                {t("Suggest")}
+              </button>
 
               {/* Web Search Button - Temporarily hidden but functionality preserved */}
               {false && (
@@ -1009,6 +1029,55 @@ export default function HomePage() {
                             ))}
                           </div>
                         )}
+
+                      {/* References (evidence from search) */}
+                      {msg.sources?.references && msg.sources.references.length > 0 && (
+                        <div className="mt-2 border border-slate-200 dark:border-slate-700 rounded-lg overflow-hidden">
+                          <details className="group">
+                            <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none bg-slate-50 dark:bg-slate-800/50 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
+                              <ChevronDown className="w-3.5 h-3.5 text-slate-400 transition-transform group-open:rotate-180" />
+                              <BookOpen className="w-3.5 h-3.5 text-amber-500" />
+                              <span className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                                {t("References")} ({msg.sources.references.length})
+                              </span>
+                            </summary>
+                            <div className="divide-y divide-slate-100 dark:divide-slate-700/50">
+                              {msg.sources.references.map((ref, i) => (
+                                <div key={`ref-${i}`} className="px-3 py-2.5 space-y-1.5">
+                                  <div className="flex items-center gap-1.5">
+                                    <FileText className="w-3 h-3 text-blue-500 shrink-0 mt-0.5" />
+                                    <div className="min-w-0">
+                                      <span className="text-xs font-medium text-slate-700 dark:text-slate-300 block truncate">
+                                        {ref.file.split('/').pop()}
+                                      </span>
+                                      <span className="text-[10px] text-slate-400 dark:text-slate-500 block truncate select-all" title={ref.file}>
+                                        {ref.file}
+                                      </span>
+                                    </div>
+                                  </div>
+                                  {ref.summary && (
+                                    <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
+                                      {ref.summary}
+                                    </p>
+                                  )}
+                                  {ref.snippets && ref.snippets.length > 0 && (
+                                    <div className="space-y-1">
+                                      {ref.snippets.map((snippet: string, si: number) => (
+                                        <pre
+                                          key={si}
+                                          className="text-xs bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 px-2 py-1.5 rounded overflow-x-auto whitespace-pre-wrap break-words leading-relaxed"
+                                        >
+                                          {snippet}
+                                        </pre>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+                        </div>
+                      )}
                     </div>
                   </>
                 )}
@@ -1073,6 +1142,55 @@ export default function HomePage() {
                 >
                   <Send className="w-5 h-5" />
                 </button>
+              )}
+
+              {/* Search Suggestions Dropdown */}
+              {showSuggestions && searchSuggestions.length > 0 && (
+                <div
+                  ref={suggestionsRef}
+                  className="absolute bottom-full left-0 right-0 mb-2 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-xl shadow-slate-200/50 dark:shadow-slate-900/50 z-50 max-h-80 overflow-y-auto"
+                >
+                  <div className="p-2">
+                    <div className="text-xs text-slate-500 dark:text-slate-400 px-3 py-2 border-b border-slate-100 dark:border-slate-700">
+                      Found {searchSuggestions.length} file{searchSuggestions.length !== 1 ? 's' : ''} in {chatState.selectedKb}
+                    </div>
+                    {searchSuggestions.map((suggestion, index) => (
+                      <button
+                        key={index}
+                        onClick={() => handleSuggestionClick(suggestion)}
+                        className={`w-full text-left px-3 py-3 rounded-lg transition-all duration-150 flex items-center gap-3 group ${
+                          index === selectedSuggestionIndex
+                            ? "bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-700"
+                            : "hover:bg-slate-50 dark:hover:bg-slate-700/50"
+                        }`}
+                      >
+                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-xs font-medium ${
+                          suggestion.type.toLowerCase() === 'pdf'
+                            ? 'bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400'
+                            : suggestion.type.toLowerCase() === 'docx'
+                            ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400'
+                            : suggestion.type.toLowerCase() === 'pptx'
+                            ? 'bg-orange-100 dark:bg-orange-900/30 text-orange-600 dark:text-orange-400'
+                            : suggestion.type.toLowerCase() === 'csv'
+                            ? 'bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400'
+                            : suggestion.type.toLowerCase() === 'xlsx'
+                            ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400'
+                            : 'bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400'
+                        }`}>
+                          {suggestion.type}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="font-medium text-slate-900 dark:text-slate-100 text-sm truncate">
+                            {highlightMatch(suggestion.display_name, suggestion.highlight_start, suggestion.highlight_end)}
+                          </div>
+                          <div className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5" title={suggestion.filename}>
+                            {suggestion.filename}{suggestion.size ? ` • ${suggestion.size}` : ""}
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
               )}
             </div>
           </div>

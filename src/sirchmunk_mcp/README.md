@@ -290,7 +290,7 @@ Intelligent code and document search.
 | `enable_dir_scan` | boolean | No | true | Directory scanning (DEEP) |
 | `include` | array | No | - | Glob patterns to include |
 | `exclude` | array | No | - | Glob patterns to exclude |
-| `return_cluster` | boolean | No | false | Return full KnowledgeCluster |
+| `return_context` | boolean | No | false | Return full SearchContext with cluster and telemetry |
 
 ### `sirchmunk_get_cluster`
 

@@ -68,13 +68,33 @@ def _classify_error(exc: Exception) -> str:
     return str(exc)
 
 
-# Try to import tkinter for file dialogs
-try:
-    import tkinter as tk
-    from tkinter import filedialog, messagebox
-    TKINTER_AVAILABLE = True
-except ImportError:
-    TKINTER_AVAILABLE = False
+# Tkinter availability is checked lazily to avoid initialising
+# the macOS Cocoa/AppKit framework at module-import time.
+# Eagerly importing tkinter in a headless server causes the macOS
+# crash-reporter dialog to appear when the process receives SIGINT.
+_tkinter_checked = False
+TKINTER_AVAILABLE = False
+tk = None
+filedialog = None
+messagebox = None
+
+
+def _ensure_tkinter():
+    """Lazily import tkinter on first use and cache the result."""
+    global _tkinter_checked, TKINTER_AVAILABLE, tk, filedialog, messagebox
+    if _tkinter_checked:
+        return TKINTER_AVAILABLE
+    _tkinter_checked = True
+    try:
+        import tkinter as _tk
+        from tkinter import filedialog as _fd, messagebox as _mb
+        tk = _tk
+        filedialog = _fd
+        messagebox = _mb
+        TKINTER_AVAILABLE = True
+    except ImportError:
+        TKINTER_AVAILABLE = False
+    return TKINTER_AVAILABLE
 
 router = APIRouter(prefix="/api/v1", tags=["chat", "search"])
 
@@ -609,8 +629,13 @@ async def _run_rag_search(
     paths: List[str],
     search_mode: str,
     search_log_callback,
-) -> tuple[str, list]:
-    """Execute a single RAG search attempt. Returns (result_text, llm_usages)."""
+) -> tuple:
+    """Execute a single RAG search attempt.
+
+    Returns:
+        ``(answer_text, llm_usages, references)`` where *references* is a
+        list of evidence dicts extracted from the SearchContext cluster.
+    """
     search_engine = get_search_instance(log_callback=search_log_callback)
 
     result = await search_engine.search(
@@ -618,8 +643,33 @@ async def _run_rag_search(
         paths=paths,
         mode=search_mode,
         top_k_files=3,
+        return_context=True,
     )
-    return result, list(search_engine.llm_usages)
+
+    references: List[Dict[str, Any]] = []
+    if hasattr(result, "answer"):
+        answer = result.answer or ""
+        cluster = result.cluster
+        if cluster and getattr(cluster, "evidences", None):
+            for ev in cluster.evidences:
+                if not ev.is_found:
+                    continue
+                raw_snippets = ev.snippets[:3] if ev.snippets else []
+                snippets = []
+                for s in raw_snippets:
+                    if isinstance(s, dict):
+                        snippets.append(s.get("snippet", str(s)))
+                    else:
+                        snippets.append(str(s))
+                references.append({
+                    "file": str(ev.file_or_url),
+                    "summary": ev.summary or "",
+                    "snippets": snippets,
+                })
+    else:
+        answer = result if isinstance(result, str) else str(result)
+
+    return answer, list(search_engine.llm_usages), references
 
 
 async def _chat_rag(
@@ -656,7 +706,7 @@ async def _chat_rag(
 
             logger.info("[MODE 2] RAG search with query: %s, paths: %s", message, paths)
 
-            search_result, llm_usages = await _run_rag_search(
+            search_result, llm_usages, references = await _run_rag_search(
                 message, paths, search_mode, search_log_callback,
             )
 
@@ -677,6 +727,8 @@ async def _chat_rag(
                 "content": f"Retrieved content from {kb_name}",
                 "relevance_score": 0.92,
             }]
+            if references:
+                sources["references"] = references
             return search_result, sources
 
         except Exception as e:
@@ -820,7 +872,7 @@ async def _chat_rag_web_search(
 
             logger.info("[MODE 4] RAG search with query: %s, paths: %s", message, paths)
 
-            rag_result, llm_usages = await _run_rag_search(
+            rag_result, llm_usages, references = await _run_rag_search(
                 message, paths, search_mode, search_log_callback,
             )
 
@@ -841,6 +893,8 @@ async def _chat_rag_web_search(
                 "content": f"Retrieved from {kb_name}",
                 "relevance_score": 0.92,
             }]
+            if references:
+                sources["references"] = references
             break  # success
 
         except Exception as e:
@@ -1068,7 +1122,7 @@ async def open_file_picker(request: Dict[str, Any]):
     Open native file picker dialog using tkinter
     Returns real absolute paths from user's local filesystem
     """
-    if not TKINTER_AVAILABLE:
+    if not _ensure_tkinter():
         return {
             "success": False,
             "error": "Tkinter not available on this system",
@@ -1109,14 +1163,15 @@ async def open_file_picker(request: Dict[str, Any]):
 @router.get("/file-picker/status")
 async def get_file_picker_status():
     """Check if file picker is available on this system"""
+    avail = _ensure_tkinter()
     return {
         "success": True,
         "data": {
-            "tkinter_available": TKINTER_AVAILABLE,
+            "tkinter_available": avail,
             "server_browser": True,
             "supported_types": ["files", "directory"],
             "features": {
-                "multiple_files": TKINTER_AVAILABLE,
+                "multiple_files": avail,
                 "directory_selection": True,
                 "absolute_paths": True
             }
@@ -1243,24 +1298,87 @@ async def load_chat_session(session_id: str):
         }
     }
 
-# Legacy search endpoints for backward compatibility
-@router.get("/search/{kb_name}/suggestions")
-async def get_search_suggestions(kb_name: str, query: str, limit: int = 8):
-    """Get search suggestions - kept for backward compatibility"""
-    # For now, return empty suggestions since we're using real file search
+# Search suggestions endpoint — returns files matching the query text
+@router.get("/search/suggestions")
+async def get_search_suggestions(query: str, kb_name: str = "", limit: int = 8):
+    """Get file-name suggestions matching the typed query.
+
+    Performs a fast filename-only search (via ``rga --files`` + regex
+    filter) against the paths listed in *kb_name* (comma-separated).
+    No LLM calls are involved.
+    """
     if not query or len(query.strip()) < 2:
+        return {"success": True, "data": [], "query": query}
+
+    raw_paths = [p.strip() for p in kb_name.split(",") if p.strip()] if kb_name else []
+    if not raw_paths:
+        return {"success": True, "data": [], "query": query}
+
+    try:
+        from sirchmunk.retrieve.text_retriever import GrepRetriever
+        from sirchmunk.search import AgenticSearch
+        from sirchmunk.utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH
+        import re as _re
+
+        paths = AgenticSearch.validate_search_paths(
+            raw_paths, require_exists=True,
+        )
+        if not paths:
+            return {"success": True, "data": [], "query": query}
+
+        retriever = GrepRetriever(work_path=DEFAULT_SIRCHMUNK_WORK_PATH)
+        escaped = _re.escape(query.strip())
+        results = await retriever.retrieve_by_filename(
+            patterns=[escaped],
+            path=paths,
+            max_depth=8,
+        )
+
+        def _human_size(path: str) -> str:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                return ""
+            for unit in ("B", "KB", "MB", "GB"):
+                if size < 1024:
+                    return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+                size /= 1024
+            return f"{size:.1f} TB"
+
+        suggestions = []
+        for r in results[:limit]:
+            filename = r.get("filename", "")
+            filepath = r.get("path", "")
+            ext = filename.rsplit(".", 1)[-1].upper() if "." in filename else ""
+
+            # Compute highlight range within the display name
+            hl_start, hl_end = -1, -1
+            try:
+                match = _re.search(escaped, filename, _re.IGNORECASE)
+                if match:
+                    hl_start, hl_end = match.start(), match.end()
+            except _re.error:
+                pass
+
+            suggestions.append({
+                "filename": filepath,
+                "display_name": filename,
+                "type": ext,
+                "size": _human_size(filepath),
+                "kb_name": kb_name,
+                "highlight_start": hl_start,
+                "highlight_end": hl_end,
+            })
+
         return {
             "success": True,
-            "data": [],
-            "query": query
+            "data": suggestions,
+            "query": query,
+            "total_matches": len(results),
         }
-
-    return {
-        "success": True,
-        "data": [],
-        "query": query,
-        "total_matches": 0
-    }
+    except Exception as e:
+        logger.warning(f"Suggestions search failed: {e}")
+        return {"success": True, "data": [], "query": query}
 
 @router.get("/search/knowledge-bases")
 async def get_knowledge_bases():

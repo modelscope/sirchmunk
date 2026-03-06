@@ -108,6 +108,7 @@ interface QueryInfo {
 interface ChatSource {
   rag?: Array<{ kb_name: string; content: string }>;
   web?: Array<{ url: string; title?: string; snippet?: string }>;
+  references?: Array<{ file: string; summary: string; snippets: string[] }>;
 }
 
 interface HomeChatMessage {
@@ -803,7 +804,7 @@ export function GlobalProvider({ children }: { children: React.ReactNode }) {
           if (lastMessage?.role === "assistant") {
             messages[messages.length - 1] = {
               ...lastMessage,
-              sources: { rag: data.rag, web: data.web },
+              sources: { rag: data.rag, web: data.web, references: data.references },
             };
           }
           return { ...prev, messages };
