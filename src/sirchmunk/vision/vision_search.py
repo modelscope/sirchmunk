@@ -8,12 +8,16 @@ fast text-based retrieval over cached captions and tags.
 
 Two speed modes, both supporting text-only / image-only / hybrid input:
 
-    FAST (default) — greedy + early stopping:
-        Phase 0 → Phase 1 → Phase 2 → assemble
-        Skips VLM verification and feedback; returns SigLIP2 scores directly.
+    FAST (default) — greedy Phase 1+2 + VLM verification:
+        Phase 0 → Phase 1 → Phase 2 → Phase 3 (VLM) → Phase 4 (persist)
+        Uses greedy parameters in Phase 1+2 for speed, then sends a
+        collage to the VLM for semantic verification.  Skips the online
+        feedback/weight-adaptation loop.
 
     DEEP — full precision pipeline:
-        Phase 0 → Phase 1 → Phase 2 → Phase 3 (VLM) → Phase 4 (persist) → assemble
+        Phase 0 → Phase 1 → Phase 2 → Phase 3 (VLM) → Phase 4 (persist + feedback)
+        Thorough parameters in Phase 1+2; VLM verification; verified
+        results feed the online feedback loop for operator weight tuning.
 
 Architecture:
     ┌────────────────────────────────────────────────────────────────┐
@@ -28,12 +32,12 @@ Architecture:
     │          ↑ query expansion (3-5 clip_query variants)           │
     │          ↑ 6 crops per image (global + 4 quad + centre)        │
     ├────────────────────────────────────────────────────────────────┤
-    │ Phase 3  VLM Verifier  — adaptive collage verification  [DEEP] │
+    │ Phase 3  VLM Verifier  — adaptive collage verification         │
     │          ↑ 2×2 / 3×3 / multi-call based on candidate count    │
     ├────────────────────────────────────────────────────────────────┤
-    │ Phase 4  Persist + feedback + result assembly           [DEEP] │
-    │          ↑ VLM verdicts → operator weight adaptation           │
-    │          ↑ hard negative mining for SigLIP threshold tuning    │
+    │ Phase 4  Persist + result assembly                             │
+    │          ↑ VLM verdicts → operator weight adaptation   [DEEP]  │
+    │          ↑ hard negative mining for SigLIP threshold   [DEEP]  │
     └────────────────────────────────────────────────────────────────┘
 """
 
@@ -76,6 +80,26 @@ class VisionSearchResult:
     confidence: float = 0.0
     semantic_tags: List[str] = field(default_factory=list)
     source: str = "pipeline"   # "cache" | "pipeline" | "fast_pipeline"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to a plain dict safe for ``json.dumps``."""
+        return {
+            "path": self.path,
+            "caption": self.caption,
+            "confidence": self.confidence,
+            "semantic_tags": list(self.semantic_tags),
+            "source": self.source,
+        }
+
+    def __str__(self) -> str:
+        parts = [self.path]
+        if self.caption:
+            parts.append(f"caption={self.caption!r}")
+        parts.append(f"confidence={self.confidence:.2f}")
+        if self.semantic_tags:
+            parts.append(f"tags={self.semantic_tags}")
+        parts.append(f"source={self.source}")
+        return f"VisionSearchResult({', '.join(parts)})"
 
 
 class VisionSearch:
@@ -150,9 +174,11 @@ class VisionSearch:
 
         The difference is:
 
-        - **FAST** (default) — greedy: Phase 0 → 1 → 2 → return.
-          Skips VLM verification; uses SigLIP2 scores as confidence.
-        - **DEEP** — full: Phase 0 → 1 → 2 → 3 (VLM) → 4 (persist/feedback).
+        - **FAST** (default) — greedy Phase 1+2, then VLM verification:
+          Phase 0 → 1 → 2 → 3 (VLM collage) → 4 (persist).
+          Skips the online feedback/weight-adaptation loop.
+        - **DEEP** — thorough Phase 1+2, VLM verification + feedback:
+          Phase 0 → 1 → 2 → 3 (VLM collage) → 4 (persist + feedback).
 
         Args:
             query:        Natural language description of the target images.
@@ -219,11 +245,17 @@ class VisionSearch:
     ) -> List[VisionSearchResult]:
         """Core pipeline shared by FAST and DEEP modes.
 
+        Both modes run the full Phase 0–3 pipeline including VLM collage
+        verification.  DEEP additionally runs the online feedback loop
+        for operator weight adaptation.
+
         Args:
             query:        Text query (may be empty for image-only).
             paths:        Search paths.
             top_k:        Max results.
-            fast:         True for greedy mode (skip Phase 3+4).
+            fast:         True for greedy Phase 1+2 parameters.  VLM
+                          verification still runs; only the feedback
+                          loop is skipped.
             input_type:   ``"text"`` | ``"image"`` | ``"hybrid"``.
             pil_images:   PIL images for image/hybrid modes.
             source_paths: Original file paths for query images.
@@ -322,35 +354,25 @@ class VisionSearch:
         self._backfill_siglip_embeds(candidates)
 
         # ============================================================== #
-        # Phase 3+4: VLM verification + persist (DEEP only)
+        # Phase 3: VLM collage verification (both FAST and DEEP)
         # ============================================================== #
         results: List[VisionSearchResult] = []
         seen: set = set()
 
-        if fast:
-            # FAST: directly use SigLIP2 scores
-            for s in scored[:top_k]:
-                results.append(VisionSearchResult(
-                    path=s.path,
-                    caption=f"SigLIP2 score: {s.score:.3f}",
-                    confidence=s.score,
-                    source="fast_pipeline",
-                ))
-                seen.add(s.path)
-        else:
-            # DEEP: VLM verification + persist + feedback
-            verify_query = query or await self._describe_query_images(pil_images)
-            verified, t3_elapsed = await self._phase3_verify(
-                scored=scored,
-                query=verify_query,
-                cached=cached,
-            )
-            timings.append(f"Phase3-VLM: {t3_elapsed:.2f}s")
+        verify_query = query or await self._describe_query_images(pil_images)
+        verified, t3_elapsed = await self._phase3_verify(
+            scored=scored,
+            query=verify_query,
+            cached=cached,
+        )
+        timings.append(f"Phase3-VLM: {t3_elapsed:.2f}s")
 
-            t4 = time.time()
-            for v in verified:
-                if not v.verified:
-                    continue
+        # ============================================================== #
+        # Phase 4: Persist verified results + assemble VisionSearchResult
+        # ============================================================== #
+        t4 = time.time()
+        for v in verified:
+            if v.verified:
                 knowledge = ImageKnowledge(
                     path=v.path,
                     caption=v.caption,
@@ -361,28 +383,30 @@ class VisionSearch:
                 await self._store.store(knowledge)
                 if query:
                     await self._store.update_query_history(v.path, query)
+
+            results.append(VisionSearchResult(
+                path=v.path,
+                caption=v.caption,
+                confidence=v.confidence,
+                semantic_tags=v.semantic_tags,
+                source="pipeline" if v.verified else "vlm_unverified",
+            ))
+            seen.add(v.path)
+
+        # Feedback loop — DEEP only (online weight adaptation)
+        if not fast and constraint is not None:
+            self._collect_feedback(verify_query, constraint, scored, verified)
+        timings.append(f"Phase4-Persist: {time.time() - t4:.2f}s")
+
+        # Append any scored candidates that were not sent to VLM
+        # (e.g. already_verified exclusion) using their SigLIP2 scores
+        for s in scored[:top_k]:
+            if s.path not in seen:
                 results.append(VisionSearchResult(
-                    path=v.path,
-                    caption=v.caption,
-                    confidence=v.confidence,
-                    semantic_tags=v.semantic_tags,
-                    source="pipeline",
+                    path=s.path, caption="", confidence=s.score,
+                    source="siglip_score",
                 ))
-                seen.add(v.path)
-
-            if constraint is not None:
-                self._collect_feedback(verify_query, constraint, scored, verified)
-            timings.append(f"Phase4-Persist: {time.time() - t4:.2f}s")
-
-            # If VLM verified nothing, fall back to SigLIP2 scores
-            if not results:
-                for s in scored[:top_k]:
-                    if s.path not in seen:
-                        results.append(VisionSearchResult(
-                            path=s.path, caption="", confidence=s.score,
-                            source="siglip_score",
-                        ))
-                        seen.add(s.path)
+                seen.add(s.path)
 
         # ============================================================== #
         # Merge cached results + sort + record episode

@@ -226,9 +226,9 @@ class KnowledgeCluster:
     # Related knowledge clusters for estimated weak semantic connections
     related_clusters: List[WeakSemanticEdge] = None
 
-    # Search results: list of file paths or URLs that were retrieved
-    # Used to track which sources contributed to this knowledge cluster
-    search_results: List[str] = None
+    # Search results: list of file paths/URLs (str) or rich result dicts
+    # (e.g. VisionSearchResult.to_dict()) that were retrieved.
+    search_results: List[Any] = None
 
     # Historical queries: list of original user input queries that led to this cluster
     # Used for semantic similarity matching and cluster reuse
@@ -343,10 +343,19 @@ class KnowledgeCluster:
         # Add search results
         if self.search_results:
             lines.append(separator)
-            lines.append(f"Search Results ({len(self.search_results)} files):")
+            lines.append(f"Search Results ({len(self.search_results)} items):")
             for i, result in enumerate(self.search_results[:5], 1):
-                result_preview = result[:80] + "..." if len(result) > 80 else result
-                lines.append(f"  [{i}] {result_preview}")
+                if isinstance(result, dict):
+                    label = result.get("path", result.get("url", str(result)))
+                    caption = result.get("caption", "")
+                    preview = f"{label}"
+                    if caption:
+                        preview += f" — {caption[:60]}"
+                else:
+                    preview = str(result)
+                if len(preview) > 80:
+                    preview = preview[:77] + "..."
+                lines.append(f"  [{i}] {preview}")
             if len(self.search_results) > 5:
                 lines.append(f"  ... (+{len(self.search_results) - 5} more)")
         

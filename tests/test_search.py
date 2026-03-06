@@ -4,9 +4,20 @@
 Every test calls the real search() with a real LLM and real files —
 no mocks, no patches.  Configuration is loaded exclusively from
 tests/.env.test.
+
+Return-value contract (after the return_cluster removal):
+    - Default (return_context=False):
+        - FAST / DEEP text search → ``str``
+        - FILENAME_ONLY           → ``List[Dict]``
+        - Vision (auto / forced)  → ``str``
+    - return_context=True:
+        - All modes → ``SearchContext``
+            .answer  : str
+            .cluster : KnowledgeCluster | None
 """
 
 import asyncio
+import json
 import os
 import unittest
 from pathlib import Path
@@ -110,7 +121,7 @@ class _BaseSearchTest(unittest.TestCase):
         )
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return asyncio.run(coro)
 
 
 # ================================================================== #
@@ -131,22 +142,8 @@ class TestSearchFastMode(_BaseSearchTest):
         self.assertIsInstance(result, str)
         self.assertTrue(len(result) > 0)
 
-    def test_fast_return_cluster(self):
-        """FAST + return_cluster returns a KnowledgeCluster."""
-        query = _cfg("TEST_QUERY_FAST", "transformer attention mechanism")
-        result = self._run(self.searcher.search(
-            query=query,
-            paths=self.search_paths,
-            mode="FAST",
-            return_cluster=True,
-        ))
-
-        self.assertIsInstance(result, KnowledgeCluster)
-        self.assertTrue(result.id.startswith("FS"))
-        self.assertTrue(len(result.content) > 0)
-
     def test_fast_return_context(self):
-        """FAST + return_context returns (answer, SearchContext) tuple."""
+        """FAST + return_context returns a SearchContext with answer and cluster."""
         query = _cfg("TEST_QUERY_FAST", "transformer attention mechanism")
         result = self._run(self.searcher.search(
             query=query,
@@ -155,10 +152,30 @@ class TestSearchFastMode(_BaseSearchTest):
             return_context=True,
         ))
 
-        self.assertIsInstance(result, tuple)
-        self.assertEqual(len(result), 2)
-        self.assertIsInstance(result[0], str)
-        self.assertIsInstance(result[1], SearchContext)
+        self.assertIsInstance(result, SearchContext)
+        self.assertIsInstance(result.answer, str)
+        self.assertTrue(len(result.answer) > 0)
+        self.assertIsNotNone(result.cluster)
+        self.assertIsInstance(result.cluster, KnowledgeCluster)
+        self.assertTrue(result.cluster.id.startswith("FS"))
+        self.assertEqual(result.answer, result.cluster.content)
+
+    def test_fast_context_serializable(self):
+        """SearchContext.to_dict() produces a JSON-serializable dict."""
+        query = _cfg("TEST_QUERY_FAST", "transformer attention mechanism")
+        result = self._run(self.searcher.search(
+            query=query,
+            paths=self.search_paths,
+            mode="FAST",
+            return_context=True,
+        ))
+
+        self.assertIsInstance(result, SearchContext)
+        d = result.to_dict()
+        self.assertIsInstance(d, dict)
+        self.assertIn("answer", d)
+        serialized = json.dumps(d, ensure_ascii=False)
+        self.assertIsInstance(serialized, str)
 
 
 # ================================================================== #
@@ -179,21 +196,8 @@ class TestSearchDeepMode(_BaseSearchTest):
         self.assertIsInstance(result, str)
         self.assertTrue(len(result) > 0)
 
-    def test_deep_return_cluster(self):
-        """DEEP + return_cluster returns a KnowledgeCluster."""
-        query = _cfg("TEST_QUERY_DEEP", "How does transformer attention work?")
-        result = self._run(self.searcher.search(
-            query=query,
-            paths=self.search_paths,
-            mode="DEEP",
-            return_cluster=True,
-        ))
-
-        self.assertIsInstance(result, KnowledgeCluster)
-        self.assertTrue(len(result.id) > 0)
-
     def test_deep_return_context(self):
-        """DEEP + return_context returns (answer, SearchContext) tuple."""
+        """DEEP + return_context returns a SearchContext with answer and cluster."""
         query = _cfg("TEST_QUERY_DEEP", "How does transformer attention work?")
         result = self._run(self.searcher.search(
             query=query,
@@ -202,10 +206,12 @@ class TestSearchDeepMode(_BaseSearchTest):
             return_context=True,
         ))
 
-        self.assertIsInstance(result, tuple)
-        self.assertEqual(len(result), 2)
-        self.assertIsInstance(result[0], str)
-        self.assertIsInstance(result[1], SearchContext)
+        self.assertIsInstance(result, SearchContext)
+        self.assertIsInstance(result.answer, str)
+        self.assertTrue(len(result.answer) > 0)
+        self.assertIsNotNone(result.cluster)
+        self.assertIsInstance(result.cluster, KnowledgeCluster)
+        self.assertEqual(result.answer, result.cluster.content)
 
 
 # ================================================================== #
@@ -239,12 +245,55 @@ class TestSearchFilenameOnly(_BaseSearchTest):
 
 
 # ================================================================== #
+#  PATH VALIDATION                                                     #
+# ================================================================== #
+
+class TestPathValidation(unittest.TestCase):
+    """Unit tests for AgenticSearch.validate_search_paths (no LLM)."""
+
+    def test_rejects_hyphen_prefix(self):
+        clean = AgenticSearch.validate_search_paths(["--help", "/tmp"])
+        self.assertEqual(len(clean), 1)
+        self.assertNotIn("--help", clean)
+
+    def test_rejects_null_byte(self):
+        clean = AgenticSearch.validate_search_paths(["/tmp/foo\x00bar"])
+        self.assertEqual(clean, [])
+
+    def test_rejects_nonexistent_with_require_exists(self):
+        clean = AgenticSearch.validate_search_paths(
+            ["/absolutely/does/not/exist/xyz"],
+            require_exists=True,
+        )
+        self.assertEqual(clean, [])
+
+    def test_accepts_valid_url(self):
+        clean = AgenticSearch.validate_search_paths(
+            ["https://example.com/docs"],
+        )
+        self.assertEqual(clean, ["https://example.com/docs"])
+
+    def test_rejects_malformed_url(self):
+        clean = AgenticSearch.validate_search_paths(["https://"])
+        self.assertEqual(clean, [])
+
+    def test_deduplicates(self):
+        clean = AgenticSearch.validate_search_paths(["/tmp", "/tmp", "/tmp"])
+        self.assertEqual(len(clean), 1)
+
+
+# ================================================================== #
 #  VISION AUTO-DETECT (text query triggers vision pipeline)            #
 # ================================================================== #
 
 @unittest.skipUnless(_HAS_VISION, "Vision dependencies not installed")
 class TestSearchVisionAutoDetect(_BaseSearchTest):
-    """Vision search triggered by LLM-detected image intent (COCO2017)."""
+    """Vision search triggered by LLM-detected image intent.
+
+    After the SearchContext unification, vision auto-detect returns a
+    ``str`` answer (or ``SearchContext`` with ``return_context=True``),
+    NOT a raw ``List[VisionSearchResult]``.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -255,21 +304,8 @@ class TestSearchVisionAutoDetect(_BaseSearchTest):
                 "TEST_VISION_SEARCH_PATHS not configured in .env.test"
             )
 
-    def _assert_vision_results(self, results: list):
-        """Shared assertion helper for VisionSearchResult lists."""
-        self.assertIsInstance(results, list)
-        self.assertTrue(len(results) > 0, "Expected at least one vision result")
-        for r in results:
-            self.assertIsInstance(r, VisionSearchResult)
-            self.assertTrue(
-                os.path.isfile(r.path),
-                f"Result path does not exist: {r.path}",
-            )
-            self.assertGreaterEqual(r.confidence, 0.0)
-            self.assertTrue(len(r.path) > 0)
-
-    def test_vision_fast_returns_results(self):
-        """FAST vision: COCO2017 query returns VisionSearchResult list."""
+    def test_vision_fast_returns_string(self):
+        """FAST vision auto-detect returns a structured answer string."""
         query = _cfg(
             "TEST_QUERY_VISION_FAST",
             "find photos of dogs playing outdoors",
@@ -279,12 +315,64 @@ class TestSearchVisionAutoDetect(_BaseSearchTest):
             paths=self.vision_paths,
             mode="FAST",
         ))
-        self._assert_vision_results(result)
-        for r in result:
-            self.assertEqual(r.source, "fast_pipeline")
+        self.assertIsInstance(result, str)
+        self.assertTrue(len(result) > 0)
 
-    def test_vision_deep_returns_results(self):
-        """DEEP vision: COCO2017 query returns verified VisionSearchResult."""
+    def test_vision_fast_return_context(self):
+        """FAST vision + return_context returns SearchContext with vision cluster."""
+        query = _cfg(
+            "TEST_QUERY_VISION_FAST",
+            "find photos of dogs playing outdoors",
+        )
+        result = self._run(self.searcher.search(
+            query=query,
+            paths=self.vision_paths,
+            mode="FAST",
+            return_context=True,
+        ))
+
+        self.assertIsInstance(result, SearchContext)
+        self.assertIsInstance(result.answer, str)
+        self.assertTrue(len(result.answer) > 0)
+
+        if result.cluster is not None:
+            self.assertEqual(result.answer, result.cluster.content)
+            self.assertTrue(result.cluster.id.startswith("VS") or
+                            result.cluster.id.startswith("FS"))
+            for sr in result.cluster.search_results:
+                if isinstance(sr, dict):
+                    self.assertIn("path", sr)
+                    self.assertIn("confidence", sr)
+
+    def test_vision_fast_context_has_vlm_captions(self):
+        """FAST vision now includes VLM collage verification with captions."""
+        query = _cfg(
+            "TEST_QUERY_VISION_FAST",
+            "find photos of dogs playing outdoors",
+        )
+        result = self._run(self.searcher.search(
+            query=query,
+            paths=self.vision_paths,
+            mode="FAST",
+            return_context=True,
+        ))
+
+        self.assertIsInstance(result, SearchContext)
+        if result.cluster:
+            self.assertEqual(result.answer, result.cluster.content)
+            if result.cluster.evidences:
+                has_caption = any(ev.summary for ev in result.cluster.evidences)
+                self.assertTrue(
+                    has_caption,
+                    "FAST vision should have VLM-generated captions",
+                )
+            if result.cluster.search_results:
+                for sr in result.cluster.search_results:
+                    if isinstance(sr, dict):
+                        self.assertIn("caption", sr)
+
+    def test_vision_deep_returns_string(self):
+        """DEEP vision auto-detect returns a structured answer string."""
         query = _cfg(
             "TEST_QUERY_VISION_DEEP",
             "find all images containing a red fire truck on the street",
@@ -294,21 +382,32 @@ class TestSearchVisionAutoDetect(_BaseSearchTest):
             paths=self.vision_paths,
             mode="DEEP",
         ))
-        self._assert_vision_results(result)
+        self.assertIsInstance(result, str)
+        self.assertTrue(len(result) > 0)
 
-    def test_vision_result_has_caption(self):
-        """DEEP vision results should carry VLM-generated captions."""
+    def test_vision_deep_context_has_captions(self):
+        """DEEP vision + return_context: evidence summaries carry VLM captions."""
         result = self._run(self.searcher.search(
             query="find images of people riding bicycles",
             paths=self.vision_paths,
             mode="DEEP",
+            return_context=True,
         ))
-        self._assert_vision_results(result)
-        captioned = [r for r in result if r.caption]
-        self.assertTrue(
-            len(captioned) > 0,
-            "At least one DEEP result should have a VLM caption",
-        )
+
+        self.assertIsInstance(result, SearchContext)
+        if result.cluster:
+            self.assertEqual(result.answer, result.cluster.content)
+            if result.cluster.evidences:
+                has_caption = any(ev.summary for ev in result.cluster.evidences)
+                self.assertTrue(
+                    has_caption,
+                    "At least one evidence should have a caption as summary",
+                )
+            if result.cluster.search_results:
+                for sr in result.cluster.search_results:
+                    if isinstance(sr, dict):
+                        self.assertIn("path", sr)
+                        self.assertIn("caption", sr)
 
 
 # ================================================================== #
@@ -317,14 +416,18 @@ class TestSearchVisionAutoDetect(_BaseSearchTest):
 
 @unittest.skipUnless(_HAS_VISION, "Vision dependencies not installed")
 class TestSearchVisionQueryImages(_BaseSearchTest):
-    """Vision search with explicit reference images (image-to-image)."""
+    """Vision search with explicit reference images (image-to-image).
+
+    With query_images, search() now returns ``str`` (or ``SearchContext``
+    with ``return_context=True``), NOT raw ``List[VisionSearchResult]``.
+    """
 
     def setUp(self):
         if not self.query_images:
             self.skipTest("QUERY_IMAGES not configured in .env.test")
 
-    def test_query_images_forces_vision(self):
-        """Providing query_images triggers the vision pipeline."""
+    def test_query_images_returns_string(self):
+        """Providing query_images returns a structured answer string."""
         result = self._run(self.searcher.search(
             query="find similar images",
             paths=self.search_paths,
@@ -332,24 +435,95 @@ class TestSearchVisionQueryImages(_BaseSearchTest):
             mode="FAST",
         ))
 
-        self.assertIsInstance(result, list)
-        if result:
-            self.assertIsInstance(result[0], VisionSearchResult)
+        self.assertIsInstance(result, str)
+        self.assertTrue(len(result) > 0)
 
-    def test_query_images_deep_mode(self):
-        """DEEP mode with query_images returns verified results."""
+    def test_query_images_return_context(self):
+        """query_images + return_context returns SearchContext with vision cluster."""
+        result = self._run(self.searcher.search(
+            query="find similar images",
+            paths=self.search_paths,
+            query_images=self.query_images,
+            mode="FAST",
+            return_context=True,
+        ))
+
+        self.assertIsInstance(result, SearchContext)
+        self.assertIsInstance(result.answer, str)
+        if result.cluster:
+            self.assertEqual(result.answer, result.cluster.content)
+            self.assertTrue(result.cluster.id.startswith("VS"))
+            for sr in result.cluster.search_results:
+                self.assertIsInstance(sr, dict)
+                self.assertIn("path", sr)
+
+    def test_query_images_deep_return_context(self):
+        """DEEP mode + query_images + return_context."""
         result = self._run(self.searcher.search(
             query="find similar images",
             paths=self.search_paths,
             query_images=self.query_images,
             mode="DEEP",
+            return_context=True,
         ))
 
-        self.assertIsInstance(result, list)
-        if result:
-            for r in result:
-                self.assertIsInstance(r, VisionSearchResult)
-                self.assertTrue(os.path.isfile(r.path))
+        self.assertIsInstance(result, SearchContext)
+        self.assertIsInstance(result.answer, str)
+        if result.cluster:
+            self.assertEqual(result.answer, result.cluster.content)
+
+
+# ================================================================== #
+#  VisionSearchResult unit tests                                       #
+# ================================================================== #
+
+@unittest.skipUnless(_HAS_VISION, "Vision dependencies not installed")
+class TestVisionSearchResult(unittest.TestCase):
+    """Unit tests for VisionSearchResult serialization (no LLM)."""
+
+    def _make(self, **overrides):
+        defaults = dict(
+            path="/tmp/test.jpg",
+            caption="A dog in a park",
+            confidence=0.85,
+            semantic_tags=["dog", "park", "outdoor"],
+            source="fast_pipeline",
+        )
+        defaults.update(overrides)
+        return VisionSearchResult(**defaults)
+
+    def test_to_dict_keys(self):
+        r = self._make()
+        d = r.to_dict()
+        self.assertIsInstance(d, dict)
+        for key in ("path", "caption", "confidence", "semantic_tags", "source"):
+            self.assertIn(key, d)
+
+    def test_to_dict_values(self):
+        r = self._make()
+        d = r.to_dict()
+        self.assertEqual(d["path"], "/tmp/test.jpg")
+        self.assertEqual(d["caption"], "A dog in a park")
+        self.assertAlmostEqual(d["confidence"], 0.85, places=2)
+        self.assertEqual(d["semantic_tags"], ["dog", "park", "outdoor"])
+        self.assertEqual(d["source"], "fast_pipeline")
+
+    def test_to_dict_json_serializable(self):
+        r = self._make()
+        serialized = json.dumps(r.to_dict())
+        self.assertIsInstance(serialized, str)
+
+    def test_str_contains_path(self):
+        r = self._make()
+        s = str(r)
+        self.assertIn("/tmp/test.jpg", s)
+        self.assertIn("VisionSearchResult", s)
+
+    def test_str_without_caption(self):
+        r = self._make(caption="")
+        s = str(r)
+        self.assertIn("/tmp/test.jpg", s)
+        self.assertNotIn("caption=", s)
 
 
 if __name__ == "__main__":

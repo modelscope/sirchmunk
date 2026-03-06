@@ -889,6 +889,7 @@ class AgenticSearch(BaseSearch):
         query: str,
         paths: list,
         mode: str = "FAST",
+        vision_top_k: int = 10,
     ) -> Optional[list]:
         """Check whether *query* has vision intent and dispatch if so.
 
@@ -919,7 +920,7 @@ class AgenticSearch(BaseSearch):
             return await vs.search(
                 query=query,
                 paths=[str(p) for p in paths],
-                top_k=10,
+                top_k=vision_top_k,
                 mode=mode,
             )
         except Exception as e:
@@ -927,6 +928,95 @@ class AgenticSearch(BaseSearch):
                 f"[search] Vision pipeline failed ({e}), continuing with text"
             )
             return None
+
+    # ------------------------------------------------------------------
+    # Vision result adapter
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_vision_answer(results: list) -> str:
+        """Build a structured answer string from vision search results.
+
+        The output is human-readable but carries enough structure for
+        downstream consumers (e.g. the web chat) to extract individual
+        file paths, captions, and confidence scores.
+        """
+        if not results:
+            return "No matching images found."
+
+        lines = [f"Found {len(results)} image(s) matching your query:\n"]
+        for i, r in enumerate(results, 1):
+            entry = f"{i}. **{Path(r.path).name}**"
+            if getattr(r, "caption", ""):
+                entry += f"\n   Caption: {r.caption}"
+            entry += f"\n   Confidence: {getattr(r, 'confidence', 0):.2f}"
+            tags = getattr(r, "semantic_tags", [])
+            if tags:
+                entry += f"\n   Tags: {', '.join(tags[:5])}"
+            entry += f"\n   Path: {r.path}"
+            lines.append(entry)
+        return "\n".join(lines)
+
+    def _wrap_vision_results(
+        self,
+        query: str,
+        results: list,
+        *,
+        return_context: bool = False,
+    ) -> Union[str, "SearchContext"]:
+        """Convert ``List[VisionSearchResult]`` into the standard return format.
+
+        Builds a structured answer, an evidence-bearing
+        ``KnowledgeCluster`` whose ``search_results`` carry full
+        ``VisionSearchResult.to_dict()`` dicts, and (optionally) a
+        ``SearchContext``.
+
+        Args:
+            query: Original user query.
+            results: List of ``VisionSearchResult`` from the vision pipeline.
+            return_context: Mirror the flag from ``search()``.
+
+        Returns:
+            ``str`` summary when *return_context* is False, otherwise
+            a fully populated ``SearchContext``.
+        """
+        answer = self._build_vision_answer(results)
+
+        if not return_context:
+            return answer
+
+        ctx = SearchContext()
+
+        evidences = []
+        search_result_dicts: list = []
+        for r in results:
+            rd = r.to_dict() if hasattr(r, "to_dict") else {"path": str(r)}
+            search_result_dicts.append(rd)
+            evidences.append(EvidenceUnit(
+                doc_id=hashlib.sha256(r.path.encode("utf-8")).hexdigest()[:12],
+                file_or_url=r.path,
+                summary=getattr(r, "caption", ""),
+                is_found=True,
+                snippets=list(getattr(r, "semantic_tags", [])[:3]),
+                extracted_at=datetime.now(timezone.utc),
+            ))
+
+        _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
+        ctx.cluster = KnowledgeCluster(
+            id=f"VS{_digest}",
+            name=query[:60],
+            description=[f"Vision search result for: {query}"],
+            content=answer,
+            evidences=evidences,
+            confidence=max((getattr(r, "confidence", 0.5) for r in results), default=0.5),
+            abstraction_level=AbstractionLevel.TECHNIQUE,
+            hotness=0.5,
+            lifecycle=Lifecycle.EMERGING,
+            queries=[query],
+            search_results=search_result_dicts,
+        )
+        ctx.answer = ctx.cluster.content
+        return ctx
 
     # ------------------------------------------------------------------
     # Unified search entry point
@@ -943,7 +1033,7 @@ class AgenticSearch(BaseSearch):
         max_token_budget: int = 64000,
         max_depth: Optional[int] = 8,
         top_k_files: int = 3,
-        top_k: int = 10,
+        vision_top_k: int = 10,
         enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
@@ -954,13 +1044,14 @@ class AgenticSearch(BaseSearch):
 
         Vision intent is **auto-detected** during query analysis — if the
         LLM determines the user is looking for images, the query is
-        transparently routed to the vision pipeline.  When ``query_images``
+        transparently routed to the vision pipeline.  When *query_images*
         is provided, vision mode is forced.  The vision pipeline inherits
-        the current ``mode`` (FAST or DEEP):
+        the current *mode* (FAST or DEEP):
 
-        - **FAST vision**: Visual Grep → SigLIP2 → return (no VLM call).
-        - **DEEP vision**: Visual Grep → SigLIP2 → VLM verification →
-          feedback loop.
+        - **FAST vision**: Visual Grep → SigLIP2 → VLM collage
+          verification → persist.
+        - **DEEP vision**: Visual Grep → SigLIP2 → VLM collage
+          verification → persist + feedback loop.
 
         Modes:
             +--------------+-------------------+-------------------------------------------+
@@ -981,16 +1072,19 @@ class AgenticSearch(BaseSearch):
                 ``self.paths`` or the current working directory.
             mode: Search mode — ``"DEEP"``, ``"FAST"``, or
                 ``"FILENAME_ONLY"``.
+            query_images: Reference images for vision similarity or
+                hybrid search.  Each element can be a file path ``str``,
+                base64 data URI ``str``, raw ``bytes``, or a
+                ``PIL.Image.Image`` object.  When provided, forces vision
+                mode regardless of *mode*.
             max_loops: Maximum ReAct iterations (DEEP mode, default: 10).
             max_token_budget: LLM token budget (DEEP mode, default: 64000).
-            max_depth: Maximum directory depth for file search (default: 5).
-            top_k_files: Max files for evidence extraction (default: 3).
-            top_k: Max results for vision search (default: 10).
+            max_depth: Maximum directory depth for file search (default: 8).
+            top_k_files: Max files for text evidence extraction (default: 3).
+            vision_top_k: Max results returned by the vision pipeline
+                (default: 10).  Only used when vision search is triggered
+                (either via *query_images* or auto-detected intent).
             enable_dir_scan: Enable directory scanning tool (DEEP mode).
-            include: File glob patterns to include.
-            exclude: File glob patterns to exclude.
-            return_context: If True, return ``(answer, SearchContext)`` tuple.
-            return_cluster: If True, return the full KnowledgeCluster.
             include: File glob patterns to include (e.g. ``["*.py", "*.md"]``).
                 Used in both FILENAME_ONLY and DEEP modes.
             exclude: File glob patterns to exclude (e.g. ``["*.log"]``).
@@ -999,47 +1093,38 @@ class AgenticSearch(BaseSearch):
                 that carries ``answer``, ``cluster`` (KnowledgeCluster),
                 and full pipeline telemetry (LLM usage, files read, etc.).
             spec_stale_hours: Hours before spec cache is stale (default: 72).
-            query_images: Reference images for vision similarity or
-                hybrid search.  Each element can be a file path ``str``,
-                base64 data URI ``str``, raw ``bytes``, or a
-                ``PIL.Image.Image`` object.  When provided, forces vision
-                mode.
 
         Returns:
-            - ``str``: Answer summary (default).
+            - ``str``: Answer summary (default for FAST/DEEP text search
+              and vision search).
             - ``SearchContext``: If *return_context* — contains ``answer``,
               ``cluster``, and telemetry in a single object.
             - ``List[Dict]``: File matches in FILENAME_ONLY mode.
-            - ``str``: Answer summary (default for FAST/DEEP text search).
-            - ``(str, SearchContext)``: If *return_context* (text search).
-            - ``KnowledgeCluster``: If *return_cluster* (text search).
-            - ``List[Dict]``: File matches (FILENAME_ONLY).
-            - ``List[VisionSearchResult]``: Image results (vision).
         """
-        paths = self.validate_search_paths(
-            self._resolve_paths(paths),
-        )
+        paths = self.validate_search_paths(self._resolve_paths(paths))
         if not paths:
             msg = "No valid search paths remain after validation."
             _loguru_logger.warning(msg)
             if return_context:
                 ctx = SearchContext()
-                ctx.answer = msg
+                ctx.cluster = self._make_answer_cluster(query, msg, "ERR")
+                ctx.answer = ctx.cluster.content
                 return ctx
             return msg
-        # Force vision mode when query_images are provided
+
+        # ---- Force vision when query_images are provided ----
         if query_images:
-            paths = self._resolve_paths(paths)
             vs = self._ensure_vision_search()
-            return await vs.search(
+            vision_results = await vs.search(
                 query=query or "",
                 paths=[str(p) for p in paths],
-                top_k=top_k,
+                top_k=vision_top_k,
                 query_images=query_images,
                 mode=mode,
             )
-
-        paths = self._resolve_paths(paths)
+            return self._wrap_vision_results(
+                query, vision_results, return_context=return_context,
+            )
 
         # ---- FILENAME_ONLY: pattern-based file discovery, no LLM ----
         if mode == "FILENAME_ONLY":
@@ -1058,7 +1143,7 @@ class AgenticSearch(BaseSearch):
         if mode == "FAST":
             answer, cluster, context = await self._search_fast(
                 query=query, paths=paths, max_depth=max_depth,
-                top_k_files=top_k_files, top_k=top_k,
+                top_k_files=top_k_files, vision_top_k=vision_top_k,
                 include=include, exclude=exclude,
             )
         else:
@@ -1066,6 +1151,7 @@ class AgenticSearch(BaseSearch):
                 query=query, paths=paths,
                 max_loops=max_loops, max_token_budget=max_token_budget,
                 max_depth=max_depth, top_k_files=top_k_files,
+                vision_top_k=vision_top_k,
                 enable_dir_scan=enable_dir_scan,
                 include=include, exclude=exclude,
                 spec_stale_hours=spec_stale_hours,
@@ -1074,10 +1160,12 @@ class AgenticSearch(BaseSearch):
         # ---- Unified return wrapping ----
         if return_context:
             prefix = "FS" if mode == "FAST" else "DS"
-            context.answer = answer
             context.cluster = cluster or self._make_answer_cluster(
                 query, answer, prefix,
             )
+            if context.cluster.content != answer:
+                context.cluster.content = answer
+            context.answer = context.cluster.content
             return context
         return answer
 
@@ -1094,6 +1182,7 @@ class AgenticSearch(BaseSearch):
         max_token_budget: int = 64000,
         max_depth: Optional[int] = 5,
         top_k_files: int = 3,
+        vision_top_k: int = 10,
         enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
@@ -1133,13 +1222,12 @@ class AgenticSearch(BaseSearch):
         # Phase 0c: Vision intent quick-check (single LLM call, no-op
         #           if the query doesn't look image-related)
         # ==============================================================
-        vision_result = await self._try_vision_dispatch(query, paths, mode="DEEP")
+        vision_result = await self._try_vision_dispatch(
+            query, paths, mode="DEEP", vision_top_k=vision_top_k,
+        )
         if vision_result is not None:
-            summary = (
-                f"Found {len(vision_result)} image(s) matching your query."
-                if vision_result else "No matching images found."
-            )
-            return summary, self._make_answer_cluster(query, summary, "VS"), context
+            wrapped = self._wrap_vision_results(query, vision_result, return_context=True)
+            return wrapped.answer, wrapped.cluster, context
 
         # ==============================================================
         # Phase 1: Parallel probing — all four paths fire concurrently
@@ -1359,7 +1447,7 @@ class AgenticSearch(BaseSearch):
         *,
         max_depth: Optional[int] = 5,
         top_k_files: int = 2,
-        top_k: int = 10,
+        vision_top_k: int = 10,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
@@ -1412,16 +1500,20 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         if modality == "vision":
             await self._logger.info(
-                f"[FAST:Step1] Vision intent detected — routing to vision pipeline"
+                "[FAST:Step1] Vision intent detected — routing to vision pipeline"
             )
             try:
                 vs = self._ensure_vision_search()
-                return await vs.search(
+                vision_results = await vs.search(
                     query=query,
                     paths=[str(p) for p in paths],
-                    top_k=top_k,
+                    top_k=vision_top_k,
                     mode="FAST",
                 )
+                wrapped = self._wrap_vision_results(
+                    query, vision_results, return_context=True,
+                )
+                return wrapped.answer, wrapped.cluster, context
             except Exception as e:
                 await self._logger.warning(
                     f"[FAST] Vision search failed ({e}), falling back to text"
@@ -1531,7 +1623,6 @@ class AgenticSearch(BaseSearch):
             query=query, query_type="text_fast", paths=paths,
             hit_paths=[file_path],
         )
-        return answer_resp.content or ""
         return answer, cluster, context
 
     # ---- FAST helpers ----
