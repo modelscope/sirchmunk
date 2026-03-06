@@ -9,5 +9,8 @@ opencv-python-headless>=4.8.0
 torch>=2.0.0
 transformers>=4.45.0
 
+# SIMD-accelerated brute-force vector search (optional, NumPy fallback)
+usearch>=2.9
+
 # VLM client (OpenAI-compatible multimodal HTTP)
 httpx>=0.24.0

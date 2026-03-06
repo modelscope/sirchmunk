@@ -152,6 +152,23 @@ class VisualGrep:
         op_names = [op.name for op, _ in active]
         print(f"  [VisualGrep] Active operators ({len(active)}): {op_names}")
 
+        # ---- Batch-compute SigLIP embed scores (SIMD-accelerated) ----
+        siglip_batch_scores: Dict[str, float] = {}
+        siglip_op = next(
+            (op for op, _ in active if op.name == "siglip_embed"), None,
+        )
+        if siglip_op is not None:
+            from .operators.siglip_embed_op import SigLIPEmbedOperator
+            if isinstance(siglip_op, SigLIPEmbedOperator):
+                siglip_batch_scores = SigLIPEmbedOperator.batch_score(
+                    signatures, constraint,
+                )
+                if siglip_batch_scores:
+                    print(
+                        f"  [VisualGrep] SigLIP batch-scored "
+                        f"{len(siglip_batch_scores)} images (SIMD)"
+                    )
+
         # ---- Score via weighted operator fusion (parallelised) ----
         t_score = time.time()
         scorer = partial(
@@ -159,6 +176,7 @@ class VisualGrep:
             con=constraint,
             active_ops=active,
             weight_overrides=weight_overrides,
+            precomputed_siglip=siglip_batch_scores,
         )
 
         if len(signatures) >= _PARALLEL_SCORE_THRESHOLD:
@@ -389,11 +407,15 @@ def _fused_score(
     con: VisualConstraint,
     active_ops: List[Tuple[GrepOperator, float]],
     weight_overrides: Optional[Dict[str, float]] = None,
+    precomputed_siglip: Optional[Dict[str, float]] = None,
 ) -> float:
     """Weighted average of all active operator scores.
 
     If *weight_overrides* is provided, operator weights are replaced
     by the learned values from the feedback loop.
+
+    When *precomputed_siglip* is given, the ``siglip_embed`` operator
+    uses the pre-computed batch score instead of recomputing per-image.
     """
     if not active_ops:
         return 0.5
@@ -405,7 +427,15 @@ def _fused_score(
             if weight_overrides
             else default_w
         )
-        weighted_sum += op.score(sig, con) * w
+        if (
+            precomputed_siglip is not None
+            and op.name == "siglip_embed"
+            and sig.path in precomputed_siglip
+        ):
+            sc = precomputed_siglip[sig.path]
+        else:
+            sc = op.score(sig, con)
+        weighted_sum += sc * w
         total_w += w
     return weighted_sum / total_w if total_w > 0 else 0.5
 

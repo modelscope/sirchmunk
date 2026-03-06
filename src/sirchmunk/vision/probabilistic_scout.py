@@ -34,6 +34,11 @@ import numpy as np
 from PIL import Image
 
 from sirchmunk.schema.vision import ImageCandidate, ScoredCandidate
+from sirchmunk.vision.vector_search import (
+    is_accelerated as _vs_accel,
+    multi_query_max_pool,
+    preferred_dtype,
+)
 
 # ------------------------------------------------------------------ #
 # Lazy-loaded SigLIP2 singleton (module-level for reuse across calls)
@@ -476,24 +481,23 @@ class ProbabilisticScout:
         queries: List[str],
         top_k: int = 9,
     ) -> List[ScoredCandidate]:
-        """FAST greedy ranking: global-crop-only + batch-wise early stopping.
+        """FAST greedy ranking: global-crop-only + batch vector search.
 
-        Candidates are assumed pre-sorted by ``grep_score`` (descending).
-        Processes them in chunks of ``_FAST_CHUNK_SIZE``; stops when
-        ``_FAST_PATIENCE`` consecutive chunks fail to improve the running
-        top-k, provided at least ``top_k * _FAST_MIN_EVAL_FACTOR``
-        candidates have been evaluated.
+        1. Bulk-score all cached embeddings with a single SIMD search.
+        2. Process uncached candidates in chunks, encoding then scoring.
+        3. Early-stop when ``_FAST_PATIENCE`` consecutive chunks fail to
+           improve the running top-k.
         """
-        import torch
-
         _ensure_model(self._model_id)
         t0 = time.time()
 
         text_matrix = self._encode_texts(queries)  # (Q, D)
         embed_dim = text_matrix.shape[1]
+        dtype = preferred_dtype()
+        backend = "USearch-SIMD" if _vs_accel() else "NumPy"
         print(
             f"    [SigLIPScout] Encoded {len(queries)} query variant(s), "
-            f"dim={embed_dim}"
+            f"dim={embed_dim}, backend={backend}"
         )
 
         # Bulk cache lookup — extract global row from cached multi-scale
@@ -510,54 +514,51 @@ class ProbabilisticScout:
             f"{n_to_compute} to compute (global-only)"
         )
 
+        # --- Phase A: batch-score all cached embeddings at once ----------
         top_scores: Dict[str, float] = {}
-        min_top = float("-inf")
-        stale = 0
+        if cached_global:
+            cached_paths = list(cached_global.keys())
+            cached_mat = np.stack(
+                [cached_global[p] for p in cached_paths],
+            ).astype(dtype)
+            scores = multi_query_max_pool(cached_mat, text_matrix.astype(dtype))
+            for i, p in enumerate(cached_paths):
+                top_scores[p] = float(scores[i])
+
+        # --- Phase B: incremental encoding + scoring for uncached --------
         total_encoded = 0
+        stale = 0
         min_before_stop = min(
             top_k * _FAST_MIN_EVAL_FACTOR, len(candidates),
         )
-        processed = 0
+        processed = len(cached_global)
 
-        for ci in range(0, len(candidates), _FAST_CHUNK_SIZE):
-            chunk = candidates[ci: ci + _FAST_CHUNK_SIZE]
-            improved = False
+        uncached_cands = [
+            c for c in candidates if c.path not in cached_global
+        ]
 
-            # Separate cached vs. uncached within this chunk
-            to_encode: List[str] = []
-            chunk_embeds: Dict[str, np.ndarray] = {}
-            for c in chunk:
-                g = cached_global.get(c.path)
-                if g is not None:
-                    chunk_embeds[c.path] = g
-                else:
-                    to_encode.append(c.path)
+        for ci in range(0, len(uncached_cands), _FAST_CHUNK_SIZE):
+            chunk = uncached_cands[ci: ci + _FAST_CHUNK_SIZE]
+            new = self._encode_global_batch([c.path for c in chunk])
+            total_encoded += len(new)
 
-            if to_encode:
-                new = self._encode_global_batch(to_encode)
-                chunk_embeds.update(new)
-                total_encoded += len(new)
-
-            # Score each candidate
-            for c in chunk:
-                emb = chunk_embeds.get(c.path)
-                if emb is None:
-                    continue
-                score = float((text_matrix @ emb).max())
-
-                if len(top_scores) < top_k:
-                    top_scores[c.path] = score
+            if new:
+                chunk_paths = list(new.keys())
+                chunk_mat = np.stack(
+                    [new[p] for p in chunk_paths],
+                ).astype(dtype)
+                chunk_scores = multi_query_max_pool(
+                    chunk_mat, text_matrix.astype(dtype),
+                )
+                improved = False
+                for i, p in enumerate(chunk_paths):
+                    sc = float(chunk_scores[i])
+                    top_scores[p] = sc
                     improved = True
-                    if len(top_scores) >= top_k:
-                        min_top = min(top_scores.values())
-                elif score > min_top:
-                    worst = min(top_scores, key=top_scores.get)
-                    del top_scores[worst]
-                    top_scores[c.path] = score
-                    min_top = min(top_scores.values())
-                    improved = True
+            else:
+                improved = False
 
-            processed = ci + len(chunk)
+            processed += len(chunk)
             stale = 0 if improved else stale + 1
 
             if (
@@ -572,16 +573,83 @@ class ProbabilisticScout:
                 )
                 break
 
+        # --- Assemble top-k from combined scores -------------------------
+        sorted_items = sorted(
+            top_scores.items(), key=lambda x: x[1], reverse=True,
+        )[:top_k]
+
         elapsed = time.time() - t0
         scored = [
             ScoredCandidate(path=p, score=s, round_scores=[s])
-            for p, s in top_scores.items()
+            for p, s in sorted_items
         ]
-        scored.sort(key=lambda x: x.score, reverse=True)
         print(
             f"    [SigLIPScout] Ranked {processed} images (fast) "
             f"in {elapsed:.1f}s"
         )
+        return scored
+
+    # ------------------------------------------------------------------ #
+    # Shared: flatten multi-scale embeddings → batch search → max-pool
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _flatten_multiscale(
+        candidates: List[ImageCandidate],
+        all_embeds: Dict[str, np.ndarray],
+        dtype: np.dtype = np.float32,
+    ) -> Tuple[np.ndarray, List[str], np.ndarray]:
+        """Stack per-candidate multi-scale embeddings into one matrix.
+
+        Returns:
+            ``(matrix, paths, group_ids)`` where *matrix* is
+            ``(total_rows, D)``, *paths* is the ordered candidate path
+            list, and *group_ids* maps each matrix row to a candidate
+            index in *paths* (for max-pooling).
+        """
+        rows: List[np.ndarray] = []
+        paths: List[str] = []
+        group_ids: List[int] = []
+        cand_idx = 0
+        for c in candidates:
+            ms = all_embeds.get(c.path)
+            if ms is None:
+                continue
+            if ms.ndim == 1:
+                ms = ms.reshape(1, -1)
+            paths.append(c.path)
+            for row in ms:
+                rows.append(row)
+                group_ids.append(cand_idx)
+            cand_idx += 1
+
+        if not rows:
+            empty = np.empty((0, 0), dtype=dtype)
+            return empty, [], np.array([], dtype=np.int64)
+
+        matrix = np.stack(rows).astype(dtype)
+        return matrix, paths, np.array(group_ids, dtype=np.int64)
+
+    @staticmethod
+    def _maxpool_scores(
+        flat_scores: np.ndarray,
+        group_ids: np.ndarray,
+        paths: List[str],
+    ) -> List[ScoredCandidate]:
+        """Max-pool flat similarity scores back to per-candidate level."""
+        n_cands = len(paths)
+        best = np.full(n_cands, -np.inf, dtype=np.float32)
+        for i, gid in enumerate(group_ids):
+            if flat_scores[i] > best[gid]:
+                best[gid] = flat_scores[i]
+
+        scored = [
+            ScoredCandidate(path=paths[ci], score=float(best[ci]),
+                            round_scores=[float(best[ci])])
+            for ci in range(n_cands)
+            if best[ci] > -np.inf
+        ]
+        scored.sort(key=lambda s: s.score, reverse=True)
         return scored
 
     # ------------------------------------------------------------------ #
@@ -596,39 +664,41 @@ class ProbabilisticScout:
         """Rank candidates by max-pooled SigLIP2 similarity.
 
         ``score = max_{q in queries, s in scales} sim(q, image_s)``
-        """
-        import torch
 
+        Uses SIMD-accelerated batch search when USearch is available;
+        otherwise falls back to a vectorised NumPy implementation.
+        """
         _ensure_model(self._model_id)
         t0 = time.time()
 
         text_matrix = self._encode_texts(queries)   # (Q, D)
         embed_dim = text_matrix.shape[1]
+        dtype = preferred_dtype()
+        backend = "USearch-SIMD" if _vs_accel() else "NumPy"
         print(
             f"    [SigLIPScout] Encoded {len(queries)} query variant(s), "
-            f"dim={embed_dim}"
+            f"dim={embed_dim}, backend={backend}, dtype={dtype}"
         )
 
         all_embeds = self._get_candidate_multiscale(
             candidates, embed_dim, label="text-search",
         )
 
-        scored: List[ScoredCandidate] = []
-        for c in candidates:
-            ms_embed = all_embeds.get(c.path)
-            if ms_embed is not None:
-                sim_matrix = text_matrix @ ms_embed.T     # (Q, 6)
-                best_score = float(sim_matrix.max())
-                global_score = float(sim_matrix[:, 0].max())
-                scored.append(ScoredCandidate(
-                    path=c.path,
-                    score=best_score,
-                    round_scores=[global_score, best_score],
-                ))
+        matrix, paths, group_ids = self._flatten_multiscale(
+            candidates, all_embeds, dtype=dtype,
+        )
+
+        if matrix.shape[0] == 0:
+            return []
+
+        flat_scores = multi_query_max_pool(matrix, text_matrix.astype(dtype))
+        scored = self._maxpool_scores(flat_scores, group_ids, paths)
 
         elapsed = time.time() - t0
-        scored.sort(key=lambda s: s.score, reverse=True)
-        print(f"    [SigLIPScout] Ranked {len(scored)} images in {elapsed:.1f}s")
+        print(
+            f"    [SigLIPScout] Ranked {len(scored)} images "
+            f"({matrix.shape[0]} vectors) in {elapsed:.1f}s"
+        )
         return scored
 
     # ------------------------------------------------------------------ #
@@ -641,33 +711,32 @@ class ProbabilisticScout:
         query_images: List[Image.Image],
         fast: bool = False,
     ) -> List[ScoredCandidate]:
-        """Rank by SigLIP2 image-to-image similarity (multi-scale on candidates)."""
+        """Rank by SigLIP2 image-to-image similarity (batch vector search)."""
         _ensure_model(self._model_id)
         t0 = time.time()
 
         query_matrix = self._encode_images_global(query_images)  # (Nq, D)
         embed_dim = query_matrix.shape[1]
+        dtype = preferred_dtype()
 
         all_embeds = self._get_candidate_multiscale(
             candidates, embed_dim, label="image-search",
             global_only=fast,
         )
 
-        scored: List[ScoredCandidate] = []
-        for c in candidates:
-            ms_embed = all_embeds.get(c.path)
-            if ms_embed is not None:
-                sim_matrix = query_matrix @ ms_embed.T   # (Nq, 6)
-                sim = float(sim_matrix.max())
-                scored.append(ScoredCandidate(
-                    path=c.path, score=sim, round_scores=[sim],
-                ))
+        matrix, paths, group_ids = self._flatten_multiscale(
+            candidates, all_embeds, dtype=dtype,
+        )
+        if matrix.shape[0] == 0:
+            return []
+
+        flat_scores = multi_query_max_pool(matrix, query_matrix.astype(dtype))
+        scored = self._maxpool_scores(flat_scores, group_ids, paths)
 
         elapsed = time.time() - t0
-        scored.sort(key=lambda s: s.score, reverse=True)
         print(
             f"    [SigLIPScout] Image-to-image ranked "
-            f"{len(scored)} in {elapsed:.1f}s"
+            f"{len(scored)} ({matrix.shape[0]} vectors) in {elapsed:.1f}s"
         )
         return scored
 
@@ -683,35 +752,57 @@ class ProbabilisticScout:
         text_weight: float = 0.5,
         fast: bool = False,
     ) -> List[ScoredCandidate]:
-        """Weighted combination of text and image SigLIP2 scores (multi-scale)."""
+        """Weighted combination of text and image SigLIP2 scores (batch search)."""
         _ensure_model(self._model_id)
         t0 = time.time()
 
-        text_matrix = self._encode_texts(text_queries)       # (Qt, D)
+        text_matrix = self._encode_texts(text_queries)            # (Qt, D)
         image_matrix = self._encode_images_global(image_queries)  # (Qi, D)
         embed_dim = text_matrix.shape[1]
+        dtype = preferred_dtype()
 
         all_embeds = self._get_candidate_multiscale(
             candidates, embed_dim, label="hybrid",
             global_only=fast,
         )
 
-        img_w = 1.0 - text_weight
-        scored: List[ScoredCandidate] = []
-        for c in candidates:
-            ms_embed = all_embeds.get(c.path)
-            if ms_embed is not None:
-                t_sim = float((text_matrix @ ms_embed.T).max())
-                i_sim = float((image_matrix @ ms_embed.T).max())
-                combined = text_weight * t_sim + img_w * i_sim
-                scored.append(ScoredCandidate(
-                    path=c.path, score=combined,
-                    round_scores=[t_sim, i_sim],
-                ))
+        matrix, paths, group_ids = self._flatten_multiscale(
+            candidates, all_embeds, dtype=dtype,
+        )
+        if matrix.shape[0] == 0:
+            return []
 
-        elapsed = time.time() - t0
+        t_flat = multi_query_max_pool(matrix, text_matrix.astype(dtype))
+        i_flat = multi_query_max_pool(matrix, image_matrix.astype(dtype))
+
+        img_w = 1.0 - text_weight
+        n_cands = len(paths)
+        t_best = np.full(n_cands, -np.inf, dtype=np.float32)
+        i_best = np.full(n_cands, -np.inf, dtype=np.float32)
+        for idx, gid in enumerate(group_ids):
+            if t_flat[idx] > t_best[gid]:
+                t_best[gid] = t_flat[idx]
+            if i_flat[idx] > i_best[gid]:
+                i_best[gid] = i_flat[idx]
+
+        scored: List[ScoredCandidate] = []
+        for ci in range(n_cands):
+            ts = float(t_best[ci])
+            ims = float(i_best[ci])
+            if ts <= -np.inf:
+                continue
+            combined = text_weight * ts + img_w * ims
+            scored.append(ScoredCandidate(
+                path=paths[ci], score=combined,
+                round_scores=[ts, ims],
+            ))
+
         scored.sort(key=lambda s: s.score, reverse=True)
-        print(f"    [SigLIPScout] Hybrid ranked {len(scored)} in {elapsed:.1f}s")
+        elapsed = time.time() - t0
+        print(
+            f"    [SigLIPScout] Hybrid ranked {len(scored)} "
+            f"({matrix.shape[0]} vectors) in {elapsed:.1f}s"
+        )
         return scored
 
     # ------------------------------------------------------------------ #

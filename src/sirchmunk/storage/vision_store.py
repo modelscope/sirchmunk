@@ -170,6 +170,99 @@ class VisionKnowledgeStore:
         print(f"    [VisionKnowledgeStore] Exact-query hits: {len(results)}")
         return results[:limit]
 
+    async def search_by_vector(
+        self,
+        query_embed: Any,
+        limit: int = 20,
+        min_similarity: float = 0.3,
+    ) -> list:
+        """Semantic vector search over stored SigLIP embeddings.
+
+        Loads all cached SigLIP embeddings from ``image_signatures``,
+        joins with ``image_knowledge``, and ranks by cosine similarity
+        against *query_embed* using SIMD-accelerated brute-force search.
+
+        Falls back to empty results if no embeddings are stored.
+
+        Args:
+            query_embed: ``(D,)`` L2-normalised query embedding.
+            limit:       Maximum number of results.
+            min_similarity: Minimum cosine similarity threshold.
+
+        Returns:
+            List of ``ImageKnowledge`` sorted by similarity (desc).
+        """
+        import numpy as np
+        from sirchmunk.vision.vector_search import top_k_similar, Metric
+
+        print(f"    [VisionKnowledgeStore] Semantic vector search (limit={limit})")
+
+        rows = self._conn.execute(
+            "SELECT s.path, s.signature_json, "
+            "       k.caption, k.tags, k.phash, k.color_moments, "
+            "       k.verified_at, k.confidence, k.query_history "
+            "FROM image_signatures s "
+            "INNER JOIN image_knowledge k ON s.path = k.path",
+        ).fetchall()
+
+        if not rows:
+            print("    [VisionKnowledgeStore] No embeddings with knowledge — skip")
+            return []
+
+        paths: list = []
+        embeds: list = []
+        row_map: dict = {}
+        for r in rows:
+            path, sig_json = r[0], r[1]
+            try:
+                sig_dict = json.loads(sig_json)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            emb = sig_dict.get("siglip_embed")
+            if not emb or not isinstance(emb, list):
+                continue
+            vec = np.array(emb, dtype=np.float32)
+            norm = np.linalg.norm(vec)
+            if norm < 1e-8:
+                continue
+            embeds.append(vec / norm)
+            paths.append(path)
+            row_map[path] = r
+
+        if not embeds:
+            print("    [VisionKnowledgeStore] No SigLIP embeddings found")
+            return []
+
+        matrix = np.stack(embeds)  # (N, D)
+        q = np.asarray(query_embed, dtype=np.float32).ravel()
+        q_norm = np.linalg.norm(q)
+        if q_norm < 1e-8:
+            return []
+        q = q / q_norm
+
+        indices, scores = top_k_similar(
+            matrix, q, min(limit, len(paths)), Metric.INNER_PRODUCT,
+        )
+
+        results = []
+        for idx, sc in zip(indices, scores):
+            if float(sc) < min_similarity:
+                continue
+            path = paths[int(idx)]
+            r = row_map[path]
+            k = _row_to_knowledge((
+                r[0], r[2], r[3], r[4], r[5], r[6], r[7], r[8],
+            ))
+            results.append(k)
+
+        print(
+            f"    [VisionKnowledgeStore] Semantic search: "
+            f"{len(results)} hits from {len(embeds)} indexed "
+            f"(top={float(scores[0]):.3f})" if len(scores) > 0 else
+            f"    [VisionKnowledgeStore] Semantic search: 0 hits"
+        )
+        return results
+
     async def search_text(
         self,
         query: str,

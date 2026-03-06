@@ -286,7 +286,7 @@ class VisionSearch:
             print(f"[VisionSearch:Memory] {advice.memo}")
 
         # ============================================================== #
-        # Phase 0: Knowledge cache — exact-query short-circuit
+        # Phase 0: Knowledge cache — exact-query + semantic short-circuit
         # ============================================================== #
         t0 = time.time()
         cached: list = []
@@ -301,6 +301,20 @@ class VisionSearch:
                         f"{len(valid)} results ({time.time() - t0:.2f}s)"
                     )
                     return _wrap_cached(valid[:top_k])
+
+            if len(cached) < top_k:
+                semantic_hits = await self._phase0_semantic_search(query, top_k)
+                seen_paths = {c.path for c in cached}
+                for hit in semantic_hits:
+                    if hit.path not in seen_paths and os.path.isfile(hit.path):
+                        cached.append(hit)
+                        seen_paths.add(hit.path)
+                if len(cached) >= top_k:
+                    print(
+                        f"[VisionSearch:Phase0] Semantic cache hit — "
+                        f"{len(cached)} results ({time.time() - t0:.2f}s)"
+                    )
+                    return _wrap_cached(cached[:top_k])
         timings.append(f"Phase0-Cache: {time.time() - t0:.2f}s")
 
         # ============================================================== #
@@ -443,6 +457,35 @@ class VisionSearch:
             phase_stats=phase_stats,
         )
         return final_results
+
+    # ------------------------------------------------------------------ #
+    # Phase 0 — Semantic vector cache
+    # ------------------------------------------------------------------ #
+
+    async def _phase0_semantic_search(
+        self,
+        query: str,
+        limit: int,
+    ) -> list:
+        """Semantic vector search over stored SigLIP embeddings.
+
+        Encodes *query* with SigLIP2 (if loaded) and searches the
+        knowledge store by vector similarity.  Returns quickly when
+        no model or embeddings are available.
+        """
+        from .probabilistic_scout import encode_text_query
+
+        embed = encode_text_query(query)
+        if embed is None:
+            return []
+
+        try:
+            return await self._store.search_by_vector(
+                query_embed=embed, limit=limit, min_similarity=0.35,
+            )
+        except Exception as exc:
+            logger.warning("Phase0 semantic search failed: %s", exc)
+            return []
 
     # ------------------------------------------------------------------ #
     # Phase implementations
