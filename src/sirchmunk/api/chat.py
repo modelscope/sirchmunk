@@ -92,7 +92,7 @@ def _resolve_rag_paths(kb_name: str) -> Tuple[List[str], str]:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_HISTORY_MAX_TURNS = 10
-_DEFAULT_HISTORY_MAX_TOKENS = 8000
+_DEFAULT_HISTORY_MAX_TOKENS = 32000
 
 
 def _estimate_tokens(text: str) -> int:

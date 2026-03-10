@@ -202,8 +202,8 @@ def get_current_env_variables() -> Dict[str, Any]:
             "category": "chat"
         },
         "CHAT_HISTORY_MAX_TOKENS": {
-            "value": os.getenv("CHAT_HISTORY_MAX_TOKENS", "8000"),
-            "default": "8000",
+            "value": os.getenv("CHAT_HISTORY_MAX_TOKENS", "32000"),
+            "default": "32000",
             "description": "Maximum token budget for conversation history",
             "category": "chat"
         },
