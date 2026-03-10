@@ -40,6 +40,40 @@ from sirchmunk.utils.utils import (
 )
 
 
+# Only for quick simple-chat intent detection to reduce unnecessary LLM calls
+_CHAT_QUERY_RE = re.compile(
+    r"^("
+    # Greetings (ZH / EN / pinyin / JA / KO)
+    r"你好|您好|嗨|哈喽|喂|早上好|下午好|晚上好|早安|午安|晚安"
+    r"|hello|hi|hey|howdy|greetings|yo"
+    r"|nihao|ni\s*hao"
+    r"|good\s*(morning|afternoon|evening|night)"
+    r"|こんにちは|こんばんは|おはよう"
+    r"|안녕하세요|안녕"
+    # Identity / capability
+    r"|who\s+are\s+you|what\s+are\s+you|你是谁|你是什么"
+    r"|介绍.*你自己|tell\s+me\s+about\s+yourself"
+    r"|what\s+can\s+you\s+do|你能做什么|你会什么"
+    # Small talk
+    r"|how\s+are\s+you|你好吗|你怎么样|what'?s\s+up"
+    # Thanks
+    r"|thank\s*you|thanks|谢谢|感谢|多谢"
+    # Goodbye
+    r"|bye|goodbye|再见|拜拜|see\s+you"
+    # Ping / test
+    r"|test(ing)?|ping"
+    r")[\s!！？?。.，,~～…]*$",
+    re.IGNORECASE,
+)
+
+_CHAT_RESPONSE_SYSTEM = (
+    "You are Sirchmunk, an intelligent document search and analysis assistant. "
+    "The user sent a conversational message (greeting, identity question, etc.) "
+    "rather than a search query. Respond naturally and helpfully in 1-3 sentences. "
+    "Reply in the same language as the user's message."
+)
+
+
 class AgenticSearch(BaseSearch):
 
     def __init__(
@@ -927,6 +961,14 @@ class AgenticSearch(BaseSearch):
                 return ctx
             return msg
 
+        # ---- Chat intent short-circuit (rule-based, no LLM cost) ----
+        if mode != "FILENAME_ONLY" and self._is_chat_query(query):
+            answer, cluster, ctx = await self._respond_chat(query)
+            if return_context:
+                ctx.answer = answer
+                return ctx
+            return answer
+
         # ---- FILENAME_ONLY: pattern-based file discovery, no LLM ----
         if mode == "FILENAME_ONLY":
             results = await self._search_by_filename(
@@ -1110,10 +1152,11 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         context.increment_loop()
         answer: str = ""
+        should_save: bool = True
 
         if cluster and cluster.content:
             await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
-            answer = await self._summarise_cluster(query, cluster)
+            answer, should_save = await self._summarise_cluster(query, cluster)
             if not cluster.search_results:
                 cluster.search_results = list(merged_files)
         else:
@@ -1144,14 +1187,17 @@ class AgenticSearch(BaseSearch):
                 context.add_llm_tokens(total_tok, usage=usage)
 
         # ==============================================================
-        # Phase 5: Persistence (only when no cluster was reused in Phase 0)
-        # When Phase 0 reuses a cluster we return early, so this block
-        # runs only for newly built clusters from Phase 1–4.
+        # Phase 5: Persistence (quality-gated)
+        # Skipped when Phase 4 quality check says the answer is low-quality
+        # or when Phase 0 reused a cluster (early-returned above).
         # ==============================================================
         phase5_tasks = []
-        if cluster:
+        if cluster and should_save:
             self._add_query_to_cluster(cluster, query)
             phase5_tasks.append(self._save_cluster_with_embedding(cluster))
+        elif not should_save:
+            await self._logger.info("[Phase 5] Quality gate: low-quality answer, skipping cluster save")
+            cluster = None
         phase5_tasks.append(self._save_spec_context(paths, context, scan_result=scan_result))
         results = await asyncio.gather(*phase5_tasks, return_exceptions=True)
         for r in results:
@@ -1213,6 +1259,37 @@ class AgenticSearch(BaseSearch):
         if answer:
             await self._logger.success("[DocQA] Direct document analysis complete")
         return answer
+
+    # ------------------------------------------------------------------
+    # Chat intent detection — short-circuit for non-search queries
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_chat_query(query: str) -> bool:
+        """Return True for obvious conversational queries (rule-based, no LLM)."""
+        return bool(_CHAT_QUERY_RE.match(query.strip()))
+
+    async def _respond_chat(
+        self, query: str, context: Optional[SearchContext] = None,
+    ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
+        """Generate a direct conversational response (single LLM call, no retrieval)."""
+        await self._logger.info(
+            f"[search] Chat intent detected — responding directly: '{query[:60]}'"
+        )
+        ctx = context or SearchContext()
+        resp = await self.llm.achat(
+            messages=[
+                {"role": "system", "content": _CHAT_RESPONSE_SYSTEM},
+                {"role": "user", "content": query},
+            ],
+            stream=False,
+        )
+        self.llm_usages.append(resp.usage)
+        if resp.usage and isinstance(resp.usage, dict):
+            ctx.add_llm_tokens(
+                resp.usage.get("total_tokens", 0), usage=resp.usage,
+            )
+        return resp.content or "", None, ctx
 
     # ------------------------------------------------------------------
     # FAST mode — greedy search with early termination
@@ -1277,6 +1354,14 @@ class AgenticSearch(BaseSearch):
             )
 
         analysis = self._parse_fast_json(resp.content)
+
+        if analysis.get("type") == "chat":
+            chat_reply = analysis.get("response", "")
+            if chat_reply:
+                await self._logger.info("[FAST:Step1] LLM classified as chat intent")
+                return chat_reply, None, context
+            return (await self._respond_chat(query, context))
+
         primary = analysis.get("primary", [])[:2]
         fallback = analysis.get("fallback", [])[:3]
         file_hints = analysis.get("file_hints", [])
@@ -1364,13 +1449,17 @@ class AgenticSearch(BaseSearch):
                 answer_resp.usage.get("total_tokens", 0), usage=answer_resp.usage,
             )
 
-        answer = answer_resp.content or ""
+        answer, should_save = self._parse_summary_response(answer_resp.content or "")
         keywords_used = primary if used_level == "primary" else fallback
+
+        if not should_save:
+            await self._logger.info("[FAST] Quality gate: low-quality answer, skipping cluster save")
+            await self._logger.success("[FAST] Search complete (2 LLM calls, no persist)")
+            return answer, None, context
+
         cluster = self._build_fast_cluster(
             query, answer, file_path, evidence, keywords_used,
         )
-
-        # Persist the new cluster (only reached when Step 0 did not reuse)
         self._add_query_to_cluster(cluster, query)
         try:
             await self._save_cluster_with_embedding(cluster)
@@ -1828,10 +1917,12 @@ class AgenticSearch(BaseSearch):
 
     async def _summarise_cluster(
         self, query: str, cluster: KnowledgeCluster,
-    ) -> str:
+    ) -> Tuple[str, bool]:
         """Generate a final answer summary from a KnowledgeCluster.
 
-        Same pipeline as ``search()``'s final summarisation step.
+        Returns:
+            ``(summary_text, should_save)`` — *should_save* is the LLM's
+            quality verdict on whether the result is worth persisting.
         """
         sep = "\n"
         cluster_text_content = (
@@ -1853,7 +1944,7 @@ class AgenticSearch(BaseSearch):
         self.llm_usages.append(response.usage)
 
         summary, should_save = self._parse_summary_response(response.content)
-        return summary
+        return summary, should_save
 
     async def _react_refinement(
         self,

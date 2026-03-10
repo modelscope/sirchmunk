@@ -249,23 +249,27 @@ based strictly on the document content.
 """
 
 
-FAST_QUERY_ANALYSIS = """Extract search terms at two granularity levels from the user query for a ripgrep file search. Both levels in one response.
+FAST_QUERY_ANALYSIS = """Classify the user query and, if it is a document/file search query, extract search terms at two granularity levels for a ripgrep file search.
 
 ### User Query
 {user_input}
 
 ### Output
 Return JSON only, no extra text:
-{{"primary": ["compound phrase"], "fallback": ["term1", "term2"], "file_hints": [], "intent": "..."}}
+{{"type": "search", "primary": ["compound phrase"], "fallback": ["term1", "term2"], "file_hints": [], "intent": "..."}}
 
 Rules:
-- **primary**: 1 compound phrase (2-3 words) that is the most discriminating and likely to appear **verbatim** in the target document. This is tried first.
-- **fallback**: 1-3 single-word atomic terms decomposed from the primary phrase. These are tried only if primary misses. Pick the most specific word(s), not generic ones.
+- **type**: "search" if the query requires retrieving information from files or documents; "chat" if it is a greeting, small talk, identity question, or any other conversational message that does NOT need file retrieval. When type is "chat", set primary and fallback to empty arrays and put a brief natural reply (same language as the query) in "response".
+- **primary**: 1 compound phrase (2-3 words) most likely to appear **verbatim** in the target document. Tried first.
+- **fallback**: 1-3 single-word atomic terms from the primary phrase. Tried only if primary misses.
 - **file_hints**: filename fragments or glob patterns ONLY if clearly implied; empty array otherwise.
-- **intent**: one sentence.
+- **intent**: one sentence describing the query intent.
 
 Example: query "How does transformer attention work?"
-→ {{"primary": ["transformer attention"], "fallback": ["attention", "transformer"], "file_hints": [], "intent": "understand transformer attention mechanism"}}
+→ {{"type": "search", "primary": ["transformer attention"], "fallback": ["attention", "transformer"], "file_hints": [], "intent": "understand transformer attention mechanism"}}
+
+Example: query "你好"
+→ {{"type": "chat", "primary": [], "fallback": [], "file_hints": [], "intent": "greeting", "response": "你好！我是 Sirchmunk，一个智能文档搜索助手。有什么可以帮你的？"}}
 """
 
 
@@ -282,6 +286,17 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 - **User Input**: {user_input}
 - **Search Result Text**: {text_content}
 
-### Output
+### Quality Evaluation
+After generating the summary, evaluate whether this result is worth caching based on:
+1. Does the search result contain substantial, relevant information for the user input?
+2. Is the content meaningful and not just error messages or "no information found"?
+3. Are there sufficient evidences and context to answer the user's query?
+
+If YES to all above, output "true"; otherwise output "false".
+
+### Output Format
+<SUMMARY>
 [Generate the Markdown Briefing here]
+</SUMMARY>
+<SHOULD_SAVE>true/false</SHOULD_SAVE>
 """

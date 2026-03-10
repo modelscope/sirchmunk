@@ -25,11 +25,56 @@ _DEFAULT_LLM_MODEL_NAME = "gpt-5.2"
 _DEFAULT_GREP_CONCURRENT_LIMIT = "5"
 _DEFAULT_WORK_PATH = os.path.expanduser("~/.sirchmunk")
 
+# Keys that must have non-empty values in target .env to "load and reuse" when switching work path
+_REQUIRED_ENV_KEYS_FOR_REUSE = ("LLM_API_KEY", "LLM_BASE_URL")
+
 
 def _get_env_file_path() -> Path:
     """Get the .env file path in the Sirchmunk work directory."""
     work_path = os.getenv("SIRCHMUNK_WORK_PATH", _DEFAULT_WORK_PATH)
     return Path(work_path).expanduser().resolve() / ".env"
+
+
+def _load_env_file_to_dict(env_path: Path) -> Dict[str, str]:
+    """Load a .env file into a key-value dict without modifying os.environ.
+
+    Used when switching work path so we can preserve the existing .env
+    at the target path instead of overwriting with defaults.
+
+    Args:
+        env_path: Path to the .env file.
+
+    Returns:
+        Dict of key -> value. Empty dict if file does not exist or on parse error.
+    """
+    out: Dict[str, str] = {}
+    if not env_path.exists():
+        return out
+    try:
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+            if key:
+                if len(val) >= 2 and (val[0] == val[-1] == '"' or val[0] == val[-1] == "'"):
+                    val = val[1:-1]
+                out[key] = val
+    except Exception:
+        pass
+    return out
+
+
+def _existing_env_can_reuse(existing: Dict[str, str]) -> bool:
+    """Return True if existing .env has all required keys with non-empty values."""
+    for key in _REQUIRED_ENV_KEYS_FOR_REUSE:
+        if not (existing.get(key) or "").strip():
+            return False
+    return True
 
 
 def _update_env_file(updates: Dict[str, str]):
@@ -216,11 +261,34 @@ async def save_settings(request: SaveSettingsRequest):
                     env_updates[key] = str(value)
                     saved_items.append(key)
 
-        # Persist all changes to .env and os.environ in one pass
         if env_updates:
-            _update_env_file(env_updates)
-            for key, value in env_updates.items():
-                os.environ[key] = value
+            # Only trigger work-path-switch logic when the value actually changed
+            work_path_changed = False
+            if "SIRCHMUNK_WORK_PATH" in env_updates:
+                new_resolved = str(Path(env_updates["SIRCHMUNK_WORK_PATH"]).expanduser().resolve())
+                old_resolved = str(Path(os.getenv("SIRCHMUNK_WORK_PATH", _DEFAULT_WORK_PATH)).expanduser().resolve())
+                work_path_changed = (new_resolved != old_resolved)
+                env_updates["SIRCHMUNK_WORK_PATH"] = new_resolved
+
+            if work_path_changed:
+                os.environ["SIRCHMUNK_WORK_PATH"] = env_updates["SIRCHMUNK_WORK_PATH"]
+                new_env_path = Path(env_updates["SIRCHMUNK_WORK_PATH"]) / ".env"
+                existing_at_new = _load_env_file_to_dict(new_env_path)
+
+                if new_env_path.exists() and _existing_env_can_reuse(existing_at_new):
+                    merged = dict(existing_at_new)
+                    merged["SIRCHMUNK_WORK_PATH"] = env_updates["SIRCHMUNK_WORK_PATH"]
+                    _update_env_file(merged)
+                    for k, v in merged.items():
+                        os.environ[k] = v
+                else:
+                    _update_env_file(env_updates)
+                    for k, v in env_updates.items():
+                        os.environ[k] = v
+            else:
+                _update_env_file(env_updates)
+                for k, v in env_updates.items():
+                    os.environ[k] = v
 
         return {
             "success": True,

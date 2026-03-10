@@ -398,8 +398,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
         Exit code (0 for success, non-zero for failure)
     """
     try:
-        # Load environment
-        work_path = _get_default_work_path().expanduser().resolve()
+        work_path = Path(
+            getattr(args, "work_path", None) or str(_get_default_work_path())
+        ).expanduser().resolve()
+        os.environ["SIRCHMUNK_WORK_PATH"] = str(work_path)
+
+        # Load environment from work path .env
         env_file = work_path / ".env"
         if env_file.exists():
             _load_env_file(env_file)
@@ -421,6 +425,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
         print(f"  Host:   {args.host}")
         print(f"  Port:   {args.port}")
+        print(f"  Work:   {work_path}")
         print(f"  Reload: {args.reload}")
         print()
         print(f"  API:   http://{display_host}:{args.port}/api/v1/")
@@ -755,8 +760,11 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
         Exit code (0 for success, non-zero for failure)
     """
     try:
-        # Load environment
-        work_path = _get_default_work_path().expanduser().resolve()
+        work_path = Path(
+            getattr(args, "work_path", None) or str(_get_default_work_path())
+        ).expanduser().resolve()
+        os.environ["SIRCHMUNK_WORK_PATH"] = str(work_path)
+
         env_file = work_path / ".env"
         if env_file.exists():
             _load_env_file(env_file)
@@ -793,6 +801,7 @@ def cmd_web_serve(args: argparse.Namespace) -> int:
 
         print(f"  Host:   {args.host}")
         print(f"  Port:   {args.port}")
+        print(f"  Work:   {work_path}")
         print(f"  Reload: {args.reload}")
         print(f"  WebUI:  enabled (single port)")
         print()
@@ -1106,6 +1115,11 @@ Examples:
     serve_parser.add_argument("--port", "-p", type=int, default=8584, help="Port (default: 8584)")
     serve_parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
     serve_parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    serve_parser.add_argument(
+        "--work-path",
+        default=str(_get_default_work_path()),
+        help="Working directory (default: ~/.sirchmunk)",
+    )
     serve_parser.set_defaults(func=cmd_serve)
 
     # === search command ===
@@ -1155,6 +1169,11 @@ Examples:
     web_serve_parser.add_argument("--frontend-port", type=int, default=8585, help="Frontend port for dev mode")
     web_serve_parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
     web_serve_parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    web_serve_parser.add_argument(
+        "--work-path",
+        default=str(_get_default_work_path()),
+        help="Working directory (default: ~/.sirchmunk)",
+    )
     web_serve_parser.set_defaults(func=cmd_web_serve)
 
     # === mcp command group ===

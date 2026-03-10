@@ -8,7 +8,7 @@ import platform
 import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Tuple
 from pydantic import BaseModel
 import json
 import asyncio
@@ -66,6 +66,25 @@ def _classify_error(exc: Exception) -> str:
     if isinstance(exc, (ConnectionError, TimeoutError)):
         return "Network error — check connectivity"
     return str(exc)
+
+
+def _resolve_rag_paths(kb_name: str) -> Tuple[List[str], str]:
+    """Resolve RAG search paths from frontend kb_name or SIRCHMUNK_SEARCH_PATHS.
+
+    When the user has set SIRCHMUNK_SEARCH_PATHS in settings, it takes effect
+    when the chat does not send a specific kb_name (e.g. no path selected in UI).
+    Returns (paths_list, display_name_for_sources).
+    """
+    def _parse(s: str) -> List[str]:
+        return [p.strip() for p in (s or "").split(",") if p.strip()]
+
+    if kb_name and _parse(kb_name):
+        paths = _parse(kb_name)
+        return paths, kb_name
+    env_paths = os.getenv("SIRCHMUNK_SEARCH_PATHS", "")
+    paths = _parse(env_paths)
+    display = ", ".join(paths) if paths else ""
+    return paths, display
 
 
 # Tkinter availability is checked lazily to avoid initialising
@@ -688,7 +707,8 @@ async def _chat_rag(
     (auth, bad request) skip the retry and fall back immediately.
     """
     sources = {}
-    if not kb_name:
+    paths, paths_display = _resolve_rag_paths(kb_name)
+    if not paths:
         await manager.send_personal_message(json.dumps({
             "type": "error",
             "message": "No search paths specified for RAG search."
@@ -696,7 +716,6 @@ async def _chat_rag(
         response = "Please specify search paths for RAG search."
         return response, sources
 
-    paths = [path.strip() for path in kb_name.split(",")]
     last_error: Optional[Exception] = None
 
     for attempt in range(_RAG_PIPELINE_MAX_RETRIES + 1):
@@ -723,8 +742,8 @@ async def _chat_rag(
             }), websocket)
 
             sources["rag"] = [{
-                "kb_name": kb_name,
-                "content": f"Retrieved content from {kb_name}",
+                "kb_name": paths_display,
+                "content": f"Retrieved content from {paths_display}",
                 "relevance_score": 0.92,
             }]
             if references:
@@ -853,7 +872,8 @@ async def _chat_rag_web_search(
     LLM chat with both knowledge base retrieval and web search
     """
     sources = {}
-    if not kb_name:
+    paths, paths_display = _resolve_rag_paths(kb_name)
+    if not paths:
         await manager.send_personal_message(json.dumps({
             "type": "error",
             "message": "No search paths specified for RAG search."
@@ -862,7 +882,6 @@ async def _chat_rag_web_search(
         return response, sources
 
     # Step 1: Perform RAG search (with pipeline-level retry for transient errors)
-    paths = [path.strip() for path in kb_name.split(",")]
     rag_result = None
 
     for attempt in range(_RAG_PIPELINE_MAX_RETRIES + 1):
@@ -889,8 +908,8 @@ async def _chat_rag_web_search(
             }), websocket)
 
             sources["rag"] = [{
-                "kb_name": kb_name,
-                "content": f"Retrieved from {kb_name}",
+                "kb_name": paths_display,
+                "content": f"Retrieved from {paths_display}",
                 "relevance_score": 0.92,
             }]
             if references:
