@@ -471,6 +471,7 @@ docker run -d \
   -e UI_THEME=light \
   -e UI_LANGUAGE=en \
   -e SIRCHMUNK_VERBOSE=false \
+  -e SIRCHMUNK_ENABLE_CLUSTER_REUSE=false \
   -e SIRCHMUNK_SEARCH_PATHS=/mnt/docs \
   -v /path/to/your_work_path:/data/sirchmunk \
   -v /path/to/your/docs:/mnt/docs:ro \
