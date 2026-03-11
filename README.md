@@ -462,6 +462,8 @@ docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirch
 # Start the service
 docker run -d \
   --name sirchmunk \
+  --cpus="4" \
+  --memory="2g" \
   -p 8584:8584 \
   -e LLM_API_KEY="your-api-key-here" \
   -e LLM_BASE_URL="https://api.openai.com/v1" \
