@@ -61,7 +61,7 @@
 **Sirchmunk** 具备 **高吞吐** 与 **实时感知** 的特性，能够高效处理本地大型数据集和文件系统。
 
 
-> 更多技术细节，参考 [Sirchmunk blog](https://modelscope.github.io/sirchmunk-web/blog/).
+> 更多技术细节，参考 [Sirchmunk blog](https://modelscope.github.io/sirchmunk-web/zh/blog/).
 
 
 ---
