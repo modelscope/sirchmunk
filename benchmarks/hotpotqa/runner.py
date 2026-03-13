@@ -136,13 +136,13 @@ async def run_single(
             )
 
             raw_answer = getattr(result, "answer", "") or str(result)
-            files_read = list(getattr(result, "read_file_ids", set()))
+            files_read = list(getattr(result, "read_file_ids", None) or set())
 
             # Supplement from cluster evidences (Phase 3 may read files
             # without populating read_file_ids in older code paths)
             cluster = getattr(result, "cluster", None)
             if cluster:
-                for ev in getattr(cluster, "evidences", []):
+                for ev in (getattr(cluster, "evidences", None) or []):
                     fp = str(getattr(ev, "file_or_url", ""))
                     if fp and fp not in files_read:
                         files_read.append(fp)
@@ -151,7 +151,7 @@ async def run_single(
                 "total_tokens": getattr(result, "total_llm_tokens", 0),
                 "loop_count": getattr(result, "loop_count", 0),
                 "files_read": files_read,
-                "llm_calls": len(getattr(result, "llm_usages", [])),
+                "llm_calls": len(getattr(result, "llm_usages", None) or []),
             }
 
             titles = _extract_titles_from_files(files_read)

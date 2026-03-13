@@ -279,13 +279,16 @@ class KeywordSearchTool(BaseTool):
         if phrases:
             results = await self._do_search_per_term(phrases, literal=True, regex=False)
 
-        # Phase B: add singles only when phrase hits are insufficient
+        # Phase B: add single-word terms only when phrase hits are insufficient.
+        # merge_results already produced per-file dicts, so we merge manually.
         if len(results) < 3 and singles:
             extra = await self._do_search_per_term(singles, literal=True, regex=False)
             if extra:
-                results = self._retriever.merge_results(
-                    results + extra, limit=self._max_results * 2,
-                )
+                seen = {r.get("path") for r in results}
+                for item in extra:
+                    if item.get("path") not in seen:
+                        results.append(item)
+                        seen.add(item.get("path"))
 
         # Phase C: if nothing found at all, try all keywords together
         if not results:

@@ -577,9 +577,9 @@ class AgenticSearch(BaseSearch):
             description=[f"Search result for: {query}"],
             content=answer,
             queries=[query],
-            evidences=evidences if evidences else None,
+            evidences=evidences,
             search_results=list(file_paths or []),
-            resources=resources or None,
+            resources=resources or [],
             confidence=0.5,
             abstraction_level=AbstractionLevel.TECHNIQUE,
             hotness=0.5,
@@ -1199,11 +1199,15 @@ class AgenticSearch(BaseSearch):
         # scoring to pick the most query-relevant files before the
         # expensive Monte Carlo evidence extraction.
         if len(merged_files) > top_k_files * 2:
-            reranked = await asyncio.get_event_loop().run_in_executor(
-                None,
-                self._bm25_rerank_files,
-                query, merged_files, top_k_files * 2,
-            )
+            try:
+                loop = asyncio.get_running_loop()
+                reranked = await loop.run_in_executor(
+                    None,
+                    self._bm25_rerank_files,
+                    query, merged_files, top_k_files * 2,
+                )
+            except Exception:
+                reranked = None
             if reranked is not None:
                 await self._logger.info(
                     f"[Phase 3] BM25 reranked {len(merged_files)} -> {len(reranked)} files"
@@ -1223,7 +1227,7 @@ class AgenticSearch(BaseSearch):
         for fp in merged_files[:top_k_files]:
             context.mark_file_read(fp)
         if cluster:
-            for ev in getattr(cluster, "evidences", []):
+            for ev in (getattr(cluster, "evidences", None) or []):
                 fp = str(getattr(ev, "file_or_url", ""))
                 if fp:
                     context.mark_file_read(fp)
@@ -2365,13 +2369,11 @@ class AgenticSearch(BaseSearch):
         except ImportError:
             return None
 
-        from pathlib import Path as _P
-
         docs: List[str] = []
         valid_paths: List[str] = []
         for fp in file_paths:
             try:
-                text = _P(fp).read_text(encoding="utf-8", errors="ignore")[:2000]
+                text = Path(fp).read_text(encoding="utf-8", errors="ignore")[:2000]
                 if text.strip():
                     docs.append(text)
                     valid_paths.append(fp)
@@ -2415,8 +2417,7 @@ class AgenticSearch(BaseSearch):
         small enough to process whole or when no keyword matches.
         """
         try:
-            from pathlib import Path as _P
-            raw = _P(file_path).read_text(encoding="utf-8", errors="ignore")
+            raw = Path(file_path).read_text(encoding="utf-8", errors="ignore")
             if len(raw) <= AgenticSearch._SNIPPET_EXTRACTION_THRESHOLD:
                 return None
 
@@ -2502,15 +2503,16 @@ class AgenticSearch(BaseSearch):
 
             if cluster:
                 # Restore original file paths in evidence units
-                for ev in getattr(cluster, "evidences", []):
+                for ev in (getattr(cluster, "evidences", None) or []):
                     for orig_fp, eff_fp in zip(file_paths, effective_paths):
                         if str(getattr(ev, "file_or_url", "")) == eff_fp and eff_fp != orig_fp:
                             ev.file_or_url = Path(orig_fp)
                             break
 
+                n_ev = len(cluster.evidences) if cluster.evidences else 0
                 await self._logger.success(
                     f"[Phase 3] KnowledgeCluster built: {cluster.name} "
-                    f"({len(cluster.evidences)} evidence units)"
+                    f"({n_ev} evidence units)"
                 )
             return cluster
         except Exception as exc:
