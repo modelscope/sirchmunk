@@ -191,6 +191,14 @@ class AgenticSearch(BaseSearch):
         self.spec_path.mkdir(parents=True, exist_ok=True)
         self._spec_lock = asyncio.Lock()  # guards concurrent spec writes
 
+        # ---- Self-evolving retrieval memory (optional, graceful degradation) ----
+        self._memory = None
+        try:
+            from sirchmunk.memory import RetrievalMemory
+            self._memory = RetrievalMemory(work_path=str(self.work_path))
+        except Exception as exc:
+            _loguru_logger.info(f"Retrieval memory not available: {exc}")
+
     def update_log_callback(self, log_callback: LogCallback = None) -> None:
         """Replace the per-request log callback on all sub-components.
 
@@ -1013,6 +1021,22 @@ class AgenticSearch(BaseSearch):
                 return ctx
             return msg
 
+        # ---- Memory: strategy hint (zero-LLM, ~0 ms) ----
+        if self._memory and mode != "FILENAME_ONLY":
+            try:
+                hint = self._memory.suggest_strategy(query)
+                if hint and hint.confidence >= 0.5:
+                    if hint.mode:
+                        mode = hint.mode
+                    if hint.top_k_files is not None:
+                        top_k_files = hint.top_k_files
+                    if hint.max_loops is not None:
+                        max_loops = hint.max_loops
+                    if hint.enable_dir_scan is not None:
+                        enable_dir_scan = hint.enable_dir_scan
+            except Exception:
+                pass
+
         # ---- Chat intent short-circuit (rule-based, no LLM cost) ----
         if mode != "FILENAME_ONLY" and self._is_chat_query(query):
             answer, cluster, ctx = await self._respond_chat(query, chat_history=chat_history)
@@ -1138,6 +1162,13 @@ class AgenticSearch(BaseSearch):
 
         query_keywords, initial_keywords = kw_result if isinstance(kw_result, tuple) else ({}, [])
 
+        # Memory: expand keywords with semantic bridge + filter noise
+        if self._memory and query_keywords:
+            try:
+                query_keywords = self._memory.expand_keywords(query_keywords)
+            except Exception:
+                pass
+
         await self._logger.info(
             f"[Phase 1] Results: keywords={len(initial_keywords)}, "
             f"dir_scan={'OK' if scan_result else 'N/A'}, "
@@ -1188,12 +1219,32 @@ class AgenticSearch(BaseSearch):
         # Phase 3: Merge file paths + build KnowledgeCluster
         # ==============================================================
         context.increment_loop()
+
+        # Memory: supplement candidates with entity-based path lookup
+        memory_paths: List[str] = []
+        if self._memory and query_keywords:
+            try:
+                entities = [
+                    k for k in query_keywords
+                    if k and len(k) > 1 and k[0].isupper()
+                ]
+                memory_paths = self._memory.get_entity_paths(entities)
+            except Exception:
+                pass
+
         merged_files = self._merge_file_paths(
             keyword_files=keyword_files,
             dir_scan_files=dir_scan_files,
-            knowledge_hits=knowledge_hits,
+            knowledge_hits=knowledge_hits + memory_paths,
         )
         await self._logger.info(f"[Phase 3] Merged {len(merged_files)} unique candidate files")
+
+        # Memory: filter out known dead paths
+        if self._memory and merged_files:
+            try:
+                merged_files = self._memory.filter_dead_paths(merged_files)
+            except Exception:
+                pass
 
         # BM25 rerank: when candidates far exceed top_k_files, use BM25
         # scoring to pick the most query-relevant files before the
@@ -1296,6 +1347,36 @@ class AgenticSearch(BaseSearch):
         for r in results:
             if isinstance(r, Exception):
                 _loguru_logger.warning(f"[Phase 5] Persistence task failed: {r}")
+
+        # Memory: record feedback signal (fire-and-forget)
+        if self._memory:
+            try:
+                from sirchmunk.memory.schemas import FeedbackSignal
+                elapsed = (
+                    datetime.now(timezone.utc)
+                    - (context.start_time.replace(tzinfo=timezone.utc)
+                       if context.start_time.tzinfo is None
+                       else context.start_time)
+                ).total_seconds()
+                signal = FeedbackSignal(
+                    query=query,
+                    mode="DEEP",
+                    answer_found=bool(answer and answer.strip()),
+                    cluster_confidence=(
+                        getattr(cluster, "confidence", 0.0)
+                        if cluster else 0.0
+                    ),
+                    react_loops=context.loop_count,
+                    files_read_count=len(context.read_file_ids),
+                    total_tokens=context.total_llm_tokens,
+                    latency_sec=elapsed,
+                    keywords_used=list(query_keywords.keys()) if query_keywords else [],
+                    paths_searched=paths,
+                    files_read=list(context.read_file_ids),
+                )
+                asyncio.ensure_future(self._memory.record_feedback(signal))
+            except Exception:
+                pass
 
         await self._logger.success(f"[search] Complete: {context.summary()}")
         return answer, cluster, context
@@ -1775,6 +1856,31 @@ class AgenticSearch(BaseSearch):
             _loguru_logger.warning(
                 f"[FAST] Failed to save cluster with embedding: {exc}"
             )
+
+        # Memory: record feedback signal (fire-and-forget)
+        if self._memory:
+            try:
+                from sirchmunk.memory.schemas import FeedbackSignal
+                elapsed = (
+                    datetime.now(timezone.utc)
+                    - (context.start_time.replace(tzinfo=timezone.utc)
+                       if context.start_time.tzinfo is None
+                       else context.start_time)
+                ).total_seconds()
+                signal = FeedbackSignal(
+                    query=query,
+                    mode="FAST",
+                    answer_found=bool(answer and answer.strip()),
+                    files_read_count=len(context.read_file_ids),
+                    total_tokens=context.total_llm_tokens,
+                    latency_sec=elapsed,
+                    keywords_used=keywords_used,
+                    paths_searched=paths,
+                    files_read=list(context.read_file_ids),
+                )
+                asyncio.ensure_future(self._memory.record_feedback(signal))
+            except Exception:
+                pass
 
         await self._logger.success("[FAST] Search complete (2 LLM calls)")
         return answer, cluster, context
