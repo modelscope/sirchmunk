@@ -260,6 +260,8 @@ class OpenAIChat:
             if profile.thinking_param == "reasoning_effort":
                 if enable_thinking:
                     extra_body["reasoning_effort"] = "high"
+                else:
+                    extra_body.pop("reasoning_effort", None)
             else:
                 extra_body[profile.thinking_param] = enable_thinking
 

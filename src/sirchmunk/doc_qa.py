@@ -78,6 +78,7 @@ async def detect_doc_intent(
         response = await llm.achat(
             messages=[{"role": "user", "content": prompt}],
             stream=False,
+            enable_thinking=False,
         )
         if llm_usages is not None:
             llm_usages.append(response.usage)
@@ -219,6 +220,7 @@ async def analyse_documents(
     response = await llm.achat(
         messages=[{"role": "user", "content": prompt}],
         stream=True,
+        enable_thinking=False,
     )
     if llm_usages is not None:
         llm_usages.append(response.usage)

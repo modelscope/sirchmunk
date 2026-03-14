@@ -252,6 +252,7 @@ class KnowledgeBase:
         evidence_summary_llm_response = await self.llm.achat(
             messages=[{"role": "user", "content": evidence_summary_prompt}],
             stream=True,
+            enable_thinking=False,
         )
         evidence_summary_response: str = evidence_summary_llm_response.content
         self.llm_usages.append(evidence_summary_llm_response.usage)

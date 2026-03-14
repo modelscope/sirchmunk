@@ -133,11 +133,13 @@ class ReActSearchAgent:
         max_loops: int = 5,
         max_token_budget: int = 64000,
         log_callback: LogCallback = None,
+        enable_thinking: bool = False,
     ) -> None:
         self.llm = llm
         self.registry = tool_registry
         self.max_loops = max_loops
         self.max_token_budget = max_token_budget
+        self.enable_thinking = enable_thinking
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
 
     # ---- Public API ----
@@ -317,8 +319,12 @@ class ReActSearchAgent:
         """Call the LLM with the given messages.
 
         Uses stream=False for tool-calling loops to get complete responses.
+        Passes through ``enable_thinking`` for deep reasoning support.
         """
-        return await self.llm.achat(messages=messages, stream=False)
+        return await self.llm.achat(
+            messages=messages, stream=False,
+            enable_thinking=self.enable_thinking,
+        )
 
     @staticmethod
     def _build_system_prompt(context: SearchContext, tool_descriptions: str) -> str:

@@ -309,7 +309,7 @@ class MonteCarloEvidenceSampling:
             sample_content=sample.content,
         )
         try:
-            resp_obj = await self.llm.achat([{"role": "user", "content": prompt}])
+            resp_obj = await self.llm.achat([{"role": "user", "content": prompt}], enable_thinking=False)
             resp: str = resp_obj.content
             self.llm_usages.append(resp_obj.usage)
 
@@ -365,7 +365,7 @@ class MonteCarloEvidenceSampling:
             text_content=combined_context,
         )
 
-        summary_response = await self.llm.achat([{"role": "user", "content": prompt}])
+        summary_response = await self.llm.achat([{"role": "user", "content": prompt}], enable_thinking=False)
         self.llm_usages.append(summary_response.usage)
         return summary_response.content
 

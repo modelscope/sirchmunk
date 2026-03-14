@@ -177,6 +177,7 @@ class SirchmunkService:
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         return_context: bool = False,
+        enable_thinking: bool = False,
     ) -> Union[str, "SearchContext", List[Dict[str, Any]], None]:
         """Search and retrieve various types of raw documents using AgenticSearch.
         
@@ -196,6 +197,7 @@ class SirchmunkService:
             include: File patterns to include (glob)
             exclude: File patterns to exclude (glob)
             return_context: Whether to return full SearchContext object
+            enable_thinking: Enable model reasoning/thinking for complex steps
         
         Returns:
             Search results: str (summary), SearchContext (if return_context=True),
@@ -244,6 +246,7 @@ class SirchmunkService:
                 "include": include,
                 "exclude": exclude,
                 "return_context": return_context,
+                "enable_thinking": enable_thinking,
             }
             if max_loops is not None:
                 kwargs["max_loops"] = max_loops

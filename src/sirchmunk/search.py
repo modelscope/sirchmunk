@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import threading
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -124,62 +125,12 @@ class AgenticSearch(BaseSearch):
             log_callback=log_callback
         )
 
-        # Initialize KnowledgeManager for persistent storage
-        self.knowledge_storage = KnowledgeStorage(work_path=str(self.work_path))
-
-        # Load historical knowledge clusters from cache
-        self._load_historical_knowledge()
-
         self.verbose: bool = verbose
-
         self.llm_usages: List[Dict[str, Any]] = []
-
-        # Maximum number of queries to keep per cluster (FIFO strategy)
         self.max_queries_per_cluster: int = 5
-
-        # Initialize embedding client for cluster reuse.
-        # EmbeddingUtil.__init__ is cheap (stores config only).
-        # start_loading() is called immediately so the background thread
-        # can download / construct the model while the first search runs.
-        # By the time the search finishes and needs to persist the cluster
-        # embedding, the model is typically ready.
-        self.embedding_client = None
         self.cluster_sim_threshold: float = kwargs.pop('cluster_sim_threshold', 0.85)
         self.cluster_sim_top_k: int = kwargs.pop('cluster_sim_top_k', 3)
-        if reuse_knowledge:
-            try:
-                from sirchmunk.utils.embedding_util import EmbeddingUtil
 
-                embedding_cache = os.getenv("EMBEDDING_CACHE_DIR")
-                cache_dir = (
-                    embedding_cache
-                    if embedding_cache
-                    else str(self.work_path / ".cache" / "models")
-                )
-                self.embedding_client = EmbeddingUtil(cache_dir=cache_dir)
-                self.embedding_client.start_loading()
-                _loguru_logger.info(
-                    "Embedding client created, background model loading started"
-                )
-            except Exception as e:
-                _loguru_logger.error(
-                    f"Failed to initialize embedding client: {e}. "
-                    "Knowledge cluster embeddings will NOT be stored. "
-                    "Ensure sentence-transformers, torch, and modelscope are installed."
-                )
-                self.embedding_client = None
-        else:
-            _loguru_logger.info(
-                "Knowledge reuse disabled (reuse_knowledge=False). "
-                "Embeddings will not be computed."
-            )
-
-        if not check_dependencies():
-            _loguru_logger.info("Installing rga (ripgrep-all) and rg (ripgrep)...")
-            install_rga()
-
-        # Suppress noisy pypdf warnings about malformed PDF cross-references.
-        # pypdf._reader emits logging.warning() for "Ignoring wrong pointing object".
         logging.getLogger("pypdf._reader").setLevel(logging.ERROR)
 
         # ---- Agentic (ReAct) components (lazy-initialised on first use) ----
@@ -189,15 +140,102 @@ class AgenticSearch(BaseSearch):
         # ---- Spec-path cache for per-search-path context ----
         self.spec_path: Path = self.work_path / ".cache" / "spec"
         self.spec_path.mkdir(parents=True, exist_ok=True)
-        self._spec_lock = asyncio.Lock()  # guards concurrent spec writes
+        self._spec_lock = asyncio.Lock()
 
-        # ---- Self-evolving retrieval memory (optional, graceful degradation) ----
+        # ---- Heavy components (populated by background warm-up thread) ----
+        self.knowledge_storage: Optional[KnowledgeStorage] = None
+        self.embedding_client = None
         self._memory = None
+
+        # ---- Background warm-up: non-blocking ----
+        self._warmup_event = threading.Event()
+        _warmup_thread = threading.Thread(
+            target=self._warmup_bg,
+            kwargs={"reuse_knowledge": reuse_knowledge},
+            daemon=True,
+            name="sirchmunk-warmup",
+        )
+        _warmup_thread.start()
+
+    # ------------------------------------------------------------------
+    # Background warm-up
+    # ------------------------------------------------------------------
+
+    def _warmup_bg(self, *, reuse_knowledge: bool) -> None:
+        """Background thread: initialise heavy components without blocking __init__."""
         try:
-            from sirchmunk.memory import RetrievalMemory
-            self._memory = RetrievalMemory(work_path=str(self.work_path))
+            # 1. KnowledgeStorage — DuckDB + Parquet load
+            try:
+                self.knowledge_storage = KnowledgeStorage(work_path=str(self.work_path))
+                self._load_historical_knowledge()
+            except Exception as exc:
+                _loguru_logger.warning(f"[warmup] KnowledgeStorage init failed: {exc}")
+
+            # 2. Embedding model — triggers its own daemon thread for download/load
+            if reuse_knowledge:
+                try:
+                    from sirchmunk.utils.embedding_util import EmbeddingUtil
+
+                    embedding_cache = os.getenv("EMBEDDING_CACHE_DIR")
+                    cache_dir = (
+                        embedding_cache
+                        if embedding_cache
+                        else str(self.work_path / ".cache" / "models")
+                    )
+                    self.embedding_client = EmbeddingUtil(cache_dir=cache_dir)
+                    self.embedding_client.start_loading()
+                    _loguru_logger.info(
+                        "[warmup] Embedding client created, background model loading started"
+                    )
+                except Exception as exc:
+                    _loguru_logger.error(
+                        f"[warmup] Embedding init failed: {exc}. "
+                        "Cluster embeddings will NOT be stored."
+                    )
+                    self.embedding_client = None
+            else:
+                _loguru_logger.info(
+                    "[warmup] Knowledge reuse disabled — embeddings will not be computed"
+                )
+
+            # 3. System dependencies (rga / rg)
+            try:
+                if not check_dependencies():
+                    _loguru_logger.info("[warmup] Installing rga (ripgrep-all) and rg (ripgrep)...")
+                    install_rga()
+            except Exception as exc:
+                _loguru_logger.warning(f"[warmup] Dependency check failed: {exc}")
+
+            # 4. Self-evolving retrieval memory
+            try:
+                from sirchmunk.memory import RetrievalMemory
+                self._memory = RetrievalMemory(work_path=str(self.work_path))
+            except Exception as exc:
+                _loguru_logger.info(f"[warmup] Retrieval memory not available: {exc}")
+
         except Exception as exc:
-            _loguru_logger.info(f"Retrieval memory not available: {exc}")
+            _loguru_logger.error(f"[warmup] Unexpected error: {exc}")
+        finally:
+            self._warmup_event.set()
+            _loguru_logger.info("[warmup] Background warm-up complete")
+
+    async def _ensure_warmup(self, timeout: float = 30.0) -> None:
+        """Wait for background warm-up to finish (non-blocking for the event loop).
+
+        Called once at the top of ``search()``.  If warm-up is already done
+        this is a no-op (~0 ms).  Otherwise it awaits in a thread-pool so
+        the asyncio loop isn't blocked.
+        """
+        if self._warmup_event.is_set():
+            return
+        loop = asyncio.get_running_loop()
+        ready = await loop.run_in_executor(
+            None, self._warmup_event.wait, timeout,
+        )
+        if not ready:
+            _loguru_logger.warning(
+                "[warmup] Timed out — proceeding with available components"
+            )
 
     def update_log_callback(self, log_callback: LogCallback = None) -> None:
         """Replace the per-request log callback on all sub-components.
@@ -354,13 +392,10 @@ class AgenticSearch(BaseSearch):
         Returns:
             KnowledgeCluster if a suitable cached cluster is found, None otherwise.
         """
-        if not self.embedding_client:
+        if not self.embedding_client or not self.knowledge_storage:
             return None
 
         try:
-            # Wait briefly for the model so reuse can work when it's already loading.
-            # Use a short timeout to avoid blocking the first request (e.g. in Docker
-            # the model may take 30–60s to load; we skip reuse and do full search instead).
             if not self.embedding_client.is_ready():
                 self.embedding_client.start_loading()
                 try:
@@ -475,6 +510,9 @@ class AgenticSearch(BaseSearch):
         Args:
             cluster: KnowledgeCluster to save
         """
+        if not self.knowledge_storage:
+            return
+
         # Save knowledge cluster to persistent storage.
         # insert() returns False (without raising) when the cluster already
         # exists, so we explicitly fall back to update() in that case.
@@ -921,6 +959,7 @@ class AgenticSearch(BaseSearch):
         return_context: bool = False,
         spec_stale_hours: float = 72.0,
         chat_history: Optional[List[Dict[str, str]]] = None,
+        enable_thinking: bool = False,
     ) -> Union[str, SearchContext, List[Dict[str, Any]]]:
         """Perform intelligent search with multi-mode support.
 
@@ -1002,6 +1041,10 @@ class AgenticSearch(BaseSearch):
                 that carries ``answer``, ``cluster`` (KnowledgeCluster),
                 and full pipeline telemetry (LLM usage, files read, etc.).
             spec_stale_hours: Hours before spec cache is stale (default: 72).
+            enable_thinking: If True, enable model reasoning/thinking for
+                complex processing steps (final answer synthesis, ReAct
+                reasoning). Simple extraction/classification steps always
+                run with thinking disabled. Default: False.
 
         Returns:
             - ``str``: Answer summary (default).
@@ -1009,6 +1052,9 @@ class AgenticSearch(BaseSearch):
               ``cluster``, and telemetry in a single object.
             - ``List[Dict]``: File matches in FILENAME_ONLY mode.
         """
+        # ---- Ensure background warm-up is complete ----
+        await self._ensure_warmup()
+
         paths = self.validate_search_paths(
             self._resolve_paths(paths),
         )
@@ -1064,6 +1110,7 @@ class AgenticSearch(BaseSearch):
                 query=query, paths=paths, max_depth=max_depth,
                 top_k_files=top_k_files, enable_dir_scan=enable_dir_scan,
                 include=include, exclude=exclude,
+                enable_thinking=enable_thinking,
             )
         else:
             answer, cluster, context = await self._search_deep(
@@ -1073,6 +1120,7 @@ class AgenticSearch(BaseSearch):
                 enable_dir_scan=enable_dir_scan,
                 include=include, exclude=exclude,
                 spec_stale_hours=spec_stale_hours,
+                enable_thinking=enable_thinking,
             )
 
         # ---- Unified return wrapping ----
@@ -1104,6 +1152,7 @@ class AgenticSearch(BaseSearch):
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         spec_stale_hours: float = 72.0,
+        enable_thinking: bool = False,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Parallel multi-path retrieval pipeline (Phases 0a–5).
 
@@ -1295,7 +1344,9 @@ class AgenticSearch(BaseSearch):
 
         if cluster and cluster.content:
             await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
-            answer, should_save = await self._summarise_cluster(query, cluster)
+            answer, should_save = await self._summarise_cluster(
+                query, cluster, enable_thinking=enable_thinking,
+            )
             if not cluster.search_results:
                 cluster.search_results = list(merged_files)
         else:
@@ -1306,6 +1357,7 @@ class AgenticSearch(BaseSearch):
                 enable_dir_scan=enable_dir_scan,
                 max_loops=max_loops, max_token_budget=max_token_budget,
                 max_depth=max_depth, include=include, exclude=exclude,
+                enable_thinking=enable_thinking,
             )
 
             # Merge Phase 3 file marks into the new ReAct context
@@ -1470,7 +1522,7 @@ class AgenticSearch(BaseSearch):
             *(chat_history or []),
             {"role": "user", "content": query},
         ]
-        resp = await self.llm.achat(messages=messages, stream=False)
+        resp = await self.llm.achat(messages=messages, stream=False, enable_thinking=False)
         self.llm_usages.append(resp.usage)
         if resp.usage and isinstance(resp.usage, dict):
             ctx.add_llm_tokens(
@@ -1582,6 +1634,7 @@ class AgenticSearch(BaseSearch):
         resp = await self.llm.achat(
             messages=[{"role": "user", "content": prompt}],
             stream=True,
+            enable_thinking=False,
         )
         self.llm_usages.append(resp.usage)
         return resp.content or ""
@@ -1605,6 +1658,7 @@ class AgenticSearch(BaseSearch):
             resp = await self.llm.achat(
                 messages=[{"role": "user", "content": prompt}],
                 stream=True,
+                enable_thinking=False,
             )
             self.llm_usages.append(resp.usage)
             if resp.content:
@@ -1622,6 +1676,7 @@ class AgenticSearch(BaseSearch):
         resp = await self.llm.achat(
             messages=[{"role": "user", "content": prompt}],
             stream=True,
+            enable_thinking=False,
         )
         self.llm_usages.append(resp.usage)
         return resp.content or ""
@@ -1649,6 +1704,7 @@ class AgenticSearch(BaseSearch):
         enable_dir_scan: bool = False,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
+        enable_thinking: bool = False,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Greedy search: 2-3 LLM calls, single best file, focused evidence.
 
@@ -1684,6 +1740,7 @@ class AgenticSearch(BaseSearch):
         resp = await self.llm.achat(
             messages=[{"role": "user", "content": prompt}],
             stream=False,
+            enable_thinking=False,
         )
         self.llm_usages.append(resp.usage)
         if resp.usage and isinstance(resp.usage, dict):
@@ -1831,6 +1888,7 @@ class AgenticSearch(BaseSearch):
         answer_resp = await self.llm.achat(
             messages=[{"role": "user", "content": answer_prompt}],
             stream=True,
+            enable_thinking=enable_thinking,
         )
         self.llm_usages.append(answer_resp.usage)
         if answer_resp.usage and isinstance(answer_resp.usage, dict):
@@ -2126,6 +2184,7 @@ class AgenticSearch(BaseSearch):
         kw_response = await self.llm.achat(
             messages=[{"role": "user", "content": keyword_prompt}],
             stream=False,
+            enable_thinking=False,
         )
         self.llm_usages.append(kw_response.usage)
 
@@ -2272,6 +2331,8 @@ class AgenticSearch(BaseSearch):
         Returns:
             List of file paths from previously cached clusters.
         """
+        if not self.knowledge_storage:
+            return []
         try:
             clusters = await self.knowledge_storage.find(query, limit=3)
             if not clusters:
@@ -2638,7 +2699,11 @@ class AgenticSearch(BaseSearch):
     # ------------------------------------------------------------------
 
     async def _summarise_cluster(
-        self, query: str, cluster: KnowledgeCluster,
+        self,
+        query: str,
+        cluster: KnowledgeCluster,
+        *,
+        enable_thinking: bool = False,
     ) -> Tuple[str, bool]:
         """Generate a final answer summary from a KnowledgeCluster.
 
@@ -2662,6 +2727,7 @@ class AgenticSearch(BaseSearch):
         response = await self.llm.achat(
             messages=[{"role": "user", "content": result_sum_prompt}],
             stream=True,
+            enable_thinking=enable_thinking,
         )
         self.llm_usages.append(response.usage)
 
@@ -2680,6 +2746,7 @@ class AgenticSearch(BaseSearch):
         max_depth: Optional[int] = 5,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
+        enable_thinking: bool = False,
     ) -> Tuple[str, SearchContext]:
         """Fall back to ReAct loop when parallel probing yields insufficient evidence.
 
@@ -2699,6 +2766,7 @@ class AgenticSearch(BaseSearch):
             tool_registry=registry,
             max_loops=max_loops,
             max_token_budget=max_token_budget,
+            enable_thinking=enable_thinking,
         )
 
         augmented_query = query

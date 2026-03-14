@@ -499,6 +499,7 @@ def cmd_search(args: argparse.Namespace) -> int:
                 mode=args.mode,
                 output_format=args.output,
                 verbose=args.verbose,
+                enable_thinking=args.enable_thinking,
             ))
 
     except KeyboardInterrupt:
@@ -516,6 +517,7 @@ async def _search_local(
     mode: str = "FAST",
     output_format: str = "text",
     verbose: bool = False,
+    enable_thinking: bool = False,
 ) -> int:
     """Execute search locally using AgenticSearch.
 
@@ -525,6 +527,7 @@ async def _search_local(
         mode: Search mode (FAST, DEEP, FILENAME_ONLY)
         output_format: Output format (text, json)
         verbose: Enable verbose output
+        enable_thinking: Enable LLM reasoning for complex steps
 
     Returns:
         Exit code
@@ -571,6 +574,7 @@ async def _search_local(
         paths=paths,
         mode=mode,
         return_context=output_format == "json",
+        enable_thinking=enable_thinking,
     )
 
     # Output result
@@ -1135,6 +1139,8 @@ Examples:
     search_parser.add_argument("--api", action="store_true", help="Use API server instead of local search")
     search_parser.add_argument("--api-url", default="http://localhost:8584", help="API server URL")
     search_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    search_parser.add_argument("--enable-thinking", action="store_true", default=False,
+                               help="Enable LLM reasoning/thinking for complex steps")
     search_parser.set_defaults(func=cmd_search)
 
     # === web command group ===

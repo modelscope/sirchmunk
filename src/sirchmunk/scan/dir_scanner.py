@@ -365,6 +365,7 @@ class DirectoryScanner:
             response = await self.llm.achat(
                 messages=[{"role": "user", "content": prompt}],
                 stream=False,
+                enable_thinking=False,
             )
             ranked = self._parse_rank_response(response.content, scan_result.candidates)
             scan_result.ranked_candidates = ranked

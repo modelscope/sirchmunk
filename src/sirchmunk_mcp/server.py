@@ -60,6 +60,7 @@ def create_server(config: Config) -> FastMCP:
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         return_context: bool = False,
+        enable_thinking: bool = False,
     ) -> str:
         """Search local files, documents, and raw data on disk. Supports 100+ file formats
         including PDF, Word, Excel, PowerPoint, CSV, JSON, YAML, Markdown, HTML, source code,
@@ -96,6 +97,7 @@ def create_server(config: Config) -> FastMCP:
             include: File patterns to include (glob, e.g., ['*.py', '*.md', '*.pdf'])
             exclude: File patterns to exclude (glob, e.g., ['*.pyc', '*.log', 'node_modules'])
             return_context: Return full SearchContext with KnowledgeCluster and telemetry
+            enable_thinking: Enable LLM reasoning/thinking for complex processing steps (default: False)
 
         Returns:
             Search results as formatted text with source references
@@ -118,6 +120,7 @@ def create_server(config: Config) -> FastMCP:
                 include=include,
                 exclude=exclude,
                 return_context=return_context,
+                enable_thinking=enable_thinking,
             )
 
             if result is None:
