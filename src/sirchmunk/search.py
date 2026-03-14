@@ -1239,6 +1239,9 @@ class AgenticSearch(BaseSearch):
         answer: str = ""
         should_save: bool = True
 
+        # Preserve Phase 3 file marks before possible context reassignment
+        _phase3_read_files = set(context.read_file_ids)
+
         if cluster and cluster.content:
             await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
             answer, should_save = await self._summarise_cluster(query, cluster)
@@ -1253,6 +1256,11 @@ class AgenticSearch(BaseSearch):
                 max_loops=max_loops, max_token_budget=max_token_budget,
                 max_depth=max_depth, include=include, exclude=exclude,
             )
+
+            # Merge Phase 3 file marks into the new ReAct context
+            # so callers always see what was retrieved in Phase 2-3.
+            for fp in _phase3_read_files:
+                context.mark_file_read(fp)
 
             if not cluster:
                 cluster = await self._build_cluster_from_context(

@@ -138,14 +138,24 @@ async def run_single(
             raw_answer = getattr(result, "answer", "") or str(result)
             files_read = list(getattr(result, "read_file_ids", None) or set())
 
-            # Supplement from cluster evidences (Phase 3 may read files
-            # without populating read_file_ids in older code paths)
+            # Supplement from cluster evidences
             cluster = getattr(result, "cluster", None)
             if cluster:
                 for ev in (getattr(cluster, "evidences", None) or []):
                     fp = str(getattr(ev, "file_or_url", ""))
                     if fp and fp not in files_read:
                         files_read.append(fp)
+
+            # Supplement from keyword search retrieval logs —
+            # KeywordSearchTool logs files_discovered but doesn't
+            # call mark_file_read, so we collect them here.
+            _seen = set(files_read)
+            for log_entry in (getattr(result, "retrieval_logs", None) or []):
+                meta = getattr(log_entry, "metadata", None) or {}
+                for p in meta.get("files_discovered", []):
+                    if p and p not in _seen:
+                        files_read.append(p)
+                        _seen.add(p)
 
             telemetry = {
                 "total_tokens": getattr(result, "total_llm_tokens", 0),
