@@ -214,6 +214,32 @@ JSON format only.
 """
 
 
+BATCH_EVALUATE_EVIDENCE_SAMPLES = """
+You are a document retrieval assistant. Evaluate if each text snippet below contains clues to answer the user's question.
+
+### Language Constraint:
+Detect the language of the "Query" and respond in the same language.
+
+### Inputs:
+Query: "{query}"
+{snippets_block}
+
+### Output Requirement:
+Return a JSON array with one object per snippet, in the same order:
+[
+  {{"id": 1, "score": <0-10>, "reasoning": "<short reasoning>"}},
+  ...
+]
+
+Score scale (0-10):
+  0-3: Completely irrelevant.
+  4-7: Contains relevant keywords or context but no direct answer.
+  8-10: Contains exact data, facts, or direct answer.
+
+JSON array only, no other text.
+"""
+
+
 DETECT_DOC_INTENT = """Classify the user query below.
 
 Determine whether the user wants to perform a **whole-document operation** on

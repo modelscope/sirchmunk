@@ -1,73 +1,46 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import asyncio
-import json
-import math
-import random
-import re
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Set, Tuple
+"""Evidence extraction pipeline orchestrator.
 
-from rapidfuzz import fuzz, process
+``EvidenceSampler`` coordinates the layered evidence extraction pipeline:
 
+1. **DocumentChunker** — structure-aware segmentation
+2. **SignalScorer** — RapidFuzz + BM25 + (optional) embedding fusion
+3. **AdaptiveSamplingStrategy** — dynamic config, early stopping, Gaussian refinement
+4. **BatchEvaluator** — batched LLM scoring (3-5× fewer calls)
+5. **EvidenceCache** — cross-query result reuse
+
+The public types ``SampleWindow`` and ``RoiResult`` are re-exported here
+for full backward compatibility — existing imports continue to work.
+"""
+
+from typing import Any, Dict, List, Optional, Set
+
+from sirchmunk.learnings._types import RoiResult, SampleWindow
+from sirchmunk.learnings.chunking import DocumentChunker
+from sirchmunk.learnings.evidence_cache import EvidenceCache
+from sirchmunk.learnings.sampling import AdaptiveSamplingStrategy, SamplingConfig
+from sirchmunk.learnings.scoring import BatchEvaluator, ScoredChunk, SignalScorer
 from sirchmunk.llm.openai_chat import OpenAIChat
-from sirchmunk.llm.prompts import EVALUATE_EVIDENCE_SAMPLE, ROI_RESULT_SUMMARY
-from sirchmunk.utils import create_logger, LogCallback
+from sirchmunk.llm.prompts import ROI_RESULT_SUMMARY
+from sirchmunk.utils import LogCallback, create_logger
+
+__all__ = [
+    "EvidenceSampler",
+    "MonteCarloEvidenceSampling",
+    "RoiResult",
+    "SampleWindow",
+]
 
 
-@dataclass
-class SampleWindow:
-    """
-    Sampling window configuration and metadata.
-    """
+class EvidenceSampler:
+    """Orchestrate evidence extraction through a layered pipeline.
 
-    start_idx: int
-
-    end_idx: int
-
-    content: str
-
-    # Relevance score from LLM
-    score: float = 0.0
-
-    # Literal match score from RapidFuzz
-    fuzz_score: float = 0.0
-
-    reasoning: str = ""
-
-    round_num: int = 0
-    # 'fuzz', 'stratified', 'gaussian'
-
-    source: str = "unknown"
-
-
-@dataclass
-class RoiResult:
-    """
-    Data class to store the final Region of Interest (ROI) result and metadata.
-    """
-
-    summary: str
-
-    is_found: bool
-
-    # Segments within the document (e.g., paragraph, code snippet)
-    # Format: {"snippet": "xxx", "start": 7, "end": 65, "score": 9.0, "reasoning": "xxx"}
-    snippets: List[Dict[str, Any]]
-
-    def to_dict(self):
-        """
-        Convert RoiResult to a dictionary.
-        """
-        return {
-            "summary": self.summary,
-            "is_found": self.is_found,
-            "snippets": self.snippets,
-        }
-
-
-class MonteCarloEvidenceSampling:
-    """
-    Monte Carlo Evidence Importance Sampling for Document Retrieval.
+    Drop-in replacement for the former monolithic
+    ``MonteCarloEvidenceSampling`` class.  The constructor signature is
+    a strict superset — callers that do not pass the new optional
+    parameters (``embedding_util``, ``tokenizer``, ``cache``) get the
+    same behaviour as before, with the added benefit of batch LLM
+    evaluation and structure-aware chunking.
     """
 
     def __init__(
@@ -76,311 +49,35 @@ class MonteCarloEvidenceSampling:
         doc_content: str,
         verbose: bool = True,
         log_callback: LogCallback = None,
+        *,
+        embedding_util: Any = None,
+        tokenizer: Any = None,
+        cache: Optional[EvidenceCache] = None,
     ):
         self.llm = llm
         self.doc = doc_content
         self.doc_len = len(doc_content)
         self.verbose = verbose
-
-        # Adaptive configuration: for smaller documents (already
-        # keyword-filtered), use fewer rounds and larger windows
-        # to save LLM calls while maintaining recall.
-        if self.doc_len <= 5_000:
-            self.max_rounds = 1
-            self.probe_window = min(1500, self.doc_len)
-            self.roi_window = self.doc_len
-            self.fuzz_candidates_num = 3
-            self.random_exploration_num = 1
-            self.samples_per_round = 2
-        elif self.doc_len <= 20_000:
-            self.max_rounds = 2
-            self.probe_window = 800
-            self.roi_window = 2500
-            self.fuzz_candidates_num = 4
-            self.random_exploration_num = 1
-            self.samples_per_round = 3
-        else:
-            self.max_rounds = 3
-            self.probe_window = 500
-            self.roi_window = 2000
-            self.fuzz_candidates_num = 5
-            self.random_exploration_num = 2
-            self.samples_per_round = 5
-
-        self.top_k_seeds = 2
-        self.visited_starts: Set[int] = set()
-        
         self._log = create_logger(log_callback=log_callback)
         self.llm_usages: List[Dict[str, Any]] = []
 
-    def _get_content(self, start: int) -> Tuple[int, int, str]:
-        """
-        Safely retrieves a document slice with boundary checks.
-        """
-        start = max(0, min(start, self.doc_len - self.probe_window))
-        end = min(start + self.probe_window, self.doc_len)
-        return start, end, self.doc[start:end]
-
-    async def _get_fuzzy_anchors(
-        self, query: str, keywords: List[str] = None, threshold: float = 10.0
-    ) -> List[SampleWindow]:
-        """
-        Uses RapidFuzz to find heuristic anchors based on literal matching.
-        Logic: Sliding window slices -> Calculate similarity with Query -> Top K.
-
-        Args:
-            query (str): The user query string.
-            threshold (float): Minimum similarity score to consider between 0-100.
-
-        Returns:
-            List[SampleWindow]: List of sampled windows based on fuzzy matching.
-        """
-        if self.verbose:
-            await self._log.info("Executing RapidFuzz heuristic pre-filtering...")
-
-        keywords = keywords or []
-
-        # 1. Build sliding window slices (stride = half window size)
-        stride = self.probe_window // 2
-        chunks = []
-        for i in range(0, self.doc_len, stride):
-            chunks.append(i)
-
-        # 2. Construct text list for matching
-        chunk_texts = [self.doc[i : i + self.probe_window] for i in chunks]
-
-        # 3. Extract most similar fragments
-        # TODO: try to add `fuzz.token_set_ratio` for multi-channel retrieval
-        results = process.extract(
-            query=f"{query} {' '.join(keywords)}".strip(),
-            choices=list(chunk_texts),
-            scorer=fuzz.token_set_ratio,
-            limit=int(self.fuzz_candidates_num * 2),
-            score_cutoff=None,
+        # --- components ---
+        initial_config = AdaptiveSamplingStrategy.configure(self.doc_len)
+        self._chunker = DocumentChunker(
+            target_size=initial_config.probe_window,
+            max_size=initial_config.probe_window * 2,
         )
+        self._scorer = SignalScorer(tokenizer=tokenizer)
+        self._evaluator = BatchEvaluator(llm=llm, log_callback=log_callback)
+        self._strategy = AdaptiveSamplingStrategy
+        self._cache = cache
+        self._embedding_util = embedding_util
 
-        anchors = []
-        for text, score, index in results:
-            start_idx = chunks[index]
+        self._visited: Set[int] = set()
 
-            # Simple deduplication
-            if start_idx in self.visited_starts:
-                continue
-
-            # Threshold filtering (e.g., > 30)
-            if score < threshold:
-                continue
-
-            self.visited_starts.add(start_idx)
-            _, end, content = self._get_content(start_idx)
-
-            anchors.append(
-                SampleWindow(
-                    start_idx=start_idx,
-                    end_idx=end,
-                    content=content,
-                    fuzz_score=score,
-                    round_num=1,
-                    source="fuzz",
-                )
-            )
-
-            if len(anchors) >= self.fuzz_candidates_num:
-                break
-
-        top_score = anchors[0].fuzz_score if anchors else 0.0
-        if self.verbose:
-            await self._log.info(
-                f"   Anchors hit: {len(anchors)} (Top Fuzz Score: {top_score:.1f})"
-            )
-
-        return anchors
-
-    def _sample_stratified_supplement(self, count: int) -> List[SampleWindow]:
-        """
-        Adds a small amount of global random sampling for 'Exploration',
-        preventing cases where Query is semantically relevant but lacks keyword matches.
-
-        Args:
-            count (int): Number of random samples to generate.
-
-        Returns:
-            List[SampleWindow]: List of randomly sampled windows.
-        """
-        samples = []
-        if count <= 0:
-            return samples
-
-        step = self.doc_len // count
-        for i in range(count):
-            section_start = i * step
-            section_end = min((i + 1) * step, self.doc_len)
-
-            # Random selection within section
-            max_start = max(section_start, section_end - self.probe_window)
-            rand_start = random.randint(section_start, max_start)
-
-            start, end, content = self._get_content(rand_start)
-
-            # Check for overlap with existing points
-            is_duplicate = False
-            for v in self.visited_starts:
-                if abs(v - start) < (self.probe_window // 2):
-                    is_duplicate = True
-                    break
-
-            if not is_duplicate:
-                self.visited_starts.add(start)
-                samples.append(
-                    SampleWindow(
-                        start_idx=start,
-                        end_idx=end,
-                        content=content,
-                        round_num=1,
-                        source="stratified",
-                    )
-                )
-
-        return samples
-
-    def _sample_gaussian(
-        self, seeds: List[SampleWindow], current_round: int
-    ) -> List[SampleWindow]:
-        """
-        [Subsequent Rounds] Gaussian Importance Sampling.
-
-        Args:
-            seeds (List[SampleWindow]): High-value seeds from previous round.
-            current_round (int): Current round number.
-
-        Returns:
-            List[SampleWindow]: List of newly sampled windows.
-        """
-        samples = []
-        # Sigma Decay: Shrink search range as rounds progress
-        base_sigma = self.doc_len / 20
-        sigma = base_sigma / (2 ** (current_round - 1))
-
-        samples_needed = self.samples_per_round
-
-        for seed in seeds:
-            if samples_needed <= 0:
-                break
-
-            # Allocate children per seed
-            num_children = max(1, math.ceil(samples_needed / len(seeds)))
-            center = (seed.start_idx + seed.end_idx) // 2
-
-            for _ in range(num_children):
-                new_center = int(random.gauss(center, sigma))
-                raw_start = new_center - (self.probe_window // 2)
-                start, end, content = self._get_content(raw_start)
-
-                # Deduplication check
-                too_close = False
-                for existing in self.visited_starts:
-                    if abs(existing - start) < (self.probe_window // 3):
-                        too_close = True
-                        break
-
-                if not too_close:
-                    self.visited_starts.add(start)
-                    samples.append(
-                        SampleWindow(
-                            start_idx=start,
-                            end_idx=end,
-                            content=content,
-                            round_num=current_round,
-                            source="gaussian",
-                        )
-                    )
-                    samples_needed -= 1
-
-        return samples
-
-    _SCORE_RE = re.compile(r'"score"\s*:\s*(\d+(?:\.\d+)?)')
-
-    async def _evaluate_sample_async(
-        self, sample: SampleWindow, query: str
-    ) -> SampleWindow:
-        """
-        Evaluates a single sample asynchronously.
-        """
-        prompt = EVALUATE_EVIDENCE_SAMPLE.format(
-            query=query,
-            sample_source=sample.source,
-            sample_content=sample.content,
-        )
-        try:
-            resp_obj = await self.llm.achat([{"role": "user", "content": prompt}], enable_thinking=False)
-            resp: str = resp_obj.content
-            self.llm_usages.append(resp_obj.usage)
-
-            clean_resp = resp.replace("```json", "").replace("```", "").strip()
-            try:
-                data = json.loads(clean_resp)
-            except json.JSONDecodeError:
-                # LLM responses often contain unescaped quotes inside the
-                # "reasoning" value (e.g. Chinese book-title quotes).
-                # Fall back to regex extraction for the critical "score" field.
-                m = self._SCORE_RE.search(clean_resp)
-                if m:
-                    data = {"score": float(m.group(1)), "reasoning": ""}
-                else:
-                    raise
-            sample.score = float(data.get("score", 0))
-            sample.reasoning = data.get("reasoning", "")
-        except Exception as e:
-            await self._log.warning(f"Error evaluating sample at {sample.start_idx}: {e}")
-            sample.score = 0.0
-
-        return sample
-
-    async def _evaluate_batch(
-        self, samples: List[SampleWindow], query: str
-    ) -> List[SampleWindow]:
-        """
-        Evaluates a batch of samples concurrently.
-        """
-        if self.verbose:
-            await self._log.info(f"   Evaluating {len(samples)} samples with LLM...")
-
-        # Create async tasks
-        tasks = [self._evaluate_sample_async(s, query) for s in samples]
-
-        # Run concurrently
-        evaluated_samples = await asyncio.gather(*tasks)
-        return list(evaluated_samples)
-
-    async def _generate_summary(
-        self, top_samples: List[SampleWindow], query: str
-    ) -> str:
-        """
-        Expands the context windows for multiple top samples and generates a summary.
-        """
-        combined_context = ""
-        half_window = self.roi_window // 2
-
-        # Sort by index to maintain document flow if needed, or by score
-        processed_samples = sorted(top_samples, key=lambda x: x.start_idx)
-
-        for i, sample in enumerate(processed_samples):
-            center = (sample.start_idx + sample.end_idx) // 2
-            start = max(0, center - half_window)
-            end = min(self.doc_len, center + half_window)
-            expanded_content = self.doc[start:end]
-            combined_context += (
-                f"\n--- Context Fragment {i + 1} ---\n...{expanded_content}...\n"
-            )
-
-        prompt = ROI_RESULT_SUMMARY.format(
-            user_input=query,
-            text_content=combined_context,
-        )
-
-        summary_response = await self.llm.achat([{"role": "user", "content": prompt}], enable_thinking=False)
-        self.llm_usages.append(summary_response.usage)
-        return summary_response.content
+    # ==================================================================
+    # Public API — signature-compatible with the old get_roi()
+    # ==================================================================
 
     async def get_roi(
         self,
@@ -389,119 +86,264 @@ class MonteCarloEvidenceSampling:
         confidence_threshold: float = 8.5,
         top_k: int = 5,
     ) -> RoiResult:
-        """
-        Get the Region of Interest (ROI) for the given query.
+        keywords = keywords or {}
 
-        Args:
-            query (str): The user query string.
-            keywords (Dict[str, float], optional): Enhanced keywords with IDF scores for fuzzy matching.
-            confidence_threshold (float): Confidence score threshold for early stopping.
-            top_k (int): Number of top snippets to consider for final summary.
-
-        Returns:
-            RoiResult: The final ROI result with metadata.
-        """
         if self.verbose:
             await self._log.info(
                 f"=== Starting Hybrid Adaptive Retrieval (Doc Len: {self.doc_len}) ==="
             )
             await self._log.info(f"Query: {query}, optional keywords: {keywords}")
 
-        keywords = keywords or {}
+        # 1. Cache lookup
+        if self._cache:
+            cached = self._cache.get(self.doc, query)
+            if cached:
+                if self.verbose:
+                    await self._log.info("Cache hit — returning cached result")
+                return RoiResult(
+                    summary=cached.summary,
+                    is_found=cached.is_found,
+                    snippets=cached.snippets,
+                )
 
+        # 2. Configure
+        config = self._strategy.configure(self.doc_len)
+        config.confidence_threshold = confidence_threshold
+
+        # 3. Short-document fast path
+        if config.skip_sampling:
+            result = await self._fast_path(query, config)
+            self._cache_result(query, result)
+            return result
+
+        # 4. Structure-aware chunking
+        chunks = self._chunker.chunk(self.doc)
+
+        # 5. Multi-signal pre-scoring (zero LLM cost)
+        scored_chunks = await self._scorer.score(
+            query=query,
+            keywords=list(keywords.keys()),
+            chunks=chunks,
+            embedding_util=self._embedding_util,
+        )
+
+        if self.verbose:
+            top3 = scored_chunks[:3]
+            labels = ", ".join(
+                f"[{sc.start}..{sc.end} score={sc.combined_score:.2f}]" for sc in top3
+            )
+            await self._log.info(
+                f"Pre-scored {len(scored_chunks)} chunks — top 3: {labels}"
+            )
+
+        # 6. Iterative sampling + batch evaluation
+        result = await self._iterative_sampling(
+            query, scored_chunks, config, top_k,
+        )
+        self._cache_result(query, result)
+        return result
+
+    # ==================================================================
+    # Internal pipeline stages
+    # ==================================================================
+
+    async def _fast_path(
+        self, query: str, config: SamplingConfig,
+    ) -> RoiResult:
+        """Short doc (≤3 KB): evaluate the entire content in one LLM call."""
+        if self.verbose:
+            await self._log.info("Short document detected — evaluating entire content")
+
+        sample = SampleWindow(
+            start_idx=0,
+            end_idx=self.doc_len,
+            content=self.doc,
+            round_num=1,
+            source="whole_doc",
+        )
+        evaluated = await self._evaluator.evaluate([sample], query)
+        self._collect_usages()
+
+        if evaluated:
+            s = evaluated[0]
+            await self._log.info(
+                f"  [Whole Doc] Score: {s.score} | {s.reasoning[:50]}..."
+            )
+
+        if evaluated and evaluated[0].score >= 4.0:
+            summary = await self._generate_summary(evaluated[:1], query, config)
+            return RoiResult(
+                summary=summary,
+                is_found=True,
+                snippets=[self._snippet_dict(s) for s in evaluated[:1]],
+            )
+
+        best = evaluated[0] if evaluated else sample
+        return RoiResult(
+            summary="No exact answer found in the document.",
+            is_found=False,
+            snippets=[self._snippet_dict(best)],
+        )
+
+    async def _iterative_sampling(
+        self,
+        query: str,
+        scored_chunks: List[ScoredChunk],
+        config: SamplingConfig,
+        top_k: int,
+    ) -> RoiResult:
+        """Multi-round sampling with batch evaluation and early stopping."""
         all_candidates: List[SampleWindow] = []
         top_seeds: List[SampleWindow] = []
 
-        for r in range(1, self.max_rounds + 1):
+        for r in range(1, config.max_rounds + 1):
             if self.verbose:
-                await self._log.info(f"--- Round {r}/{self.max_rounds} ---")
-            current_samples = []
+                await self._log.info(f"--- Round {r}/{config.max_rounds} ---")
+
+            current_samples: List[SampleWindow] = []
 
             if r == 1:
-                # === Strategy: Fuzz Anchors + Random Supplement ===
-                fuzz_samples = await self._get_fuzzy_anchors(
-                    query=query,
-                    keywords=list(keywords.keys()),
-                    threshold=10.0,
+                current_samples = self._round_one_samples(
+                    scored_chunks, config,
                 )
-                current_samples.extend(fuzz_samples)
+            else:
+                current_samples = self._refinement_samples(
+                    top_seeds, all_candidates, config, r,
+                )
 
-                # Only add random exploration when fuzz anchors are weak or absent
-                best_fuzz = max((s.fuzz_score for s in fuzz_samples), default=0)
-                needed_random = self.random_exploration_num
-                if len(fuzz_samples) == 0:
-                    needed_random += 3
-                elif best_fuzz >= 70.0:
-                    needed_random = 0  # strong anchors, skip random noise
-
-                if needed_random > 0:
-                    random_samples = self._sample_stratified_supplement(needed_random)
-                    current_samples.extend(random_samples)
-                else:
-                    random_samples = []
-
+            if not current_samples:
                 if self.verbose:
-                    await self._log.info(
-                        f"Sampling Distribution: Fuzz Anchors={len(fuzz_samples)} "
-                        f"(best={best_fuzz:.0f}), Random Exploration={len(random_samples)}"
-                    )
+                    await self._log.info("No new samples generated this round, skipping.")
+                continue
 
-            else:
-                # === Subsequent Rounds: Gaussian Focusing ===
-                # Filter low score seeds
-                valid_seeds = [s for s in top_seeds if s.score >= 4.0]
+            if self.verbose:
+                await self._log.info(
+                    f"   Evaluating {len(current_samples)} samples with LLM (batch)..."
+                )
 
-                if not valid_seeds:
-                    await self._log.warning(
-                        "No high-value regions found, attempting global random sampling again..."
-                    )
-                    current_samples = self._sample_stratified_supplement(
-                        self.samples_per_round
-                    )
-                else:
-                    max_score = valid_seeds[0].score
-                    if self.verbose:
-                        await self._log.info(
-                            f"Focusing: Based on {len(valid_seeds)} seeds (Max Score: {max_score})"
-                        )
-                    current_samples = self._sample_gaussian(valid_seeds, r)
+            evaluated = await self._evaluator.evaluate(current_samples, query)
+            self._collect_usages()
+            all_candidates.extend(evaluated)
 
-            if not current_samples and self.verbose:
-                await self._log.info("No new samples generated this round, skipping.")
-            else:
-                evaluated = await self._evaluate_batch(current_samples, query)
-                all_candidates.extend(evaluated)
+            for s in evaluated:
+                await self._log.info(
+                    f"  [Pos {s.start_idx:6d} | Src: {s.source:10s}] "
+                    f"Score: {s.score} | {s.reasoning[:30]}..."
+                )
 
-                for s in evaluated:
-                    await self._log.info(
-                        f"  [Pos {s.start_idx:6d} | Src: {s.source:8s}] Score: {s.score} | {s.reasoning[:30]}..."
-                    )
-
-            # Sort and update seeds
             all_candidates.sort(key=lambda x: x.score, reverse=True)
-            top_seeds = all_candidates[: self.top_k_seeds]
+            top_seeds = all_candidates[: config.top_k_seeds]
 
-            # Early stopping: stop when best score meets confidence threshold,
-            # or when round 1 produces a "good enough" result (score >= 7)
-            # to avoid expensive Gaussian refinement rounds.
-            best_score_so_far = top_seeds[0].score if top_seeds else 0.0
-            if best_score_so_far >= confidence_threshold:
+            best_score = top_seeds[0].score if top_seeds else 0.0
+            scores = [c.score for c in all_candidates]
+            mean = sum(scores) / len(scores) if scores else 0.0
+            variance = (
+                sum((s - mean) ** 2 for s in scores) / len(scores)
+                if scores
+                else 0.0
+            )
+
+            ess = self._strategy.compute_ess(scores)
+            if self.verbose and r > 1:
+                await self._log.info(
+                    f"IS diagnostics: ESS={ess:.1f}/{len(scores)}, "
+                    f"best={best_score:.1f}, var={variance:.1f}"
+                )
+
+            if not self._strategy.should_continue(best_score, r, config, variance):
                 if self.verbose:
                     await self._log.info(
-                        f"High confidence target found (Score={best_score_so_far:.1f} "
-                        f">= {confidence_threshold}), stopping early."
-                    )
-                break
-            if r == 1 and best_score_so_far >= 7.0 and len(all_candidates) >= 2:
-                if self.verbose:
-                    await self._log.info(
-                        f"Good enough evidence after round 1 (Score={best_score_so_far:.1f}), "
-                        f"skipping Gaussian refinement."
+                        f"Early stop: best_score={best_score:.1f}, "
+                        f"variance={variance:.1f}"
                     )
                 break
 
-        # --- Final Result Processing ---
-        if not all_candidates:
+        return await self._build_result(all_candidates, query, top_k, config)
+
+    # ------------------------------------------------------------------
+    # Round 1: pre-scored chunks + random exploration
+    # ------------------------------------------------------------------
+
+    def _round_one_samples(
+        self,
+        scored_chunks: List[ScoredChunk],
+        config: SamplingConfig,
+    ) -> List[SampleWindow]:
+        current: List[SampleWindow] = []
+
+        top_scored = self._strategy.select_from_scored(
+            scored_chunks, self._visited, config.fuzz_candidates_num,
+        )
+        for sc in top_scored:
+            current.append(
+                SampleWindow(
+                    start_idx=sc.start,
+                    end_idx=sc.end,
+                    content=sc.content,
+                    fuzz_score=sc.combined_score * 100,
+                    round_num=1,
+                    source="scored",
+                )
+            )
+
+        best_signal = top_scored[0].combined_score if top_scored else 0
+        needed_random = config.random_exploration_num
+        if not top_scored or best_signal < 0.3:
+            needed_random += 3
+        elif best_signal >= 0.7:
+            needed_random = 0
+
+        if needed_random > 0:
+            randoms = self._strategy.sample_random(
+                self.doc, self.doc_len, config.probe_window,
+                needed_random, self._visited,
+            )
+            current.extend(randoms)
+
+        return current
+
+    # ------------------------------------------------------------------
+    # Rounds 2+: Gaussian refinement or random fallback
+    # ------------------------------------------------------------------
+
+    def _refinement_samples(
+        self,
+        top_seeds: List[SampleWindow],
+        all_candidates: List[SampleWindow],
+        config: SamplingConfig,
+        current_round: int,
+    ) -> List[SampleWindow]:
+        valid_seeds = [s for s in top_seeds if s.score >= 4.0]
+
+        if valid_seeds:
+            return self._strategy.sample_gaussian(
+                valid_seeds,
+                self.doc_len,
+                config.probe_window,
+                current_round,
+                config.samples_per_round,
+                self._visited,
+                self.doc,
+                all_candidates=all_candidates,
+            )
+
+        return self._strategy.sample_random(
+            self.doc, self.doc_len, config.probe_window,
+            config.samples_per_round, self._visited,
+        )
+
+    # ------------------------------------------------------------------
+    # Result assembly
+    # ------------------------------------------------------------------
+
+    async def _build_result(
+        self,
+        candidates: List[SampleWindow],
+        query: str,
+        top_k: int,
+        config: SamplingConfig,
+    ) -> RoiResult:
+        if not candidates:
             await self._log.warning("Failed to retrieve any content.")
             return RoiResult(
                 summary="Could not retrieve relevant content.",
@@ -509,54 +351,92 @@ class MonteCarloEvidenceSampling:
                 snippets=[],
             )
 
-        # Collect top candidates that are relevant enough
-        # Using 4.0 as a soft threshold for relevance inclusion
-        relevant_candidates = [c for c in all_candidates if c.score >= 4.0]
+        relevant = [c for c in candidates if c.score >= 4.0]
 
-        # If nothing meets the threshold, fallback to the single best candidate
-        if not relevant_candidates:
-            best = all_candidates[0]
+        if not relevant:
+            best = candidates[0]
             return RoiResult(
                 summary="No exact answer found in the document.",
                 is_found=False,
-                snippets=[
-                    {
-                        "snippet": best.content,
-                        "start": best.start_idx,
-                        "end": best.end_idx,
-                        "score": best.score,
-                        "reasoning": best.reasoning,
-                    }
-                ],
+                snippets=[self._snippet_dict(best)],
             )
 
-        # Take up to top_k_seeds (e.g., 2 or 3) as the final set for summarization
-        final_candidates = relevant_candidates[:top_k]
-        best_score = final_candidates[0].score
+        final = relevant[:top_k]
 
         if self.verbose:
             await self._log.info(
-                f"=== Final Lock: {len(final_candidates)} snippets, Top Score {best_score} ==="
+                f"=== Final Lock: {len(final)} snippets, Top Score {final[0].score} ==="
             )
 
-        # Generate summary
-        summary = await self._generate_summary(final_candidates, query)
-
-        # Construct new snippet format
-        roi_snippets = []
-        for c in final_candidates:
-            roi_snippets.append(
-                {
-                    "snippet": c.content,
-                    "start": c.start_idx,
-                    "end": c.end_idx,
-                    "score": c.score,
-                    "reasoning": c.reasoning,
-                }
-            )
-
+        summary = await self._generate_summary(final, query, config)
         return RoiResult(
             summary=summary,
             is_found=True,
-            snippets=roi_snippets,
+            snippets=[self._snippet_dict(c) for c in final],
         )
+
+    async def _generate_summary(
+        self,
+        top_samples: List[SampleWindow],
+        query: str,
+        config: SamplingConfig,
+    ) -> str:
+        combined_context = ""
+        half_window = config.roi_window // 2
+        processed = sorted(top_samples, key=lambda x: x.start_idx)
+
+        for i, sample in enumerate(processed):
+            center = (sample.start_idx + sample.end_idx) // 2
+            start = max(0, center - half_window)
+            end = min(self.doc_len, center + half_window)
+            expanded = self.doc[start:end]
+            combined_context += (
+                f"\n--- Context Fragment {i + 1} ---\n...{expanded}...\n"
+            )
+
+        prompt = ROI_RESULT_SUMMARY.format(
+            user_input=query,
+            text_content=combined_context,
+        )
+
+        resp = await self.llm.achat(
+            [{"role": "user", "content": prompt}],
+            enable_thinking=False,
+        )
+        self.llm_usages.append(resp.usage)
+        return resp.content
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _collect_usages(self) -> None:
+        self.llm_usages.extend(self._evaluator.llm_usages)
+        self._evaluator.llm_usages.clear()
+
+    def _cache_result(self, query: str, result: RoiResult) -> None:
+        if self._cache and result.is_found:
+            self._cache.put(
+                doc_content=self.doc,
+                query=query,
+                scored_positions=[
+                    (s["start"], s["end"], s["score"]) for s in result.snippets
+                ],
+                summary=result.summary,
+                is_found=result.is_found,
+                snippets=result.snippets,
+            )
+
+    @staticmethod
+    def _snippet_dict(s: SampleWindow) -> Dict[str, Any]:
+        return {
+            "snippet": s.content,
+            "start": s.start_idx,
+            "end": s.end_idx,
+            "score": s.score,
+            "reasoning": s.reasoning,
+        }
+
+
+# Backward-compatible alias
+MonteCarloEvidenceSampling = EvidenceSampler

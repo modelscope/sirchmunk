@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from sirchmunk.base import BaseSearch
+from sirchmunk.learnings.evidence_cache import EvidenceCache
 from sirchmunk.learnings.knowledge_base import KnowledgeBase
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import (
@@ -118,11 +119,15 @@ class AgenticSearch(BaseSearch):
         # Create bound logger with callback - returns AsyncLogger instance
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
 
+        # Shared evidence cache across all searches in this session
+        self._evidence_cache = EvidenceCache()
+
         # Pass log_callback to KnowledgeBase so it can also log through the same callback
         self.knowledge_base = KnowledgeBase(
             llm=self.llm,
             work_path=self.work_path,
-            log_callback=log_callback
+            log_callback=log_callback,
+            evidence_cache=self._evidence_cache,
         )
 
         self.verbose: bool = verbose
@@ -184,6 +189,7 @@ class AgenticSearch(BaseSearch):
                     )
                     self.embedding_client = EmbeddingUtil(cache_dir=cache_dir)
                     self.embedding_client.start_loading()
+                    self.knowledge_base.embedding_util = self.embedding_client
                     _loguru_logger.info(
                         "[warmup] Embedding client created, background model loading started"
                     )
@@ -2535,14 +2541,11 @@ class AgenticSearch(BaseSearch):
         """Use BM25 to rerank candidate files by query relevance.
 
         Reads first 2000 chars of each file as document representation,
-        scores them against the query using bm25s, and returns the
-        top-k most relevant file paths.  Falls back to None on error
+        scores them against the query using ``BM25Scorer``, and returns
+        the top-k most relevant file paths.  Falls back to None on error
         (caller should keep the original list).
         """
-        try:
-            import bm25s
-        except ImportError:
-            return None
+        from sirchmunk.utils.bm25_util import BM25Scorer
 
         docs: List[str] = []
         valid_paths: List[str] = []
@@ -2559,18 +2562,12 @@ class AgenticSearch(BaseSearch):
             return None
 
         try:
-            corpus_tokens = bm25s.tokenize(docs, stopwords="en")
-            retriever = bm25s.BM25()
-            retriever.index(corpus_tokens)
-
-            query_tokens = bm25s.tokenize([query], stopwords="en")
+            scorer = BM25Scorer()
             k = min(top_k, len(docs))
-            results, scores = retriever.retrieve(query_tokens, k=k)
-
-            reranked: List[str] = []
-            for idx in results[0]:
-                if 0 <= idx < len(valid_paths):
-                    reranked.append(valid_paths[idx])
+            indices = scorer.rerank(query, docs, k)
+            if indices is None:
+                return None
+            reranked = [valid_paths[i] for i in indices if 0 <= i < len(valid_paths)]
             return reranked if reranked else None
         except Exception:
             return None

@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 
+from sirchmunk.learnings.evidence_cache import EvidenceCache
 from sirchmunk.learnings.evidence_processor import (
-    MonteCarloEvidenceSampling,
+    EvidenceSampler,
     RoiResult,
 )
 from sirchmunk.llm.openai_chat import OpenAIChat
@@ -37,6 +38,10 @@ class KnowledgeBase:
         metadata_map: Dict[str, Any] = None,
         work_path: Union[str, Path] = None,
         log_callback: LogCallback = None,
+        *,
+        evidence_cache: Optional[EvidenceCache] = None,
+        embedding_util: Any = None,
+        tokenizer: Any = None,
     ):
         """
         Initialize the KnowledgeBase with an LLM and metadata mapping.
@@ -48,6 +53,9 @@ class KnowledgeBase:
                 v: metadata path or content
             work_path: Working directory path
             log_callback: Optional log callback function for custom logging
+            evidence_cache: Shared EvidenceCache for cross-query result reuse.
+            embedding_util: Optional EmbeddingUtil for semantic pre-scoring.
+            tokenizer: Optional TokenizerUtil for BM25 tokenization.
         """
         self.llm = llm
         self.metadata_map = metadata_map
@@ -67,6 +75,11 @@ class KnowledgeBase:
         self._log = create_logger(log_callback=log_callback)
 
         self.llm_usages: List[Dict[str, Any]] = []
+
+        # Components forwarded to EvidenceSampler
+        self.evidence_cache = evidence_cache
+        self.embedding_util = embedding_util
+        self.tokenizer = tokenizer
 
     @staticmethod
     def _get_file_info(
@@ -141,11 +154,14 @@ class KnowledgeBase:
             extraction_result = await fast_extract(file_path=file_path_or_url)
             doc_content: str = extraction_result.content
 
-            sampler = MonteCarloEvidenceSampling(
+            sampler = EvidenceSampler(
                 llm=self.llm,
                 doc_content=doc_content,
                 verbose=verbose,
                 log_callback=self.log_callback,
+                embedding_util=self.embedding_util,
+                tokenizer=self.tokenizer,
+                cache=self.evidence_cache,
             )
             roi_result: RoiResult = await sampler.get_roi(
                 query=query,
