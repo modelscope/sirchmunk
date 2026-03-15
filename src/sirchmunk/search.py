@@ -1454,28 +1454,42 @@ class AgenticSearch(BaseSearch):
             if not cluster.search_results:
                 cluster.search_results = list(merged_files)
         else:
-            await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
-            answer, context = await self._react_refinement(
-                query=query, paths=paths,
-                initial_keywords=initial_keywords, spec_context=spec_context,
-                enable_dir_scan=enable_dir_scan,
-                max_loops=max_loops, max_token_budget=max_token_budget,
-                max_depth=max_depth, include=include, exclude=exclude,
-                enable_thinking=enable_thinking,
-            )
-
-            # Merge Phase 3 file marks into the new ReAct context
-            # so callers always see what was retrieved in Phase 2-3.
-            for fp in _phase3_read_files:
-                context.mark_file_read(fp)
-
-            if not cluster:
-                cluster = await self._build_cluster_from_context(
-                    query=query, answer=answer, context=context,
-                    query_keywords=query_keywords, top_k_files=top_k_files,
+            # Try to recover partial evidence from snippets/summaries
+            # before falling back to the expensive ReAct loop.
+            _assembled = self._assemble_evidence_snippets(cluster) if cluster else ""
+            if _assembled:
+                cluster.content = _assembled
+                await self._logger.info(
+                    "[Phase 4] Assembled partial evidence from snippets, generating summary"
                 )
-            elif answer and not cluster.content:
-                cluster.content = answer
+                answer, should_save = await self._summarise_cluster(
+                    query, cluster, enable_thinking=enable_thinking,
+                )
+                if not cluster.search_results:
+                    cluster.search_results = list(merged_files)
+            else:
+                await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
+                answer, context = await self._react_refinement(
+                    query=query, paths=paths,
+                    initial_keywords=initial_keywords, spec_context=spec_context,
+                    enable_dir_scan=enable_dir_scan,
+                    max_loops=max_loops, max_token_budget=max_token_budget,
+                    max_depth=max_depth, include=include, exclude=exclude,
+                    enable_thinking=enable_thinking,
+                )
+
+                # Merge Phase 3 file marks into the new ReAct context
+                # so callers always see what was retrieved in Phase 2-3.
+                for fp in _phase3_read_files:
+                    context.mark_file_read(fp)
+
+                if not cluster:
+                    cluster = await self._build_cluster_from_context(
+                        query=query, answer=answer, context=context,
+                        query_keywords=query_keywords, top_k_files=top_k_files,
+                    )
+                elif answer and not cluster.content:
+                    cluster.content = answer
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -2820,6 +2834,35 @@ class AgenticSearch(BaseSearch):
     # ------------------------------------------------------------------
     # Phase 4: Answer generation
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _assemble_evidence_snippets(cluster: Any) -> str:
+        """Recover usable content from individual evidence summaries/snippets.
+
+        When the overall cluster content assembly fails (e.g. due to JSON
+        parsing errors in LLM scoring), individual evidence units may still
+        contain useful summaries or raw text snippets.  This method gathers
+        those fragments so a summary can be generated without a full
+        ReAct fallback, saving significant latency.
+
+        Returns an empty string if no meaningful content can be recovered.
+        """
+        if not cluster:
+            return ""
+        parts: List[str] = []
+        for ev in (getattr(cluster, "evidences", None) or []):
+            summary = getattr(ev, "summary", "")
+            if summary and len(summary.strip()) > 30:
+                parts.append(summary.strip())
+                continue
+            for snip in (getattr(ev, "snippets", None) or []):
+                text = snip.get("snippet", "") if isinstance(snip, dict) else str(snip)
+                if text and len(text.strip()) > 50:
+                    parts.append(text.strip())
+        if not parts:
+            return ""
+        combined = "\n\n".join(parts)
+        return combined if len(combined) > 100 else ""
 
     async def _summarise_cluster(
         self,

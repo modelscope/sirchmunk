@@ -22,6 +22,7 @@ collapsing SP precision to near zero.
 
 import asyncio
 import json as json_mod
+import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -47,32 +48,33 @@ def _normalize_prediction(pred: str) -> str:
     """Post-process prediction to improve EM/F1 matching.
 
     Strips markdown formatting, quotation marks, trailing periods,
-    and common wrapper phrases that LLMs add.
+    common wrapper phrases, and normalizes common formatting
+    differences (ampersand, ordinals, hedging prefixes).
     """
-    import re
     s = pred.strip()
-    # Remove markdown bold/italic
     s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
     s = re.sub(r"\*(.+?)\*", r"\1", s)
-    # Remove surrounding quotes (ASCII and Unicode)
     if len(s) >= 2 and s[0] in ('"', "'", "\u201c", "\u2018") and s[-1] in ('"', "'", "\u201d", "\u2019"):
         s = s[1:-1].strip()
-    # Remove trailing period / colon
     s = s.rstrip(".:")
-    # Remove common LLM wrapper phrases (case-insensitive)
+    s = s.replace(" & ", " and ")
+    s = re.sub(r'\b(\d+)(?:st|nd|rd|th)\b', r'\1', s)
     _PREFIXES = [
-        "the answer is ", "the short answer is ",
+        "the answer is: ", "the answer is ",
+        "the short answer is: ", "the short answer is ",
         "answer: ", "short answer: ",
         "based on the information, ",
         "based on the context, ",
         "according to the documents, ",
+        "approximately ", "about ", "around ", "roughly ",
+        "nearly ", "almost ", "more than ", "less than ",
+        "at least ", "up to ",
     ]
     s_lower = s.lower()
     for prefix in _PREFIXES:
         if s_lower.startswith(prefix):
             s = s[len(prefix):].strip()
             s_lower = s.lower()
-    # Remove trailing parenthetical clarifications: "Paris (the capital)"
     s = re.sub(r"\s*\(.*?\)\s*$", "", s).strip()
     return s
 
@@ -149,21 +151,50 @@ def _collect_evidence_texts(cluster: Any, result: Any = None) -> List[str]:
     return texts
 
 
-_MAX_SENTS_PER_ARTICLE = 2
+_MAX_SENTS_PER_ARTICLE = 3
+_MAX_SP_PAIRS_PER_QUERY = 12
+_SENT_OVERLAP_THRESHOLD = 0.4
+_SENT_MIN_OVERLAP_TOKENS = 3
+
+_SP_STOP = frozenset({
+    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+    'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+    'would', 'could', 'should', 'may', 'might', 'shall', 'can',
+    'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
+    'as', 'into', 'through', 'during', 'before', 'after', 'and',
+    'or', 'but', 'if', 'because', 'while', 'that', 'this',
+    'which', 'what', 'it', 'its', 'he', 'she', 'they', 'them',
+    'his', 'her', 'their', 'who', 'whom', 'whose', 'not', 'no',
+    'so', 'than', 'too', 'very', 'just', 'also', 'only',
+})
+_WORD_RE = re.compile(r'\b\w+\b')
+
+
+def _content_tokens(text: str) -> Set[str]:
+    """Extract meaningful content tokens for overlap-based matching."""
+    return {
+        t for t in _WORD_RE.findall(text.lower())
+        if t not in _SP_STOP and len(t) >= 2
+    }
 
 
 def _strip_disambiguation(title: str) -> str:
     """Remove Wikipedia disambiguation suffix, e.g. 'Foo (film)' → 'Foo'."""
-    import re
     return re.sub(r"\s*\([^)]*\)\s*$", "", title).strip()
 
 
-def _is_title_relevant(title: str, context_lower: str) -> bool:
+def _is_title_relevant(
+    title: str,
+    context_lower: str,
+    context_tokens: Optional[Set[str]] = None,
+) -> bool:
     """Determine if a Wikipedia article title is relevant to the search context.
 
-    Checks both the full title and the title without its disambiguation
-    suffix (e.g. "On Chesil Beach (film)" also matches "On Chesil Beach").
-    Requires the title to be at least 3 characters to avoid spurious matches.
+    Checks:
+      1. Exact substring match (full title or without disambiguation suffix).
+      2. Token coverage: all meaningful title words appear in context.
+         Only applied when the title has ≥ 2 content tokens to avoid
+         spurious matches on single common words.
     """
     t = title.lower().strip()
     if len(t) < 3:
@@ -173,6 +204,10 @@ def _is_title_relevant(title: str, context_lower: str) -> bool:
     stripped = _strip_disambiguation(t)
     if stripped != t and len(stripped) >= 3 and stripped in context_lower:
         return True
+    if context_tokens is not None:
+        title_toks = _content_tokens(t)
+        if len(title_toks) >= 2 and title_toks.issubset(context_tokens):
+            return True
     return False
 
 
@@ -180,35 +215,46 @@ def _select_relevant_sentences(
     sentences: List[str],
     context_lower: str,
     answer_lower: str = "",
+    context_tokens: Optional[Set[str]] = None,
 ) -> List[int]:
     """Choose which sentence IDs to include in the SP prediction.
 
-    Gold SP statistics (from HotpotQA paper + empirical analysis):
-      - ~75% of gold SPs use sent_id 0
-      - ~18% use sent_id 1
-      - ~5% use sent_id 2
-      - ~2% use sent_id >= 3
-
     Strategy:
-      1. Always include sentence 0 (the article's opening statement).
-      2. Include any sentence whose content (first 80 chars) matches
-         the evidence/answer context — picks up the specific bridging
-         fact regardless of position.
-      3. Include any sentence containing the answer text.
+      1. Always include sentence 0 (opening statement).
+      2. Substring match: include sentences whose leading text appears
+         verbatim in the context.
+      3. Token overlap: include sentences sharing enough content tokens
+         with the evidence/question/answer context — catches bridging
+         facts at any position regardless of paraphrasing.
+      4. Answer match: include sentences containing the answer text.
     Capped at ``_MAX_SENTS_PER_ARTICLE`` to keep SP precision high.
     """
     selected: Set[int] = set()
     if sentences:
         selected.add(0)
 
+    if context_tokens is None:
+        context_tokens = _content_tokens(context_lower)
+
     for sid, sent in enumerate(sentences):
         s = sent.strip() if isinstance(sent, str) else ""
         if not s or len(s) <= 15:
             continue
         s_lower = s.lower()
-        prefix = s_lower[:80].rstrip(".,;:!?")
-        if prefix in context_lower:
+
+        prefix = s_lower[:120].rstrip(".,;:!?")
+        if len(prefix) > 20 and prefix in context_lower:
             selected.add(sid)
+            continue
+
+        sent_toks = _content_tokens(s)
+        if sent_toks:
+            common = sent_toks & context_tokens
+            if (len(common) >= _SENT_MIN_OVERLAP_TOKENS
+                    and len(common) / len(sent_toks) >= _SENT_OVERLAP_THRESHOLD):
+                selected.add(sid)
+                continue
+
         if answer_lower and len(answer_lower) >= 3 and answer_lower in s_lower:
             selected.add(sid)
 
@@ -241,6 +287,7 @@ def _extract_titles_and_sp(
 
     _ev = evidence_texts or []
     context_lower = "\n".join([question, answer] + _ev).lower()
+    context_tokens = _content_tokens(context_lower)
     from evaluate import normalize_answer
     answer_lower = normalize_answer(answer) if answer else ""
 
@@ -269,7 +316,9 @@ def _extract_titles_and_sp(
                             continue
 
                         # --- Relevance check ---
-                        relevant = _is_title_relevant(title, context_lower)
+                        relevant = _is_title_relevant(
+                            title, context_lower, context_tokens,
+                        )
 
                         if not relevant:
                             for sent in sentences:
@@ -281,12 +330,16 @@ def _extract_titles_and_sp(
                         if relevant:
                             for sid in _select_relevant_sentences(
                                 sentences, context_lower, answer_lower,
+                                context_tokens,
                             ):
                                 predicted_sp.append([title, sid])
                     except (json_mod.JSONDecodeError, TypeError, IndexError):
                         continue
         except (FileNotFoundError, PermissionError):
             continue
+
+    if len(predicted_sp) > _MAX_SP_PAIRS_PER_QUERY:
+        predicted_sp = predicted_sp[:_MAX_SP_PAIRS_PER_QUERY]
 
     return all_titles, predicted_sp
 

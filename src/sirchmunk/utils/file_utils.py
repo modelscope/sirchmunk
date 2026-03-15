@@ -8,12 +8,52 @@ from kreuzberg import ExtractionResult, extract_file
 from loguru import logger
 
 
+def _infer_mime_for_path(file_path: Union[str, Path]) -> str | None:
+    """Return MIME type for path-based detection, or None if unknown/extensionless.
+
+    When the path has no extension (e.g. HotpotQA wiki_82, wiki_96), kreuzberg
+    raises ValidationError. Callers should pass mime_type="text/plain" for
+    those cases.
+    """
+    p = Path(file_path)
+    suffix = (p.suffix or "").lower()
+    # Map known extensions to MIME; extensionless or unknown -> None
+    _MIME_MAP = {
+        ".txt": "text/plain",
+        ".md": "text/markdown",
+        ".json": "application/json",
+        ".jsonl": "application/jsonlines",
+        ".csv": "text/csv",
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".xml": "application/xml",
+    }
+    return _MIME_MAP.get(suffix)
+
+
 async def fast_extract(file_path: Union[str, Path]) -> ExtractionResult:
     """
-    Automatically detects and extracts text content from various file formats like docx, pptx, pdf, xlsx.
+    Automatically detects and extracts text content from various file formats
+    (docx, pptx, pdf, xlsx, etc.). For paths with no extension or unknown
+    extension (e.g. HotpotQA wiki_82), treats content as text/plain to avoid
+    ValidationError from MIME inference.
     """
-    result: ExtractionResult = await extract_file(file_path=file_path)
+    path = Path(file_path).resolve()
+    mime_type: str | None = _infer_mime_for_path(path)
 
+    if mime_type is None:
+        # Extensionless or unknown: force text/plain so kreuzberg does not raise
+        # "Could not determine MIME type from file path"
+        mime_type = "text/plain"
+
+    result: ExtractionResult = await extract_file(
+        file_path=path,
+        mime_type=mime_type,
+    )
     return result
 
 
