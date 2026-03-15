@@ -297,8 +297,14 @@ class CorpusMemory(MemoryStore):
         target: str,
         relation: str = "synonym",
         success: bool = True,
+        *,
+        defer_save: bool = False,
     ) -> None:
-        """Record a semantic equivalence between *source* and *target*."""
+        """Record a semantic equivalence between *source* and *target*.
+
+        When *defer_save* is True, the caller is responsible for calling
+        ``_save_bridge()`` afterwards (used by batch operations).
+        """
         key = source.lower()
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -325,7 +331,8 @@ class CorpusMemory(MemoryStore):
                     hit_count=1,
                 ))
             entry.updated_at = now
-        self._save_bridge()
+        if not defer_save:
+            self._save_bridge()
 
     # ── Keyword co-occurrence mining ─────────────────────────────────
 
@@ -337,8 +344,8 @@ class CorpusMemory(MemoryStore):
         """Mine pairwise co-occurrence from a successful keyword set.
 
         For every pair (k_i, k_j) in *keywords*, records a weak semantic
-        bridge with relation ``cooccurrence``.  Returns the count of pairs
-        recorded.
+        bridge with relation ``cooccurrence``.  All writes are batched
+        into a single disk flush at the end.
         """
         filtered = [
             k for k in keywords
@@ -352,8 +359,11 @@ class CorpusMemory(MemoryStore):
                 continue
             self.record_semantic_bridge(
                 a, b, relation="cooccurrence", success=success,
+                defer_save=True,
             )
             count += 1
+        if count:
+            self._save_bridge()
         return count
 
     # ── Entity extraction (language-agnostic) ─────────────────────────

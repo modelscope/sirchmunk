@@ -1140,6 +1140,8 @@ class AgenticSearch(BaseSearch):
                 include=include, exclude=exclude,
                 spec_stale_hours=spec_stale_hours,
                 enable_thinking=enable_thinking,
+                memory_extra_files=_memory_extra_files,
+                memory_extra_keywords=_memory_extra_keywords,
             )
 
         # ---- Unified return wrapping ----
@@ -1172,6 +1174,8 @@ class AgenticSearch(BaseSearch):
         exclude: Optional[List[str]] = None,
         spec_stale_hours: float = 72.0,
         enable_thinking: bool = False,
+        memory_extra_files: Optional[List[str]] = None,
+        memory_extra_keywords: Optional[List[str]] = None,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Parallel multi-path retrieval pipeline (Phases 0a–5).
 
@@ -1251,7 +1255,7 @@ class AgenticSearch(BaseSearch):
             except Exception:
                 pass
             # Merge similar-query keywords from memory hints
-            for mk in _memory_extra_keywords:
+            for mk in (memory_extra_keywords or []):
                 if mk and mk not in query_keywords:
                     query_keywords[mk] = 0.3
 
@@ -1318,7 +1322,7 @@ class AgenticSearch(BaseSearch):
                 pass
 
         # Merge similar-query file hints from memory
-        all_extra = list(set(memory_paths + _memory_extra_files))
+        all_extra = list(set(memory_paths + (memory_extra_files or [])))
 
         merged_files = self._merge_file_paths(
             keyword_files=keyword_files,

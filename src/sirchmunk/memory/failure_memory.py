@@ -157,25 +157,34 @@ class FailureMemory(MemoryStore):
     def seed_noise_keywords(self) -> int:
         """Pre-fill noise_keywords with common stop words (idempotent).
 
-        Returns the number of newly inserted keywords.
+        Uses a single query to find existing keywords, then batch-inserts
+        only the missing ones.  Returns the number of newly inserted keywords.
         """
+        try:
+            rows = self._db.fetch_all(
+                "SELECT keyword FROM noise_keywords", [],
+            )
+            existing = {r[0] for r in rows} if rows else set()
+        except Exception:
+            existing = set()
+
+        to_insert = [w for w in self._DEFAULT_NOISE_WORDS if w not in existing]
+        if not to_insert:
+            return 0
+
+        now = datetime.now(timezone.utc).isoformat()
         inserted = 0
-        for word in self._DEFAULT_NOISE_WORDS:
+        for word in to_insert:
             try:
-                existing = self._db.fetch_one(
-                    "SELECT keyword FROM noise_keywords WHERE keyword = ?",
-                    [word],
-                )
-                if not existing:
-                    self._db.insert_data("noise_keywords", {
-                        "keyword": word,
-                        "avg_files_found": 9999.0,
-                        "avg_useful_ratio": 0.0,
-                        "sample_count": self._NOISE_MIN_SAMPLES,
-                        "recommendation": "skip",
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    })
-                    inserted += 1
+                self._db.insert_data("noise_keywords", {
+                    "keyword": word,
+                    "avg_files_found": 9999.0,
+                    "avg_useful_ratio": 0.0,
+                    "sample_count": self._NOISE_MIN_SAMPLES,
+                    "recommendation": "skip",
+                    "updated_at": now,
+                })
+                inserted += 1
             except Exception:
                 pass
         if inserted:

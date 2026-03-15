@@ -53,6 +53,13 @@ _ZH_DEFINITION_RE = re.compile(r"什么是|是什么|定义|含义|意思是")
 _ZH_PROCEDURAL_RE = re.compile(r"如何|怎么|怎样|步骤|流程|方法是")
 _ZH_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
+# Pre-compiled regex for classify_query entity extraction
+_EN_NAMED_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b")
+_YEAR_RE = re.compile(r"\b\d{4}\b")
+_LOCATION_RE = re.compile(r"\b(?:city|country|state|river|mountain)\b")
+_CJK_LOC_RE = re.compile(r"[\u4e00-\u9fff]{2,}(?:市|省|县|国|河|山|湖)")
+_CJK_TITLE_RE = re.compile(r"《[^》]+》")
+
 
 class PatternMemory(MemoryStore):
     """Query pattern → strategy mapping and reasoning chain templates.
@@ -263,27 +270,26 @@ class PatternMemory(MemoryStore):
         entity_types: List[str] = []
         entity_count = 0
 
-        en_named = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", query)
+        en_named = _EN_NAMED_RE.findall(query)
         if en_named:
             entity_types.append("named_entity")
             entity_count += len(en_named)
 
-        if re.search(r"\b\d{4}\b", query):
+        year_matches = _YEAR_RE.findall(query)
+        if year_matches:
             entity_types.append("date")
-            entity_count += len(re.findall(r"\b\d{4}\b", query))
+            entity_count += len(year_matches)
 
-        if re.search(r"\b(?:city|country|state|river|mountain)\b", q_lower):
+        if _LOCATION_RE.search(q_lower):
             entity_types.append("location")
 
         if has_cjk:
-            cjk_entities = re.findall(
-                r"[\u4e00-\u9fff]{2,}(?:市|省|县|国|河|山|湖)", query,
-            )
+            cjk_entities = _CJK_LOC_RE.findall(query)
             if cjk_entities:
                 if "location" not in entity_types:
                     entity_types.append("location")
                 entity_count += len(cjk_entities)
-            cjk_names = re.findall(r"《[^》]+》", query)
+            cjk_names = _CJK_TITLE_RE.findall(query)
             if cjk_names:
                 entity_types.append("title")
                 entity_count += len(cjk_names)

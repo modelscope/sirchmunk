@@ -28,7 +28,9 @@ Storage layout::
 """
 from __future__ import annotations
 
+import atexit
 import asyncio
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -144,11 +146,26 @@ class RetrievalMemory:
             pass
 
         self._feedback_count = 0
+        self._feedback_lock = threading.Lock()
+
+        # ── Register atexit to flush dirty state ──────────────────────
+        atexit.register(self._atexit_flush)
 
         logger.info(
             f"RetrievalMemory initialised at {self._memory_dir} "
             f"({len(self._stores)} layers)"
         )
+
+    def _atexit_flush(self) -> None:
+        """Best-effort flush on interpreter shutdown."""
+        try:
+            self._pattern_memory.close()
+        except Exception:
+            pass
+        try:
+            self._query_similarity.close()
+        except Exception:
+            pass
 
     # ── Embedding util setter (for deferred warm-up) ──────────────────
 
@@ -259,14 +276,16 @@ class RetrievalMemory:
 
     def _dispatch_feedback(self, signal: FeedbackSignal) -> None:
         """Synchronous dispatcher — called inside an executor thread."""
-        self._feedback_count += 1
+        with self._feedback_lock:
+            self._feedback_count += 1
+            count = self._feedback_count
         confidence = self._compute_confidence(signal)
 
         # 1. Raw signal storage
         try:
             self._feedback_memory.record_signal(signal)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[memory:dispatch] FeedbackMemory failed: {exc}")
 
         # 2. PatternMemory — strategy outcome (gradient)
         try:
@@ -283,8 +302,8 @@ class RetrievalMemory:
                 latency=signal.latency_sec,
                 tokens=signal.total_tokens,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[memory:dispatch] PatternMemory failed: {exc}")
 
         # 3. CorpusMemory — entity → path mappings (improved extraction)
         try:
@@ -295,8 +314,8 @@ class RetrievalMemory:
                         self._corpus_memory.record_entity_path(
                             entity, fp, success=(confidence >= 0.5),
                         )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[memory:dispatch] CorpusMemory entity failed: {exc}")
 
         # 4. CorpusMemory — keyword co-occurrence + semantic bridge
         if confidence >= 0.5 and signal.keywords_used:
@@ -304,8 +323,8 @@ class RetrievalMemory:
                 self._corpus_memory.record_keyword_cooccurrence(
                     signal.keywords_used, success=True,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"[memory:dispatch] cooccurrence failed: {exc}")
 
         # 5. PathMemory — per-path retrieval stats
         try:
@@ -314,8 +333,8 @@ class RetrievalMemory:
                 self._path_memory.record_retrieval(
                     fp, useful=(fp in useful_set or confidence >= 0.5),
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[memory:dispatch] PathMemory failed: {exc}")
 
         # 6. FailureMemory — noise keywords + dead paths + failed strategies
         try:
@@ -341,8 +360,8 @@ class RetrievalMemory:
                 )
                 ph = compute_params_hash({"mode": signal.mode})
                 self._failure_memory.record_strategy_failure(pid, ph)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[memory:dispatch] FailureMemory failed: {exc}")
 
         # 7. QuerySimilarityIndex — record for future similarity lookup
         try:
@@ -358,11 +377,11 @@ class RetrievalMemory:
                 ),
                 answer_snippet=(signal.answer_text or "")[:300],
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[memory:dispatch] QuerySimilarity failed: {exc}")
 
         # 8. Periodic maintenance
-        if self._feedback_count % self._MAINTENANCE_INTERVAL == 0:
+        if count % self._MAINTENANCE_INTERVAL == 0:
             try:
                 self.decay_all()
                 self.cleanup_all()

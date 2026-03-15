@@ -10,8 +10,9 @@ At lookup time, the current query is compared to the index:
    ``BM25Scorer`` from ``sirchmunk.utils.bm25_util`` for lexical
    similarity.
 
-The index is persisted as a small JSON file for portability and
-human-readability.
+The index is persisted as a small JSON file (embedding vectors are
+kept only in memory and recomputed on cold start to avoid bloated
+JSON files).
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -43,7 +44,7 @@ class QuerySimilarityIndex:
         Maximum number of queries retained (FIFO eviction).
     """
 
-    _SAVE_INTERVAL = 5.0  # seconds between writes
+    _SAVE_INTERVAL = 5.0
 
     def __init__(
         self,
@@ -59,8 +60,10 @@ class QuerySimilarityIndex:
         self._max_entries = max_entries
         self._lock = threading.RLock()
         self._entries: List[Dict[str, Any]] = []
+        self._embeddings: Dict[int, List[float]] = {}
         self._dirty = False
         self._last_save: float = 0.0
+        self._bm25_cache: Optional[Tuple[int, Any]] = None
         self._load()
 
     # ── Persistence ───────────────────────────────────────────────────
@@ -115,7 +118,6 @@ class QuerySimilarityIndex:
         answer_snippet: str = "",
     ) -> None:
         """Record a query and its outcome summary."""
-        embedding = self._encode(query)
         entry: Dict[str, Any] = {
             "query": query,
             "confidence": round(confidence, 4),
@@ -125,14 +127,23 @@ class QuerySimilarityIndex:
             "answer_snippet": answer_snippet[:300],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-        if embedding is not None:
-            entry["embedding"] = embedding
+
+        embedding = self._encode(query)
 
         with self._lock:
+            idx = len(self._entries)
             self._entries.append(entry)
+            if embedding is not None:
+                self._embeddings[idx] = embedding
             if len(self._entries) > self._max_entries:
-                self._entries = self._entries[-self._max_entries:]
+                drop = len(self._entries) - self._max_entries
+                self._entries = self._entries[drop:]
+                self._embeddings = {
+                    k - drop: v for k, v in self._embeddings.items()
+                    if k >= drop
+                }
             self._dirty = True
+            self._bm25_cache = None
         self._maybe_save()
 
     # ── Lookup ────────────────────────────────────────────────────────
@@ -146,13 +157,14 @@ class QuerySimilarityIndex:
         """Return up to *top_k* similar historical queries."""
         with self._lock:
             entries = list(self._entries)
+            embeddings = dict(self._embeddings)
         if not entries:
             return []
 
         embedding = self._encode(query)
-        if embedding is not None:
+        if embedding is not None and embeddings:
             return self._search_by_embedding(
-                query, embedding, entries, top_k, min_similarity,
+                query, embedding, entries, embeddings, top_k, min_similarity,
             )
         return self._search_by_bm25(query, entries, top_k, min_similarity)
 
@@ -183,14 +195,15 @@ class QuerySimilarityIndex:
         query: str,
         query_emb: List[float],
         entries: List[Dict[str, Any]],
+        embeddings: Dict[int, List[float]],
         top_k: int,
         min_sim: float,
     ) -> List[SimilarQueryHint]:
-        scored: List[tuple] = []
-        for e in entries:
-            emb = e.get("embedding")
-            if emb is None:
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for idx, emb in embeddings.items():
+            if idx >= len(entries):
                 continue
+            e = entries[idx]
             sim = self._cosine(query_emb, emb)
             if sim >= min_sim and e.get("query", "") != query:
                 scored.append((sim, e))
@@ -209,6 +222,21 @@ class QuerySimilarityIndex:
 
     # ── BM25 fallback ─────────────────────────────────────────────────
 
+    def _get_bm25_scorer(
+        self, entries: List[Dict[str, Any]],
+    ) -> Optional[Any]:
+        """Return a cached BM25Scorer, rebuilding only when entries change."""
+        n = len(entries)
+        if self._bm25_cache is not None and self._bm25_cache[0] == n:
+            return self._bm25_cache[1]
+        try:
+            from sirchmunk.utils.bm25_util import BM25Scorer
+            scorer = BM25Scorer(tokenizer=self._tokenizer)
+            self._bm25_cache = (n, scorer)
+            return scorer
+        except Exception:
+            return None
+
     def _search_by_bm25(
         self,
         query: str,
@@ -216,15 +244,15 @@ class QuerySimilarityIndex:
         top_k: int,
         min_sim: float,
     ) -> List[SimilarQueryHint]:
+        scorer = self._get_bm25_scorer(entries)
+        if scorer is None:
+            return []
         try:
-            from sirchmunk.utils.bm25_util import BM25Scorer
-
-            scorer = BM25Scorer(tokenizer=self._tokenizer)
             docs = [e.get("query", "") for e in entries]
             scores = scorer.score(query, docs)
             if not scores:
                 return []
-            max_s = max(scores) if scores else 1.0
+            max_s = max(scores)
             if max_s <= 0:
                 return []
             normed = [s / max_s for s in scores]
@@ -232,7 +260,7 @@ class QuerySimilarityIndex:
                 enumerate(normed), key=lambda x: x[1], reverse=True,
             )
             results: List[SimilarQueryHint] = []
-            for idx, nscore in indexed[:top_k]:
+            for idx, nscore in indexed:
                 if nscore < min_sim:
                     break
                 e = entries[idx]
@@ -246,6 +274,8 @@ class QuerySimilarityIndex:
                     keywords=e.get("keywords", []),
                     useful_files=e.get("useful_files", []),
                 ))
+                if len(results) >= top_k:
+                    break
             return results
         except Exception:
             return []
@@ -255,7 +285,7 @@ class QuerySimilarityIndex:
     def stats(self) -> Dict[str, Any]:
         with self._lock:
             n = len(self._entries)
-            has_emb = sum(1 for e in self._entries if e.get("embedding"))
+            has_emb = len(self._embeddings)
         return {
             "total_queries": n,
             "with_embeddings": has_emb,
