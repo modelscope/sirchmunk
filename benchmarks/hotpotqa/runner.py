@@ -11,12 +11,19 @@ After search, article titles and supporting-fact predictions are
 extracted from wiki files read during the search.  Predicted SP follows
 the (title, sent_id) format of the official evaluation so that
 Sup EM/F1 and Joint EM/F1 can be computed.
+
+SP prediction uses evidence-based relevance filtering: only articles
+whose title or sentence content appears in the search context (question,
+answer, evidence snippets) are included.  Without this filter, every
+article in every read JSONL file (~360 articles/file × ~21 files)
+would be predicted, yielding ~17K SP pairs vs. ~4 gold pairs —
+collapsing SP precision to near zero.
 """
 
 import asyncio
 import json as json_mod
 import time
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from config import ExperimentConfig
 
@@ -27,6 +34,7 @@ Rules:
 - If the response says it cannot find the answer, output: unknown
 - For yes/no questions, output: yes or no
 - For dates, use the format that appears in the response.
+- For person names, use the full name as it appears in the response.
 
 Question: {question}
 Response:
@@ -43,17 +51,29 @@ def _normalize_prediction(pred: str) -> str:
     """
     import re
     s = pred.strip()
+    # Remove markdown bold/italic
     s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
     s = re.sub(r"\*(.+?)\*", r"\1", s)
-    if len(s) >= 2 and s[0] in ('"', "'", "\u201c") and s[-1] in ('"', "'", "\u201d"):
+    # Remove surrounding quotes (ASCII and Unicode)
+    if len(s) >= 2 and s[0] in ('"', "'", "\u201c", "\u2018") and s[-1] in ('"', "'", "\u201d", "\u2019"):
         s = s[1:-1].strip()
+    # Remove trailing period / colon
     s = s.rstrip(".:")
-    for prefix in [
-        "The answer is ", "The short answer is ",
-        "Answer: ", "Short answer: ",
-    ]:
-        if s.lower().startswith(prefix.lower()):
+    # Remove common LLM wrapper phrases (case-insensitive)
+    _PREFIXES = [
+        "the answer is ", "the short answer is ",
+        "answer: ", "short answer: ",
+        "based on the information, ",
+        "based on the context, ",
+        "according to the documents, ",
+    ]
+    s_lower = s.lower()
+    for prefix in _PREFIXES:
+        if s_lower.startswith(prefix):
             s = s[len(prefix):].strip()
+            s_lower = s.lower()
+    # Remove trailing parenthetical clarifications: "Paris (the capital)"
+    s = re.sub(r"\s*\(.*?\)\s*$", "", s).strip()
     return s
 
 
@@ -77,25 +97,73 @@ async def _extract_short_answer(
         return verbose
 
 
+# ---------------------------------------------------------------------------
+# Evidence-based SP extraction
+# ---------------------------------------------------------------------------
+
+def _collect_evidence_texts(cluster: Any) -> List[str]:
+    """Collect textual content from a knowledge cluster for SP matching.
+
+    Gathers cluster content, description, evidence summaries, and raw
+    evidence snippets — the combined text represents what the system
+    actually "looked at" during the search.
+    """
+    texts: List[str] = []
+    if not cluster:
+        return texts
+
+    content = getattr(cluster, "content", None)
+    if content:
+        texts.append(str(content))
+
+    for desc in (getattr(cluster, "description", None) or []):
+        if desc:
+            texts.append(str(desc))
+
+    for ev in (getattr(cluster, "evidences", None) or []):
+        summary = getattr(ev, "summary", "")
+        if summary:
+            texts.append(str(summary))
+        for snip in (getattr(ev, "snippets", None) or []):
+            if isinstance(snip, dict):
+                s = snip.get("snippet", "")
+            elif isinstance(snip, str):
+                s = snip
+            else:
+                continue
+            if s:
+                texts.append(s)
+
+    return texts
+
+
 def _extract_titles_and_sp(
     files_read: List[str],
+    question: str = "",
+    answer: str = "",
+    evidence_texts: Optional[List[str]] = None,
 ) -> Tuple[Set[str], List[List]]:
     """Parse wiki JSONL files to extract article titles and predicted SP.
 
-    Each wiki file contains JSON lines (one per article).  For every
-    article in the files that AgenticSearch opened, we extract:
-      1. The article title  (for Evidence Recall)
-      2. All first-paragraph (title, sent_id) pairs  (for Sup EM/F1)
+    Returns (all_titles, predicted_sp) where:
+      - all_titles: ALL article titles from all read files
+        (broad set for Evidence Recall diagnostic metric)
+      - predicted_sp: Only (title, sent_id) pairs from articles that are
+        demonstrably relevant to the query (narrow set for Sup EM/F1)
 
-    HotpotQA wiki format per line:
-      {"id": "...", "title": "...", "text": [["s0", "s1", ...]], ...}
-    or:
-      {"id": "...", "title": "...", "text": ["s0", "s1", ...], ...}
+    Relevance filtering (for predicted_sp only):
+      1. Article title appears in the question, answer, or evidence text
+      2. Article sentence content (first 60 chars) appears in the evidence
 
-    Returns (titles_set, predicted_sp_list).
+    Without this filter, every article in every read JSONL would be
+    predicted (~17K SP pairs), collapsing SP precision to near zero.
     """
-    titles: Set[str] = set()
+    all_titles: Set[str] = set()
     predicted_sp: List[List] = []
+
+    # Build combined context for relevance matching
+    _ev = evidence_texts or []
+    context_lower = "\n".join([question, answer] + _ev).lower()
 
     for fpath in files_read:
         try:
@@ -109,22 +177,37 @@ def _extract_titles_and_sp(
                         title = obj.get("title")
                         if not title:
                             continue
-                        titles.add(title)
+                        all_titles.add(title)
+
                         text = obj.get("text")
                         if not text:
                             continue
-                        # text is either [["s0","s1",...]] or ["s0","s1",...]
-                        if text and isinstance(text[0], list):
-                            sentences = text[0]
-                        else:
-                            sentences = text
-                        for sid in range(len(sentences)):
-                            predicted_sp.append([title, sid])
+                        sentences = (
+                            text[0] if text and isinstance(text[0], list)
+                            else text
+                        )
+                        if not sentences:
+                            continue
+
+                        # --- Relevance check ---
+                        relevant = title.lower() in context_lower
+
+                        if not relevant:
+                            for sent in sentences:
+                                s = sent.strip() if isinstance(sent, str) else ""
+                                if len(s) > 20 and s[:60].lower() in context_lower:
+                                    relevant = True
+                                    break
+
+                        if relevant:
+                            for sid in range(len(sentences)):
+                                predicted_sp.append([title, sid])
                     except (json_mod.JSONDecodeError, TypeError, IndexError):
                         continue
         except (FileNotFoundError, PermissionError):
             continue
-    return titles, predicted_sp
+
+    return all_titles, predicted_sp
 
 
 async def run_single(
@@ -185,7 +268,12 @@ async def run_single(
                 "llm_calls": len(getattr(result, "llm_usages", None) or []),
             }
 
-            titles, predicted_sp = _extract_titles_and_sp(files_read)
+            # Collect evidence texts for relevance-based SP filtering
+            evidence_texts = _collect_evidence_texts(cluster)
+
+            titles, predicted_sp = _extract_titles_and_sp(
+                files_read, question, raw_answer, evidence_texts,
+            )
             retrieved_titles = list(titles)
 
             if cfg.extract_answer and raw_answer:
