@@ -463,6 +463,7 @@ class FileReadTool(BaseTool):
     """
 
     _LARGE_FILE_THRESHOLD = 30_000
+    _CHUNK_CACHE_MAX = 32
 
     def __init__(
         self,
@@ -474,6 +475,7 @@ class FileReadTool(BaseTool):
         self._bm25_scorer = bm25_scorer
         # Base paths for relative path resolution (e.g., wiki corpus dir)
         self._base_paths = [Path(p).resolve() for p in (base_paths or [])]
+        self._chunk_cache: Dict[str, List[str]] = {}
 
     @staticmethod
     def _normalize_path(fp: str, base_paths: Optional[List[Path]] = None) -> Optional[Path]:
@@ -611,7 +613,7 @@ class FileReadTool(BaseTool):
 
                 # Focused extraction for large files when keywords provided
                 if len(content) > self._LARGE_FILE_THRESHOLD and keywords:
-                    content = self._extract_focused_content(content, keywords)
+                    content = self._extract_focused_content(content, keywords, file_path=fp_str)
 
                 if len(content) > self._max_chars:
                     content = content[: self._max_chars] + "\n... [truncated]"
@@ -634,24 +636,11 @@ class FileReadTool(BaseTool):
 
         return result_text, {"files_read": files_read, "tokens": approx_tokens}
 
-    def _extract_focused_content(
-        self,
-        content: str,
-        keywords: List[str],
-        max_chunks: int = 20,
-    ) -> str:
-        """Extract keyword-relevant chunks using BM25 ranking.
-
-        Splits content into line-based chunks (preserving structural
-        boundaries for JSONL and similar formats), then selects the
-        most relevant chunks via BM25 scoring.  Falls back to simple
-        keyword matching when no scorer is available.
-        """
+    def _make_chunks(self, content: str) -> List[str]:
+        """Split content into ~1000-char chunks, keeping lines intact."""
         lines = content.splitlines()
         if not lines:
-            return content
-
-        # Group lines into ~1000-char chunks, keeping lines intact
+            return []
         chunks: List[str] = []
         buf: List[str] = []
         buf_len = 0
@@ -666,8 +655,35 @@ class FileReadTool(BaseTool):
                 buf_len += line_len
         if buf:
             chunks.append("\n".join(buf))
+        return chunks
 
-        if len(chunks) <= max_chunks:
+    def _get_chunks(self, file_path: str, content: str) -> List[str]:
+        """Return cached chunks for *file_path*, building them if needed."""
+        if file_path in self._chunk_cache:
+            return self._chunk_cache[file_path]
+        chunks = self._make_chunks(content)
+        if len(self._chunk_cache) >= self._CHUNK_CACHE_MAX:
+            oldest = next(iter(self._chunk_cache))
+            del self._chunk_cache[oldest]
+        self._chunk_cache[file_path] = chunks
+        return chunks
+
+    def _extract_focused_content(
+        self,
+        content: str,
+        keywords: List[str],
+        max_chunks: int = 20,
+        file_path: str = "",
+    ) -> str:
+        """Extract keyword-relevant chunks using BM25 ranking.
+
+        Splits content into line-based chunks (preserving structural
+        boundaries for JSONL and similar formats), then selects the
+        most relevant chunks via BM25 scoring.  Falls back to simple
+        keyword matching when no scorer is available.
+        """
+        chunks = self._get_chunks(file_path, content) if file_path else self._make_chunks(content)
+        if not chunks or len(chunks) <= max_chunks:
             return content
 
         query = " ".join(keywords)
@@ -675,6 +691,7 @@ class FileReadTool(BaseTool):
         # Only invoke BM25 when chunk count is significantly above limit
         if self._bm25_scorer and len(chunks) > max_chunks * 1.5:
             try:
+                self._bm25_scorer.index_corpus(chunks)
                 indices = self._bm25_scorer.rerank(
                     query, chunks, top_k=max_chunks,
                 )

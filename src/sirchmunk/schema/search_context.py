@@ -78,6 +78,7 @@ class SearchContext:
     read_file_ids: Set[str] = field(default_factory=set, init=False)
     retrieval_logs: List[RetrievalLog] = field(default_factory=list, init=False)
     search_history: List[str] = field(default_factory=list, init=False)
+    reasoning_texts: List[str] = field(default_factory=list, init=False)
     loop_count: int = field(default=0, init=False)
     start_time: datetime = field(default_factory=datetime.now, init=False)
 
@@ -148,6 +149,16 @@ class SearchContext:
         """Record a search query issued during this session."""
         self.search_history.append(query)
 
+    def add_reasoning(self, text: str) -> None:
+        """Record LLM reasoning text from a ReAct turn.
+
+        Captures entity mentions, intermediate conclusions, and
+        bridging facts that appear in the LLM's chain-of-thought
+        but not in tool results or the final answer.
+        """
+        if text:
+            self.reasoning_texts.append(text)
+
     # ---- Loop management ----
 
     def increment_loop(self) -> None:
@@ -174,6 +185,7 @@ class SearchContext:
             "read_file_ids": sorted(self.read_file_ids),
             "retrieval_logs": [log.to_dict() for log in self.retrieval_logs],
             "search_history": self.search_history,
+            "reasoning_texts_count": len(self.reasoning_texts),
             "loop_count": self.loop_count,
             "start_time": self.start_time.isoformat(),
         }

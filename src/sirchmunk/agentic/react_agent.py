@@ -111,6 +111,10 @@ def _build_tool_descriptions(registry: ToolRegistry) -> str:
     return "\n".join(lines)
 
 
+_MAX_RECENT_ROUNDS = 4
+_PRUNED_ROUND_SUMMARY_CHARS = 300
+
+
 class ReActSearchAgent:
     """Iterative ReAct agent for agentic information retrieval.
 
@@ -220,9 +224,16 @@ class ReActSearchAgent:
                 )
 
         budget_exceeded = False
+        _NO_PROGRESS_LIMIT = 3
+        _consecutive_no_progress = 0
+        _prev_files_count = len(context.read_file_ids)
+
         while not context.is_loop_limit_reached() and not context.is_budget_exceeded():
             context.increment_loop()
             await self._logger.info(f"[ReAct] Loop {context.loop_count}/{context.max_loops} | {context.summary()}")
+
+            # Prune older rounds to keep prompt size bounded
+            messages = self._prune_messages(messages)
 
             # Call LLM
             llm_response = await self._call_llm(messages)
@@ -238,6 +249,7 @@ class ReActSearchAgent:
             # Budget overflow detected after this LLM call
             if context.is_budget_exceeded():
                 budget_exceeded = True
+                context.add_reasoning(content)
                 answer = _extract_answer(content)
                 if answer:
                     final_answer = answer
@@ -247,6 +259,7 @@ class ReActSearchAgent:
             # Check for final answer in response
             answer = _extract_answer(content)
             if answer:
+                context.add_reasoning(content)
                 final_answer = answer
                 await self._logger.success(f"[ReAct] Answer found at loop {context.loop_count}")
                 break
@@ -256,6 +269,7 @@ class ReActSearchAgent:
             if tool_call is None:
                 # LLM didn't call a tool and didn't answer — nudge it
                 await self._logger.warning("[ReAct] No tool call or answer detected, nudging...")
+                context.add_reasoning(content)
                 messages.append({"role": "assistant", "content": content})
                 messages.append({
                     "role": "user",
@@ -298,6 +312,24 @@ class ReActSearchAgent:
                 f"Budget remaining: {context.budget_remaining}"
             )
 
+            # Record LLM reasoning for downstream SP matching
+            context.add_reasoning(content)
+
+            # Track progress: did this tool call discover new files?
+            cur_files_count = len(context.read_file_ids)
+            if cur_files_count > _prev_files_count:
+                _consecutive_no_progress = 0
+                _prev_files_count = cur_files_count
+            else:
+                _consecutive_no_progress += 1
+
+            if _consecutive_no_progress >= _NO_PROGRESS_LIMIT:
+                await self._logger.warning(
+                    f"[ReAct] No new files in {_NO_PROGRESS_LIMIT} consecutive tool calls — early stop"
+                )
+                messages.append({"role": "assistant", "content": content})
+                break
+
             # Append reasoning + tool call + observation to conversation
             messages.append({"role": "assistant", "content": content})
             messages.append({
@@ -336,6 +368,7 @@ class ReActSearchAgent:
             if total_tok == 0:
                 total_tok = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
             context.add_llm_tokens(total_tok, usage=usage if usage else None)
+            context.add_reasoning(content)
             final_answer = _extract_answer(content) or content
 
         await self._logger.success(f"[ReAct] Completed: {context.summary()}")
@@ -395,3 +428,49 @@ class ReActSearchAgent:
             max_loops=context.max_loops,
             files_read_count=len(context.read_file_ids),
         )
+
+    @staticmethod
+    def _prune_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Sliding-window pruning to keep prompt size bounded.
+
+        Preserves the system message (index 0) and user query (index 1)
+        as immutable context.  The remaining messages form assistant/user
+        round pairs.  When the number of rounds exceeds
+        ``_MAX_RECENT_ROUNDS``, older rounds are collapsed into a compact
+        summary message to reduce prompt tokens while retaining key facts.
+        """
+        if len(messages) <= 2:
+            return messages
+
+        head = messages[:2]
+        body = messages[2:]
+
+        # Each "round" is an (assistant, user) pair = 2 messages
+        n_msgs = len(body)
+        keep_msgs = _MAX_RECENT_ROUNDS * 2
+        if n_msgs <= keep_msgs:
+            return messages
+
+        old_msgs = body[: n_msgs - keep_msgs]
+        recent_msgs = body[n_msgs - keep_msgs:]
+
+        # Build compact summary of pruned rounds
+        summary_parts: List[str] = ["[Earlier rounds condensed]"]
+        for msg in old_msgs:
+            role = msg.get("role", "")
+            text = msg.get("content", "")
+            if role == "assistant":
+                snippet = text[:_PRUNED_ROUND_SUMMARY_CHARS].replace("\n", " ")
+                if len(text) > _PRUNED_ROUND_SUMMARY_CHARS:
+                    snippet += "..."
+                summary_parts.append(f"- Assistant: {snippet}")
+            elif role == "user" and "**Tool result**" in text:
+                tool_match = re.search(r"\*\*Tool result\*\*\s*\((\w+)\)", text)
+                tool_name = tool_match.group(1) if tool_match else "tool"
+                result_snippet = text[:150].replace("\n", " ")
+                summary_parts.append(f"- {tool_name} result: {result_snippet}...")
+
+        summary = "\n".join(summary_parts)
+        summary_msg = {"role": "user", "content": summary}
+
+        return head + [summary_msg] + recent_msgs

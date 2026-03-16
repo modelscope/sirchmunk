@@ -161,8 +161,6 @@ def _normalize_prediction(pred: str) -> str:
     # Only remove if disambiguation suffix is at the end
     s = re.sub(r"\s*\((?:film|movie|band|singer|actor|actress|musician|album|song|novel|book|TV series|series|disambiguation|person|place|company|organization|politician|athlete|writer|artist|painter|director|composer|scientist|mathematician|physicist|chemist|biologist|philosopher|economist|historian|psychologist|sociologist|anthropologist)\)\s*$", "", s, flags=re.IGNORECASE).strip()
 
-    # Normalize common formatting
-    s = s.replace(" & ", " and ")
     s = re.sub(r'\b(\d+)(?:st|nd|rd|th)\b', r'\1', s)
 
     # Remove common wrapper prefixes
@@ -299,6 +297,9 @@ def _collect_evidence_texts(cluster: Any, result: Any = None) -> List[str]:
     # --- Search context text (ReAct reasoning, search queries) ---
     if result is not None:
         for entry in (getattr(result, "search_history", None) or []):
+            if isinstance(entry, str) and entry:
+                texts.append(entry)
+        for entry in (getattr(result, "reasoning_texts", None) or []):
             if isinstance(entry, str) and entry:
                 texts.append(entry)
 

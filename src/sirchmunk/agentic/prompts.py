@@ -58,9 +58,12 @@ For complex questions that require connecting multiple pieces of information:
 
 REACT_CONTINUATION_PROMPT = """Based on the tool results above, decide your next action:
 
-1. If you have **sufficient evidence** to answer the query, output your answer wrapped in `<ANSWER>...</ANSWER>` tags.
-2. If you need **more information**, call another tool (output the JSON block).
-3. If the budget is nearly exhausted or you've reached the loop limit, synthesize the best answer you can from available evidence.
+1. If you have **sufficient evidence** to answer the query — even partially — output your answer NOW wrapped in `<ANSWER>...</ANSWER>` tags. Do NOT continue searching if you already have a good answer.
+2. If you need **more information** and have a clear plan for what to search next, call another tool (output the JSON block).
+3. If the last 2-3 tool calls returned no new useful information, STOP searching and synthesize your best answer.
+4. If the budget is nearly exhausted or you've reached the loop limit, synthesize the best answer you can from available evidence.
+
+**Efficiency reminder**: Prefer answering early with high confidence over exhaustive searching. Each additional loop costs tokens.
 
 Budget remaining: {budget_remaining} tokens | Loop: {loop_count}/{max_loops} | Files read: {files_read_count}
 """

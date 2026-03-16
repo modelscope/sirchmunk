@@ -322,6 +322,7 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
     print(f"  Top-K:        {cfg.top_k_files}")
     print(f"  Model:        {cfg.llm_model}")
     print(f"  Concurrent:   {cfg.max_concurrent}")
+    print(f"  Token Budget: {cfg.max_token_budget}")
     print(f"  Dir Scan:     {'ON' if cfg.enable_dir_scan else 'OFF'}")
     print(f"  Extract:      {'ON' if cfg.extract_answer else 'OFF'}")
     print(f"  GPT-Eval:     {'ON' if cfg.enable_gpt_eval else 'OFF'}")
@@ -428,6 +429,7 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
             "setting": cfg.setting, "split": cfg.split, "limit": cfg.limit,
             "mode": cfg.mode, "model": cfg.llm_model, "seed": cfg.seed,
             "top_k_files": cfg.top_k_files,
+            "max_token_budget": cfg.max_token_budget,
             "enable_dir_scan": cfg.enable_dir_scan,
             "extract_answer": cfg.extract_answer,
             "enable_thinking": cfg.enable_thinking,
