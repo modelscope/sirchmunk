@@ -219,6 +219,7 @@ class ReActSearchAgent:
                     f"[ReAct] Initial keyword search: {len(result_text)} chars"
                 )
 
+        budget_exceeded = False
         while not context.is_loop_limit_reached() and not context.is_budget_exceeded():
             context.increment_loop()
             await self._logger.info(f"[ReAct] Loop {context.loop_count}/{context.max_loops} | {context.summary()}")
@@ -233,6 +234,15 @@ class ReActSearchAgent:
             if total_tok == 0:
                 total_tok = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
             context.add_llm_tokens(total_tok, usage=usage if usage else None)
+
+            # Budget overflow detected after this LLM call
+            if context.is_budget_exceeded():
+                budget_exceeded = True
+                answer = _extract_answer(content)
+                if answer:
+                    final_answer = answer
+                    await self._logger.success(f"[ReAct] Answer found at budget boundary (loop {context.loop_count})")
+                break
 
             # Check for final answer in response
             answer = _extract_answer(content)
@@ -260,6 +270,18 @@ class ReActSearchAgent:
             tool_name, tool_args = tool_call
             await self._logger.info(f"[ReAct] Calling tool: {tool_name}({json.dumps(tool_args, ensure_ascii=False)[:200]})")
 
+            # Pre-emptive budget guard: if remaining budget is very low,
+            # skip the tool call and force synthesis from existing evidence.
+            _BUDGET_GUARD_THRESHOLD = 2000
+            if context.budget_remaining < _BUDGET_GUARD_THRESHOLD:
+                await self._logger.warning(
+                    f"[ReAct] Budget nearly exhausted ({context.budget_remaining} tokens) — "
+                    f"skipping tool call, forcing synthesis"
+                )
+                budget_exceeded = True
+                messages.append({"role": "assistant", "content": content})
+                break
+
             # Execute the tool
             result_text, meta = await self.registry.execute(
                 tool_name=tool_name,
@@ -286,17 +308,27 @@ class ReActSearchAgent:
                 ),
             })
 
+        if not budget_exceeded and context.is_budget_exceeded():
+            budget_exceeded = True
+
         # If loop exited without answer, ask LLM to synthesize
         if final_answer is None:
-            await self._logger.warning("[ReAct] Loop limit or budget reached — forcing synthesis")
-            messages.append({
-                "role": "user",
-                "content": (
+            if budget_exceeded:
+                await self._logger.warning("[ReAct] Token budget exceeded — forcing synthesis from partial evidence")
+                synthesis_prompt = (
+                    "⚠️ Token budget exhausted. You MUST answer NOW from the evidence already collected. "
+                    "Do NOT request more tools. Synthesize your best answer from ALL tool results above, "
+                    "even if incomplete. If uncertain, give your best guess. "
+                    "Wrap it in <ANSWER>...</ANSWER> tags."
+                )
+            else:
+                await self._logger.warning("[ReAct] Loop limit reached — forcing synthesis")
+                synthesis_prompt = (
                     "You have reached the retrieval limit. "
                     "Please synthesize your best answer from ALL evidence collected so far. "
                     "Wrap it in <ANSWER>...</ANSWER> tags."
-                ),
-            })
+                )
+            messages.append({"role": "user", "content": synthesis_prompt})
             llm_response = await self._call_llm(messages)
             content = llm_response.content or ""
             usage = llm_response.usage or {}

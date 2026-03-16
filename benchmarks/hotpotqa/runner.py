@@ -195,9 +195,9 @@ def _collect_evidence_texts(cluster: Any, result: Any = None) -> List[str]:
 
 
 _MAX_SENTS_PER_ARTICLE = 3
-_MAX_SP_PAIRS_PER_QUERY = 12
-_SENT_OVERLAP_THRESHOLD = 0.4
-_SENT_MIN_OVERLAP_TOKENS = 3
+_MAX_SP_PAIRS_PER_QUERY = 8
+_SENT_OVERLAP_THRESHOLD = 0.5
+_SENT_MIN_OVERLAP_TOKENS = 4
 
 _SP_STOP = frozenset({
     'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
@@ -249,7 +249,7 @@ def _is_title_relevant(
         return True
     if context_tokens is not None:
         title_toks = _content_tokens(t)
-        if len(title_toks) >= 2 and title_toks.issubset(context_tokens):
+        if len(title_toks) >= 3 and title_toks.issubset(context_tokens):
             return True
     return False
 
@@ -263,18 +263,15 @@ def _select_relevant_sentences(
     """Choose which sentence IDs to include in the SP prediction.
 
     Strategy:
-      1. Always include sentence 0 (opening statement).
-      2. Substring match: include sentences whose leading text appears
+      1. Substring match: include sentences whose leading text appears
          verbatim in the context.
-      3. Token overlap: include sentences sharing enough content tokens
+      2. Token overlap: include sentences sharing enough content tokens
          with the evidence/question/answer context — catches bridging
          facts at any position regardless of paraphrasing.
-      4. Answer match: include sentences containing the answer text.
+      3. Answer match: include sentences containing the answer text.
     Capped at ``_MAX_SENTS_PER_ARTICLE`` to keep SP precision high.
     """
     selected: Set[int] = set()
-    if sentences:
-        selected.add(0)
 
     if context_tokens is None:
         context_tokens = _content_tokens(context_lower)
@@ -382,9 +379,34 @@ def _extract_titles_and_sp(
             continue
 
     if len(predicted_sp) > _MAX_SP_PAIRS_PER_QUERY:
-        predicted_sp = predicted_sp[:_MAX_SP_PAIRS_PER_QUERY]
+        predicted_sp = _prioritize_sp(predicted_sp, answer_lower, context_lower)
 
     return all_titles, predicted_sp
+
+
+def _prioritize_sp(
+    sp_pairs: List[List],
+    answer_lower: str,
+    context_lower: str,
+) -> List[List]:
+    """Rank SP pairs by relevance: answer-bearing > context-dense > rest."""
+    answer_toks = _content_tokens(answer_lower) if answer_lower else set()
+
+    def _score(pair: List) -> float:
+        title, sid = pair[0], pair[1]
+        s = 0.0
+        t_lower = title.lower()
+        if answer_lower and answer_lower in t_lower:
+            s += 10.0
+        if answer_toks:
+            t_toks = _content_tokens(t_lower)
+            s += len(answer_toks & t_toks) * 2.0
+        if sid == 0:
+            s += 0.5
+        return s
+
+    scored = sorted(sp_pairs, key=_score, reverse=True)
+    return scored[:_MAX_SP_PAIRS_PER_QUERY]
 
 
 async def run_single(
@@ -416,6 +438,7 @@ async def run_single(
                 max_token_budget=cfg.max_token_budget,
                 enable_dir_scan=cfg.enable_dir_scan,
                 return_context=True,
+                enable_thinking=cfg.enable_thinking,
             )
 
             raw_answer = getattr(result, "answer", "") or str(result)

@@ -313,8 +313,13 @@ class KeywordSearchTool(BaseTool):
                 deduped[path] = []
             deduped[path].extend(item.get("matches", []))
 
-        # BM25-rerank files when more candidates than display limit
-        if self._bm25_scorer and len(deduped) > self._max_results:
+        # BM25-rerank files when significantly more candidates than limit;
+        # skip the expensive rerank when the overflow is minor (≤ 1.5×).
+        _BM25_RERANK_RATIO = 1.5
+        if (
+            self._bm25_scorer
+            and len(deduped) > self._max_results * _BM25_RERANK_RATIO
+        ):
             ranked = self._bm25_rerank_results(keywords, deduped, self._max_results)
             if ranked is not None:
                 deduped = ranked
@@ -605,7 +610,8 @@ class FileReadTool(BaseTool):
 
         query = " ".join(keywords)
 
-        if self._bm25_scorer:
+        # Only invoke BM25 when chunk count is significantly above limit
+        if self._bm25_scorer and len(chunks) > max_chunks * 1.5:
             try:
                 indices = self._bm25_scorer.rerank(
                     query, chunks, top_k=max_chunks,

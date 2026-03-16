@@ -86,6 +86,9 @@ class ExperimentConfig:
     wiki_corpus_dir: Path
     output_dir: Path
 
+    # LLM reasoning
+    enable_thinking: bool
+
     # Memory
     enable_memory: bool
 
@@ -141,6 +144,7 @@ def get_config(
         "dataset_dir": dataset_dir,
         "wiki_corpus_dir": wiki_corpus_dir,
         "output_dir": output_dir,
+        "enable_thinking": _bool_env(os.getenv("SIRCHMUNK_ENABLE_THINKING"), False),
         "enable_memory": _bool_env(os.getenv("SIRCHMUNK_ENABLE_MEMORY"), False),
         "max_concurrent": int(os.getenv("HOTPOT_MAX_CONCURRENT", "5")),
         "request_delay": float(os.getenv("HOTPOT_REQUEST_DELAY", "0.5")),

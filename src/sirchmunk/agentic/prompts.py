@@ -36,8 +36,9 @@ For complex questions that require connecting multiple pieces of information:
 - **Decompose**: Break the question into sub-questions. Solve them one at a time.
 - **Bridge**: If finding X requires first knowing Y, search for Y first, then use the discovered entity Y to search for X.
 - **Compare**: If comparing two entities, search for each entity separately, collect their attributes, then synthesize.
-- **Chain evidence**: After each file_read, identify key facts (names, dates, entities) and use them as keywords for the next search.
-- **Be specific**: Use entity names, dates, and precise terms rather than generic words.
+- **Chain evidence**: After each file_read, extract key entities (person names, place names, dates, titles of works) discovered in the text. Use these newly discovered entities as keywords for subsequent keyword_search calls to follow the evidence chain.
+- **Entity chaining**: When a file_read reveals a new entity that bridges to the answer (e.g., reading about a band reveals the lead singer's name), immediately search for that new entity. Do NOT stop at the first file — follow entity links across 2-3 hops.
+- **Be specific**: Use entity names, dates, and precise terms rather than generic words. Prefer full names over partial names.
 
 ## Rules
 - Think step-by-step before each tool call.

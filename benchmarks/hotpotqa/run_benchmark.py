@@ -326,6 +326,7 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
     print(f"  Extract:      {'ON' if cfg.extract_answer else 'OFF'}")
     print(f"  GPT-Eval:     {'ON' if cfg.enable_gpt_eval else 'OFF'}")
     print(f"  LLM Judge:    {'ON' if cfg.enable_llm_judge else 'OFF'}")
+    print(f"  Thinking:     {'ON' if cfg.enable_thinking else 'OFF'}")
     if args.resume:
         print(f"  Resume from:  {args.resume}")
     print(_SEP_THICK)
@@ -429,6 +430,7 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
             "top_k_files": cfg.top_k_files,
             "enable_dir_scan": cfg.enable_dir_scan,
             "extract_answer": cfg.extract_answer,
+            "enable_thinking": cfg.enable_thinking,
             "wiki_corpus_dir": str(cfg.wiki_corpus_dir),
             "resumed_from": str(args.resume) if args.resume else None,
             "resumed_count": len(resumed_results),
