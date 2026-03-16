@@ -1914,11 +1914,14 @@ class AgenticSearch(BaseSearch):
             user_input=query,
             text_content=evidence,
         )
+        import time as _time
+        _t0 = _time.time()
         answer_resp = await self.llm.achat(
             messages=[{"role": "user", "content": answer_prompt}],
             stream=True,
             enable_thinking=enable_thinking,
         )
+        await self._logger.info(f"[Timing] FAST answer synthesis: {_time.time()-_t0:.2f}s")
         self.llm_usages.append(answer_resp.usage)
         if answer_resp.usage and isinstance(answer_resp.usage, dict):
             context.add_llm_tokens(
@@ -2224,11 +2227,14 @@ class AgenticSearch(BaseSearch):
         try:
             dynamic_prompt = generate_keyword_extraction_prompt(num_levels=2)
             keyword_prompt = dynamic_prompt.format(user_input=query)
+            import time as _time
+            _t0 = _time.time()
             kw_response = await self.llm.achat(
                 messages=[{"role": "user", "content": keyword_prompt}],
                 stream=False,
                 enable_thinking=False,
             )
+            await self._logger.info(f"[Timing] Keyword extraction: {_time.time()-_t0:.2f}s")
             self.llm_usages.append(kw_response.usage)
 
             keyword_sets = self._extract_and_validate_multi_level_keywords(
@@ -2839,11 +2845,14 @@ class AgenticSearch(BaseSearch):
         )
 
         await self._logger.info("[Phase 4] Generating search result summary...")
+        import time as _time
+        _t0 = _time.time()
         response = await self.llm.achat(
             messages=[{"role": "user", "content": result_sum_prompt}],
             stream=True,
             enable_thinking=enable_thinking,
         )
+        await self._logger.info(f"[Timing] Result summary: {_time.time()-_t0:.2f}s")
         self.llm_usages.append(response.usage)
 
         summary, should_save = self._parse_summary_response(response.content)

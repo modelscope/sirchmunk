@@ -353,10 +353,15 @@ class ReActSearchAgent:
         Uses stream=False for tool-calling loops to get complete responses.
         Passes through ``enable_thinking`` for deep reasoning support.
         """
-        return await self.llm.achat(
+        import time as _time
+        _t0 = _time.time()
+        result = await self.llm.achat(
             messages=messages, stream=False,
             enable_thinking=self.enable_thinking,
         )
+        _elapsed = _time.time() - _t0
+        await self._logger.info(f"[Timing] ReAct LLM call: {_elapsed:.2f}s")
+        return result
 
     @staticmethod
     def _build_system_prompt(context: SearchContext, tool_descriptions: str) -> str:

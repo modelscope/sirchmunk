@@ -195,21 +195,56 @@ class BatchEvaluator:
         self._log = create_logger(log_callback=log_callback)
         self.llm_usages: List[Dict[str, Any]] = []
 
+    # Maximum concurrent batch evaluations to avoid LLM API rate limits
+    MAX_CONCURRENT_BATCHES = 3
+
     # ---- public API ---------------------------------------------------
 
     async def evaluate(
         self, samples: List[SampleWindow], query: str,
     ) -> List[SampleWindow]:
-        """Score *samples* in batches; updates ``.score`` / ``.reasoning`` in place."""
+        """Score *samples* in batches; updates ``.score`` / ``.reasoning`` in place.
+
+        Batches are evaluated in parallel (up to MAX_CONCURRENT_BATCHES) for
+        improved throughput while respecting LLM API rate limits.
+        """
         if not samples:
             return samples
 
-        for i in range(0, len(samples), self.MAX_BATCH_SIZE):
-            batch = samples[i : i + self.MAX_BATCH_SIZE]
-            if len(batch) == 1:
-                await self._evaluate_single(batch[0], query)
-            else:
-                await self._evaluate_one_batch(batch, query)
+        import asyncio
+        import time as _time
+
+        # Split into batches
+        batches = [
+            samples[i : i + self.MAX_BATCH_SIZE]
+            for i in range(0, len(samples), self.MAX_BATCH_SIZE)
+        ]
+
+        # Semaphore to limit concurrent LLM calls
+        semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_BATCHES)
+
+        async def _eval_batch_safe(batch: List[SampleWindow]) -> None:
+            """Evaluate a single batch with concurrency control and error handling."""
+            async with semaphore:
+                try:
+                    if len(batch) == 1:
+                        await self._evaluate_single(batch[0], query)
+                    else:
+                        await self._evaluate_one_batch(batch, query)
+                except Exception as e:
+                    await self._log.warning(f"Batch evaluation error: {e}")
+                    # Mark failed samples with score 0 so they don't block the pipeline
+                    for s in batch:
+                        if s.score == 0:
+                            s.reasoning = f"Evaluation failed: {e}"
+
+        _t0 = _time.time()
+        # Execute all batches in parallel (bounded by semaphore)
+        await asyncio.gather(*[_eval_batch_safe(b) for b in batches])
+        await self._log.info(
+            f"[Timing] Batch evaluation ({len(samples)} samples, "
+            f"{len(batches)} batches, parallel): {_time.time()-_t0:.2f}s"
+        )
         return samples
 
     # ---- batch evaluation ---------------------------------------------
