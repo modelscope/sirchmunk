@@ -1049,6 +1049,7 @@ class AgenticSearch(BaseSearch):
         spec_stale_hours: float = 72.0,
         chat_history: Optional[List[Dict[str, str]]] = None,
         enable_thinking: bool = False,
+        enable_cross_lingual: bool = True,
     ) -> Union[str, SearchContext, List[Dict[str, Any]]]:
         """Perform intelligent search with multi-mode support.
 
@@ -1125,10 +1126,12 @@ class AgenticSearch(BaseSearch):
                 that carries ``answer``, ``cluster`` (KnowledgeCluster),
                 and full pipeline telemetry (LLM usage, files read, etc.).
             spec_stale_hours: Hours before spec cache is stale (default: 72).
+            chat_history: Optional list of chat messages for intent detection (DEEP mode).
             enable_thinking: If True, enable model reasoning/thinking for
                 complex processing steps (final answer synthesis, ReAct
                 reasoning). Simple extraction/classification steps always
                 run with thinking disabled. Default: False.
+            enable_cross_lingual: If True, enable cross-lingual keyword extraction and matching.
 
         Returns:
             - ``str``: Answer summary (default).
@@ -1210,6 +1213,7 @@ class AgenticSearch(BaseSearch):
                 top_k_files=top_k_files, enable_dir_scan=enable_dir_scan,
                 include=include, exclude=exclude,
                 enable_thinking=enable_thinking,
+                enable_cross_lingual=enable_cross_lingual,
             )
         else:
             answer, cluster, context = await self._search_deep(
@@ -1220,6 +1224,7 @@ class AgenticSearch(BaseSearch):
                 include=include, exclude=exclude,
                 spec_stale_hours=spec_stale_hours,
                 enable_thinking=enable_thinking,
+                enable_cross_lingual=enable_cross_lingual,
                 memory_extra_files=_memory_extra_files,
                 memory_extra_keywords=_memory_extra_keywords,
             )
@@ -1254,6 +1259,7 @@ class AgenticSearch(BaseSearch):
         exclude: Optional[List[str]] = None,
         spec_stale_hours: float = 72.0,
         enable_thinking: bool = False,
+        enable_cross_lingual: bool = True,
         memory_extra_files: Optional[List[str]] = None,
         memory_extra_keywords: Optional[List[str]] = None,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
@@ -1302,7 +1308,7 @@ class AgenticSearch(BaseSearch):
         context.increment_loop()
 
         phase1_results = await asyncio.gather(
-            self._probe_keywords(query),
+            self._probe_keywords(query, enable_cross_lingual=enable_cross_lingual),
             self._probe_dir_scan(paths, enable_dir_scan),
             self._probe_knowledge_cache(query),
             self._load_spec_context(paths, stale_hours=spec_stale_hours),
@@ -1720,6 +1726,7 @@ class AgenticSearch(BaseSearch):
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         enable_thinking: bool = False,
+        enable_cross_lingual: bool = True,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Greedy search: 2-3 LLM calls, single best file, focused evidence.
 
@@ -1806,13 +1813,15 @@ class AgenticSearch(BaseSearch):
 
         primary = analysis.get("primary", [])[:2]
         fallback = analysis.get("fallback", [])[:3]
-        primary_alt = analysis.get("primary_alt", [])[:2]
-        fallback_alt = analysis.get("fallback_alt", [])[:3]
 
-        if primary_alt:
-            primary = primary + primary_alt
-        if fallback_alt:
-            fallback = fallback + fallback_alt
+        # Cross-lingual keywords (disabled by default for monolingual datasets)
+        if enable_cross_lingual:
+            primary_alt = analysis.get("primary_alt", [])[:2]
+            fallback_alt = analysis.get("fallback_alt", [])[:3]
+            if primary_alt:
+                primary = primary + primary_alt
+            if fallback_alt:
+                fallback = fallback + fallback_alt
 
         if not primary and not fallback:
             await self._logger.warning("[FAST] No keywords extracted")
@@ -2188,13 +2197,19 @@ class AgenticSearch(BaseSearch):
     # ------------------------------------------------------------------
 
     async def _probe_keywords(
-        self, query: str,
+        self, query: str, *, enable_cross_lingual: bool = True,
     ) -> Tuple[Dict[str, float], List[str]]:
         """Extract multi-level keywords from the query via LLM.
 
         Also extracts cross-lingual alternative keywords from the
-        ``<KEYWORDS_ALT>`` block and merges them into the result list.
+        ``<KEYWORDS_ALT>`` block and merges them into the result list
+        when ``enable_cross_lingual`` is True.
         Falls back to heuristic extraction if LLM output is unparseable.
+
+        Args:
+            query: User query to extract keywords from.
+            enable_cross_lingual: Whether to include translated keywords.
+                Disable for monolingual datasets like HotpotQA.
 
         Returns:
             Tuple of (keyword_idf_dict, keyword_list).
@@ -2220,9 +2235,12 @@ class AgenticSearch(BaseSearch):
                 for ks in keyword_sets
             ]
 
-            alt_keywords = self._extract_alt_keywords(kw_response.content)
-            if alt_keywords:
-                await self._logger.info(f"[Probe:Keywords] Cross-lingual alt: {list(alt_keywords.keys())}")
+            # Cross-lingual keywords (disabled for monolingual datasets)
+            alt_keywords: Dict[str, float] = {}
+            if enable_cross_lingual:
+                alt_keywords = self._extract_alt_keywords(kw_response.content)
+                if alt_keywords:
+                    await self._logger.info(f"[Probe:Keywords] Cross-lingual alt: {list(alt_keywords.keys())}")
 
             for kw_set in keyword_sets:
                 if kw_set:

@@ -568,6 +568,7 @@ async def run_single(
                 enable_dir_scan=cfg.enable_dir_scan,
                 return_context=True,
                 enable_thinking=cfg.enable_thinking,
+                enable_cross_lingual=cfg.enable_cross_lingual,
             )
 
             raw_answer = getattr(result, "answer", "") or str(result)

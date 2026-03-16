@@ -66,6 +66,7 @@ class ExperimentConfig:
     top_k_files: int
     max_token_budget: int
     enable_dir_scan: bool
+    enable_cross_lingual: bool
 
     # LLM
     llm_base_url: str
@@ -136,6 +137,7 @@ def get_config(
         "top_k_files": int(os.getenv("HOTPOT_TOP_K_FILES", "5")),
         "max_token_budget": int(os.getenv("HOTPOT_MAX_TOKEN_BUDGET", "128000")),
         "enable_dir_scan": _bool_env(os.getenv("HOTPOT_ENABLE_DIR_SCAN"), True),
+        "enable_cross_lingual": _bool_env(os.getenv("HOTPOT_ENABLE_CROSS_LINGUAL"), False),
         "llm_base_url": os.getenv("LLM_BASE_URL", ""),
         "llm_api_key": os.getenv("LLM_API_KEY", ""),
         "llm_model": os.getenv("LLM_MODEL_NAME", ""),
