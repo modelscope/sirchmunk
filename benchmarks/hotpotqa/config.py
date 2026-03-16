@@ -67,6 +67,7 @@ class ExperimentConfig:
     max_token_budget: int
     enable_dir_scan: bool
     enable_cross_lingual: bool
+    rga_max_count: Optional[int]
 
     # LLM
     llm_base_url: str
@@ -138,6 +139,7 @@ def get_config(
         "max_token_budget": int(os.getenv("HOTPOT_MAX_TOKEN_BUDGET", "128000")),
         "enable_dir_scan": _bool_env(os.getenv("HOTPOT_ENABLE_DIR_SCAN"), True),
         "enable_cross_lingual": _bool_env(os.getenv("HOTPOT_ENABLE_CROSS_LINGUAL"), False),
+        "rga_max_count": _int_or_none(os.getenv("HOTPOT_RGA_MAX_COUNT"), 50),
         "llm_base_url": os.getenv("LLM_BASE_URL", ""),
         "llm_api_key": os.getenv("LLM_API_KEY", ""),
         "llm_model": os.getenv("LLM_MODEL_NAME", ""),

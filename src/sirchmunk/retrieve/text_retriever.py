@@ -46,6 +46,7 @@ class GrepRetriever(BaseRetriever):
         literal: bool = False,
         regex: bool = True,
         max_depth: Optional[int] = None,
+        max_count: Optional[int] = None,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         file_type: Optional[str] = None,
@@ -74,6 +75,7 @@ class GrepRetriever(BaseRetriever):
             literal: If True, treat patterns as literal strings (`-F`). Applies to all terms.
             regex: If False, implies `literal=True`.
             max_depth: Maximum directory depth to search (`--max-depth`).
+            max_count: Maximum matches per file (`--max-count`). Limits results per file for performance.
             include: List of glob patterns to include (`-g`).
             exclude: List of glob patterns to exclude (`-g '!...'`).
             file_type: Search only files of given type (`-t <type>`), e.g., 'py', 'md'.
@@ -114,6 +116,7 @@ class GrepRetriever(BaseRetriever):
                 literal=literal,
                 regex=regex,
                 max_depth=max_depth,
+                max_count=max_count,
                 include=include,
                 exclude=exclude,
                 file_type=file_type,
@@ -135,6 +138,7 @@ class GrepRetriever(BaseRetriever):
                 literal=literal,
                 regex=regex,
                 max_depth=max_depth,
+                max_count=max_count,
                 include=include,
                 exclude=exclude,
                 file_type=file_type,
@@ -161,6 +165,7 @@ class GrepRetriever(BaseRetriever):
                 literal=literal,
                 regex=regex,
                 max_depth=max_depth,
+                max_count=max_count,
                 include=include,
                 exclude=exclude,
                 file_type=file_type,
@@ -431,6 +436,7 @@ class GrepRetriever(BaseRetriever):
         line_number = kwargs.get("line_number", True)
         with_filename = kwargs.get("with_filename", True)
         max_depth = kwargs.get("max_depth")
+        max_count = kwargs.get("max_count")  # --max-count per file
         include = kwargs.get("include")
         exclude = kwargs.get("exclude")
         file_type = kwargs.get("file_type")
@@ -465,6 +471,8 @@ class GrepRetriever(BaseRetriever):
             args.append("--no-filename")
         if max_depth is not None:
             args.extend(["--max-depth", str(max_depth)])
+        if max_count is not None:
+            args.extend(["--max-count", str(max_count)])
         if include:
             for inc in include:
                 args.extend(["-g", inc])

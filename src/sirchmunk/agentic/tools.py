@@ -144,6 +144,7 @@ class KeywordSearchTool(BaseTool):
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         bm25_scorer: Any = None,
+        max_count: Optional[int] = None,
     ) -> None:
         self._retriever = retriever
         self._paths = paths
@@ -153,6 +154,7 @@ class KeywordSearchTool(BaseTool):
         self._include = include
         self._exclude = list(set(self._DEFAULT_EXCLUDE) | set(exclude or []))
         self._bm25_scorer = bm25_scorer
+        self._max_count = max_count
 
     @property
     def name(self) -> str:
@@ -211,6 +213,7 @@ class KeywordSearchTool(BaseTool):
                 literal=literal,
                 regex=regex,
                 max_depth=self._max_depth,
+                max_count=self._max_count,
                 include=self._include,
                 exclude=self._exclude,
                 timeout=30.0,
@@ -252,6 +255,7 @@ class KeywordSearchTool(BaseTool):
             literal=False,
             regex=True,
             max_depth=self._max_depth,
+            max_count=self._max_count,
             include=self._include,
             exclude=self._exclude,
             timeout=30.0,

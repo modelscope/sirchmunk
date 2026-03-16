@@ -662,6 +662,7 @@ async def run_batch(
         reuse_knowledge=cfg.reuse_knowledge,
         verbose=False,
         enable_memory=cfg.enable_memory,
+        rga_max_count=cfg.rga_max_count,
     )
 
     semaphore = asyncio.Semaphore(cfg.max_concurrent)

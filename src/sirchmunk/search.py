@@ -90,9 +90,13 @@ class AgenticSearch(BaseSearch):
         log_callback: LogCallback = None,
         reuse_knowledge: bool = True,
         enable_memory: bool = False,
+        rga_max_count: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        # Store rga max_count setting
+        self._rga_max_count = rga_max_count
 
         # Normalise and store default search paths
         if paths is not None:
@@ -1002,6 +1006,7 @@ class AgenticSearch(BaseSearch):
                 include=include,
                 exclude=exclude,
                 bm25_scorer=bm25_scorer,
+                max_count=self._rga_max_count,
             )
         )
 
@@ -2484,6 +2489,7 @@ class AgenticSearch(BaseSearch):
             max_results=20,
             include=include,
             exclude=exclude,
+            max_count=self._rga_max_count,
         )
         ctx = SearchContext()
         result_text, meta = await tool.execute(context=ctx, keywords=filtered)
