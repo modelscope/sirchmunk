@@ -586,6 +586,18 @@ def _prioritize_sp(
     return [[p[0], p[1]] for p in scored[:_MAX_SP_PAIRS_PER_QUERY]]
 
 
+_SAMPLE_RETRYABLE_KEYWORDS = ("429", "RateLimitError", "rate limit",
+                              "APIConnectionError", "APITimeoutError",
+                              "InternalServerError", "502", "503", "504")
+_SAMPLE_RETRY_BASE_DELAY = 30.0
+
+
+def _is_retryable_error(error_str: str) -> bool:
+    """Check whether a sample-level error is transient and worth retrying."""
+    e_lower = error_str.lower()
+    return any(kw.lower() in e_lower for kw in _SAMPLE_RETRYABLE_KEYWORDS)
+
+
 async def run_single(
     entry: Dict[str, Any],
     searcher: Any,
@@ -597,85 +609,101 @@ async def run_single(
     qid = entry["_id"]
     question = entry["question"]
 
-    async with semaphore:
-        t0 = time.time()
-        error = None
-        raw_answer = ""
-        answer = ""
-        telemetry: Dict[str, Any] = {}
-        retrieved_titles: List[str] = []
-        predicted_sp: List[List] = []
+    max_attempts = cfg.sample_max_retries + 1
 
-        try:
-            result = await searcher.search(
-                query=question,
-                paths=[str(cfg.wiki_corpus_dir)],
-                mode=cfg.mode,
-                top_k_files=cfg.top_k_files,
-                max_token_budget=cfg.max_token_budget,
-                enable_dir_scan=cfg.enable_dir_scan,
-                return_context=True,
-                enable_thinking=cfg.enable_thinking,
-                enable_cross_lingual=cfg.enable_cross_lingual,
-            )
+    for attempt in range(max_attempts):
+        async with semaphore:
+            t0 = time.time()
+            error = None
+            raw_answer = ""
+            answer = ""
+            telemetry: Dict[str, Any] = {}
+            retrieved_titles: List[str] = []
+            predicted_sp: List[List] = []
 
-            raw_answer = getattr(result, "answer", "") or str(result)
-            files_read = list(getattr(result, "read_file_ids", None) or set())
+            try:
+                result = await searcher.search(
+                    query=question,
+                    paths=[str(cfg.wiki_corpus_dir)],
+                    mode=cfg.mode,
+                    top_k_files=cfg.top_k_files,
+                    max_token_budget=cfg.max_token_budget,
+                    enable_dir_scan=cfg.enable_dir_scan,
+                    return_context=True,
+                    enable_thinking=cfg.enable_thinking,
+                    enable_cross_lingual=cfg.enable_cross_lingual,
+                )
 
-            # Supplement from cluster evidences
-            cluster = getattr(result, "cluster", None)
-            if cluster:
-                for ev in (getattr(cluster, "evidences", None) or []):
-                    fp = str(getattr(ev, "file_or_url", ""))
-                    if fp and fp not in files_read:
-                        files_read.append(fp)
+                raw_answer = getattr(result, "answer", "") or str(result)
+                files_read = list(getattr(result, "read_file_ids", None) or set())
 
-            # Supplement from keyword search retrieval logs
-            _seen = set(files_read)
-            for log_entry in (getattr(result, "retrieval_logs", None) or []):
-                meta = getattr(log_entry, "metadata", None) or {}
-                for p in meta.get("files_discovered", []):
-                    if p and p not in _seen:
-                        files_read.append(p)
-                        _seen.add(p)
+                # Supplement from cluster evidences
+                cluster = getattr(result, "cluster", None)
+                if cluster:
+                    for ev in (getattr(cluster, "evidences", None) or []):
+                        fp = str(getattr(ev, "file_or_url", ""))
+                        if fp and fp not in files_read:
+                            files_read.append(fp)
 
-            telemetry = {
-                "total_tokens": getattr(result, "total_llm_tokens", 0),
-                "loop_count": getattr(result, "loop_count", 0),
-                "files_read": files_read,
-                "llm_calls": len(getattr(result, "llm_usages", None) or []),
-            }
+                # Supplement from keyword search retrieval logs
+                _seen = set(files_read)
+                for log_entry in (getattr(result, "retrieval_logs", None) or []):
+                    meta = getattr(log_entry, "metadata", None) or {}
+                    for p in meta.get("files_discovered", []):
+                        if p and p not in _seen:
+                            files_read.append(p)
+                            _seen.add(p)
 
-            # Collect evidence texts for relevance-based SP filtering
-            evidence_texts = _collect_evidence_texts(cluster, result)
+                telemetry = {
+                    "total_tokens": getattr(result, "total_llm_tokens", 0),
+                    "loop_count": getattr(result, "loop_count", 0),
+                    "files_read": files_read,
+                    "llm_calls": len(getattr(result, "llm_usages", None) or []),
+                }
 
-            titles, predicted_sp = _extract_titles_and_sp(
-                files_read, question, raw_answer, evidence_texts,
-            )
-            retrieved_titles = list(titles)
+                # Collect evidence texts for relevance-based SP filtering
+                evidence_texts = _collect_evidence_texts(cluster, result)
 
-            _reasoning_texts = list(getattr(result, "reasoning_texts", None) or [])
-            if cfg.extract_answer and raw_answer:
-                # Short answers (< 80 chars) are likely already factoid-level;
-                # skip the extra LLM call to avoid corruption and latency.
-                if len(raw_answer.strip()) > 80:
-                    answer = await _extract_short_answer(
-                        question, raw_answer, llm,
-                        reasoning_texts=_reasoning_texts,
-                    )
-                    answer = _normalize_prediction(answer)
-                    if not answer:
+                titles, predicted_sp = _extract_titles_and_sp(
+                    files_read, question, raw_answer, evidence_texts,
+                )
+                retrieved_titles = list(titles)
+
+                _reasoning_texts = list(getattr(result, "reasoning_texts", None) or [])
+                if cfg.extract_answer and raw_answer:
+                    # Short answers (< 80 chars) are likely already factoid-level;
+                    # skip the extra LLM call to avoid corruption and latency.
+                    if len(raw_answer.strip()) > 80:
+                        answer = await _extract_short_answer(
+                            question, raw_answer, llm,
+                            reasoning_texts=_reasoning_texts,
+                        )
+                        answer = _normalize_prediction(answer)
+                        if not answer:
+                            answer = _normalize_prediction(raw_answer)
+                    else:
                         answer = _normalize_prediction(raw_answer)
                 else:
                     answer = _normalize_prediction(raw_answer)
-            else:
-                answer = _normalize_prediction(raw_answer)
-        except Exception as e:
-            error = str(e)
+            except Exception as e:
+                error = str(e)
 
-        elapsed = time.time() - t0
-        if cfg.request_delay > 0:
-            await asyncio.sleep(cfg.request_delay)
+            elapsed = time.time() - t0
+            if cfg.request_delay > 0:
+                await asyncio.sleep(cfg.request_delay)
+
+        # Retry decision (outside semaphore so slot is released for others)
+        if not error or attempt >= max_attempts - 1:
+            break
+        if not _is_retryable_error(error):
+            break
+
+        delay = _SAMPLE_RETRY_BASE_DELAY * (2 ** attempt)
+        logging.getLogger(__name__).warning(
+            "[run_single] %s attempt %d/%d failed (%s), retrying in %.0fs",
+            qid, attempt + 1, max_attempts, error[:80], delay,
+        )
+        await asyncio.sleep(delay)
 
     return {
         "_id": qid,
@@ -714,6 +742,9 @@ async def run_batch(
         api_key=cfg.llm_api_key,
         base_url=cfg.llm_base_url,
         model=cfg.llm_model,
+        max_retries=4,
+        retry_base_delay=2.0,
+        retry_max_delay=60.0,
     )
     searcher = AgenticSearch(
         llm=llm,

@@ -105,9 +105,10 @@ class ExperimentConfig:
     rga_max_parse_lines: int
     merge_max_files: int
 
-    # Concurrency
+    # Concurrency & retry
     max_concurrent: int
     request_delay: float
+    sample_max_retries: int
 
     def __post_init__(self) -> None:
         self.dataset_dir = Path(self.dataset_dir).resolve()
@@ -170,6 +171,7 @@ def get_config(
         "merge_max_files": int(os.getenv("HOTPOT_MERGE_MAX_FILES", "2000")),
         "max_concurrent": int(os.getenv("HOTPOT_MAX_CONCURRENT", "5")),
         "request_delay": float(os.getenv("HOTPOT_REQUEST_DELAY", "0.5")),
+        "sample_max_retries": int(os.getenv("HOTPOT_SAMPLE_MAX_RETRIES", "2")),
     }
 
     for k, v in overrides.items():
