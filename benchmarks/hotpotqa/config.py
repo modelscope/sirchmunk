@@ -61,6 +61,9 @@ class ExperimentConfig:
     limit: Optional[int]
     seed: int
 
+    # Ablation
+    llm_only: bool
+
     # Search
     mode: Literal["FAST", "DEEP"]
     top_k_files: int
@@ -145,6 +148,7 @@ def get_config(
         "split": os.getenv("HOTPOT_SPLIT", "validation"),
         "limit": _int_or_none(os.getenv("HOTPOT_LIMIT"), 1000),
         "seed": int(os.getenv("HOTPOT_SEED", "42")),
+        "llm_only": _bool_env(os.getenv("HOTPOT_LLM_ONLY"), False),
         "mode": os.getenv("HOTPOT_MODE", "DEEP"),
         "top_k_files": int(os.getenv("HOTPOT_TOP_K_FILES", "5")),
         "max_token_budget": int(os.getenv("HOTPOT_MAX_TOKEN_BUDGET", "128000")),

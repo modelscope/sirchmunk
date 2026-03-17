@@ -99,7 +99,7 @@ def _restore_stdout_stderr(orig_stdout, orig_stderr):
 
 from config import get_config
 from data_loader import load_samples, validate_wiki_corpus
-from runner import run_batch
+from runner import run_batch, run_batch_llm_only
 from evaluate import evaluate_predictions
 from llm_judge import run_llm_judge, run_gpt_eval
 
@@ -305,25 +305,35 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
         print(f"[ERROR] HOTPOT_DATASET_DIR not set or missing: {cfg.dataset_dir}")
         return
 
-    try:
-        n_corpus = validate_wiki_corpus(cfg.wiki_corpus_dir)
-    except (FileNotFoundError, RuntimeError) as e:
-        print(f"[ERROR] {e}")
-        return
+    n_corpus = 0
+    if not cfg.llm_only:
+        try:
+            n_corpus = validate_wiki_corpus(cfg.wiki_corpus_dir)
+        except (FileNotFoundError, RuntimeError) as e:
+            print(f"[ERROR] {e}")
+            return
 
-    _print_header("HotpotQA Fullwiki Benchmark — AgenticSearch")
+    _bench_title = ("HotpotQA Fullwiki Benchmark — LLM-Only (Ablation)"
+                    if cfg.llm_only
+                    else "HotpotQA Fullwiki Benchmark — AgenticSearch")
+    _print_header(_bench_title)
     print(f"  Config:       {args.env.resolve()}")
-    print(f"  Wiki Corpus:  {cfg.wiki_corpus_dir}")
-    print(f"  Corpus Files: {n_corpus}")
+    if cfg.llm_only:
+        print(f"  Mode:         LLM-ONLY (no retrieval)")
+    else:
+        print(f"  Wiki Corpus:  {cfg.wiki_corpus_dir}")
+        print(f"  Corpus Files: {n_corpus}")
     print(f"  Setting:      {cfg.setting}")
     print(f"  Split:        {cfg.split}")
     print(f"  Limit:        {cfg.limit or 'ALL'}")
-    print(f"  Mode:         {cfg.mode}")
-    print(f"  Top-K:        {cfg.top_k_files}")
+    if not cfg.llm_only:
+        print(f"  Mode:         {cfg.mode}")
+        print(f"  Top-K:        {cfg.top_k_files}")
     print(f"  Model:        {cfg.llm_model}")
     print(f"  Concurrent:   {cfg.max_concurrent}")
-    print(f"  Token Budget: {cfg.max_token_budget}")
-    print(f"  Dir Scan:     {'ON' if cfg.enable_dir_scan else 'OFF'}")
+    if not cfg.llm_only:
+        print(f"  Token Budget: {cfg.max_token_budget}")
+        print(f"  Dir Scan:     {'ON' if cfg.enable_dir_scan else 'OFF'}")
     print(f"  Extract:      {'ON' if cfg.extract_answer else 'OFF'}")
     print(f"  GPT-Eval:     {'ON' if cfg.enable_gpt_eval else 'OFF'}")
     print(f"  LLM Judge:    {'ON' if cfg.enable_llm_judge else 'OFF'}")
@@ -371,9 +381,14 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
     new_results = []
     t0 = time.time()
     if pending_samples:
-        print(f"\n[run] Starting evaluation on {len(pending_samples)} questions "
-              f"against wiki corpus ({n_corpus} files) ...")
-        new_results = await run_batch(pending_samples, cfg)
+        if cfg.llm_only:
+            print(f"\n[run] Starting LLM-only evaluation on "
+                  f"{len(pending_samples)} questions ...")
+            new_results = await run_batch_llm_only(pending_samples, cfg)
+        else:
+            print(f"\n[run] Starting evaluation on {len(pending_samples)} questions "
+                  f"against wiki corpus ({n_corpus} files) ...")
+            new_results = await run_batch(pending_samples, cfg)
 
         # Save intermediate checkpoint after each batch
         all_results_so_far = resumed_results + new_results
@@ -417,7 +432,8 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
 
     # --- Save artifacts ---
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tag = (f"{cfg.setting}_{cfg.split}_{cfg.mode}_"
+    _mode_tag = "LLM-ONLY" if cfg.llm_only else cfg.mode
+    tag = (f"{cfg.setting}_{cfg.split}_{_mode_tag}_"
            f"{cfg.llm_model}_{len(results)}q_{timestamp}")
 
     def _round_metric(v):
@@ -427,7 +443,9 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
     report = {
         "config": {
             "setting": cfg.setting, "split": cfg.split, "limit": cfg.limit,
-            "mode": cfg.mode, "model": cfg.llm_model, "seed": cfg.seed,
+            "mode": "LLM-ONLY" if cfg.llm_only else cfg.mode,
+            "llm_only": cfg.llm_only,
+            "model": cfg.llm_model, "seed": cfg.seed,
             "top_k_files": cfg.top_k_files,
             "max_token_budget": cfg.max_token_budget,
             "enable_dir_scan": cfg.enable_dir_scan,

@@ -780,3 +780,129 @@ async def run_batch(
     tasks = [_tracked(s) for s in samples]
     results = await asyncio.gather(*tasks)
     return list(results)
+
+
+# ---------------------------------------------------------------------------
+# LLM-Only ablation mode
+# ---------------------------------------------------------------------------
+
+_LLM_ONLY_PROMPT = """\
+Answer the following question using ONLY your own knowledge. \
+Do NOT say you need to search or look anything up. \
+Provide a short, direct factoid answer (1-10 words).
+For yes/no or comparison questions, answer with: yes or no
+
+Question: {question}
+
+Short answer:"""
+
+
+async def run_single_llm_only(
+    entry: Dict[str, Any],
+    llm: Any,
+    cfg: ExperimentConfig,
+    semaphore: asyncio.Semaphore,
+) -> Dict[str, Any]:
+    """Answer a HotpotQA question using LLM parametric knowledge only."""
+    qid = entry["_id"]
+    question = entry["question"]
+
+    max_attempts = cfg.sample_max_retries + 1
+
+    for attempt in range(max_attempts):
+        async with semaphore:
+            t0 = time.time()
+            error = None
+            raw_answer = ""
+            answer = ""
+            usage_tokens = 0
+
+            try:
+                resp = await llm.achat(
+                    messages=[{"role": "user", "content": _LLM_ONLY_PROMPT.format(question=question)}],
+                    stream=False,
+                    enable_thinking=cfg.enable_thinking,
+                )
+                raw_answer = (resp.content or "").strip()
+                usage = resp.usage or {}
+                usage_tokens = (
+                    usage.get("total_tokens", 0)
+                    or usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                )
+
+                if raw_answer:
+                    answer = _normalize_prediction(raw_answer)
+            except Exception as e:
+                error = str(e)
+
+            elapsed = time.time() - t0
+            if cfg.request_delay > 0:
+                await asyncio.sleep(cfg.request_delay)
+
+        if not error or attempt >= max_attempts - 1:
+            break
+        if not _is_retryable_error(error):
+            break
+
+        delay = _SAMPLE_RETRY_BASE_DELAY * (2 ** attempt)
+        logging.getLogger(__name__).warning(
+            "[llm_only] %s attempt %d/%d failed (%s), retrying in %.0fs",
+            qid, attempt + 1, max_attempts, error[:80], delay,
+        )
+        await asyncio.sleep(delay)
+
+    return {
+        "_id": qid,
+        "question": question,
+        "prediction": answer,
+        "raw_prediction": raw_answer,
+        "gold_answer": entry.get("answer") or "",
+        "type": entry.get("type", ""),
+        "level": entry.get("level", ""),
+        "elapsed": round(elapsed, 2),
+        "telemetry": {
+            "total_tokens": usage_tokens,
+            "loop_count": 0,
+            "files_read": [],
+            "llm_calls": 1,
+        },
+        "retrieved_titles": [],
+        "predicted_sp": [],
+        "error": error,
+    }
+
+
+async def run_batch_llm_only(
+    samples: List[Dict[str, Any]],
+    cfg: ExperimentConfig,
+) -> List[Dict[str, Any]]:
+    """Run LLM-only (no retrieval) on all samples for ablation study."""
+    from sirchmunk.llm.openai_chat import OpenAIChat
+
+    llm = OpenAIChat(
+        api_key=cfg.llm_api_key,
+        base_url=cfg.llm_base_url,
+        model=cfg.llm_model,
+        max_retries=4,
+        retry_base_delay=2.0,
+        retry_max_delay=60.0,
+    )
+
+    semaphore = asyncio.Semaphore(cfg.max_concurrent)
+    total = len(samples)
+    completed = 0
+
+    async def _tracked(entry):
+        nonlocal completed
+        r = await run_single_llm_only(entry, llm, cfg, semaphore)
+        completed += 1
+        status = "OK" if not r["error"] else f"ERR: {r['error'][:60]}"
+        t = r.get("telemetry", {})
+        print(f"  [{completed}/{total}] {r['_id']}  "
+              f"{r['elapsed']:.1f}s  tok={t.get('total_tokens', 0)}  "
+              f"{status}")
+        return r
+
+    tasks = [_tracked(s) for s in samples]
+    results = await asyncio.gather(*tasks)
+    return list(results)
