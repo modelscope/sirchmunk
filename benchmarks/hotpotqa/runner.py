@@ -22,6 +22,7 @@ collapsing SP precision to near zero.
 
 import asyncio
 import json as json_mod
+import logging
 import os
 import re
 import time
@@ -29,6 +30,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from config import ExperimentConfig
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +656,12 @@ async def run_batch(
     # Build title→filepath index at startup (one-time cost)
     build_title_index(cfg.wiki_corpus_dir)
 
+    # Resolve ugrep corpus path: explicit config or fall back to wiki_corpus_dir
+    _ugrep_cp = cfg.ugrep_corpus_path or cfg.wiki_corpus_dir
+    if _ugrep_cp:
+        from sirchmunk.retrieve.text_retriever import GrepRetriever
+        GrepRetriever.ensure_ugrep_index(_ugrep_cp)
+
     llm = OpenAIChat(
         api_key=cfg.llm_api_key,
         base_url=cfg.llm_base_url,
@@ -664,6 +673,10 @@ async def run_batch(
         verbose=False,
         enable_memory=cfg.enable_memory,
         rga_max_count=cfg.rga_max_count,
+        ugrep_corpus_path=_ugrep_cp,
+        highfreq_file_threshold=cfg.highfreq_file_threshold,
+        rga_max_parse_lines=cfg.rga_max_parse_lines,
+        merge_max_files=cfg.merge_max_files,
     )
 
     semaphore = asyncio.Semaphore(cfg.max_concurrent)

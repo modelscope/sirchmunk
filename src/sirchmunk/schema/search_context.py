@@ -76,6 +76,7 @@ class SearchContext:
     total_llm_tokens: int = field(default=0, init=False)
     llm_usages: List[Dict[str, Any]] = field(default_factory=list, init=False)
     read_file_ids: Set[str] = field(default_factory=set, init=False)
+    discovered_files: Set[str] = field(default_factory=set, init=False)
     retrieval_logs: List[RetrievalLog] = field(default_factory=list, init=False)
     search_history: List[str] = field(default_factory=list, init=False)
     reasoning_texts: List[str] = field(default_factory=list, init=False)
@@ -117,6 +118,17 @@ class SearchContext:
     def is_file_read(self, file_path: str) -> bool:
         """Check whether a file has already been fully read."""
         return str(file_path) in self.read_file_ids
+
+    def add_discovered_files(self, paths: List[str]) -> None:
+        """Record file paths discovered by keyword search."""
+        for p in paths:
+            if p:
+                self.discovered_files.add(str(p))
+
+    @property
+    def total_known_files(self) -> int:
+        """Combined count of read + discovered file paths."""
+        return len(self.read_file_ids | self.discovered_files)
 
     # ---- Logging ----
 
@@ -183,6 +195,7 @@ class SearchContext:
             "llm_call_count": len(self.llm_usages),
             "llm_usages": self.llm_usages,
             "read_file_ids": sorted(self.read_file_ids),
+            "discovered_files_count": len(self.discovered_files),
             "retrieval_logs": [log.to_dict() for log in self.retrieval_logs],
             "search_history": self.search_history,
             "reasoning_texts_count": len(self.reasoning_texts),

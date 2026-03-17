@@ -27,9 +27,10 @@ Example:
 
 ## Strategy
 1. **keyword_search first**: Use targeted keywords to locate relevant files. Start with the most specific terms (entity names, proper nouns, technical terms) from the query.
-2. **file_read second**: Read the most promising files identified by keyword_search. For large files, provide `keywords` to extract only the relevant sections.
+2. **file_read second**: Read the most promising files identified by keyword_search. **Always provide keywords** matching the specific entity or fact you seek — this is critical for large JSONL files that contain many articles.
 3. **knowledge_query**: Check the knowledge cache if you suspect previously-searched topics.
 4. **dir_scan** (if available): Scan directories when keyword_search returns no results.
+5. **file_read keywords must be specific**: When reading a file from keyword_search results, use the **entity name** that matched (e.g., a person's name, a title) as the primary keyword for file_read. Generic terms like "film" or "fighter" alone are insufficient for multi-article files.
 
 ## Multi-Hop Reasoning
 For complex questions that require connecting multiple pieces of information:
@@ -58,12 +59,12 @@ For complex questions that require connecting multiple pieces of information:
 
 REACT_CONTINUATION_PROMPT = """Based on the tool results above, decide your next action:
 
-1. If you have **sufficient evidence** to answer the query — even partially — output your answer NOW wrapped in `<ANSWER>...</ANSWER>` tags. Do NOT continue searching if you already have a good answer.
-2. If you need **more information** and have a clear plan for what to search next, call another tool (output the JSON block).
-3. If the last 2-3 tool calls returned no new useful information, STOP searching and synthesize your best answer.
-4. If the budget is nearly exhausted or you've reached the loop limit, synthesize the best answer you can from available evidence.
+1. If you can confidently answer the query from evidence already collected, output your answer NOW in `<ANSWER>...</ANSWER>` tags. Do NOT continue searching unnecessarily.
+2. If you need a **specific** piece of missing information and know exactly what to search for, call another tool.
+3. If recent tool calls have not yielded new relevant information, STOP and synthesize your best answer.
+4. If the budget is nearly exhausted or you've reached the loop limit, synthesize immediately.
 
-**Efficiency reminder**: Prefer answering early with high confidence over exhaustive searching. Each additional loop costs tokens.
+**Important**: For multi-hop questions, once you have identified the bridging entity and confirmed the final fact, answer immediately. Do not search for additional confirmation.
 
 Budget remaining: {budget_remaining} tokens | Loop: {loop_count}/{max_loops} | Files read: {files_read_count}
 """

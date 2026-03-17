@@ -15,6 +15,8 @@ from .base import BaseRetriever
 
 RGA_SEMAPHORE = asyncio.Semaphore(value=GREP_CONCURRENT_LIMIT)
 
+_UGREP_PREFILTER_MAX_FILES = 500
+
 
 class GrepRetriever(BaseRetriever):
     """A Python wrapper for ripgrep-all (rga), exposing its functionality via static methods.
@@ -26,7 +28,12 @@ class GrepRetriever(BaseRetriever):
     For more information about ripgrep-all, please refer to `https://github.com/phiresky/ripgrep-all`
     """
 
-    def __init__(self, work_path: Union[str, Path] = None, **kwargs):
+    def __init__(
+        self,
+        work_path: Union[str, Path] = None,
+        ugrep_corpus_path: Union[str, Path, None] = None,
+        **kwargs,
+    ):
         super().__init__()
 
         self.work_path: Path = Path(work_path or DEFAULT_SIRCHMUNK_WORK_PATH).expanduser().resolve()
@@ -34,6 +41,15 @@ class GrepRetriever(BaseRetriever):
             self.work_path / StorageStructure.CACHE_DIR / StorageStructure.GREP_DIR
         )
         self.rga_cache.mkdir(parents=True, exist_ok=True)
+
+        self._ugrep_corpus_path: Optional[Path] = (
+            Path(ugrep_corpus_path).expanduser().resolve()
+            if ugrep_corpus_path else None
+        )
+
+        self._highfreq_file_threshold: int = int(kwargs.get("highfreq_file_threshold", 0))
+        self._rga_max_parse_lines: int = int(kwargs.get("rga_max_parse_lines", 0))
+        self._merge_max_files: int = int(kwargs.get("merge_max_files", 0))
 
     async def retrieve(
         self,
@@ -106,6 +122,13 @@ class GrepRetriever(BaseRetriever):
         rga_cache_path = rga_cache_path or self.rga_cache
         rga_cache_path = str(Path(rga_cache_path).resolve())
 
+        _ugrep_cp = str(self._ugrep_corpus_path) if self._ugrep_corpus_path else None
+        _shared_kw = dict(
+            ugrep_corpus_path=_ugrep_cp,
+            highfreq_file_threshold=self._highfreq_file_threshold,
+            rga_max_parse_lines=self._rga_max_parse_lines,
+        )
+
         # Multi-term logic routing
         if logic == "or":
             results, retrieve_pattern = await self._retrieve_or(
@@ -128,6 +151,7 @@ class GrepRetriever(BaseRetriever):
                 rga_cache_max_blob_len=rga_cache_max_blob_len,
                 rga_cache_path=rga_cache_path,
                 timeout=timeout,
+                **_shared_kw,
             )
         elif logic == "and":
             results = await self._retrieve_and(
@@ -150,6 +174,7 @@ class GrepRetriever(BaseRetriever):
                 rga_cache_max_blob_len=rga_cache_max_blob_len,
                 rga_cache_path=rga_cache_path,
                 timeout=timeout,
+                **_shared_kw,
             )
         elif logic == "not":
             if len(terms) < 2:
@@ -176,6 +201,7 @@ class GrepRetriever(BaseRetriever):
                 rga_cache_max_blob_len=rga_cache_max_blob_len,
                 rga_cache_path=rga_cache_path,
                 timeout=timeout,
+                **_shared_kw,
             )
         else:
             raise ValueError(
@@ -344,19 +370,26 @@ class GrepRetriever(BaseRetriever):
 
     @staticmethod
     async def _run_rga_async(
-            args: List[str], json_output: bool = True, timeout: float = 60.0
+            args: List[str],
+            json_output: bool = True,
+            timeout: float = 60.0,
+            max_parse_lines: int = 0,
     ) -> Dict[str, Any]:
+        import time as _time
+
         cmd = ["rga", "--no-config"]
         if json_output:
             cmd.append("--json")
         cmd.extend(args)
 
+        _t_wait = _time.perf_counter()
         try:
             await asyncio.wait_for(RGA_SEMAPHORE.acquire(), timeout=timeout)
         except asyncio.TimeoutError:
             raise RuntimeError(
                 f"rga search timed out while waiting for a queue slot ({timeout}s)."
             )
+        _wait_ms = (_time.perf_counter() - _t_wait) * 1000
 
         try:
             try:
@@ -367,12 +400,16 @@ class GrepRetriever(BaseRetriever):
                 raise RuntimeError("ripgrep-all ('rga') not found. Please install it first.")
 
             try:
+                _t_proc = _time.perf_counter()
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(), timeout=timeout
                 )
+                _proc_ms = (_time.perf_counter() - _t_proc) * 1000
 
+                _t_decode = _time.perf_counter()
                 stdout_str = stdout.decode().strip()
                 stderr_str = stderr.decode().strip()
+                _decode_ms = (_time.perf_counter() - _t_decode) * 1000
                 returncode = process.returncode
 
                 if returncode != 0:
@@ -381,29 +418,54 @@ class GrepRetriever(BaseRetriever):
                             f"ripgrep-all depends on 'ripgrep' (rg), but it's missing or failed: {stderr_str}"
                         )
                     elif returncode > 1:
-                        # Exit code 2 means "some errors occurred" (e.g.
-                        # preprocessor failures on individual files), but
-                        # valid matches may still be present in stdout.
-                        # Only raise if there is NO stdout content at all.
                         if not stdout_str:
                             raise RuntimeError(
                                 f"rga execution failed with code {returncode}: {stderr_str}"
                             )
-                        # Log the errors but continue to parse results
                         logger.warning(
                             f"rga returned exit code {returncode} with partial errors "
                             f"(first 300 chars): {stderr_str[:300]}"
                         )
 
-                # Parse JSON Lines — also for exit code 2 when stdout has content
+                # Parse JSON Lines
                 parsed_stdout = stdout_str
+                _n_lines = 0
+                _n_lines_truncated = False
+                _t_parse = _time.perf_counter()
                 if json_output and returncode in (0, 1, 2) and stdout_str:
                     try:
+                        lines = stdout_str.splitlines()
+                        _n_lines = len(lines)
+                        if max_parse_lines and _n_lines > max_parse_lines:
+                            logger.warning(
+                                "[rga:defense] {} JSON lines exceeds limit {}, "
+                                "truncating to prevent CPU/memory explosion",
+                                _n_lines, max_parse_lines,
+                            )
+                            lines = lines[:max_parse_lines]
+                            _n_lines_truncated = True
                         parsed_stdout = [
-                            json.loads(line) for line in stdout_str.splitlines() if line
+                            json.loads(line) for line in lines if line
                         ]
                     except json.JSONDecodeError as e:
                         raise RuntimeError(f"Failed to parse rga JSON output: {e}")
+                _parse_ms = (_time.perf_counter() - _t_parse) * 1000
+
+                # Extract pattern preview from args for logging
+                _pattern_preview = ""
+                for i, a in enumerate(args):
+                    if not a.startswith("-") and i > 0:
+                        _pattern_preview = a[:60]
+                        break
+
+                _trunc_tag = " TRUNCATED" if _n_lines_truncated else ""
+                logger.info(
+                    "[rga:profile] pattern={} | wait={:.0f}ms proc={:.0f}ms "
+                    "decode={:.0f}ms parse={:.0f}ms | stdout={}B lines={}{} exit={}",
+                    _pattern_preview, _wait_ms, _proc_ms,
+                    _decode_ms, _parse_ms, len(stdout), _n_lines,
+                    _trunc_tag, returncode,
+                )
 
                 return {
                     "returncode": returncode,
@@ -421,9 +483,100 @@ class GrepRetriever(BaseRetriever):
             RGA_SEMAPHORE.release()
 
     @staticmethod
+    async def _run_ugrep_prefilter_async(
+        pattern: str,
+        corpus_path: str,
+        literal: bool = True,
+        case_sensitive: bool = False,
+        timeout: float = 10.0,
+    ) -> Optional[List[str]]:
+        """Pre-filter files using ``ugrep --index`` for fast candidate identification.
+
+        Returns *None* when ugrep is unavailable or an error occurs (caller
+        should fall back to full rga search).  Returns an empty list when no
+        files match the pattern.
+        """
+        import time as _time
+
+        cmd = ["ugrep", "--index", "-rl"]
+        if literal:
+            cmd.append("-F")
+        if not case_sensitive:
+            cmd.append("-i")
+        cmd.extend(["--", pattern, corpus_path])
+
+        _t0 = _time.perf_counter()
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(
+                process.communicate(), timeout=timeout,
+            )
+            _elapsed_ms = (_time.perf_counter() - _t0) * 1000
+
+            if process.returncode not in (0, 1):
+                return None
+
+            files = [
+                line for line in stdout.decode().strip().splitlines()
+                if line.strip()
+            ]
+            logger.info(
+                "[ugrep:prefilter] pattern={} | {} candidates in {:.0f}ms",
+                pattern[:60], len(files), _elapsed_ms,
+            )
+            return files
+        except FileNotFoundError:
+            logger.debug("ugrep not found; pre-filtering disabled")
+            return None
+        except asyncio.TimeoutError:
+            logger.debug("ugrep pre-filter timed out ({}s)", timeout)
+            return None
+        except Exception as exc:
+            logger.debug("ugrep pre-filter error: {}", exc)
+            return None
+
+    @staticmethod
+    def ensure_ugrep_index(corpus_path: Union[str, Path]) -> None:
+        """Start ``ugrep-indexer`` in background if no index exists yet."""
+        import shutil
+
+        corpus = Path(corpus_path).expanduser().resolve()
+        if not corpus.is_dir():
+            return
+        if shutil.which("ugrep-indexer") is None:
+            logger.debug("ugrep-indexer not installed; skipping index build")
+            return
+
+        has_index = any(
+            d.name == "._UG#_Store"
+            for d in corpus.iterdir()
+            if d.is_dir()
+        )
+        if has_index:
+            logger.debug("ugrep index already exists at {}", corpus)
+            return
+
+        logger.info("Starting background ugrep-indexer for {}", corpus)
+        try:
+            subprocess.Popen(
+                ["ugrep-indexer", "-f", str(corpus)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            logger.warning("Failed to start ugrep-indexer: {}", exc)
+
+    @staticmethod
     async def _retrieve_single(**kwargs) -> List[Dict[str, Any]]:
         """Wrapper for original single-pattern search (extracted for reuse)."""
         pattern = kwargs.pop("pattern")
+        ugrep_corpus_path = kwargs.pop("ugrep_corpus_path", None)
+        highfreq_file_threshold = kwargs.pop("highfreq_file_threshold", 0)
+        rga_max_parse_lines = kwargs.pop("rga_max_parse_lines", 0)
         args = []
 
         # Basic ripgrep-all args
@@ -449,6 +602,27 @@ class GrepRetriever(BaseRetriever):
             "rga_cache_max_blob_len", 10000000
         )  # Default 10MB
         rga_cache_path = kwargs.get("rga_cache_path")
+
+        # ugrep --index pre-filtering: narrow search scope to candidate files
+        if ugrep_corpus_path and path and not invert_match:
+            candidates = await GrepRetriever._run_ugrep_prefilter_async(
+                pattern=pattern,
+                corpus_path=str(ugrep_corpus_path),
+                literal=literal or not regex,
+                case_sensitive=case_sensitive,
+            )
+            if candidates is not None:
+                if len(candidates) == 0:
+                    return []
+                # C: skip high-frequency terms that hit too many files
+                if highfreq_file_threshold and len(candidates) > highfreq_file_threshold:
+                    logger.warning(
+                        "[highfreq:skip] '{}' hits {} files (threshold {}), skipping",
+                        pattern[:60], len(candidates), highfreq_file_threshold,
+                    )
+                    return []
+                if len(candidates) <= _UGREP_PREFILTER_MAX_FILES:
+                    path = candidates
 
         # Build argument list
         if not regex:
@@ -506,6 +680,7 @@ class GrepRetriever(BaseRetriever):
             args=args,
             json_output=not count_only,
             timeout=timeout,
+            max_parse_lines=rga_max_parse_lines,
         )
 
         returncode = result["returncode"]
@@ -1191,7 +1366,9 @@ class GrepRetriever(BaseRetriever):
 
     @staticmethod
     def merge_results(
-        raw_results: List[Dict[str, Any]], limit: int = 50
+        raw_results: List[Dict[str, Any]],
+        limit: int = 50,
+        max_files: int = 0,
     ) -> List[Dict[str, Any]]:
         """
         Merge ripgrep-all --json output into a structured per-file result list.
@@ -1206,6 +1383,7 @@ class GrepRetriever(BaseRetriever):
         Args:
             raw_results: List of parsed JSON objects from `rga --json` output.
             limit: Maximum number of match items to keep per file (default: 50).
+            max_files: Stop processing after this many unique files (0 = unlimited).
 
         Returns:
             A list of dictionaries, each representing one file with:
@@ -1214,6 +1392,9 @@ class GrepRetriever(BaseRetriever):
               - "lines": List[str]     # lines.text from those matches, in match order
               - "total_matches": int   # total matches found in this file (before limit)
         """
+        import time as _time
+        _t0 = _time.perf_counter()
+
         if not raw_results:
             return []
 
@@ -1221,33 +1402,34 @@ class GrepRetriever(BaseRetriever):
         current_path: Optional[str] = None
         file_matches: List[Dict[str, Any]] = []  # matches for current file
         all_files: List[Dict[str, Any]] = []  # final result accumulator
+        _files_truncated = False
 
         for item in raw_results:
             item_type = item.get("type")
             data = item.get("data", {})
 
             if item_type == "begin":
+                # Early termination: stop when file limit reached
+                if max_files and len(all_files) >= max_files:
+                    _files_truncated = True
+                    break
+
                 # Start a new file context
                 path_obj = data.get("path", {})
                 current_path = path_obj.get("text")
                 file_matches = []  # reset match buffer
 
             elif item_type == "match" and current_path is not None:
-                # Accumulate match; retain full item for sorting & line extraction
-                # Note: 'score' is top-level in your example (not in 'data')
                 file_matches.append(item)
 
             elif item_type == "end":
                 # Finalize current file
                 if current_path is not None:
-                    # Sort matches by score (descending); assume score exists
                     file_matches.sort(key=lambda x: x.get("score", 0.0), reverse=True)
 
                     total_count = len(file_matches)
                     top_matches = file_matches[:limit]
 
-                    # Extract lines.text in match order (not sorted order if stable sort not guaranteed)
-                    # But since we sort, we preserve sorted order → lines follow score order
                     lines = [
                         match["data"]["lines"]["text"]
                         for match in top_matches
@@ -1257,9 +1439,9 @@ class GrepRetriever(BaseRetriever):
                     all_files.append(
                         {
                             "path": current_path,
-                            "matches": top_matches,  # full match objects
-                            "lines": lines,  # list of line strings
-                            "total_matches": total_count,  # before limiting
+                            "matches": top_matches,
+                            "lines": lines,
+                            "total_matches": total_count,
                             "total_score": 0.0,
                         }
                     )
@@ -1270,6 +1452,18 @@ class GrepRetriever(BaseRetriever):
 
             # Ignore "summary" and unknown types
 
+        _elapsed_ms = (_time.perf_counter() - _t0) * 1000
+        if _files_truncated:
+            logger.warning(
+                "[merge_results:defense] stopped at {} files (limit {}), "
+                "raw events processed partially in {:.0f}ms",
+                len(all_files), max_files, _elapsed_ms,
+            )
+        elif _elapsed_ms > 100 or len(raw_results) > 10000:
+            logger.debug(
+                "[merge_results:profile] {} raw events → {} files in {:.0f}ms",
+                len(raw_results), len(all_files), _elapsed_ms,
+            )
         return all_files
 
 

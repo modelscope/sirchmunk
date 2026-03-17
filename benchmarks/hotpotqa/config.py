@@ -97,6 +97,14 @@ class ExperimentConfig:
     # Knowledge reuse
     reuse_knowledge: bool
 
+    # ugrep pre-filtering
+    ugrep_corpus_path: Optional[Path]
+
+    # High-frequency term defense
+    highfreq_file_threshold: int
+    rga_max_parse_lines: int
+    merge_max_files: int
+
     # Concurrency
     max_concurrent: int
     request_delay: float
@@ -106,6 +114,8 @@ class ExperimentConfig:
         self.wiki_corpus_dir = Path(self.wiki_corpus_dir).resolve()
         self.output_dir = Path(self.output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.ugrep_corpus_path is not None:
+            self.ugrep_corpus_path = Path(self.ugrep_corpus_path).resolve()
 
     @property
     def parquet_dir(self) -> Path:
@@ -154,6 +164,10 @@ def get_config(
         "enable_thinking": _bool_env(os.getenv("SIRCHMUNK_ENABLE_THINKING"), False),
         "enable_memory": _bool_env(os.getenv("SIRCHMUNK_ENABLE_MEMORY"), False),
         "reuse_knowledge": _bool_env(os.getenv("HOTPOT_REUSE_KNOWLEDGE"), False),
+        "ugrep_corpus_path": os.getenv("HOTPOT_UGREP_CORPUS_PATH") or None,
+        "highfreq_file_threshold": int(os.getenv("HOTPOT_HIGHFREQ_FILE_THRESHOLD", "2000")),
+        "rga_max_parse_lines": int(os.getenv("HOTPOT_RGA_MAX_PARSE_LINES", "50000")),
+        "merge_max_files": int(os.getenv("HOTPOT_MERGE_MAX_FILES", "2000")),
         "max_concurrent": int(os.getenv("HOTPOT_MAX_CONCURRENT", "5")),
         "request_delay": float(os.getenv("HOTPOT_REQUEST_DELAY", "0.5")),
     }

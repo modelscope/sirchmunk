@@ -145,6 +145,7 @@ class KeywordSearchTool(BaseTool):
         exclude: Optional[List[str]] = None,
         bm25_scorer: Any = None,
         max_count: Optional[int] = None,
+        rga_no_cache: bool = False,
     ) -> None:
         self._retriever = retriever
         self._paths = paths
@@ -155,6 +156,7 @@ class KeywordSearchTool(BaseTool):
         self._exclude = list(set(self._DEFAULT_EXCLUDE) | set(exclude or []))
         self._bm25_scorer = bm25_scorer
         self._max_count = max_count
+        self._rga_no_cache = rga_no_cache
 
     @property
     def name(self) -> str:
@@ -216,6 +218,7 @@ class KeywordSearchTool(BaseTool):
                 max_count=self._max_count,
                 include=self._include,
                 exclude=self._exclude,
+                rga_no_cache=self._rga_no_cache,
                 timeout=30.0,
             )
 
@@ -231,7 +234,11 @@ class KeywordSearchTool(BaseTool):
                     item["_keyword"] = keyword
                 combined.append(item)
 
-        return self._retriever.merge_results(combined, limit=self._max_results * 2)
+        return self._retriever.merge_results(
+            combined,
+            limit=self._max_results * 2,
+            max_files=self._retriever._merge_max_files,
+        )
 
     async def _do_search_regex(
         self,
@@ -258,80 +265,121 @@ class KeywordSearchTool(BaseTool):
             max_count=self._max_count,
             include=self._include,
             exclude=self._exclude,
+            rga_no_cache=self._rga_no_cache,
             timeout=30.0,
         )
-        return self._retriever.merge_results(raw, limit=self._max_results)
+        return self._retriever.merge_results(
+            raw,
+            limit=self._max_results,
+            max_files=self._retriever._merge_max_files,
+        )
 
     async def execute(
         self,
         context: SearchContext,
         **kwargs,
     ) -> Tuple[str, Dict[str, Any]]:
+        import time as _time
+
         keywords: List[str] = kwargs.get("keywords", [])
         if not keywords:
             return "No keywords provided.", {}
 
+        _t_start = _time.perf_counter()
         context.add_search(" ".join(keywords))
 
-        # Progressive relaxation: compound phrases first (high precision),
-        # then individual terms only if phrases yield too few results.
         phrases = [k for k in keywords if " " in k.strip()]
         singles = [k for k in keywords if " " not in k.strip()]
 
         results: List[Dict[str, Any]] = []
+        _phase_hit = ""
 
         # Phase A: search compound phrases first (e.g. "Tivoli Gardens")
         if phrases:
+            _ta = _time.perf_counter()
             results = await self._do_search_per_term(phrases, literal=True, regex=False)
+            logger.info(
+                "[keyword_search:profile] Phase-A phrases={}: {:.2f}s, {} file groups",
+                phrases, _time.perf_counter() - _ta, len(results),
+            )
+            if results:
+                _phase_hit = "A"
 
         # Phase B: add single-word terms only when phrase hits are insufficient.
-        # merge_results already produced per-file dicts, so we merge manually.
         if len(results) < 3 and singles:
+            _tb = _time.perf_counter()
             extra = await self._do_search_per_term(singles, literal=True, regex=False)
+            logger.info(
+                "[keyword_search:profile] Phase-B singles={}: {:.2f}s, {} file groups",
+                singles, _time.perf_counter() - _tb, len(extra) if extra else 0,
+            )
             if extra:
                 seen = {r.get("path") for r in results}
                 for item in extra:
                     if item.get("path") not in seen:
                         results.append(item)
                         seen.add(item.get("path"))
+                _phase_hit = _phase_hit or "B"
 
         # Phase C: if nothing found at all, try all keywords together
         if not results:
+            _tc = _time.perf_counter()
             results = await self._do_search_per_term(keywords, literal=True, regex=False)
+            logger.info(
+                "[keyword_search:profile] Phase-C all={}: {:.2f}s, {} file groups",
+                keywords, _time.perf_counter() - _tc, len(results),
+            )
+            if results:
+                _phase_hit = "C"
 
-        # Phase D: escaped-regex OR search (single rga call, handles
-        # adapters that only work in regex mode — e.g. some PDF/DOCX)
+        # Phase D: escaped-regex OR search
         if not results:
-            logger.info("[keyword_search] Literal per-term empty, trying escaped regex OR")
+            _td = _time.perf_counter()
             results = await self._do_search_regex(keywords)
+            logger.info(
+                "[keyword_search:profile] Phase-D regex: {:.2f}s, {} file groups",
+                _time.perf_counter() - _td, len(results),
+            )
+            if results:
+                _phase_hit = "D"
 
         if not results:
+            _elapsed = _time.perf_counter() - _t_start
+            logger.info(
+                "[keyword_search:profile] TOTAL {:.2f}s — no results | keywords={}",
+                _elapsed, keywords,
+            )
             return "No results found for the given keywords.", {"keywords": keywords, "count": 0}
 
-        # Deduplicate: per-term literal search may return the same file
-        # from multiple keyword passes.  Merge matches by file path.
+        # Deduplicate
+        _t_dedup = _time.perf_counter()
         deduped: Dict[str, List[Dict]] = {}
         for item in results:
             path = item.get("path", "unknown")
             if path not in deduped:
                 deduped[path] = []
             deduped[path].extend(item.get("matches", []))
+        _dedup_ms = (_time.perf_counter() - _t_dedup) * 1000
 
-        # BM25-rerank files when significantly more candidates than limit;
-        # skip the expensive rerank when the overflow is minor (≤ 1.5×).
+        # BM25-rerank files when significantly more candidates than limit
+        _rerank_ms = 0.0
+        _rerank_input = len(deduped)
         _BM25_RERANK_RATIO = 1.5
         if (
             self._bm25_scorer
             and len(deduped) > self._max_results * _BM25_RERANK_RATIO
         ):
+            _tr = _time.perf_counter()
             ranked = self._bm25_rerank_results(keywords, deduped, self._max_results)
+            _rerank_ms = (_time.perf_counter() - _tr) * 1000
             if ranked is not None:
                 deduped = ranked
+            logger.info(
+                "[keyword_search:profile] BM25 rerank {}→{} files: {:.0f}ms",
+                _rerank_input, len(deduped), _rerank_ms,
+            )
 
-        # Format as concise snippets (low token cost).
-        # Use keyword-diverse selection: group matches by _keyword tag
-        # and round-robin so each keyword contributes at least one
-        # snippet when possible.
+        # Format as concise snippets
         output_lines: List[str] = []
         total_chars = 0
         for path, matches in list(deduped.items())[: self._max_results]:
@@ -345,11 +393,26 @@ class KeywordSearchTool(BaseTool):
 
         result_text = "\n\n".join(output_lines)
 
-        # Approximate token count (~4 chars per token)
         approx_tokens = total_chars // 4
-        # Only report the top-N files (same as snippet output) to avoid
-        # flooding downstream phases with thousands of low-relevance paths.
         discovered_paths = list(deduped.keys())[: self._max_results]
+        context.add_discovered_files(discovered_paths)
+
+        _elapsed = _time.perf_counter() - _t_start
+        timing_meta = {
+            "total_sec": round(_elapsed, 2),
+            "phase_hit": _phase_hit,
+            "dedup_ms": round(_dedup_ms, 1),
+            "rerank_ms": round(_rerank_ms, 1),
+            "files_before_dedup": len(results),
+            "files_after_dedup": _rerank_input,
+        }
+        logger.info(
+            "[keyword_search:profile] TOTAL {:.2f}s | phase={} | raw={} dedup={} "
+            "dedup_ms={:.0f} rerank_ms={:.0f} | keywords={}",
+            _elapsed, _phase_hit, len(results), _rerank_input,
+            _dedup_ms, _rerank_ms, keywords,
+        )
+
         context.add_log(
             tool_name=self.name,
             tokens=approx_tokens,
@@ -357,6 +420,7 @@ class KeywordSearchTool(BaseTool):
                 "keywords": keywords,
                 "files_found": len(deduped),
                 "files_discovered": discovered_paths,
+                "timing": timing_meta,
             },
         )
 

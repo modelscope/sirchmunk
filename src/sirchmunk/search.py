@@ -91,6 +91,10 @@ class AgenticSearch(BaseSearch):
         reuse_knowledge: bool = True,
         enable_memory: bool = False,
         rga_max_count: Optional[int] = None,
+        ugrep_corpus_path: Optional[Union[str, Path]] = None,
+        highfreq_file_threshold: int = 0,
+        rga_max_parse_lines: int = 0,
+        merge_max_files: int = 0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -119,7 +123,13 @@ class AgenticSearch(BaseSearch):
             log_callback=log_callback,
         )
 
-        self.grep_retriever: GrepRetriever = GrepRetriever(work_path=self.work_path)
+        self.grep_retriever: GrepRetriever = GrepRetriever(
+            work_path=self.work_path,
+            ugrep_corpus_path=ugrep_corpus_path,
+            highfreq_file_threshold=highfreq_file_threshold,
+            rga_max_parse_lines=rga_max_parse_lines,
+            merge_max_files=merge_max_files,
+        )
 
         # Create bound logger with callback - returns AsyncLogger instance
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
@@ -947,6 +957,32 @@ class AgenticSearch(BaseSearch):
         self._shared_bm25_scorer = BM25Scorer(tokenizer=tokenizer)
         return self._shared_bm25_scorer
 
+    @staticmethod
+    def _detect_text_only_corpus(paths: List[str], sample_limit: int = 20) -> bool:
+        """Check if search paths contain only plain-text files (no binary adapters needed).
+
+        Samples up to *sample_limit* files and returns True when none of the
+        sampled files have a binary-adapter extension (.pdf, .docx, .epub, etc.).
+        For text-only corpora rga adapter caching is useless and the
+        ``--rga-no-cache`` flag should be passed to avoid overhead.
+        """
+        _ADAPTER_EXTS = {".pdf", ".docx", ".odt", ".epub", ".fb2", ".ipynb", ".xlsx"}
+        sampled = 0
+        for p in paths:
+            pp = Path(p)
+            if not pp.is_dir():
+                continue
+            for child in pp.iterdir():
+                if child.is_file():
+                    if child.suffix.lower() in _ADAPTER_EXTS:
+                        return False
+                    sampled += 1
+                    if sampled >= sample_limit:
+                        break
+            if sampled >= sample_limit:
+                break
+        return sampled > 0
+
     def _ensure_tool_registry(
         self,
         paths: List[str],
@@ -996,6 +1032,9 @@ class AgenticSearch(BaseSearch):
         # Tool 1: Knowledge cache (zero cost)
         registry.register(KnowledgeQueryTool(self.knowledge_storage))
 
+        # Detect text-only corpus (extensionless files) to skip rga adapter cache
+        _rga_no_cache = self._detect_text_only_corpus(paths)
+
         # Tool 2: Keyword search (low cost, BM25-reranked)
         registry.register(
             KeywordSearchTool(
@@ -1007,6 +1046,7 @@ class AgenticSearch(BaseSearch):
                 exclude=exclude,
                 bm25_scorer=bm25_scorer,
                 max_count=self._rga_max_count,
+                rga_no_cache=_rga_no_cache,
             )
         )
 
@@ -2047,7 +2087,9 @@ class AgenticSearch(BaseSearch):
                 )
             return None
 
-        merged = GrepRetriever.merge_results(all_raw, limit=20)
+        merged = GrepRetriever.merge_results(
+            all_raw, limit=20, max_files=self.grep_retriever._merge_max_files,
+        )
         if not merged:
             return None
 
