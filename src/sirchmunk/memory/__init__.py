@@ -17,10 +17,13 @@ Usage::
     hint = memory.suggest_strategy("Who invented the telephone?")
 """
 
+from .bridge import MemoryBridge, MemoryPrior
 from .manager import RetrievalMemory
 from .schemas import FeedbackSignal, SimilarQueryHint, StrategyHint
 
 __all__ = [
+    "MemoryBridge",
+    "MemoryPrior",
     "RetrievalMemory",
     "FeedbackSignal",
     "SimilarQueryHint",

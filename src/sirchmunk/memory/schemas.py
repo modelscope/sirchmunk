@@ -171,6 +171,14 @@ class FeedbackSignal:
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
 
+    # BA-ReAct enrichment (populated when belief tracking is active)
+    belief_snapshot: Optional[Dict[str, float]] = None
+    mces_triggered_files: Optional[List[str]] = None
+    ess_at_termination: Optional[float] = None
+    convergence_achieved: bool = False
+    high_value_files: Optional[List[str]] = None
+    dead_candidates: Optional[List[str]] = None
+
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in self.__dict__.items()}
 

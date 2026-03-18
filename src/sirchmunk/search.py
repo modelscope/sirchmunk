@@ -1464,6 +1464,25 @@ class AgenticSearch(BaseSearch):
             f"spec_cache={'YES' if spec_context else 'NO'}"
         )
 
+        # Memory → BeliefState: extract cross-session priors for warm-start
+        _memory_prior = None
+        _memory_bridge = None
+        if self._memory:
+            try:
+                from sirchmunk.memory.bridge import MemoryBridge
+                _memory_bridge = MemoryBridge(self._memory)
+                _candidate_files = list(set(memory_extra_files or []))
+                _memory_prior = _memory_bridge.extract_priors(
+                    query=query,
+                    candidate_files=_candidate_files or None,
+                    extra_files=memory_extra_files,
+                    extra_keywords=(
+                        list(query_keywords.keys()) if query_keywords else None
+                    ),
+                )
+            except Exception:
+                pass
+
         # ==============================================================
         # Phase 2: ReAct-driven iterative retrieval
         # The agent receives Phase 1 warm-start data (keywords, spec
@@ -1479,6 +1498,7 @@ class AgenticSearch(BaseSearch):
             max_loops=max_loops, max_token_budget=max_token_budget,
             max_depth=max_depth, include=include, exclude=exclude,
             enable_thinking=enable_thinking,
+            memory_prior=_memory_prior,
         )
 
         # ==============================================================
@@ -1519,7 +1539,7 @@ class AgenticSearch(BaseSearch):
             if isinstance(r, Exception):
                 _loguru_logger.warning(f"[Phase 4] Persistence task failed: {r}")
 
-        # Memory: record feedback signal (fire-and-forget)
+        # Memory: record feedback signal enriched with belief data
         if self._memory:
             try:
                 from sirchmunk.memory.schemas import FeedbackSignal
@@ -1535,6 +1555,21 @@ class AgenticSearch(BaseSearch):
                         for p in log_entry.metadata.get("files_discovered", []):
                             if p not in _discovered:
                                 _discovered.append(p)
+
+                belief_state = getattr(context, "belief_state", None)
+                _high_value = []
+                if belief_state:
+                    try:
+                        _high_value = belief_state.to_feedback_dict().get(
+                            "high_value_files", [],
+                        )
+                    except Exception:
+                        pass
+                _useful_count = (
+                    len(_high_value) if _high_value
+                    else (len(context.read_file_ids) if (answer and answer.strip()) else 0)
+                )
+
                 signal = FeedbackSignal(
                     query=query,
                     mode="DEEP",
@@ -1545,7 +1580,7 @@ class AgenticSearch(BaseSearch):
                     ),
                     react_loops=context.loop_count,
                     files_read_count=len(context.read_file_ids),
-                    files_useful_count=len(context.read_file_ids) if (answer and answer.strip()) else 0,
+                    files_useful_count=_useful_count,
                     total_tokens=context.total_llm_tokens,
                     latency_sec=elapsed,
                     keywords_used=list(query_keywords.keys()) if query_keywords else [],
@@ -1553,6 +1588,14 @@ class AgenticSearch(BaseSearch):
                     files_read=list(context.read_file_ids),
                     files_discovered=_discovered,
                 )
+
+                # Enrich with BA-ReAct belief data
+                if _memory_bridge and belief_state:
+                    try:
+                        _memory_bridge.enrich_feedback(signal, belief_state)
+                    except Exception:
+                        pass
+
                 asyncio.ensure_future(self._memory.record_feedback(signal))
             except Exception:
                 pass
@@ -2989,11 +3032,14 @@ class AgenticSearch(BaseSearch):
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         enable_thinking: bool = False,
+        memory_prior: Any = None,
     ) -> Tuple[str, SearchContext]:
         """Fall back to ReAct loop when parallel probing yields insufficient evidence.
 
         The ReAct agent receives pre-extracted keywords and cached
         directory context so it doesn't waste turns re-discovering them.
+        When *memory_prior* is provided, the agent's BeliefState is
+        warm-started with cross-session priors from RetrievalMemory.
         """
         from sirchmunk.agentic.react_agent import ReActSearchAgent
 
@@ -3010,6 +3056,7 @@ class AgenticSearch(BaseSearch):
             max_token_budget=max_token_budget,
             enable_thinking=enable_thinking,
             enable_decomposition=True,
+            memory_prior=memory_prior,
         )
 
         augmented_query = query

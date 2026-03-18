@@ -10,7 +10,7 @@ state is tracked via SearchContext (token budget, file dedup, logs).
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 from sirchmunk.agentic.belief_state import BeliefState
 from sirchmunk.agentic.prompts import (
@@ -142,6 +142,7 @@ class ReActSearchAgent:
         enable_thinking: bool = False,
         enable_decomposition: bool = True,
         enable_belief_tracking: bool = True,
+        memory_prior: Any = None,
     ) -> None:
         self.llm = llm
         self.registry = tool_registry
@@ -150,6 +151,7 @@ class ReActSearchAgent:
         self.enable_thinking = enable_thinking
         self.enable_decomposition = enable_decomposition
         self.enable_belief_tracking = enable_belief_tracking
+        self._memory_prior = memory_prior
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
 
     # ---- Public API ----
@@ -178,7 +180,10 @@ class ReActSearchAgent:
         context.query = query
 
         if self.enable_belief_tracking:
-            context.belief_state = BeliefState()
+            belief = BeliefState()
+            if self._memory_prior is not None:
+                belief.warm_start(self._memory_prior)
+            context.belief_state = belief
 
         # Build tool descriptions for the system prompt
         tool_descriptions = _build_tool_descriptions(self.registry)
@@ -547,7 +552,8 @@ class ReActSearchAgent:
         """Build the loop continuation prompt with current state.
 
         Appends BA-ReAct advisory signals (e.g., promising unread files,
-        evidence concentration) when a belief state is available.
+        evidence concentration, chain hints) when a belief state is
+        available.
         """
         base = REACT_CONTINUATION_PROMPT.format(
             budget_remaining=context.budget_remaining,
@@ -560,6 +566,13 @@ class ReActSearchAgent:
             advisory = belief.get_advisory()
             if advisory:
                 base += f"\n{advisory}"
+            # Inject reasoning chain hint in early rounds
+            chain = belief.chain_hint
+            if chain and context.loop_count <= 2:
+                steps = " → ".join(
+                    s.get("action", "?") for s in chain[:4]
+                )
+                base += f"\nSuggested reasoning pattern: {steps}"
         return base
 
     @staticmethod

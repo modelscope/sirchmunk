@@ -363,6 +363,46 @@ class RetrievalMemory:
         except Exception as exc:
             logger.debug(f"[memory:dispatch] FailureMemory failed: {exc}")
 
+        # 6b. BA-ReAct: fine-grained PathMemory from belief snapshot
+        if signal.belief_snapshot:
+            try:
+                for fp, belief in list(signal.belief_snapshot.items())[:30]:
+                    self._path_memory.record_retrieval(
+                        fp, useful=(belief >= 0.5),
+                    )
+            except Exception as exc:
+                logger.debug(
+                    f"[memory:dispatch] belief→PathMemory failed: {exc}",
+                )
+
+        # 6c. BA-ReAct: dead-path candidates from belief tracking
+        if signal.dead_candidates:
+            try:
+                for fp in signal.dead_candidates[:20]:
+                    self._failure_memory.record_path_result(
+                        fp, useful=False,
+                    )
+            except Exception as exc:
+                logger.debug(
+                    f"[memory:dispatch] belief→FailureMemory failed: {exc}",
+                )
+
+        # 6d. BA-ReAct: high-value files as entity-path associations
+        if signal.high_value_files and signal.keywords_used:
+            try:
+                entities = CorpusMemory.extract_entities(
+                    signal.keywords_used,
+                )
+                for entity in entities[:10]:
+                    for fp in signal.high_value_files[:10]:
+                        self._corpus_memory.record_entity_path(
+                            entity, fp, success=True,
+                        )
+            except Exception as exc:
+                logger.debug(
+                    f"[memory:dispatch] belief→CorpusMemory failed: {exc}",
+                )
+
         # 7. QuerySimilarityIndex — record for future similarity lookup
         try:
             self._query_similarity.record(
