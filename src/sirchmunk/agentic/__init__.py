@@ -6,6 +6,7 @@ from .tools import (
     FileReadTool,
     KeywordSearchTool,
     KnowledgeQueryTool,
+    TitleLookupTool,
     ToolRegistry,
 )
 
@@ -16,5 +17,6 @@ __all__ = [
     "KeywordSearchTool",
     "FileReadTool",
     "KnowledgeQueryTool",
+    "TitleLookupTool",
     "DirScanTool",
 ]

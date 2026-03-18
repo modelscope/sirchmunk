@@ -11,7 +11,7 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.schema.search_context import SearchContext
@@ -856,3 +856,104 @@ class KnowledgeQueryTool(BaseTool):
         )
 
         return result_text, {"query": query, "clusters_found": len(clusters)}
+
+
+# ---------------------------------------------------------------------------
+# Tool 4: Title Lookup (zero cost — direct index lookup)
+# ---------------------------------------------------------------------------
+
+class TitleLookupTool(BaseTool):
+    """Look up document/article file paths by exact title.
+
+    Uses an externally-provided title-to-filepath index for O(1) lookup.
+    Useful when the agent already knows the exact title of a document
+    (e.g., from entity chaining in multi-hop reasoning) and wants to
+    jump directly to the containing file without a full keyword search.
+
+    Args:
+        lookup_fn: Callable that maps a title string to a list of file
+            paths.  If ``None``, the tool gracefully reports that no
+            title index is available.
+    """
+
+    def __init__(
+        self,
+        lookup_fn: Optional[Callable[[str], List[str]]] = None,
+    ) -> None:
+        self._lookup_fn = lookup_fn
+
+    @property
+    def name(self) -> str:
+        return "title_lookup"
+
+    def get_schema(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": (
+                "Look up a document/article by its exact title and return "
+                "the file path(s) containing it. Instant lookup with zero "
+                "token cost. Use this when you already know the exact title "
+                "of an article or document you want to read — much faster "
+                "than keyword_search for known titles."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": (
+                            "The exact title of the document or article to look up."
+                        ),
+                    },
+                },
+                "required": ["title"],
+            },
+        }
+
+    async def execute(
+        self,
+        context: SearchContext,
+        **kwargs,
+    ) -> Tuple[str, Dict[str, Any]]:
+        title: str = kwargs.get("title", "").strip()
+        if not title:
+            return "No title provided.", {}
+
+        if self._lookup_fn is None:
+            return (
+                "Title index is not available for this corpus. "
+                "Use keyword_search instead."
+            ), {"title": title, "available": False}
+
+        try:
+            paths = self._lookup_fn(title)
+        except Exception as exc:
+            logger.warning("title_lookup error for %r: %s", title, exc)
+            return (
+                f"Title lookup failed: {exc}. Use keyword_search as fallback."
+            ), {"title": title, "error": str(exc)}
+
+        meta = {"title": title, "paths_found": len(paths)}
+
+        if not paths:
+            return (
+                f"No files found for title \"{title}\". "
+                f"The title may be misspelled or not in the corpus. "
+                f"Try keyword_search with the entity name instead."
+            ), meta
+
+        context.add_log(
+            tool_name=self.name,
+            tokens=0,
+            metadata=meta,
+        )
+
+        lines = [f"Found {len(paths)} file(s) for \"{title}\":"]
+        for p in paths[:5]:
+            lines.append(f"  - {p}")
+        if len(paths) > 5:
+            lines.append(f"  ... and {len(paths) - 5} more")
+        lines.append("\nUse file_read to read the content. "
+                      "Provide the title as a keyword for targeted extraction.")
+
+        return "\n".join(lines), meta

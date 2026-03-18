@@ -80,6 +80,7 @@ class ExperimentConfig:
 
     # Post-processing
     extract_answer: bool
+    enable_reflection: bool
 
     # Evaluation
     enable_llm_judge: bool
@@ -160,6 +161,7 @@ def get_config(
         "llm_model": os.getenv("LLM_MODEL_NAME", ""),
         "llm_timeout": float(os.getenv("LLM_TIMEOUT", "120")),
         "extract_answer": _bool_env(os.getenv("HOTPOT_EXTRACT_ANSWER"), True),
+        "enable_reflection": _bool_env(os.getenv("HOTPOT_ENABLE_REFLECTION"), True),
         "enable_llm_judge": _bool_env(os.getenv("HOTPOT_ENABLE_LLM_JUDGE"), True),
         "judge_f1_threshold": float(os.getenv("HOTPOT_JUDGE_F1_THRESHOLD", "0.3")),
         "enable_gpt_eval": _bool_env(os.getenv("HOTPOT_ENABLE_GPT_EVAL"), True),

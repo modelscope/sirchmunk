@@ -13,6 +13,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from sirchmunk.agentic.prompts import (
+    QUERY_DECOMPOSITION_PROMPT,
     REACT_CONTINUATION_PROMPT,
     REACT_SYSTEM_PROMPT,
 )
@@ -138,12 +139,14 @@ class ReActSearchAgent:
         max_token_budget: int = 64000,
         log_callback: LogCallback = None,
         enable_thinking: bool = False,
+        enable_decomposition: bool = True,
     ) -> None:
         self.llm = llm
         self.registry = tool_registry
         self.max_loops = max_loops
         self.max_token_budget = max_token_budget
         self.enable_thinking = enable_thinking
+        self.enable_decomposition = enable_decomposition
         self._logger = create_logger(log_callback=log_callback, enable_async=True)
 
     # ---- Public API ----
@@ -173,7 +176,17 @@ class ReActSearchAgent:
         # Build tool descriptions for the system prompt
         tool_descriptions = _build_tool_descriptions(self.registry)
 
+        # Adaptive question decomposition: assess complexity and generate
+        # a search plan for multi-hop queries.
+        decomposition_hint = ""
+        if self.enable_decomposition:
+            decomposition_hint = await self._maybe_decompose_query(query, context)
+
         # Build the initial conversation
+        user_message = self._build_user_message(query, images)
+        if decomposition_hint:
+            user_message += f"\n\n{decomposition_hint}"
+
         messages: List[Dict[str, Any]] = [
             {
                 "role": "system",
@@ -181,7 +194,7 @@ class ReActSearchAgent:
             },
             {
                 "role": "user",
-                "content": self._build_user_message(query, images),
+                "content": user_message,
             },
         ]
 
@@ -379,6 +392,66 @@ class ReActSearchAgent:
         return final_answer, context
 
     # ---- Internal helpers ----
+
+    async def _maybe_decompose_query(
+        self,
+        query: str,
+        context: SearchContext,
+    ) -> str:
+        """Assess query complexity and optionally decompose into sub-questions.
+
+        Uses a lightweight LLM call to determine whether the query needs
+        multi-hop reasoning.  If so, returns a formatted hint string with
+        sub-questions to prepend to the user message.  If the query is
+        simple or the call fails, returns an empty string.
+
+        The token cost of this call is charged to the search context.
+        """
+        prompt = QUERY_DECOMPOSITION_PROMPT.format(query=query)
+        try:
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}],
+                stream=False,
+            )
+            usage = resp.usage or {}
+            total_tok = usage.get("total_tokens", 0)
+            if total_tok == 0:
+                total_tok = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+            context.add_llm_tokens(total_tok, usage=usage if usage else None)
+
+            raw = (resp.content or "").strip()
+
+            # Extract JSON from potential markdown wrapping
+            brace_start = raw.find("{")
+            brace_end = raw.rfind("}")
+            if brace_start >= 0 and brace_end > brace_start:
+                raw = raw[brace_start:brace_end + 1]
+
+            parsed = json.loads(raw)
+            needs = parsed.get("needs_decomposition", False)
+            if not needs:
+                await self._logger.info("[ReAct] Query decomposition: simple query, no decomposition needed")
+                return ""
+
+            sub_qs = parsed.get("sub_questions", [])
+            r_type = parsed.get("reasoning_type", "bridge")
+            if not sub_qs:
+                return ""
+
+            await self._logger.info(
+                f"[ReAct] Query decomposition: {r_type} type, "
+                f"{len(sub_qs)} sub-question(s)"
+            )
+
+            lines = [f"[Search plan — {r_type} reasoning]"]
+            for i, sq in enumerate(sub_qs, 1):
+                lines.append(f"  Step {i}: {sq}")
+            lines.append("Follow this plan in order. Each step may depend on the previous one's result.")
+            return "\n".join(lines)
+
+        except Exception as exc:
+            await self._logger.warning(f"[ReAct] Query decomposition failed: {exc}")
+            return ""
 
     async def _call_llm(
         self,

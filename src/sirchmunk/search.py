@@ -63,12 +63,14 @@ class AgenticSearch(BaseSearch):
         highfreq_file_threshold: int = 0,
         rga_max_parse_lines: int = 0,
         merge_max_files: int = 0,
+        title_lookup_fn=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
         # Store rga max_count setting
         self._rga_max_count = rga_max_count
+        self._title_lookup_fn = title_lookup_fn
 
         # Normalise and store default search paths
         if paths is not None:
@@ -978,6 +980,7 @@ class AgenticSearch(BaseSearch):
             FileReadTool,
             KeywordSearchTool,
             KnowledgeQueryTool,
+            TitleLookupTool,
             ToolRegistry,
         )
 
@@ -1025,7 +1028,13 @@ class AgenticSearch(BaseSearch):
             base_paths=paths,  # Enable path resolution fallback
         ))
 
-        # Tool 4: Directory scan (optional, medium cost)
+        # Tool 4: Title lookup (zero cost — direct index lookup)
+        if self._title_lookup_fn is not None:
+            registry.register(TitleLookupTool(
+                lookup_fn=self._title_lookup_fn,
+            ))
+
+        # Tool 5: Directory scan (optional, medium cost)
         if enable_dir_scan:
             from sirchmunk.agentic.dir_scan_tool import DirScanTool
             from sirchmunk.scan.dir_scanner import DirectoryScanner
@@ -2851,6 +2860,7 @@ class AgenticSearch(BaseSearch):
             max_loops=max_loops,
             max_token_budget=max_token_budget,
             enable_thinking=enable_thinking,
+            enable_decomposition=True,
         )
 
         augmented_query = query

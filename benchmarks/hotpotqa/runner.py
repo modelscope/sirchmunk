@@ -448,14 +448,14 @@ async def _extract_sp_with_llm(
     llm: Any,
     evidence_texts: Optional[List[str]] = None,
     reasoning_texts: Optional[List[str]] = None,
-) -> Tuple[Set[str], List[List]]:
+) -> Tuple[Set[str], List[List], Dict[str, List[str]]]:
     """Extract supporting facts using LLM post-processing.
 
     Replaces heuristic substring matching with a single LLM call that
     understands the question semantics and selects precise (title, sent_id)
     pairs in the same format as the official gold data.
 
-    Returns (all_titles, predicted_sp).
+    Returns (all_titles, predicted_sp, candidates_dict).
     """
     from pathlib import Path as _Path
     files_read = [str(_Path(f).resolve()) for f in files_read]
@@ -469,7 +469,7 @@ async def _extract_sp_with_llm(
     candidates = _select_candidate_articles(articles, context)
 
     if not candidates:
-        return all_titles, []
+        return all_titles, [], {}
 
     candidates_text = _format_candidates_for_llm(candidates)
 
@@ -511,11 +511,103 @@ async def _extract_sp_with_llm(
                 if title in valid_titles and 0 <= sid < len(candidates[title]):
                     predicted_sp.append([title, sid])
 
-        return all_titles, predicted_sp
+        return all_titles, predicted_sp, candidates
 
     except Exception as e:
         logger.warning("SP LLM extraction failed: %s", e)
-        return all_titles, []
+        return all_titles, [], candidates
+
+
+# ---------------------------------------------------------------------------
+# Answer reflection (optional post-processing)
+# ---------------------------------------------------------------------------
+
+_REFLECTION_PROMPT = """\
+You are verifying whether an extracted answer is correct and well-formed.
+
+Question: {question}
+Current answer: {answer}
+
+Supporting evidence (sentences identified as relevant):
+{evidence}
+
+Instructions:
+1. Check if the current answer is CONSISTENT with the supporting evidence.
+2. Check if the answer is in the correct FORM:
+   - If the question asks "who", the answer should be a person/entity name (not an adjective).
+   - If the question asks "where", the answer should be a place name.
+   - Nationality questions: use the NOUN form of the country (e.g., "Armenia" not "Armenian") \
+unless the question explicitly asks for the adjective.
+   - Use the FULL name as it appears in the evidence, not abbreviated or partial.
+3. Check if the answer is COMPLETE — not truncated or missing key parts.
+
+Output rules:
+- If the answer is correct and well-formed, output it EXACTLY as-is.
+- If the answer needs correction, output ONLY the corrected answer (1-10 words).
+- Do NOT add explanations. Output ONLY the answer.
+
+Verified answer:"""
+
+
+async def _reflect_on_answer(
+    question: str,
+    answer: str,
+    predicted_sp: List[List],
+    candidates: Dict[str, List[str]],
+    llm: Any,
+) -> str:
+    """Verify and optionally rewrite the answer using supporting evidence.
+
+    Uses the predicted supporting fact sentences as grounding evidence to
+    check answer consistency, form correctness, and completeness.  Returns
+    the original answer if reflection fails or produces no improvement.
+    """
+    if not answer or not predicted_sp or not candidates:
+        return answer
+
+    evidence_lines: List[str] = []
+    for title, sid in predicted_sp:
+        sents = candidates.get(title if isinstance(title, str) else str(title), [])
+        sid_int = int(sid) if not isinstance(sid, int) else sid
+        if 0 <= sid_int < len(sents):
+            sent = sents[sid_int].strip()
+            if sent:
+                evidence_lines.append(f"[{title}, sent {sid_int}]: {sent[:300]}")
+
+    if not evidence_lines:
+        return answer
+
+    evidence_text = "\n".join(evidence_lines)
+    prompt = _REFLECTION_PROMPT.format(
+        question=question,
+        answer=answer,
+        evidence=evidence_text,
+    )
+
+    try:
+        resp = await llm.achat(
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+        reflected = (resp.content or "").strip()
+
+        if not reflected or reflected.lower() in ("unknown", ""):
+            return answer
+
+        reflected = _normalize_prediction(reflected)
+        if not reflected:
+            return answer
+
+        if reflected.lower() != answer.lower():
+            logger.info(
+                "Reflection rewrote answer: %r -> %r", answer, reflected,
+            )
+
+        return reflected
+
+    except Exception as exc:
+        logger.warning("Answer reflection failed: %s", exc)
+        return answer
 
 
 _SAMPLE_RETRYABLE_KEYWORDS = ("429", "RateLimitError", "rate limit",
@@ -596,7 +688,7 @@ async def run_single(
                 evidence_texts = _collect_evidence_texts(cluster, result)
                 _reasoning_texts = list(getattr(result, "reasoning_texts", None) or [])
 
-                titles, predicted_sp = await _extract_sp_with_llm(
+                titles, predicted_sp, sp_candidates = await _extract_sp_with_llm(
                     question, raw_answer, files_read, llm,
                     evidence_texts=evidence_texts,
                     reasoning_texts=_reasoning_texts,
@@ -618,6 +710,12 @@ async def run_single(
                         answer = _normalize_prediction(raw_answer)
                 else:
                     answer = _normalize_prediction(raw_answer)
+
+                if cfg.enable_reflection and answer:
+                    answer = await _reflect_on_answer(
+                        question, answer, predicted_sp,
+                        sp_candidates, llm,
+                    )
             except Exception as e:
                 error = str(e)
 
@@ -689,6 +787,7 @@ async def run_batch(
         highfreq_file_threshold=cfg.highfreq_file_threshold,
         rga_max_parse_lines=cfg.rga_max_parse_lines,
         merge_max_files=cfg.merge_max_files,
+        title_lookup_fn=lookup_title_files if _TITLE_INDEX_BUILT else None,
     )
 
     semaphore = asyncio.Semaphore(cfg.max_concurrent)
