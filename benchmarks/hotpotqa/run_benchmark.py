@@ -199,13 +199,15 @@ def _print_leaderboard_table(
 
 
 def _print_diagnostic_table(title: str, rows: list, row_label_key: str = "label"):
-    """Print diagnostic metrics (Contain-Acc, Ev Recall)."""
+    """Print diagnostic metrics (Contain-Acc, Ev Recall, SP Title F1)."""
     print(f"\n  {title}")
-    print(f"  {'':12s} {'N':>5s}  │ {'Cont-Acc':>8s} {'Ev Recall':>9s}")
-    print(f"  {'─' * 12} {'─' * 5}──┼─{'─' * 8}─{'─' * 9}")
+    print(f"  {'':12s} {'N':>5s}  │ {'Cont-Acc':>8s} {'Ev Recall':>9s} │ {'SP TitleF1':>10s}")
+    print(f"  {'─' * 12} {'─' * 5}──┼─{'─' * 8}─{'─' * 9}─┼─{'─' * 10}")
     for r in rows:
+        sp_tf1 = _pct(r.get('sp_title_f1', 0))
         print(f"  {r[row_label_key]:<12s} {r['count']:>5d}  │"
-              f" {_pct(r['contain']):>8s} {_pct(r['ev_recall']):>9s}")
+              f" {_pct(r['contain']):>8s} {_pct(r['ev_recall']):>9s} │"
+              f" {sp_tf1:>10s}")
 
 
 def print_report(metrics, results, total_time, judge_results, gpt_acc, cfg):
@@ -505,6 +507,7 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
         "diagnostic_metrics": {
             "contain_acc": _round_metric(ov.get("contain", 0)),
             "ev_recall": _round_metric(ov.get("ev_recall", 0)),
+            "sp_title_f1": _round_metric(ov.get("sp_title_f1", 0)),
         },
         "gpt_eval": {
             "accuracy": round(gpt_acc * 100, 2) if gpt_acc is not None else None,

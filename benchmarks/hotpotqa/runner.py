@@ -47,18 +47,31 @@ def _normalize_title(title: str) -> str:
     return title.lower().strip()
 
 
-def build_title_index(wiki_corpus_dir: Path, progress_interval: int = 1000) -> int:
-    """Build title→filepath index from Wikipedia JSONL files.
+def _find_corpus_files(wiki_corpus_dir: Path) -> List[Path]:
+    """Discover indexable corpus files in the wiki directory.
 
-    Scans all .jsonl files in the corpus directory, parses article titles,
-    and builds a mapping for efficient lookup. Called once at startup.
+    Supports two layouts:
+      1. ``*.jsonl`` files (explicit extension)
+      2. HotpotQA wiki dump: ``<subdir>/wiki_*`` files with no extension,
+         where each line is a JSON object with a ``"title"`` key.
+    """
+    jsonl_files = list(wiki_corpus_dir.rglob("*.jsonl"))
+    if jsonl_files:
+        return jsonl_files
 
-    Args:
-        wiki_corpus_dir: Root directory containing Wikipedia JSONL files.
-        progress_interval: Print progress every N files.
+    wiki_files = sorted(wiki_corpus_dir.rglob("wiki_*"))
+    return [f for f in wiki_files if f.is_file() and f.suffix not in (".bz2",)]
+
+
+def build_title_index(wiki_corpus_dir: Path, progress_interval: int = 2000) -> int:
+    """Build title->filepath index from Wikipedia corpus files.
+
+    Scans corpus files (JSONL or HotpotQA wiki_* dumps), parses article
+    titles, and builds a normalised title -> filepath mapping for O(1)
+    lookup.  Called once at startup.
 
     Returns:
-        Number of titles indexed.
+        Number of unique titles indexed.
     """
     global _WIKI_TITLE_INDEX, _TITLE_INDEX_BUILT
 
@@ -75,16 +88,20 @@ def build_title_index(wiki_corpus_dir: Path, progress_interval: int = 1000) -> i
     files_processed = 0
     titles_indexed = 0
 
-    # Find all JSONL files
-    jsonl_files = list(wiki_corpus_dir.rglob("*.jsonl"))
-    print(f"[TitleIndex] Found {len(jsonl_files)} JSONL files to index")
+    corpus_files = _find_corpus_files(wiki_corpus_dir)
+    print(f"[TitleIndex] Found {len(corpus_files)} corpus files to index")
 
-    for jsonl_path in jsonl_files:
+    if not corpus_files:
+        print("[TitleIndex] No corpus files found — title_lookup will be unavailable")
+        _TITLE_INDEX_BUILT = True
+        return 0
+
+    for fpath in corpus_files:
         try:
-            with open(jsonl_path, encoding="utf-8") as f:
+            with open(fpath, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
-                    if not line:
+                    if not line or not line.startswith("{"):
                         continue
                     try:
                         obj = json_mod.loads(line)
@@ -93,7 +110,7 @@ def build_title_index(wiki_corpus_dir: Path, progress_interval: int = 1000) -> i
                             norm_title = _normalize_title(title)
                             if norm_title not in _WIKI_TITLE_INDEX:
                                 _WIKI_TITLE_INDEX[norm_title] = []
-                            fp_str = str(jsonl_path)
+                            fp_str = str(fpath)
                             if fp_str not in _WIKI_TITLE_INDEX[norm_title]:
                                 _WIKI_TITLE_INDEX[norm_title].append(fp_str)
                             titles_indexed += 1
@@ -101,9 +118,10 @@ def build_title_index(wiki_corpus_dir: Path, progress_interval: int = 1000) -> i
                         continue
             files_processed += 1
             if files_processed % progress_interval == 0:
-                print(f"[TitleIndex] Processed {files_processed}/{len(jsonl_files)} files, "
-                      f"{titles_indexed} titles indexed")
-        except (FileNotFoundError, PermissionError, UnicodeDecodeError) as e:
+                elapsed_so_far = time.time() - start_time
+                print(f"[TitleIndex] Processed {files_processed}/{len(corpus_files)} files, "
+                      f"{titles_indexed} titles ({elapsed_so_far:.1f}s)")
+        except (FileNotFoundError, PermissionError, UnicodeDecodeError):
             continue
 
     elapsed = time.time() - start_time
@@ -341,6 +359,32 @@ def _detect_answer_format(question: str) -> str:
     return "a short factual phrase (1-10 words)"
 
 
+def _collect_sp_evidence_lines(
+    predicted_sp: List[List],
+    candidates: Dict[str, List[str]],
+) -> List[str]:
+    """Build evidence lines from predicted SP for extraction / reflection."""
+    evidence_lines: List[str] = []
+    for sp_item in predicted_sp:
+        title = sp_item[0] if isinstance(sp_item, (list, tuple)) and len(sp_item) >= 2 else ""
+        sid = int(sp_item[1]) if isinstance(sp_item, (list, tuple)) and len(sp_item) >= 2 else -1
+        sents = candidates.get(title, [])
+        if 0 <= sid < len(sents):
+            sent = sents[sid].strip()
+            if sent:
+                evidence_lines.append(f"[{title}]: {sent[:300]}")
+    return evidence_lines
+
+
+def _raw_answer_in_evidence(raw_answer: str, evidence_lines: List[str]) -> bool:
+    """Check if the (normalised) raw answer appears in any evidence line."""
+    norm = _normalize_prediction(raw_answer)
+    if not norm:
+        return False
+    evidence_blob = " ".join(evidence_lines).lower()
+    return norm.lower() in evidence_blob
+
+
 async def _extract_grounded_answer(
     question: str,
     predicted_sp: List[List],
@@ -355,18 +399,15 @@ async def _extract_grounded_answer(
     rather than generating freely.  This reduces form mismatches and
     hallucinated entities.
 
+    After extraction, applies a **safety gate**: if the extracted answer
+    diverges from the ReAct chain's raw answer *and* the raw answer is
+    already present in the evidence, the raw answer is preferred — the
+    multi-step ReAct reasoning is trusted over a single-shot extraction
+    that may be misled by surface evidence mentions.
+
     Returns the extracted answer, or empty string on failure.
     """
-    evidence_lines: List[str] = []
-    for sp_item in predicted_sp:
-        title = sp_item[0] if isinstance(sp_item, (list, tuple)) and len(sp_item) >= 2 else ""
-        sid = int(sp_item[1]) if isinstance(sp_item, (list, tuple)) and len(sp_item) >= 2 else -1
-        sents = candidates.get(title, [])
-        if 0 <= sid < len(sents):
-            sent = sents[sid].strip()
-            if sent:
-                evidence_lines.append(f"[{title}]: {sent[:300]}")
-
+    evidence_lines = _collect_sp_evidence_lines(predicted_sp, candidates)
     if not evidence_lines:
         return ""
 
@@ -389,6 +430,18 @@ async def _extract_grounded_answer(
 
         if not answer or answer.upper() == "INSUFFICIENT":
             return ""
+
+        raw_norm = _normalize_prediction(raw_answer)
+        ext_norm = _normalize_prediction(answer)
+
+        if raw_norm and ext_norm and raw_norm.lower() != ext_norm.lower():
+            if _raw_answer_in_evidence(raw_answer, evidence_lines):
+                logger.info(
+                    "Safety gate: keeping raw answer %r (grounded in evidence) "
+                    "over extraction %r",
+                    raw_norm, ext_norm,
+                )
+                return raw_norm
 
         return answer
     except Exception as exc:
@@ -673,6 +726,41 @@ Output rules:
 Verified answer:"""
 
 
+def _should_reflect(
+    question: str,
+    answer: str,
+    raw_answer: str,
+) -> bool:
+    """Decide whether reflection is worthwhile for this sample.
+
+    Triggers reflection only when there is meaningful ambiguity or
+    form-correction opportunity, avoiding unnecessary LLM calls for
+    samples where the answer is already clean and unambiguous.
+    """
+    if not answer:
+        return False
+
+    raw_norm = _normalize_prediction(raw_answer) if raw_answer else ""
+    ans_norm = _normalize_prediction(answer)
+
+    # 1) Post-processing changed the answer — verify the change
+    if raw_norm and ans_norm and raw_norm.lower() != ans_norm.lower():
+        return True
+
+    # 2) Verbose answer that may still contain noise
+    if len(answer.split()) > 15:
+        return True
+
+    # 3) Format mismatch — yes/no question with non-yes/no answer
+    q_lower = question.strip().lower()
+    first_word = q_lower.split()[0].rstrip(",.?") if q_lower else ""
+    if first_word in _YES_NO_STARTERS:
+        if ans_norm.lower() not in ("yes", "no"):
+            return True
+
+    return False
+
+
 async def _reflect_on_answer(
     question: str,
     answer: str,
@@ -689,15 +777,7 @@ async def _reflect_on_answer(
     if not answer or not predicted_sp or not candidates:
         return answer
 
-    evidence_lines: List[str] = []
-    for title, sid in predicted_sp:
-        sents = candidates.get(title if isinstance(title, str) else str(title), [])
-        sid_int = int(sid) if not isinstance(sid, int) else sid
-        if 0 <= sid_int < len(sents):
-            sent = sents[sid_int].strip()
-            if sent:
-                evidence_lines.append(f"[{title}, sent {sid_int}]: {sent[:300]}")
-
+    evidence_lines = _collect_sp_evidence_lines(predicted_sp, candidates)
     if not evidence_lines:
         return answer
 
@@ -847,10 +927,11 @@ async def run_single(
                     answer = _normalize_prediction(raw_answer)
 
                 if cfg.enable_reflection and answer:
-                    answer = await _reflect_on_answer(
-                        question, answer, predicted_sp,
-                        sp_candidates, llm,
-                    )
+                    if _should_reflect(question, answer, raw_answer):
+                        answer = await _reflect_on_answer(
+                            question, answer, predicted_sp,
+                            sp_candidates, llm,
+                        )
             except Exception as e:
                 error = str(e)
 
@@ -926,7 +1007,7 @@ async def run_batch(
         highfreq_file_threshold=cfg.highfreq_file_threshold,
         rga_max_parse_lines=cfg.rga_max_parse_lines,
         merge_max_files=cfg.merge_max_files,
-        title_lookup_fn=lookup_title_files if _TITLE_INDEX_BUILT else None,
+        title_lookup_fn=lookup_title_files if _WIKI_TITLE_INDEX else None,
     )
 
     semaphore = asyncio.Semaphore(cfg.max_concurrent)

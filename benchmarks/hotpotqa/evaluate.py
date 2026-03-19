@@ -134,11 +134,69 @@ def sp_prec_recall_f1(
 
 
 # ---------------------------------------------------------------------------
-# Title-level evidence recall (diagnostic, non-leaderboard)
+# Title-level diagnostics (non-leaderboard)
 # ---------------------------------------------------------------------------
 
 def _normalize_title(t: str) -> str:
     return re.sub(r"[^a-z0-9 ]", "", t.lower()).strip()
+
+
+def _strip_disambiguation(t: str) -> str:
+    """Remove Wikipedia disambiguation suffixes like '(film)', '(band)'."""
+    return re.sub(r"\s*\([^)]*\)\s*$", "", t).strip()
+
+
+def _fuzzy_title_match(pred_title: str, gold_title: str) -> bool:
+    """Check if two titles refer to the same entity with lenient matching.
+
+    Handles disambiguation suffixes and containment, e.g.:
+      - "Universal Soldier (franchise)" vs "Universal Soldier: Day of Reckoning"
+      - "The Outsiders (film)" vs "The Outsiders"
+    """
+    np = _normalize_title(pred_title)
+    ng = _normalize_title(gold_title)
+    if np == ng:
+        return True
+    np_stripped = _normalize_title(_strip_disambiguation(pred_title))
+    ng_stripped = _normalize_title(_strip_disambiguation(gold_title))
+    if np_stripped and ng_stripped and np_stripped == ng_stripped:
+        return True
+    if np_stripped and ng_stripped:
+        if np_stripped in ng_stripped or ng_stripped in np_stripped:
+            return True
+    return False
+
+
+def _sp_title_prec_recall_f1(
+    predicted_sp: Set[Tuple[str, int]],
+    gold_sp: Set[Tuple[str, int]],
+) -> Tuple[float, float, float]:
+    """Title-level fuzzy SP precision, recall, F1 (diagnostic only).
+
+    Ignores sent_id — only checks whether the predicted title set
+    overlaps the gold title set using fuzzy matching.
+    """
+    pred_titles = {t for t, _ in predicted_sp}
+    gold_titles = {t for t, _ in gold_sp}
+
+    if not gold_titles and not pred_titles:
+        return 1.0, 1.0, 1.0
+    if not gold_titles or not pred_titles:
+        return 0.0, 0.0, 0.0
+
+    tp_pred = sum(
+        1 for pt in pred_titles
+        if any(_fuzzy_title_match(pt, gt) for gt in gold_titles)
+    )
+    tp_gold = sum(
+        1 for gt in gold_titles
+        if any(_fuzzy_title_match(pt, gt) for pt in pred_titles)
+    )
+
+    prec = tp_pred / len(pred_titles) if pred_titles else 0.0
+    recall = tp_gold / len(gold_titles) if gold_titles else 0.0
+    f1 = (2 * prec * recall / (prec + recall)) if (prec + recall) > 0 else 0.0
+    return prec, recall, f1
 
 
 def _evidence_recall(
@@ -190,6 +248,7 @@ def evaluate_predictions(
         "sp_em", "sp_f1", "sp_prec", "sp_recall",
         "joint_em", "joint_f1", "joint_prec", "joint_recall",
         "contain", "ev_recall",
+        "sp_title_prec", "sp_title_recall", "sp_title_f1",
     ]
     overall: Dict[str, list] = {k: [] for k in METRIC_KEYS}
     by_type: Dict[str, Dict[str, list]] = defaultdict(
@@ -226,6 +285,11 @@ def evaluate_predictions(
         )
         joint_em = float(ans_em and sp_em)
 
+        # --- Title-level fuzzy SP (diagnostic) ---
+        sp_t_prec, sp_t_recall, sp_t_f1 = _sp_title_prec_recall_f1(
+            pred_sp, gold_sp,
+        )
+
         # --- Diagnostic metrics ---
         contain = contain_match_score(pred, gold)
         retrieved_titles = r.get("retrieved_titles", [])
@@ -243,6 +307,8 @@ def evaluate_predictions(
             "joint_em": joint_em, "joint_f1": joint_f1,
             "joint_prec": joint_prec, "joint_recall": joint_recall,
             "contain": contain, "ev_recall": ev_recall,
+            "sp_title_prec": sp_t_prec, "sp_title_recall": sp_t_recall,
+            "sp_title_f1": sp_t_f1,
         }
 
         for bucket in [overall, by_type[q_type], by_level[q_level]]:
