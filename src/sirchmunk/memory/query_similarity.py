@@ -107,6 +107,30 @@ class QuerySimilarityIndex:
 
     # ── Recording ─────────────────────────────────────────────────────
 
+    def _find_entry_index(self, query: str) -> int:
+        """Return the index of the *best* existing entry for *query*, or -1."""
+        best_idx = -1
+        best_conf = -1.0
+        for i, e in enumerate(self._entries):
+            if e.get("query") == query:
+                c = e.get("confidence", 0.0)
+                if c > best_conf:
+                    best_conf = c
+                    best_idx = i
+        return best_idx
+
+    @staticmethod
+    def _validate_useful_files(
+        files: Optional[List[str]],
+    ) -> List[str]:
+        """Keep only entries that look like filesystem paths."""
+        if not files:
+            return []
+        return [
+            f for f in files
+            if isinstance(f, str) and ("/" in f or "\\" in f)
+        ][:20]
+
     def record(
         self,
         query: str,
@@ -117,24 +141,63 @@ class QuerySimilarityIndex:
         useful_files: Optional[List[str]] = None,
         answer_snippet: str = "",
     ) -> None:
-        """Record a query and its outcome summary."""
-        entry: Dict[str, Any] = {
-            "query": query,
-            "confidence": round(confidence, 4),
-            "mode": mode,
-            "keywords": (keywords or [])[:15],
-            "useful_files": (useful_files or [])[:20],
-            "answer_snippet": answer_snippet[:300],
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        """Record (or upsert) a query and its outcome summary.
 
-        embedding = self._encode(query)
+        When the same query already exists, the entry with the higher
+        confidence wins.  ``useful_files`` are merged (union) and
+        non-path strings are filtered out.
+        """
+        valid_files = self._validate_useful_files(useful_files)
 
         with self._lock:
-            idx = len(self._entries)
-            self._entries.append(entry)
-            if embedding is not None:
-                self._embeddings[idx] = embedding
+            existing_idx = self._find_entry_index(query)
+
+            if existing_idx >= 0:
+                old = self._entries[existing_idx]
+                old_conf = old.get("confidence", 0.0)
+
+                if confidence >= old_conf:
+                    merged_files = list(dict.fromkeys(
+                        valid_files
+                        + self._validate_useful_files(old.get("useful_files")),
+                    ))[:20]
+                    merged_kw = list(dict.fromkeys(
+                        (keywords or [])[:15]
+                        + (old.get("keywords") or []),
+                    ))[:15]
+                    old.update({
+                        "confidence": round(confidence, 4),
+                        "mode": mode,
+                        "keywords": merged_kw,
+                        "useful_files": merged_files,
+                        "answer_snippet": answer_snippet[:300],
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                else:
+                    merged_files = list(dict.fromkeys(
+                        self._validate_useful_files(old.get("useful_files"))
+                        + valid_files,
+                    ))[:20]
+                    old["useful_files"] = merged_files
+
+                # Remove stale duplicates (keep only the best entry)
+                self._remove_stale_duplicates(query, existing_idx)
+            else:
+                entry: Dict[str, Any] = {
+                    "query": query,
+                    "confidence": round(confidence, 4),
+                    "mode": mode,
+                    "keywords": (keywords or [])[:15],
+                    "useful_files": valid_files,
+                    "answer_snippet": answer_snippet[:300],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                embedding = self._encode(query)
+                idx = len(self._entries)
+                self._entries.append(entry)
+                if embedding is not None:
+                    self._embeddings[idx] = embedding
+
             if len(self._entries) > self._max_entries:
                 drop = len(self._entries) - self._max_entries
                 self._entries = self._entries[drop:]
@@ -142,9 +205,71 @@ class QuerySimilarityIndex:
                     k - drop: v for k, v in self._embeddings.items()
                     if k >= drop
                 }
+
             self._dirty = True
             self._bm25_cache = None
         self._maybe_save()
+
+    def _remove_stale_duplicates(self, query: str, keep_idx: int) -> None:
+        """Remove all entries for *query* except *keep_idx* (caller holds lock)."""
+        drop_set = {
+            i for i, e in enumerate(self._entries)
+            if e.get("query") == query and i != keep_idx
+        }
+        if not drop_set:
+            return
+        kept = []
+        new_emb: Dict[int, List[float]] = {}
+        for i, e in enumerate(self._entries):
+            if i in drop_set:
+                continue
+            new_idx = len(kept)
+            kept.append(e)
+            if i in self._embeddings:
+                new_emb[new_idx] = self._embeddings[i]
+        self._entries = kept
+        self._embeddings = new_emb
+
+    def update_confidence(
+        self,
+        query: str,
+        new_confidence: float,
+    ) -> bool:
+        """Update confidence of the matching entry in-place.
+
+        Called by ``inject_evaluation`` after ground-truth scores are
+        available.  Forces an immediate save since this is an infrequent
+        but high-importance operation.
+        """
+        with self._lock:
+            idx = self._find_entry_index(query)
+            if idx < 0:
+                return False
+            self._entries[idx]["confidence"] = round(new_confidence, 4)
+            self._dirty = True
+        self._save()
+        return True
+
+    def record_avoid_files(self, query: str) -> bool:
+        """Move ``useful_files`` to ``avoid_files`` for a failed query.
+
+        Called when evaluation shows the query's result was incorrect.
+        Subsequent warm_starts will inject negative beliefs for these files.
+        Forces an immediate save.
+        """
+        with self._lock:
+            idx = self._find_entry_index(query)
+            if idx < 0:
+                return False
+            entry = self._entries[idx]
+            current_useful = entry.get("useful_files", [])
+            current_avoid = entry.get("avoid_files", [])
+            merged = list(dict.fromkeys(current_avoid + current_useful))[:20]
+            entry["avoid_files"] = merged
+            entry["useful_files"] = []
+            self._dirty = True
+        self._save()
+        return True
 
     # ── Lookup ────────────────────────────────────────────────────────
 
@@ -183,6 +308,7 @@ class QuerySimilarityIndex:
                         mode=e.get("mode"),
                         keywords=e.get("keywords", []),
                         useful_files=e.get("useful_files", []),
+                        avoid_files=e.get("avoid_files", []),
                     ))
                     break
 
@@ -250,6 +376,7 @@ class QuerySimilarityIndex:
                 mode=e.get("mode"),
                 keywords=e.get("keywords", []),
                 useful_files=e.get("useful_files", []),
+                avoid_files=e.get("avoid_files", []),
             )
             for sim, e in scored[:top_k]
         ]
@@ -307,6 +434,7 @@ class QuerySimilarityIndex:
                     mode=e.get("mode"),
                     keywords=e.get("keywords", []),
                     useful_files=e.get("useful_files", []),
+                    avoid_files=e.get("avoid_files", []),
                 ))
                 if len(results) >= top_k:
                     break

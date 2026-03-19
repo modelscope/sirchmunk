@@ -27,11 +27,10 @@ Design notes
 """
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 # ------------------------------------------------------------------
@@ -64,6 +63,9 @@ class MemoryPrior:
     extra_files: Dict[str, float] = field(default_factory=dict)
     """Explicitly transferred file paths from similar-query memory hints."""
 
+    avoid_files: Set[str] = field(default_factory=set)
+    """Files that led to incorrect answers in past sessions."""
+
     avg_confidence: float = 0.0
     """Weighted average confidence across all memory sources (0-1)."""
 
@@ -76,6 +78,7 @@ class MemoryPrior:
             and not self.similar_query_files
             and self.chain_hint is None
             and not self.extra_files
+            and not self.avoid_files
         )
 
 
@@ -156,6 +159,9 @@ class MemoryBridge:
                         prior.similar_query_files[fp] = max(
                             existing, hint.confidence,
                         )
+                # Collect avoid_files from all hints (regardless of confidence)
+                for fp in getattr(hint, "avoid_files", None) or []:
+                    prior.avoid_files.add(fp)
         except Exception:
             pass
 
@@ -182,10 +188,11 @@ class MemoryBridge:
                 + len(prior.extra_files)
             )
             logger.info(
-                "MemoryBridge: extracted %d file priors, %d dead paths, "
-                "chain_hint=%s, avg_conf=%.2f",
+                "[MemoryBridge] extracted {} file priors, {} dead, "
+                "{} avoid, chain_hint={}, avg_conf={:.2f}",
                 n_priors,
                 len(prior.dead_paths),
+                len(prior.avoid_files),
                 "yes" if prior.chain_hint else "no",
                 prior.avg_confidence,
             )

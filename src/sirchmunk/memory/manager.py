@@ -514,34 +514,53 @@ class RetrievalMemory:
         """Back-fill EM/F1 on the most recent signal and re-dispatch.
 
         Called by benchmark harnesses *after* the search completes and
-        ground-truth evaluation is available.
+        ground-truth evaluation is available.  Propagates the refined
+        confidence to **all** relevant memory layers, including the
+        ``QuerySimilarityIndex`` (closing the feedback loop).
         """
+        conf = 0.5 * em_score + 0.5 * min(f1_score, 1.0)
+
+        # 1. FeedbackMemory: persist raw scores
         try:
             self._feedback_memory.inject_evaluation(
                 query, em_score, f1_score, llm_judge_verdict,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[memory:inject] FeedbackMemory failed: {exc}")
 
-        # Re-compute confidence and update PatternMemory with better signal
+        # 2. PatternMemory: strategy outcome with ground-truth confidence
         try:
-            conf = 0.5 * em_score + 0.5 * min(f1_score, 1.0)
-            features = PatternMemory.classify_query(query)
-            pid = compute_pattern_id(
-                features["query_type"],
-                features["complexity"],
-                features["entity_types"],
-                entity_count=features.get("entity_count", 0),
-                hop_hint=features.get("hop_hint", "single"),
-            )
             self._pattern_memory.record_outcome(
                 query=query,
                 confidence=conf,
                 mode="DEEP",
                 params={"max_loops": 5, "top_k_files": 5},
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(f"[memory:inject] PatternMemory failed: {exc}")
+
+        # 3. QuerySimilarityIndex: propagate confidence (closes the loop)
+        try:
+            updated = self._query_similarity.update_confidence(query, conf)
+            if updated:
+                logger.debug(
+                    "[memory:inject] QuerySimilarity confidence "
+                    "updated for '{}' → {:.3f}",
+                    query[:50], conf,
+                )
+        except Exception as exc:
+            logger.debug(f"[memory:inject] QuerySimilarity update failed: {exc}")
+
+        # 4. For clearly failed queries, record avoid_files (negative memory)
+        if conf < 0.25:
+            try:
+                self._query_similarity.record_avoid_files(query)
+                logger.debug(
+                    "[memory:inject] Recorded avoid_files for '{}' (conf={:.3f})",
+                    query[:50], conf,
+                )
+            except Exception as exc:
+                logger.debug(f"[memory:inject] avoid_files failed: {exc}")
 
     # ================================================================
     #  Maintenance API

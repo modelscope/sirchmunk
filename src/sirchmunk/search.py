@@ -1312,6 +1312,10 @@ class AgenticSearch(BaseSearch):
             try:
                 hint = self._memory.suggest_strategy(query)
                 if hint and hint.confidence >= _STRATEGY_CONFIDENCE_MIN:
+                    _loguru_logger.info(
+                        "[memory] Strategy hint applied: conf={:.2f} mode={}",
+                        hint.confidence, hint.mode,
+                    )
                     if hint.mode:
                         mode = hint.mode
                     if hint.top_k_files is not None:
@@ -1330,6 +1334,14 @@ class AgenticSearch(BaseSearch):
                         _memory_extra_keywords.extend(sh.keywords[:3])
                 _memory_extra_files = _memory_extra_files[:_MEMORY_MAX_EXTRA_FILES]
                 _memory_extra_keywords = _memory_extra_keywords[:_MEMORY_MAX_EXTRA_KEYWORDS]
+                if sim_hints:
+                    _loguru_logger.info(
+                        "[memory] Similar-query hints: {} hit(s), "
+                        "extra_files={}, extra_kw={}",
+                        len(sim_hints),
+                        len(_memory_extra_files),
+                        len(_memory_extra_keywords),
+                    )
             except Exception:
                 pass
 
@@ -1522,6 +1534,19 @@ class AgenticSearch(BaseSearch):
                         list(query_keywords.keys()) if query_keywords else None
                     ),
                 )
+                if _memory_prior and not _memory_prior.is_empty:
+                    _loguru_logger.info(
+                        "[memory] Prior: files={}, dead={}, avoid={}, "
+                        "chain={}, conf={:.2f}",
+                        len(_memory_prior.path_scores)
+                        + len(_memory_prior.entity_paths)
+                        + len(_memory_prior.similar_query_files)
+                        + len(_memory_prior.extra_files),
+                        len(_memory_prior.dead_paths),
+                        len(_memory_prior.avoid_files),
+                        "yes" if _memory_prior.chain_hint else "no",
+                        _memory_prior.avg_confidence,
+                    )
             except Exception:
                 pass
 
@@ -1636,13 +1661,17 @@ class AgenticSearch(BaseSearch):
                 if _memory_bridge and belief_state:
                     try:
                         _memory_bridge.enrich_feedback(signal, belief_state)
-                    except Exception:
-                        pass
+                    except Exception as _enrich_err:
+                        _loguru_logger.debug(
+                            "[memory] Belief enrichment failed: {}", _enrich_err,
+                        )
 
                 task = asyncio.ensure_future(self._memory.record_feedback(signal))
                 self._pending_feedback.append(task)
-            except Exception:
-                pass
+            except Exception as _sig_err:
+                _loguru_logger.debug(
+                    "[memory] Feedback signal construction failed: {}", _sig_err,
+                )
 
         await self._logger.success(f"[search] Complete: {context.summary()}")
         return answer, cluster, context
@@ -2164,8 +2193,10 @@ class AgenticSearch(BaseSearch):
                 )
                 task = asyncio.ensure_future(self._memory.record_feedback(signal))
                 self._pending_feedback.append(task)
-            except Exception:
-                pass
+            except Exception as _sig_err:
+                _loguru_logger.debug(
+                    "[memory] FAST feedback signal failed: {}", _sig_err,
+                )
 
         await self._logger.success("[FAST] Search complete (2 LLM calls)")
         return answer, cluster, context

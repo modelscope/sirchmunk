@@ -197,6 +197,7 @@ class SimilarQueryHint:
     mode: Optional[str] = None
     keywords: List[str] = field(default_factory=list)
     useful_files: List[str] = field(default_factory=list)
+    avoid_files: List[str] = field(default_factory=list)
 
 
 # ────────────────────────────────────────────────────────────────────
