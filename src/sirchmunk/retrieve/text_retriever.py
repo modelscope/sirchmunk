@@ -132,6 +132,7 @@ class GrepRetriever(BaseRetriever):
             ugrep_corpus_path=_ugrep_cp,
             highfreq_file_threshold=self._highfreq_file_threshold,
             rga_max_parse_lines=self._rga_max_parse_lines,
+            memory=self._memory,
         )
 
         # Multi-term logic routing
@@ -582,6 +583,7 @@ class GrepRetriever(BaseRetriever):
         ugrep_corpus_path = kwargs.pop("ugrep_corpus_path", None)
         highfreq_file_threshold = kwargs.pop("highfreq_file_threshold", 0)
         rga_max_parse_lines = kwargs.pop("rga_max_parse_lines", 0)
+        _mem = kwargs.pop("memory", None)
         args = []
 
         # Basic ripgrep-all args
@@ -609,7 +611,6 @@ class GrepRetriever(BaseRetriever):
         rga_cache_path = kwargs.get("rga_cache_path")
 
         # Memory-based noise keyword fast-path (skip ugrep entirely)
-        _mem = self._memory if hasattr(self, "_memory") else None
         if _mem and highfreq_file_threshold:
             try:
                 if _mem.is_noise_keyword(pattern):

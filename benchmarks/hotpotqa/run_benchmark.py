@@ -335,9 +335,17 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
         print(f"  Token Budget: {cfg.max_token_budget}")
         print(f"  Dir Scan:     {'ON' if cfg.enable_dir_scan else 'OFF'}")
     print(f"  Extract:      {'ON' if cfg.extract_answer else 'OFF'}")
+    print(f"  Reflection:   {'ON' if cfg.enable_reflection else 'OFF'}")
     print(f"  GPT-Eval:     {'ON' if cfg.enable_gpt_eval else 'OFF'}")
     print(f"  LLM Judge:    {'ON' if cfg.enable_llm_judge else 'OFF'}")
     print(f"  Thinking:     {'ON' if cfg.enable_thinking else 'OFF'}")
+    _mem_status = "OFF"
+    if cfg.enable_memory:
+        _mem_parts = ["ON"]
+        if cfg.enable_eval_feedback:
+            _mem_parts.append("eval-feedback")
+        _mem_status = " + ".join(_mem_parts)
+    print(f"  Memory:       {_mem_status}")
     if args.resume:
         print(f"  Resume from:  {args.resume}")
     print(_SEP_THICK)
