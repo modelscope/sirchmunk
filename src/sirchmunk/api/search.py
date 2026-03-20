@@ -18,7 +18,7 @@ import logging
 import os
 import time
 import uuid
-from typing import AsyncGenerator, List, Literal, Optional
+from typing import AsyncGenerator, List, Literal, Optional, Union
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -40,9 +40,16 @@ router = APIRouter(prefix="/api/v1", tags=["search"])
 class SearchRequest(BaseModel):
     """Request model for search endpoint."""
     query: str = Field(..., description="Search query or question")
-    paths: Optional[List[str]] = Field(
+    paths: Optional[Union[str, List[str]]] = Field(
         default=None,
-        description="Paths to search (directories or files). Falls back to configured default or cwd."
+        description=(
+            "Directory or file path(s) to search: a single string or a list of strings. "
+            "Omit this field, or pass null, empty string '', empty list [], or only "
+            "whitespace / empty entries, to use SIRCHMUNK_SEARCH_PATHS from the server "
+            "environment (~/.sirchmunk/.env when loaded). Explicit non-empty paths always "
+            "take priority over the environment default (then AgenticSearch falls back to "
+            "cwd if env is also unset)."
+        ),
     )
     mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = Field(
         default="FAST",
@@ -189,6 +196,44 @@ def _create_search_instance(log_callback=None) -> AgenticSearch:
 
 
 # ===================================================================
+#  Path coercion (HTTP API contract)
+# ===================================================================
+
+def _normalize_api_paths(
+    paths: Optional[Union[str, List[str]]],
+) -> Optional[Union[str, List[str]]]:
+    """Return ``None`` when the client did not supply usable paths.
+
+    ``None``, missing key, ``""``, ``[]``, or lists of only blank strings
+    all mean: defer to ``AgenticSearch._resolve_paths`` (explicit request
+    param absent → ``SIRCHMUNK_SEARCH_PATHS`` → cwd).
+
+    A single non-empty path may be returned as a bare ``str`` (one path)
+    or remains a one-element list from JSON; both are accepted by
+    ``AgenticSearch.search``.
+    """
+    if paths is None:
+        return None
+    if isinstance(paths, str):
+        stripped = paths.strip()
+        return None if stripped == "" else stripped
+    if not isinstance(paths, list):
+        return None
+    cleaned: List[str] = []
+    for p in paths:
+        if not isinstance(p, str):
+            continue
+        s = p.strip()
+        if s:
+            cleaned.append(s)
+    if not cleaned:
+        return None
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return cleaned
+
+
+# ===================================================================
 #  SSE helpers
 # ===================================================================
 
@@ -201,7 +246,7 @@ def _sse_event(event: str, data: dict) -> str:
 def _build_search_kwargs(request: SearchRequest) -> dict:
     kwargs = {
         "query": request.query,
-        "paths": request.paths,
+        "paths": _normalize_api_paths(request.paths),
         "mode": request.mode,
         "enable_dir_scan": request.enable_dir_scan,
         "return_context": request.return_context,
@@ -243,11 +288,15 @@ async def execute_search(request: SearchRequest) -> SearchResponse:
     try:
         async with _search_semaphore:
             searcher = _get_search_instance()
-            logger.info(
-                "Executing search: query='%s', mode=%s, paths=%s",
-                request.query, request.mode, request.paths,
+            kwargs = _build_search_kwargs(request)
+            logger.debug(
+                "Executing search: query='%s', mode=%s, paths(raw)=%s paths(resolved)=%s",
+                request.query,
+                request.mode,
+                request.paths,
+                kwargs.get("paths"),
             )
-            result = await searcher.search(**_build_search_kwargs(request))
+            result = await searcher.search(**kwargs)
 
         return SearchResponse(success=True, data=_format_result(result, request))
 
@@ -316,11 +365,15 @@ async def execute_search_stream(request: SearchRequest, http_request: Request):
         try:
             async with _search_semaphore:
                 searcher = _create_search_instance(log_callback=_log_callback)
-                logger.info(
-                    "[stream:%s] Starting search: query='%s' mode=%s",
-                    request_id, request.query, request.mode,
+                skwargs = _build_search_kwargs(request)
+                logger.debug(
+                    "[stream:%s] Starting search: query='%s' mode=%s paths(resolved)=%s",
+                    request_id,
+                    request.query,
+                    request.mode,
+                    skwargs.get("paths"),
                 )
-                result = await searcher.search(**_build_search_kwargs(request))
+                result = await searcher.search(**skwargs)
 
             formatted = _format_result(result, request)
             await log_queue.put(("result", {"success": True, "data": formatted}))

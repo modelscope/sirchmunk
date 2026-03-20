@@ -676,6 +676,12 @@ When the server is running (`sirchmunk serve` or `sirchmunk web serve`), the Sea
 <details>
 <summary><b>cURL Examples</b></summary>
 
+**`paths` rules (same for `/search` and `/search/stream`):**
+
+- Type: **a single string** or **an array of strings** (`"paths": "/one/dir"` or `"paths": ["/a", "/b"]`).
+- If you **omit** `paths`, send **`null`**, **`""`**, **`[]`**, or only blank strings, the server uses **`SIRCHMUNK_SEARCH_PATHS`** from its environment (typically set in `~/.sirchmunk/.env`, loaded at startup). If that is unset too, search falls back to the server process **current working directory**.
+- **Priority:** explicit non-empty request `paths` → `SIRCHMUNK_SEARCH_PATHS` → cwd.
+
 ```bash
 # FAST mode (default, greedy search with 2 LLM calls)
 curl -X POST http://localhost:8584/api/v1/search \
@@ -684,6 +690,19 @@ curl -X POST http://localhost:8584/api/v1/search \
     "query": "How does authentication work?",
     "paths": ["/path/to/project"]
   }'
+
+# Single path as a string (equivalent to a one-element list)
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "How does authentication work?",
+    "paths": "/path/to/project"
+  }'
+
+# Omit paths — use SIRCHMUNK_SEARCH_PATHS from ~/.sirchmunk/.env on the server
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "How does authentication work?"}'
 
 # DEEP mode (comprehensive analysis with Monte Carlo sampling)
 curl -X POST http://localhost:8584/api/v1/search \
@@ -703,7 +722,7 @@ curl -X POST http://localhost:8584/api/v1/search \
     "mode": "FILENAME_ONLY"
   }'
 
-# Full parameters
+# Full parameters (see Request Parameters table)
 curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
@@ -712,7 +731,7 @@ curl -X POST http://localhost:8584/api/v1/search \
     "mode": "DEEP",
     "max_depth": 10,
     "top_k_files": 20,
-    "keyword_levels": 3,
+    "max_loops": 10,
     "include_patterns": ["*.py", "*.java"],
     "exclude_patterns": ["*test*", "*__pycache__*"],
     "return_context": true
@@ -743,7 +762,9 @@ response = requests.post(
 
 data = response.json()
 if data["success"]:
-    print(data["data"]["result"])
+    payload = data.get("data") or {}
+    # API returns type "summary" | "files" | "context"
+    print(payload.get("summary", payload))
 ```
 
 **Using `httpx` (async):**
@@ -758,11 +779,14 @@ async def search():
             "http://localhost:8584/api/v1/search",
             json={
                 "query": "find all API endpoints",
+                # Optional: omit "paths" to use server SIRCHMUNK_SEARCH_PATHS
                 "paths": ["/path/to/project"],
             }
         )
         data = resp.json()
-        print(data["data"]["result"])
+        if data.get("success"):
+            p = data.get("data") or {}
+            print(p.get("summary", p))
 
 asyncio.run(search())
 ```
@@ -784,7 +808,8 @@ const response = await fetch("http://localhost:8584/api/v1/search", {
 
 const data = await response.json();
 if (data.success) {
-  console.log(data.data.result);
+  const p = data.data || {};
+  console.log(p.summary ?? p);
 }
 ```
 
@@ -793,7 +818,7 @@ if (data.success) {
 <details>
 <summary><b>SSE streaming search (<code>/api/v1/search/stream</code>)</b></summary>
 
-Use this endpoint when you need **real-time search logs** (same pipeline as `POST /api/v1/search`). The response is **`text/event-stream`** (Server-Sent Events). The JSON body is identical to `/api/v1/search`.
+Use this endpoint when you need **real-time search logs** (same pipeline as `POST /api/v1/search`). The response is **`text/event-stream`** (Server-Sent Events). The JSON body is identical to `/api/v1/search` (**`paths`** optional; string or array — see cURL section above).
 
 **Event types**
 
@@ -953,13 +978,13 @@ await searchStream("http://localhost:8584", {
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `query` | `string` | *required* | Search query or question |
-| `paths` | `string[]` | *required* | Directories or files to search (min 1); falls back to `SIRCHMUNK_SEARCH_PATHS` if unset |
+| `paths` | `string` \| `string[]` | *optional* | One path or many. Omit / `null` / `""` / `[]` / only blanks → server `SIRCHMUNK_SEARCH_PATHS` (e.g. `~/.sirchmunk/.env`), then cwd. Request paths override env. |
 | `mode` | `string` | `"FAST"` | `FAST`, `DEEP`, or `FILENAME_ONLY` |
 | `enable_dir_scan` | `bool` | `true` | Enable directory scanning (FAST/DEEP) for file discovery |
 | `max_depth` | `int` | `null` | Maximum directory depth |
 | `top_k_files` | `int` | `null` | Number of top files to return |
+| `max_loops` | `int` | `null` | Maximum ReAct iterations (DEEP mode) |
 | `max_token_budget` | `int` | `null` | LLM token budget (DEEP mode, default 128K) |
-| `keyword_levels` | `int` | `null` | Keyword granularity levels |
 | `include_patterns` | `string[]` | `null` | File glob patterns to include |
 | `exclude_patterns` | `string[]` | `null` | File glob patterns to exclude |
 | `return_context` | `bool` | `false` | Return SearchContext with cluster and telemetry |

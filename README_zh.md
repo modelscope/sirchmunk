@@ -675,6 +675,12 @@ KnowledgeCluster 是一个丰富标注的对象，完整记录了单次搜索周
 <details>
 <summary><b>cURL 示例</b></summary>
 
+**`paths` 规则（`/search` 与 `/search/stream` 相同）：**
+
+- **可选**。类型：**单个字符串**或**字符串数组**（`"paths": "/一个目录"` 或 `"paths": ["/a", "/b"]`）。
+- **不传**、**`null`**、**`""`**、**`[]`**，或列表里全是空白项时，使用服务器环境变量 **`SIRCHMUNK_SEARCH_PATHS`**（一般在 `~/.sirchmunk/.env` 中配置，服务启动时加载）。若未设置，则回退到服务进程**当前工作目录**。
+- **优先级：** 请求里非空的 `paths` → `SIRCHMUNK_SEARCH_PATHS` → cwd。
+
 ```bash
 # FAST 模式（默认，贪心搜索，2 次 LLM 调用）
 curl -X POST http://localhost:8584/api/v1/search \
@@ -683,6 +689,19 @@ curl -X POST http://localhost:8584/api/v1/search \
     "query": "认证是如何工作的？",
     "paths": ["/path/to/project"]
   }'
+
+# 单个路径用字符串（等价于单元素数组）
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "认证是如何工作的？",
+    "paths": "/path/to/project"
+  }'
+
+# 省略 paths — 使用服务器上 ~/.sirchmunk/.env 中的 SIRCHMUNK_SEARCH_PATHS
+curl -X POST http://localhost:8584/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "认证是如何工作的？"}'
 
 # DEEP 模式（蒙特卡洛证据采样全面分析）
 curl -X POST http://localhost:8584/api/v1/search \
@@ -702,7 +721,7 @@ curl -X POST http://localhost:8584/api/v1/search \
     "mode": "FILENAME_ONLY"
   }'
 
-# 完整参数示例
+# 完整参数（详见下表「请求参数说明」）
 curl -X POST http://localhost:8584/api/v1/search \
   -H "Content-Type: application/json" \
   -d '{
@@ -711,7 +730,7 @@ curl -X POST http://localhost:8584/api/v1/search \
     "mode": "DEEP",
     "max_depth": 10,
     "top_k_files": 20,
-    "keyword_levels": 3,
+    "max_loops": 10,
     "include_patterns": ["*.py", "*.java"],
     "exclude_patterns": ["*test*", "*__pycache__*"],
     "return_context": true
@@ -742,7 +761,8 @@ response = requests.post(
 
 data = response.json()
 if data["success"]:
-    print(data["data"]["result"])
+    payload = data.get("data") or {}
+    print(payload.get("summary", payload))
 ```
 
 **使用 `httpx`（异步）：**
@@ -757,11 +777,14 @@ async def search():
             "http://localhost:8584/api/v1/search",
             json={
                 "query": "查找所有 API 端点",
+                # 可选：省略 paths 时使用服务端 SIRCHMUNK_SEARCH_PATHS
                 "paths": ["/path/to/project"],
             }
         )
         data = resp.json()
-        print(data["data"]["result"])
+        if data.get("success"):
+            p = data.get("data") or {}
+            print(p.get("summary", p))
 
 asyncio.run(search())
 ```
@@ -783,7 +806,8 @@ const response = await fetch("http://localhost:8584/api/v1/search", {
 
 const data = await response.json();
 if (data.success) {
-  console.log(data.data.result);
+  const p = data.data || {};
+  console.log(p.summary ?? p);
 }
 ```
 
@@ -792,7 +816,7 @@ if (data.success) {
 <details>
 <summary><b>SSE 流式搜索（<code>/api/v1/search/stream</code>）</b></summary>
 
-需要 **实时查看搜索过程日志** 时使用本接口（检索流程与 `POST /api/v1/search` 一致）。响应类型为 **`text/event-stream`**（Server-Sent Events）。请求 JSON 与 `/api/v1/search` **完全相同**。
+需要 **实时查看搜索过程日志** 时使用本接口（检索流程与 `POST /api/v1/search` 一致）。响应类型为 **`text/event-stream`**（Server-Sent Events）。请求 JSON 与 `/api/v1/search` **完全相同**（**`paths`** 可选；可为字符串或数组，见上文 cURL 说明）。
 
 **事件类型**
 
@@ -952,13 +976,13 @@ await searchStream("http://localhost:8584", {
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `query` | `string` | *必填* | 搜索查询或问题 |
-| `paths` | `string[]` | *必填* | 搜索的目录或文件（至少 1 个）；未设置时回退到 `SIRCHMUNK_SEARCH_PATHS` |
+| `paths` | `string` \| `string[]` | *可选* | 单路径或多路径。省略 / `null` / `""` / `[]` / 仅空白 → 使用服务端 `SIRCHMUNK_SEARCH_PATHS`（如 `~/.sirchmunk/.env`），再回退 cwd。请求中的路径优先于环境变量。 |
 | `mode` | `string` | `"FAST"` | `FAST`、`DEEP` 或 `FILENAME_ONLY` |
 | `enable_dir_scan` | `bool` | `true` | 是否启用目录扫描（FAST/DEEP）以发现文件 |
 | `max_depth` | `int` | `null` | 最大目录深度 |
 | `top_k_files` | `int` | `null` | 返回的文件数量 |
+| `max_loops` | `int` | `null` | ReAct 最大迭代次数（DEEP 模式） |
 | `max_token_budget` | `int` | `null` | LLM token 预算（DEEP 模式，默认 128K） |
-| `keyword_levels` | `int` | `null` | 关键词粒度层级 |
 | `include_patterns` | `string[]` | `null` | 文件 glob 匹配模式（包含） |
 | `exclude_patterns` | `string[]` | `null` | 文件 glob 匹配模式（排除） |
 | `return_context` | `bool` | `false` | 返回完整 SearchContext（含 KnowledgeCluster 和遥测数据） |
