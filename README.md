@@ -665,8 +665,9 @@ When the server is running (`sirchmunk serve` or `sirchmunk web serve`), the Sea
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/api/v1/search` | Execute a search query |
-| `GET` | `/api/v1/search/status` | Check server and LLM configuration status |
+| `POST` | `/api/v1/search` | Execute a search query (JSON response when complete) |
+| `POST` | `/api/v1/search/stream` | Same body as `/search`; **Server-Sent Events** stream of logs + final `result` / `error` |
+| `GET` | `/api/v1/search/status` | Check server and LLM configuration status (includes `max_concurrent_searches`) |
 
 **Interactive Docs:** http://localhost:8584/docs (Swagger UI)
 
@@ -786,6 +787,163 @@ if (data.success) {
   console.log(data.data.result);
 }
 ```
+
+</details>
+
+<details>
+<summary><b>SSE streaming search (<code>/api/v1/search/stream</code>)</b></summary>
+
+Use this endpoint when you need **real-time search logs** (same pipeline as `POST /api/v1/search`). The response is **`text/event-stream`** (Server-Sent Events). The JSON body is identical to `/api/v1/search`.
+
+**Event types**
+
+| SSE `event` | `data` (JSON) | Meaning |
+|-------------|----------------|---------|
+| `log` | `{"level":"info",...,"message":"..."}` | One log line from the search pipeline |
+| `result` | `{"success":true,"data":{...}}` | Final outcome (same shape as `/search` `data`: `summary`, `files`, or `context`) |
+| `error` | `{"error":"..."}` | Fatal error; stream ends |
+
+Comment lines starting with `:` are keep-alives (safe to ignore).
+
+**Concurrency**
+
+Concurrent streaming searches are limited server-side by **`SIRCHMUNK_MAX_CONCURRENT_SEARCHES`** (default `3`). Extra clients wait until a slot is free. See `GET /api/v1/search/status` → `max_concurrent_searches`.
+
+**cURL (use `-N` / `--no-buffer` so chunks print as they arrive)**
+
+```bash
+curl -N -X POST "http://localhost:8584/api/v1/search/stream" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+    "query": "How does authentication work?",
+    "paths": ["/path/to/project"],
+    "mode": "FAST"
+  }'
+```
+
+**Python — `requests` (streaming lines)**
+
+```python
+import json
+import requests
+
+url = "http://localhost:8584/api/v1/search/stream"
+payload = {
+    "query": "How does authentication work?",
+    "paths": ["/path/to/project"],
+    "mode": "FAST",
+}
+
+event_type = ""
+with requests.post(
+    url, json=payload, stream=True, timeout=(10, 600),
+    headers={"Accept": "text/event-stream"},
+) as resp:
+    resp.raise_for_status()
+    for raw in resp.iter_lines(decode_unicode=True):
+        if raw is None or raw == "":
+            continue
+        if raw.startswith(":"):
+            continue
+        if raw.startswith("event: "):
+            event_type = raw[7:].strip()
+            continue
+        if raw.startswith("data: "):
+            obj = json.loads(raw[6:])
+            if event_type == "log":
+                print(f"[{obj.get('level', 'info')}] {obj.get('message', '')}")
+            elif event_type == "result":
+                print("DONE:", json.dumps(obj, indent=2, ensure_ascii=False))
+            elif event_type == "error":
+                print("ERROR:", obj.get("error"))
+            event_type = ""
+```
+
+**Python — `httpx`**
+
+```python
+import json
+import httpx
+
+url = "http://localhost:8584/api/v1/search/stream"
+payload = {"query": "find API routes", "paths": ["/path/to/project"], "mode": "DEEP"}
+
+event_type = ""
+with httpx.Client(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+    with client.stream(
+        "POST",
+        url,
+        json=payload,
+        headers={"Accept": "text/event-stream"},
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("event: "):
+                event_type = line[7:].strip()
+                continue
+            if line.startswith("data: "):
+                obj = json.loads(line[6:])
+                if event_type == "log":
+                    print(obj.get("message", ""))
+                elif event_type == "result":
+                    data = obj.get("data", {})
+                    print(data.get("summary") or data)
+                event_type = ""
+```
+
+**JavaScript — `fetch` + readable stream** (`EventSource` is GET-only; POST SSE needs `fetch`)
+
+```javascript
+async function searchStream(baseUrl, body) {
+  const res = await fetch(`${baseUrl}/api/v1/search/stream`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await res.text());
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  let currentEvent = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const parts = buf.split("\n\n");
+    buf = parts.pop() || "";
+    for (const block of parts) {
+      let dataLine = null;
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) currentEvent = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLine = line.slice(5).trim();
+      }
+      if (!dataLine) continue;
+      const obj = JSON.parse(dataLine);
+      if (currentEvent === "log") console.log(`[${obj.level}]`, obj.message);
+      if (currentEvent === "result") console.log("result", obj);
+      if (currentEvent === "error") console.error(obj.error);
+    }
+  }
+}
+
+await searchStream("http://localhost:8584", {
+  query: "How does authentication work?",
+  paths: ["/path/to/project"],
+  mode: "FAST",
+});
+```
+
+**CLI**
+
+`sirchmunk search --api` uses this streaming endpoint when available and prints log lines to stderr/stdout as they arrive, then prints the final summary.
 
 </details>
 

@@ -41,7 +41,6 @@ if _env_file.exists():
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import uvicorn
 
 # Import all API routers
 from .knowledge import router as knowledge_router
@@ -161,6 +160,7 @@ if _ui_available:
     print(f"[INFO] WebUI enabled, serving static files from {_static_dir}")
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(
         "main:app",
         host="0.0.0.0",

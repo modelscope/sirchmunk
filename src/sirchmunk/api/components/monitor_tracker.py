@@ -4,7 +4,12 @@ Real-time monitoring and tracking component
 Provides actual system metrics and activity tracking
 """
 
-import psutil
+# Optional: only ``MonitorTracker.get_system_metrics`` needs psutil.
+try:
+    import psutil as _psutil  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - optional dependency
+    _psutil = None
+
 import os
 from datetime import datetime, timedelta
 from typing import Dict, Any
@@ -126,6 +131,27 @@ class MonitorTracker:
         except:
             self.knowledge_storage = None
     
+    def _metrics_fallback(self, *, error: str | None = None, note: str | None = None) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "cpu": {"usage_percent": 0, "count": 1, "process_percent": 0},
+            "memory": {
+                "usage_percent": 0,
+                "total_gb": 0,
+                "used_gb": 0,
+                "available_gb": 0,
+                "process_mb": 0,
+            },
+            "disk": {"usage_percent": 0, "total_gb": 0, "used_gb": 0, "free_gb": 0},
+            "network": {"active_connections": 0},
+            "uptime": "0d 0h 0m",
+            "timestamp": datetime.now().isoformat(),
+        }
+        if error:
+            out["error"] = error
+        if note:
+            out["note"] = note
+        return out
+
     def get_system_metrics(self) -> Dict[str, Any]:
         """
         Get real system metrics
@@ -133,31 +159,38 @@ class MonitorTracker:
         Returns:
             Dictionary with CPU, memory, disk, and network metrics
         """
+        if _psutil is None:
+            return self._metrics_fallback(
+                note="psutil not installed — "
+                "install with: pip install psutil (or pip install 'sirchmunk[web]') "
+                "for live system metrics on the monitor dashboard.",
+            )
+
         try:
             # CPU usage
-            cpu_percent = psutil.cpu_percent(interval=0.5)
-            cpu_count = psutil.cpu_count()
+            cpu_percent = _psutil.cpu_percent(interval=0.5)
+            cpu_count = _psutil.cpu_count()
             
             # Memory usage
-            memory = psutil.virtual_memory()
+            memory = _psutil.virtual_memory()
             memory_total_gb = memory.total / (1024 ** 3)
             memory_used_gb = memory.used / (1024 ** 3)
             memory_available_gb = memory.available / (1024 ** 3)
             
             # Disk usage
-            disk = psutil.disk_usage('/')
+            disk = _psutil.disk_usage('/')
             disk_total_gb = disk.total / (1024 ** 3)
             disk_used_gb = disk.used / (1024 ** 3)
             disk_free_gb = disk.free / (1024 ** 3)
             
             # Network connections (limit to reasonable number for display)
             try:
-                connections = len(psutil.net_connections())
-            except:
+                connections = len(_psutil.net_connections())
+            except Exception:
                 connections = 0
             
             # System uptime
-            boot_time = psutil.boot_time()
+            boot_time = _psutil.boot_time()
             uptime_seconds = datetime.now().timestamp() - boot_time
             uptime_days = int(uptime_seconds // 86400)
             uptime_hours = int((uptime_seconds % 86400) // 3600)
@@ -165,7 +198,7 @@ class MonitorTracker:
             uptime_str = f"{uptime_days}d {uptime_hours}h {uptime_minutes}m"
             
             # Process info
-            process = psutil.Process(os.getpid())
+            process = _psutil.Process(os.getpid())
             process_memory_mb = process.memory_info().rss / (1024 ** 2)
             process_cpu_percent = process.cpu_percent(interval=0.1)
             
@@ -196,16 +229,7 @@ class MonitorTracker:
             }
         
         except Exception as e:
-            # Minimal fallback
-            return {
-                "cpu": {"usage_percent": 0, "count": 1, "process_percent": 0},
-                "memory": {"usage_percent": 0, "total_gb": 0, "used_gb": 0, "available_gb": 0, "process_mb": 0},
-                "disk": {"usage_percent": 0, "total_gb": 0, "used_gb": 0, "free_gb": 0},
-                "network": {"active_connections": 0},
-                "uptime": "0d 0h 0m",
-                "timestamp": datetime.now().isoformat(),
-                "error": str(e)
-            }
+            return self._metrics_fallback(error=str(e))
     
     def get_chat_activity(self, hours: int = 24) -> Dict[str, Any]:
         """

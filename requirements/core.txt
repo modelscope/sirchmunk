@@ -1,5 +1,6 @@
 loguru
 fastapi
+uvicorn[standard]
 openai
 genson
 pillow
