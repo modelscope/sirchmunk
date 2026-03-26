@@ -148,6 +148,7 @@ class AgenticSearch(BaseSearch):
             kwargs={
                 "reuse_knowledge": reuse_knowledge,
                 "enable_memory": enable_memory,
+                "embedding": embedding,
             },
             daemon=True,
             name="sirchmunk-warmup",
@@ -158,7 +159,7 @@ class AgenticSearch(BaseSearch):
     # Background warm-up
     # ------------------------------------------------------------------
 
-    def _warmup_bg(self, *, reuse_knowledge: bool, enable_memory: bool = False) -> None:
+    def _warmup_bg(self, *, reuse_knowledge: bool, enable_memory: bool = False, embedding: EmbeddingUtil = None) -> None:
         """Background thread: initialise heavy components without blocking __init__."""
         try:
             # 1. KnowledgeStorage — DuckDB + Parquet load
@@ -171,29 +172,40 @@ class AgenticSearch(BaseSearch):
             # 2. Embedding model — triggers its own daemon thread for download/load
             if reuse_knowledge:
                 try:
-                    from sirchmunk.utils.embedding_util import EmbeddingUtil
-
-                    embedding_cache = os.getenv("EMBEDDING_CACHE_DIR")
-                    cache_dir = (
-                        embedding_cache
-                        if embedding_cache
-                        else str(self.work_path / ".cache" / "models")
-                    )
-                    self.embedding_client = EmbeddingUtil(cache_dir=cache_dir)
-                    self.embedding_client.start_loading()
-                    self.knowledge_base.embedding_util = self.embedding_client
-                    _loguru_logger.info(
-                        "[warmup] Embedding client created, background model loading started"
-                    )
-                except Exception as exc:
+                    # Use provided embedding instance if available
+                    if embedding is not None:
+                        self.embedding_client = embedding
+                        self.embedding_client.start_loading()
+                        _loguru_logger.info(
+                            f"Using provided embedding client (model={self.embedding_client.model_id or 'default'}, cache_dir={self.embedding_client._cache_dir or 'default'})"
+                        )
+                    else:
+                        embedding_cache = os.getenv("EMBEDDING_CACHE_DIR")
+                        cache_dir = (
+                            embedding_cache
+                            if embedding_cache
+                            else str(self.work_path / ".cache" / "models")
+                        )
+                        embedding_model_id = os.getenv("EMBEDDING_MODEL_ID")
+                        self.embedding_client = EmbeddingUtil(
+                            model_id=embedding_model_id,
+                            cache_dir=cache_dir
+                        )
+                        self.embedding_client.start_loading()
+                        _loguru_logger.info(
+                            f"Embedding client created (model={embedding_model_id or 'default'}, cache_dir={cache_dir}), background model loading started"
+                        )
+                except Exception as e:
                     _loguru_logger.error(
-                        f"[warmup] Embedding init failed: {exc}. "
-                        "Cluster embeddings will NOT be stored."
+                        f"Failed to initialize embedding client: {e}. "
+                        "Knowledge cluster embeddings will NOT be stored. "
+                        "Ensure sentence-transformers, torch, and modelscope are installed."
                     )
                     self.embedding_client = None
             else:
                 _loguru_logger.info(
-                    "[warmup] Knowledge reuse disabled — embeddings will not be computed"
+                    "Knowledge reuse disabled (reuse_knowledge=False). "
+                    "Embeddings will not be computed."
                 )
 
             # 3. System dependencies (rga / rg)
