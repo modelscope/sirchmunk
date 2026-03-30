@@ -201,8 +201,8 @@ class PatternMemory(MemoryStore):
     def suggest_strategy(self, query: str) -> Optional[StrategyHint]:
         """Return a strategy hint via hierarchical Thompson Sampling (HMRPL).
 
-        Performs fine-to-coarse fallback (L4 → L0), returning the first level
-        that has enough samples and passes the Thompson Sampling threshold.
+        Performs fine-to-coarse fallback (L4 → L0). Fine-grained matches (L2+)
+        return immediately; coarse matches (L0/L1) trigger warm transfer first.
         When no level matches, falls back to soft-match or warm transfer.
         """
         features = self.classify_query(query)
@@ -213,6 +213,9 @@ class PatternMemory(MemoryStore):
         entity_types = features["entity_types"]
         entity_count = features.get("entity_count", 0)
         hop_hint = features.get("hop_hint", "single")
+
+        # Track best coarse match for warm transfer comparison
+        coarse_match: Optional[Tuple[QueryPattern, float, int]] = None
 
         with self._lock:
             # HMRPL: fine-to-coarse hierarchical lookup (L4 → L0)
@@ -234,48 +237,80 @@ class PatternMemory(MemoryStore):
                     max(pattern.alpha, 0.01), max(pattern.beta_param, 0.01),
                 )
                 if sampled >= self._MIN_SUCCESS_RATE:
-                    token_budget = self._estimate_token_budget(pattern, features)
-                    return StrategyHint(
-                        mode=pattern.optimal_mode,
-                        top_k_files=pattern.optimal_params.get("top_k_files"),
-                        max_loops=pattern.optimal_params.get("max_loops"),
-                        enable_dir_scan=pattern.optimal_params.get("enable_dir_scan"),
-                        keyword_strategy=pattern.optimal_params.get("keyword_strategy"),
-                        confidence=sampled,
-                        source_pattern_id=pattern.pattern_id,
-                        resolution_level=level,
-                        token_budget=token_budget,
+                    if level >= 2:
+                        # Fine-grained match (L2+) — trust it, return immediately
+                        token_budget = self._estimate_token_budget(pattern, features)
+                        return StrategyHint(
+                            mode=pattern.optimal_mode,
+                            top_k_files=pattern.optimal_params.get("top_k_files"),
+                            max_loops=pattern.optimal_params.get("max_loops"),
+                            enable_dir_scan=pattern.optimal_params.get("enable_dir_scan"),
+                            keyword_strategy=pattern.optimal_params.get("keyword_strategy"),
+                            confidence=sampled,
+                            source_pattern_id=pattern.pattern_id,
+                            resolution_level=level,
+                            token_budget=token_budget,
+                        )
+                    else:
+                        # Coarse match (L0 or L1) — save it but try warm transfer first
+                        coarse_match = (pattern, sampled, level)
+                        break  # Don't need to check coarser levels
+
+            # Hierarchical lookup found nothing or only coarse match; try legacy soft-match fallback
+            soft_pattern = self._soft_match(features) if coarse_match is None else None
+
+        # Try warm transfer for cold-start or coarse-match scenarios
+        warm_hint = self._suggest_warm_transfer(features, query=query)
+
+        if warm_hint:
+            # If we have a coarse match, only use warm transfer if it's more confident
+            if coarse_match is None or warm_hint.confidence > coarse_match[1]:
+                if coarse_match is not None:
+                    logger.debug(
+                        f"[memory] warm transfer preferred over L{coarse_match[2]} coarse match "
+                        f"(warm_conf={warm_hint.confidence:.3f} > coarse_conf={coarse_match[1]:.3f})"
                     )
-
-            # Hierarchical lookup found nothing; try legacy soft-match fallback
-            pattern = self._soft_match(features)
-
-        if not pattern:
-            # CTS-WT warm transfer for cold-start
-            warm_hint = self._suggest_warm_transfer(features, query=query)
-            if warm_hint:
                 return warm_hint
+
+        # Fall back to coarse match if warm transfer wasn't better
+        if coarse_match:
+            pattern, sampled, level = coarse_match
+            token_budget = self._estimate_token_budget(pattern, features)
+            return StrategyHint(
+                mode=pattern.optimal_mode,
+                top_k_files=pattern.optimal_params.get("top_k_files"),
+                max_loops=pattern.optimal_params.get("max_loops"),
+                enable_dir_scan=pattern.optimal_params.get("enable_dir_scan"),
+                keyword_strategy=pattern.optimal_params.get("keyword_strategy"),
+                confidence=sampled,
+                source_pattern_id=pattern.pattern_id,
+                resolution_level=level,
+                token_budget=token_budget,
+            )
+
+        # Legacy soft-match fallback (only when no coarse match was found)
+        if not soft_pattern:
             return None
-        if pattern.sample_count < self._MIN_SAMPLES_FOR_CONFIDENT:
+        if soft_pattern.sample_count < self._MIN_SAMPLES_FOR_CONFIDENT:
             return None
 
         # Thompson Sampling on soft-matched pattern
         sampled = random.betavariate(
-            max(pattern.alpha, 0.01), max(pattern.beta_param, 0.01),
+            max(soft_pattern.alpha, 0.01), max(soft_pattern.beta_param, 0.01),
         )
         if sampled < self._MIN_SUCCESS_RATE:
             return None
 
-        token_budget = self._estimate_token_budget(pattern, features)
+        token_budget = self._estimate_token_budget(soft_pattern, features)
         return StrategyHint(
-            mode=pattern.optimal_mode,
-            top_k_files=pattern.optimal_params.get("top_k_files"),
-            max_loops=pattern.optimal_params.get("max_loops"),
-            enable_dir_scan=pattern.optimal_params.get("enable_dir_scan"),
-            keyword_strategy=pattern.optimal_params.get("keyword_strategy"),
+            mode=soft_pattern.optimal_mode,
+            top_k_files=soft_pattern.optimal_params.get("top_k_files"),
+            max_loops=soft_pattern.optimal_params.get("max_loops"),
+            enable_dir_scan=soft_pattern.optimal_params.get("enable_dir_scan"),
+            keyword_strategy=soft_pattern.optimal_params.get("keyword_strategy"),
             confidence=sampled,
-            source_pattern_id=pattern.pattern_id,
-            resolution_level=pattern.resolution_level,
+            source_pattern_id=soft_pattern.pattern_id,
+            resolution_level=soft_pattern.resolution_level,
             token_budget=token_budget,
         )
 

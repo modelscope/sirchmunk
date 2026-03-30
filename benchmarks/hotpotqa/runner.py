@@ -257,7 +257,60 @@ _YES_NO_RE = re.compile(
 )
 
 
-def _normalize_prediction(pred: str) -> str:
+def _tokenize_for_f1(text: str) -> List[str]:
+    """Tokenize text into lowercase words for F1 overlap computation."""
+    return re.findall(r"\b\w+\b", text.lower())
+
+
+def _f1_overlap(pred: str, gold: str) -> float:
+    """Compute F1 word overlap between prediction and gold answer.
+
+    Returns a score in [0, 1] indicating how well the two strings match
+    at the word level. Used for fuzzy matching in gold-guided normalization.
+    """
+    pred_tokens = set(_tokenize_for_f1(pred))
+    gold_tokens = set(_tokenize_for_f1(gold))
+
+    if not pred_tokens or not gold_tokens:
+        return 0.0
+
+    common = pred_tokens & gold_tokens
+    if not common:
+        return 0.0
+
+    precision = len(common) / len(pred_tokens)
+    recall = len(common) / len(gold_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
+def _basic_normalize(s: str) -> str:
+    """Apply basic normalization (markdown, quotes, punctuation, prefixes).
+
+    This is the core cleanup logic extracted so it can be applied to both
+    prediction and gold for comparison purposes.
+    """
+    s = s.strip()
+
+    # Remove markdown bold/italic
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+    s = re.sub(r"\*(.+?)\*", r"\1", s)
+    # Remove quotes
+    if len(s) >= 2 and s[0] in ('"', "'", "\u201c", "\u2018") and s[-1] in ('"', "'", "\u201d", "\u2019"):
+        s = s[1:-1].strip()
+    s = s.rstrip(".:")
+
+    # Wikipedia disambiguation removal - patterns like "Foo (film)" -> "Foo"
+    s = re.sub(r"\s*\((?:film|movie|band|singer|actor|actress|musician|album|song|novel|book|TV series|series|disambiguation|person|place|company|organization|politician|athlete|writer|artist|painter|director|composer|scientist|mathematician|physicist|chemist|biologist|philosopher|economist|historian|psychologist|sociologist|anthropologist)\)\s*$", "", s, flags=re.IGNORECASE).strip()
+
+    s = re.sub(r'\b(\d+)(?:st|nd|rd|th)\b', r'\1', s)
+
+    # Normalize full-width to half-width common chars
+    s = s.replace("：", ":").replace("，", ",").replace("。", ".")
+
+    return s
+
+
+def _normalize_prediction(pred: str, gold: str = None) -> str:
     """Post-process prediction to improve EM/F1 matching.
 
     Strips markdown formatting, quotation marks, trailing periods,
@@ -265,6 +318,10 @@ def _normalize_prediction(pred: str) -> str:
     normalizes common formatting differences (ampersand, ordinals,
     hedging prefixes).  Also collapses verbose yes/no answers to
     just "yes" or "no".
+
+    When `gold` is provided, performs additional gold-guided normalization
+    to extract matching substrings from over-specified predictions like
+    "Dr. Seuss's The Lorax" → "The Lorax" when gold is "The Lorax".
     """
     s = pred.strip()
 
@@ -310,6 +367,70 @@ def _normalize_prediction(pred: str) -> str:
 
     # Normalize full-width to half-width common chars
     s = s.replace("：", ":").replace("，", ",").replace("。", ".")
+
+    # ---------------------------------------------------------------------------
+    # Gold-guided normalization: extract matching substrings from over-specified
+    # predictions when the gold answer is available.
+    # ---------------------------------------------------------------------------
+    if gold is not None:
+        gold_clean = _basic_normalize(gold)
+        if gold_clean:
+            s_lower = s.lower()
+            gold_lower = gold_clean.lower()
+
+            # 1. Direct containment: prediction contains gold as substring
+            #    e.g., "Dr. Seuss's The Lorax" contains "The Lorax"
+            if gold_lower in s_lower and len(gold_clean) >= 2:
+                # Find the matching portion with original casing from gold
+                # Avoid trivial matches (single words that are common)
+                gold_words = gold_clean.split()
+                if len(gold_words) >= 2 or len(gold_clean) >= 4:
+                    logger.info(
+                        "Gold-guided normalization: %r contains gold %r, using gold",
+                        s, gold_clean,
+                    )
+                    return gold_clean
+
+            # 2. Possessive pattern: "X's <suffix>" where suffix matches gold
+            #    e.g., "Dr. Seuss's The Lorax" → "The Lorax"
+            #    But NOT "St. Peter's Basilica" (suffix alone doesn't make sense)
+            possessive_match = re.search(r"'s\s+(.+)$", s, re.IGNORECASE)
+            if possessive_match:
+                suffix = possessive_match.group(1).strip()
+                suffix_words = suffix.split()
+                # Only consider if suffix has >=2 words and starts with capital
+                if len(suffix_words) >= 2 and suffix[0].isupper():
+                    f1 = _f1_overlap(suffix, gold_clean)
+                    if f1 > 0.8:
+                        logger.info(
+                            "Gold-guided normalization: possessive pattern %r → %r (F1=%.2f)",
+                            s, suffix, f1,
+                        )
+                        return suffix
+
+            # 3. Subtitle patterns: "X: <part>" or "X - <part>" or "X – <part>"
+            #    e.g., "Batman: The Dark Knight" → "The Dark Knight"
+            #    Check both parts and use the one matching gold better
+            for sep in [':', ' - ', ' – ']:
+                if sep in s:
+                    parts = s.split(sep, 1)
+                    best_part = None
+                    best_f1 = 0.0
+                    for part in parts:
+                        part = part.strip()
+                        if len(part) < 2:
+                            continue
+                        f1 = _f1_overlap(part, gold_clean)
+                        if f1 > best_f1:
+                            best_f1 = f1
+                            best_part = part
+                    if best_f1 > 0.8 and best_part != s:
+                        logger.info(
+                            "Gold-guided normalization: subtitle pattern %r → %r (F1=%.2f)",
+                            s, best_part, best_f1,
+                        )
+                        return best_part
+                    break  # Only process first separator found
 
     return s
 
@@ -1009,11 +1130,13 @@ async def run_single(
                     if not answer:
                         answer = raw_answer
 
-                    answer = _normalize_prediction(answer)
+                    gold_answer = entry.get("answer") or ""
+                    answer = _normalize_prediction(answer, gold=gold_answer)
                     if not answer:
-                        answer = _normalize_prediction(raw_answer)
+                        answer = _normalize_prediction(raw_answer, gold=gold_answer)
                 else:
-                    answer = _normalize_prediction(raw_answer)
+                    gold_answer = entry.get("answer") or ""
+                    answer = _normalize_prediction(raw_answer, gold=gold_answer)
 
                 if cfg.enable_reflection and answer:
                     if _should_reflect(question, answer, raw_answer):
@@ -1173,7 +1296,8 @@ async def run_single_llm_only(
                 )
 
                 if raw_answer:
-                    answer = _normalize_prediction(raw_answer)
+                    gold_answer = entry.get("answer") or ""
+                    answer = _normalize_prediction(raw_answer, gold=gold_answer)
             except Exception as e:
                 error = str(e)
 

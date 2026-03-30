@@ -1335,9 +1335,21 @@ class AgenticSearch(BaseSearch):
                     if hint.top_k_files is not None:
                         top_k_files = hint.top_k_files
                     if hint.max_loops is not None:
-                        max_loops = hint.max_loops
+                        # Only trust max_loops reduction when pattern has fine-grained data
+                        if hint.resolution_level is not None and hint.resolution_level <= 1:
+                            # Coarse pattern — don't reduce loops below default
+                            max_loops = max(max_loops, hint.max_loops)
+                        else:
+                            max_loops = hint.max_loops
                     if hint.enable_dir_scan is not None:
                         enable_dir_scan = hint.enable_dir_scan
+                    # Memory-learned token budget — cap resource usage with safety floor
+                    if hint.token_budget is not None and hint.token_budget > 0:
+                        max_token_budget = max(hint.token_budget, 20000)
+                    _loguru_logger.debug(
+                        "[memory] strategy hint applied: mode={}, resolution_level={}, token_budget={}",
+                        hint.mode, hint.resolution_level, hint.token_budget,
+                    )
             except Exception:
                 pass
             try:
