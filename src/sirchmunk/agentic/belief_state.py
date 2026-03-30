@@ -57,6 +57,7 @@ class BeliefState:
         self._dead_paths: Set[str] = set()
         self._memory_priors: Dict[str, float] = {}
         self._chain_hint: Optional[List[Dict[str, str]]] = None
+        self._strategy_rules: List[str] = []
 
     # ------------------------------------------------------------------
     # Properties
@@ -88,9 +89,11 @@ class BeliefState:
         1. Dead paths (negative memory — FailureMemory-confirmed)
         2. Entity-path priors (corpus-level entity→file associations)
         3. Reasoning chain hint (strategy-level pattern)
+        4. Strategy rules (distilled or bootstrap, for ReAct guidance)
         """
         self._dead_paths = set(prior.dead_paths) if prior.dead_paths else set()
         self._chain_hint = prior.chain_hint
+        self._strategy_rules = list(prior.strategy_rules) if prior.strategy_rules else []
 
         cap = self._MAX_WARM_BELIEF
 
@@ -332,6 +335,11 @@ class BeliefState:
             parts.append(
                 "Reasoning pattern available from similar past queries",
             )
+
+        # Strategy rules advisory (first 3 loops only to avoid prompt bloat)
+        if self._strategy_rules and self._actions < 3:
+            rules_text = "; ".join(self._strategy_rules[:3])
+            parts.append(f"Strategy hints: {rules_text}")
 
         return " | ".join(parts)
 

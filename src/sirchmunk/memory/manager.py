@@ -713,6 +713,41 @@ class RetrievalMemory:
         except Exception:
             return None
 
+    async def trigger_distillation_sweep(self) -> int:
+        """Attempt distillation for every observed query type + complexity.
+
+        Iterates over accumulated trajectories, groups them by type/
+        complexity, and triggers distillation for any group that meets
+        the batch threshold.  Returns the count of successful distillations.
+        """
+        if self._distiller is None:
+            return 0
+        seen_buckets: set = set()
+        for t in self._pattern_memory._trajectories:
+            seen_buckets.add((t.query_type, t.complexity))
+
+        distilled = 0
+        for qt, cx in seen_buckets:
+            try:
+                pending = self._pattern_memory.pending_trajectory_count(qt, cx)
+                if pending < self._pattern_memory.distillation_batch_size:
+                    continue
+                trajectories = self._pattern_memory.get_recent_trajectories(qt, cx)
+                if len(trajectories) < 3:
+                    continue
+                result = await self._distiller.distill(trajectories, qt, cx)
+                if result:
+                    self._pattern_memory.store_distillation(result)
+                    distilled += 1
+                    logger.info(
+                        "[distill-sweep] %d rules + %d warnings for %s/%s (n=%d)",
+                        len(result.rules), len(result.failure_warnings),
+                        qt, cx, result.sample_count,
+                    )
+            except Exception as exc:
+                logger.debug("[distill-sweep] %s/%s failed: %s", qt, cx, exc)
+        return distilled
+
     # ================================================================
     #  Maintenance API
     # ================================================================

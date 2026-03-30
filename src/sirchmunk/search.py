@@ -292,6 +292,17 @@ class AgenticSearch(BaseSearch):
             except Exception:
                 pass
 
+    async def trigger_distillation_sweep(self) -> int:
+        """Attempt distillation across all observed query types.
+
+        Called after evaluation injection to ensure distillation triggers
+        even when individual per-query checks missed the batch threshold.
+        Returns the number of successful distillations.
+        """
+        if not self._memory:
+            return 0
+        return await self._memory.trigger_distillation_sweep()
+
     def update_log_callback(self, log_callback: LogCallback = None) -> None:
         """Replace the per-request log callback on all sub-components.
 
@@ -1513,7 +1524,10 @@ class AgenticSearch(BaseSearch):
         if self._memory:
             try:
                 from sirchmunk.memory.bridge import MemoryBridge
-                _memory_bridge = MemoryBridge(self._memory)
+                _memory_bridge = MemoryBridge(
+                    self._memory,
+                    title_lookup_fn=self._title_lookup_fn,
+                )
                 _memory_prior = _memory_bridge.extract_priors(
                     query=query,
                     extra_keywords=(

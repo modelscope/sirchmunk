@@ -53,7 +53,7 @@ class PatternMemory(MemoryStore):
     _SAVE_MIN_INTERVAL = 5.0  # seconds between disk writes
 
     _MAX_TRAJECTORIES = 200
-    _DISTILLATION_BATCH_SIZE = 10
+    _DISTILLATION_BATCH_SIZE = 3
     _LOOP_BUDGET_MIN_OBS = 3
     _LOOP_BUDGET_SUCCESS_RATE = 0.5
 
@@ -1010,28 +1010,45 @@ class PatternMemory(MemoryStore):
         complexity: str,
         limit: int = 20,
     ) -> List[AbstractTrajectory]:
-        """Return recent trajectories matching the given type + complexity."""
+        """Return recent trajectories matching the given type + complexity.
+
+        When the exact (type, complexity) bucket has fewer than
+        ``_DISTILLATION_BATCH_SIZE`` entries, trajectories from the
+        same *query_type* (any complexity) are included to reach the
+        minimum count.  This cross-complexity sharing accelerates cold
+        start without mixing fundamentally different reasoning types.
+        """
         with self._lock:
-            matched = [
+            exact = [
                 t for t in reversed(self._trajectories)
                 if t.query_type == query_type and t.complexity == complexity
             ]
-        return matched[:limit]
+            if len(exact) >= self._DISTILLATION_BATCH_SIZE:
+                return exact[:limit]
+            same_type = [
+                t for t in reversed(self._trajectories)
+                if t.query_type == query_type and t.complexity != complexity
+            ]
+        merged = exact + same_type
+        return merged[:limit]
 
     def pending_trajectory_count(self, query_type: str, complexity: str) -> int:
-        """Count trajectories accumulated since last distillation."""
+        """Count trajectories accumulated since last distillation.
+
+        Uses cross-complexity sharing: counts all trajectories of the
+        same *query_type* so distillation triggers faster on cold start.
+        """
         with self._lock:
             key = f"{query_type}|{complexity}"
             distill = self._distillations.get(key)
             if not distill:
                 return sum(
                     1 for t in self._trajectories
-                    if t.query_type == query_type and t.complexity == complexity
+                    if t.query_type == query_type
                 )
             return sum(
                 1 for t in self._trajectories
                 if (t.query_type == query_type
-                    and t.complexity == complexity
                     and t.timestamp > distill.distilled_at)
             )
 
@@ -1069,13 +1086,32 @@ class PatternMemory(MemoryStore):
         Tracks success/total counts per loop depth.  The optimal
         loop budget is the smallest depth with success_rate >= threshold
         (minimum effective depth principle).
+
+        Creates the pattern if it doesn't exist, because the async
+        ``record_outcome`` (which normally creates patterns) may not
+        have completed yet when this method is called synchronously
+        from ``record_trajectory``.
         """
-        _, pid = self._classify_and_pid(query)
+        features, pid = self._classify_and_pid(query)
         key = str(loops_used)
+        now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             pattern = self._patterns.get(pid)
             if not pattern:
-                return
+                pattern = QueryPattern(
+                    pattern_id=pid,
+                    query_type=features["query_type"],
+                    complexity=features["complexity"],
+                    entity_types=features["entity_types"],
+                    entity_count=features.get("entity_count", 0),
+                    hop_hint=features.get("hop_hint", "single"),
+                    resolution_level=4,
+                    optimal_mode="DEEP",
+                    optimal_params={"max_loops": 5, "top_k_files": 5},
+                    created_at=now,
+                    updated_at=now,
+                )
+                self._patterns[pid] = pattern
             stats = pattern.loop_budget_stats.get(key, [0, 0])
             stats[1] += 1
             if success:
@@ -1112,14 +1148,31 @@ class PatternMemory(MemoryStore):
 
         Each (pattern, strategy) pair maintains independent Thompson
         Sampling parameters (alpha, beta) for strategy selection.
+
+        Creates the pattern if it doesn't exist (same async-safety
+        rationale as ``record_loop_outcome``).
         """
         if strategy not in SearchStrategy.ALL:
             return
-        _, pid = self._classify_and_pid(query)
+        features, pid = self._classify_and_pid(query)
+        now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             pattern = self._patterns.get(pid)
             if not pattern:
-                return
+                pattern = QueryPattern(
+                    pattern_id=pid,
+                    query_type=features["query_type"],
+                    complexity=features["complexity"],
+                    entity_types=features["entity_types"],
+                    entity_count=features.get("entity_count", 0),
+                    hop_hint=features.get("hop_hint", "single"),
+                    resolution_level=4,
+                    optimal_mode="DEEP",
+                    optimal_params={"max_loops": 5, "top_k_files": 5},
+                    created_at=now,
+                    updated_at=now,
+                )
+                self._patterns[pid] = pattern
             arm = pattern.strategy_arms.get(strategy, [1.0, 1.0])
             if success:
                 arm[0] += 1.0

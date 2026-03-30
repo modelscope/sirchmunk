@@ -28,7 +28,7 @@ Design notes
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Set, TYPE_CHECKING
 
 from loguru import logger
 
@@ -88,10 +88,27 @@ class MemoryBridge:
 
     Instantiated once per search session by ``AgenticSearch._search_deep``.
     All methods are synchronous (memory lookups are local / O(1)–O(log N)).
+
+    Parameters
+    ----------
+    memory : RetrievalMemory
+        The cross-session memory manager.
+    title_lookup_fn : callable, optional
+        ``title_lookup_fn(title) -> list[str]`` that resolves an article
+        title to corpus file paths.  Used as a fallback when CorpusMemory
+        has no entity→path mappings (cold-start).
     """
 
-    def __init__(self, memory: Any) -> None:
+    _TITLE_PRIOR_CONFIDENCE = 0.55
+    _MAX_TITLE_LOOKUPS = 6
+
+    def __init__(
+        self,
+        memory: Any,
+        title_lookup_fn: Optional[Callable[..., Any]] = None,
+    ) -> None:
         self._memory = memory
+        self._title_lookup_fn = title_lookup_fn
 
     # ---- Read path: Memory → MemoryPrior ----
 
@@ -130,6 +147,27 @@ class MemoryBridge:
                     prior.entity_paths[p] = max(0.3, 0.8 - 0.05 * rank)
         except Exception:
             pass
+
+        # 1b. TitleIndex fallback: resolve entity keywords to file paths
+        #     when CorpusMemory has no mappings (cold start).
+        if not prior.entity_paths and self._title_lookup_fn:
+            try:
+                kws = extra_keywords or []
+                looked = 0
+                for kw in kws:
+                    if looked >= self._MAX_TITLE_LOOKUPS:
+                        break
+                    if len(kw) <= 2 or kw[0].islower():
+                        continue
+                    fps = self._title_lookup_fn(kw)
+                    if fps:
+                        for fp in fps[:2]:
+                            prior.entity_paths[str(fp)] = (
+                                self._TITLE_PRIOR_CONFIDENCE
+                            )
+                    looked += 1
+            except Exception:
+                pass
 
         # 2. FailureMemory: dead paths
         if candidate_files:

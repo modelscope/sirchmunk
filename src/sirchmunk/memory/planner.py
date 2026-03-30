@@ -10,6 +10,12 @@ structured :class:`SearchPlan` that can drive either:
 * **Warm-start hint** (confidence < 0.7): the plan is injected into the
   ReAct system prompt to steer the agent's first few actions.
 
+Cold-start strategy:
+  When no distilled rules are available, the planner falls back to
+  *bootstrap rules* — universal multi-hop search heuristics indexed
+  by query type.  These produce lower-confidence plans (warm-start
+  hints) that still meaningfully guide the first ReAct loops.
+
 Cost model:
   ~2-3K tokens per planning call.  When guided execution succeeds, this
   replaces 3-5 ReAct LLM calls (~10-15K tokens), yielding 3-5x savings.
@@ -18,11 +24,47 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .schemas import SearchPlan
 
 logger = logging.getLogger(__name__)
+
+# Universal multi-hop search heuristics, keyed by query_type.
+# Applied when no distilled rules are available (cold-start).
+_BOOTSTRAP_RULES: Dict[str, List[str]] = {
+    "bridge": [
+        "Identify the bridge entity that connects two facts; search for it first.",
+        "After finding the bridge entity, follow links to the second-hop entity.",
+        "Use title_lookup when the bridge entity is a known named entity.",
+        "If keyword_search returns too many results, add the secondary entity as a filter.",
+    ],
+    "comparison": [
+        "Search both entities independently before comparing attributes.",
+        "Use parallel keyword searches for each entity's key attribute.",
+        "Focus on the specific attribute being compared (e.g. year, count, location).",
+    ],
+    "factual": [
+        "Search for the most specific named entity in the query first.",
+        "If the first search returns no relevant results, broaden with related terms.",
+        "Use title_lookup for well-known entities to quickly locate their article.",
+    ],
+}
+_BOOTSTRAP_RULES["definition"] = _BOOTSTRAP_RULES["factual"]
+
+_BOOTSTRAP_WARNINGS: Dict[str, List[str]] = {
+    "bridge": [
+        "Broad keywords without entity names lead to irrelevant results.",
+        "Reading too many files without evidence accumulation wastes loops.",
+    ],
+    "comparison": [
+        "Do not assume the answer without finding evidence for BOTH entities.",
+    ],
+    "factual": [
+        "Avoid relying on LLM parametric knowledge; always ground in corpus evidence.",
+    ],
+}
+_BOOTSTRAP_WARNINGS["definition"] = _BOOTSTRAP_WARNINGS["factual"]
 
 
 class MemoryAugmentedPlanner:
@@ -64,14 +106,18 @@ class MemoryAugmentedPlanner:
 
         rules = meta_knowledge.get("distilled_rules", [])
         warnings = meta_knowledge.get("failure_warnings", [])
+        qt = meta_knowledge.get("query_type", "factual")
 
-        # Skip planning when no meta-knowledge is available (cold start)
+        # On cold start, inject bootstrap heuristics so MAP is never a no-op
+        is_bootstrap = False
         if not rules and not warnings:
-            return None
+            rules = _BOOTSTRAP_RULES.get(qt, _BOOTSTRAP_RULES["factual"])
+            warnings = _BOOTSTRAP_WARNINGS.get(qt, _BOOTSTRAP_WARNINGS["factual"])
+            is_bootstrap = True
 
         prompt = MAP_PLANNING_PROMPT.format(
             query=query,
-            query_type=meta_knowledge.get("query_type", "factual"),
+            query_type=qt,
             complexity=meta_knowledge.get("complexity", "moderate"),
             entity_count=meta_knowledge.get("entity_count", 0),
             hop_hint=meta_knowledge.get("hop_hint", "single"),
@@ -88,7 +134,20 @@ class MemoryAugmentedPlanner:
                 stream=False,
             )
             raw = (resp.content or "").strip()
-            return self._parse_plan(raw)
+            plan = self._parse_plan(raw)
+            # Bootstrap plans get capped confidence to prevent guided execution
+            if plan and is_bootstrap:
+                plan = SearchPlan(
+                    plan_steps=plan.plan_steps,
+                    keyword_strategy=plan.keyword_strategy,
+                    expected_hops=plan.expected_hops,
+                    confidence=min(plan.confidence, 0.5),
+                    warnings=plan.warnings,
+                    reasoning_type=plan.reasoning_type,
+                    answer_format=plan.answer_format,
+                    source="MAP-bootstrap",
+                )
+            return plan
         except Exception as exc:
             logger.debug("MAP planning failed: %s", exc)
             return None

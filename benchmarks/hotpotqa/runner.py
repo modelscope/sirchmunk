@@ -30,9 +30,90 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from collections import deque
+
 from config import ExperimentConfig
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Adaptive concurrency semaphore
+# ---------------------------------------------------------------------------
+
+class AdaptiveSemaphore:
+    """Semaphore that adjusts effective concurrency based on task duration.
+
+    Wraps ``asyncio.Semaphore`` with a moving-window latency monitor.
+    When the median completion time exceeds a configurable threshold,
+    the effective concurrency is reduced by 1.  When the median drops
+    back below a recovery threshold, concurrency is restored.
+
+    This prevents API throughput collapse under contention while still
+    allowing parallel execution when the API is healthy.
+    """
+
+    _WINDOW_SIZE = 6
+    _SPIKE_THRESHOLD_SEC = 300.0
+    _RECOVER_THRESHOLD_SEC = 200.0
+    _MIN_CONCURRENCY = 1
+
+    def __init__(self, max_concurrent: int) -> None:
+        self._max = max_concurrent
+        self._effective = max_concurrent
+        self._sem = asyncio.Semaphore(max_concurrent)
+        self._durations: deque = deque(maxlen=self._WINDOW_SIZE)
+        self._extra_holds = 0
+
+    @property
+    def effective(self) -> int:
+        return self._effective
+
+    async def acquire(self) -> None:
+        await self._sem.acquire()
+
+    def release(self) -> None:
+        self._sem.release()
+
+    def record_duration(self, seconds: float) -> None:
+        """Record a task completion time and adjust concurrency."""
+        self._durations.append(seconds)
+        if len(self._durations) < 3:
+            return
+
+        sorted_d = sorted(self._durations)
+        median = sorted_d[len(sorted_d) // 2]
+
+        if median > self._SPIKE_THRESHOLD_SEC and self._effective > self._MIN_CONCURRENCY:
+            self._effective -= 1
+            self._extra_holds += 1
+            # Hold one semaphore slot to reduce effective concurrency
+            asyncio.ensure_future(self._hold_slot())
+            logger.info(
+                "AdaptiveSemaphore: reducing concurrency to %d (median=%.0fs)",
+                self._effective, median,
+            )
+        elif (median < self._RECOVER_THRESHOLD_SEC
+              and self._effective < self._max
+              and self._extra_holds > 0):
+            self._effective += 1
+            self._extra_holds -= 1
+            self._sem.release()
+            logger.info(
+                "AdaptiveSemaphore: restoring concurrency to %d (median=%.0fs)",
+                self._effective, median,
+            )
+
+    async def _hold_slot(self) -> None:
+        """Acquire and permanently hold a slot to reduce concurrency."""
+        await self._sem.acquire()
+
+    async def __aenter__(self) -> "AdaptiveSemaphore":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        self.release()
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +320,10 @@ Rules:
 - Look for bold text, named entities, dates, numbers, or proper nouns that directly answer the question.
 - For yes/no or comparison questions, output: yes or no
 - For dates, use the format that appears in the response.
-- For person names, use the full name as it appears in the response.
+- For person names, use the COMPLETE name including any title, rank, or \
+honorific (e.g. "Captain John Smith" not "John Smith", "Dr. James Watson" \
+not "James Watson"). Match the question's phrasing when it asks for a \
+specific role (e.g. "Which Captain..." expects "Captain X").
 - Even if the response expresses uncertainty or says information is incomplete, extract any specific entity/fact that partially answers the question.
 - If uncertain, provide your best guess rather than saying "unknown".
 - NEVER output "unknown". Always extract the most relevant entity or fact.
@@ -531,7 +615,9 @@ from the evidence whenever possible.
 - The answer should be {answer_format}.
 - For yes/no questions, output ONLY "yes" or "no".
 - For entity or name questions, use the FULL name exactly as it appears \
-in the evidence.
+in the evidence, including any title, rank, or honorific (e.g. "Captain \
+John Smith" not "John Smith"). If the question asks "Which Captain...", \
+the answer MUST include "Captain".
 - If the evidence is insufficient, output "INSUFFICIENT".
 - Output ONLY the answer (1-10 words). No explanation.
 
@@ -722,16 +808,23 @@ _STRIP_DISAMBIG_RE = re.compile(r"\s*\([^)]*\)\s*$")
 
 def _parse_wiki_articles(
     files_read: List[str],
+    relevant_titles: Optional[Set[str]] = None,
 ) -> Tuple[Set[str], Dict[str, List[str]]]:
     """Parse wiki JSONL files into article titles and their sentences.
 
     Returns (all_titles, articles) where:
       - all_titles: every article title seen (for Evidence Recall metric)
-      - articles: {title → [sentence_0, sentence_1, ...]} for articles
-        whose sentences could be parsed
+      - articles: {title -> [sentence_0, sentence_1, ...]} only for
+        relevant articles (those in *relevant_titles* if provided, or
+        all articles if not)
+
+    When *relevant_titles* is provided (even if empty), sentence parsing
+    is skipped for articles whose title is not in the set — only the
+    title is collected for the evidence recall metric.
     """
     all_titles: Set[str] = set()
     articles: Dict[str, List[str]] = {}
+    filter_mode = relevant_titles is not None
 
     for fpath in files_read:
         try:
@@ -746,6 +839,9 @@ def _parse_wiki_articles(
                         if not title:
                             continue
                         all_titles.add(title)
+
+                        if filter_mode and title not in relevant_titles:
+                            continue
 
                         text = obj.get("text")
                         if not text:
@@ -828,6 +924,37 @@ Example: [["Article A", 0], ["Article B", 2]]
 JSON:"""
 
 
+_COMBINED_SP_ANSWER_PROMPT = """\
+Given a multi-hop question and the search reasoning, do two things:
+1. Extract the precise short answer grounded in the evidence.
+2. Identify supporting fact sentences from the candidate articles.
+
+Rules for answer:
+- Output 1-10 words, grounded in the evidence.
+- The answer should be {answer_format}.
+- For yes/no questions, output ONLY "yes" or "no".
+- Use the FULL name from evidence, including titles/ranks/honorifics.
+
+Rules for supporting facts:
+- A supporting fact is a [title, sentence_index] pair (0-based index).
+- Typically 2-5 facts for multi-hop questions.
+- Include ONLY sentences that directly provide evidence.
+
+Question: {question}
+Raw answer from search: {raw_answer}
+
+Search reasoning (excerpts):
+{reasoning}
+
+Candidate articles:
+{candidates}
+
+Output ONLY valid JSON (no extra text):
+{{"answer": "short answer here", \
+"supporting_facts": [["Article A", 0], ["Article B", 2]]}}
+JSON:"""
+
+
 async def _extract_sp_with_llm(
     question: str,
     answer: str,
@@ -835,28 +962,48 @@ async def _extract_sp_with_llm(
     llm: Any,
     evidence_texts: Optional[List[str]] = None,
     reasoning_texts: Optional[List[str]] = None,
-) -> Tuple[Set[str], List[List], Dict[str, List[str]]]:
-    """Extract supporting facts using LLM post-processing.
+    extract_answer: bool = False,
+) -> Tuple[Set[str], List[List], Dict[str, List[str]], str]:
+    """Extract supporting facts (and optionally a grounded answer) via LLM.
 
-    Replaces heuristic substring matching with a single LLM call that
-    understands the question semantics and selects precise (title, sent_id)
-    pairs in the same format as the official gold data.
+    When *extract_answer* is True, uses a combined prompt that returns
+    both SP and a grounded answer in a single LLM call, eliminating a
+    separate ``_extract_grounded_answer`` call.
 
-    Returns (all_titles, predicted_sp, candidates_dict).
+    Returns (all_titles, predicted_sp, candidates_dict, grounded_answer).
+    The *grounded_answer* is empty when *extract_answer* is False or
+    when the combined extraction fails.
     """
     from pathlib import Path as _Path
     files_read = [str(_Path(f).resolve()) for f in files_read]
-
-    all_titles, articles = _parse_wiki_articles(files_read)
 
     _ev = evidence_texts or []
     _rt = reasoning_texts or []
     context = "\n".join([question, answer] + _ev + _rt)
 
+    # Two-pass optimization: first pass collects all titles (skipping
+    # sentence parsing) for the evidence recall metric, then second
+    # pass only parses sentences for context-relevant articles.
+    all_titles, _ = _parse_wiki_articles(files_read, relevant_titles=set())
+    context_lower = context.lower()
+    relevant = set()
+    for t in all_titles:
+        t_lower = t.lower()
+        if t_lower in context_lower:
+            relevant.add(t)
+            continue
+        stripped = _STRIP_DISAMBIG_RE.sub("", t_lower).strip()
+        if stripped and stripped != t_lower and stripped in context_lower:
+            relevant.add(t)
+    if relevant:
+        _, articles = _parse_wiki_articles(files_read, relevant_titles=relevant)
+    else:
+        _, articles = _parse_wiki_articles(files_read)
+
     candidates = _select_candidate_articles(articles, context)
 
     if not candidates:
-        return all_titles, [], {}
+        return all_titles, [], {}, ""
 
     candidates_text = _format_candidates_for_llm(candidates)
 
@@ -864,13 +1011,25 @@ async def _extract_sp_with_llm(
     if len(reasoning_summary) > 2000:
         reasoning_summary = reasoning_summary[:1000] + "\n...[truncated]...\n" + reasoning_summary[-1000:]
 
-    prompt = _SP_EXTRACT_PROMPT.format(
-        question=question,
-        answer=answer,
-        reasoning=reasoning_summary or "(no reasoning available)",
-        candidates=candidates_text,
-    )
+    # Use combined prompt when answer extraction is requested
+    if extract_answer:
+        answer_format = _detect_answer_format(question)
+        prompt = _COMBINED_SP_ANSWER_PROMPT.format(
+            question=question,
+            answer_format=answer_format,
+            raw_answer=answer[:500] if len(answer) > 500 else answer,
+            reasoning=reasoning_summary or "(no reasoning available)",
+            candidates=candidates_text,
+        )
+    else:
+        prompt = _SP_EXTRACT_PROMPT.format(
+            question=question,
+            answer=answer,
+            reasoning=reasoning_summary or "(no reasoning available)",
+            candidates=candidates_text,
+        )
 
+    grounded_answer = ""
     try:
         resp = await llm.achat(
             messages=[{"role": "user", "content": prompt}],
@@ -878,18 +1037,31 @@ async def _extract_sp_with_llm(
         )
         raw = resp.content.strip()
 
-        bracket_start = raw.find("[")
-        bracket_end = raw.rfind("]")
-        if bracket_start >= 0 and bracket_end > bracket_start:
-            raw = raw[bracket_start:bracket_end + 1]
-
-        parsed = json_mod.loads(raw)
-        if not isinstance(parsed, list):
-            return all_titles, []
+        if extract_answer:
+            # Parse combined JSON response {"answer": ..., "supporting_facts": ...}
+            brace_start = raw.find("{")
+            brace_end = raw.rfind("}")
+            if brace_start >= 0 and brace_end > brace_start:
+                try:
+                    combined = json_mod.loads(raw[brace_start:brace_end + 1])
+                    grounded_answer = combined.get("answer", "")
+                    sp_list = combined.get("supporting_facts", [])
+                except json_mod.JSONDecodeError:
+                    sp_list = []
+            else:
+                sp_list = []
+        else:
+            bracket_start = raw.find("[")
+            bracket_end = raw.rfind("]")
+            if bracket_start >= 0 and bracket_end > bracket_start:
+                raw = raw[bracket_start:bracket_end + 1]
+            sp_list = json_mod.loads(raw)
+            if not isinstance(sp_list, list):
+                return all_titles, [], candidates, ""
 
         predicted_sp: List[List] = []
         valid_titles = set(candidates.keys())
-        for item in parsed:
+        for item in (sp_list if isinstance(sp_list, list) else []):
             if (isinstance(item, (list, tuple))
                     and len(item) >= 2
                     and isinstance(item[0], str)
@@ -898,11 +1070,11 @@ async def _extract_sp_with_llm(
                 if title in valid_titles and 0 <= sid < len(candidates[title]):
                     predicted_sp.append([title, sid])
 
-        return all_titles, predicted_sp, candidates
+        return all_titles, predicted_sp, candidates, grounded_answer
 
     except Exception as e:
         logger.warning("SP LLM extraction failed: %s", e)
-        return all_titles, [], candidates
+        return all_titles, [], candidates, ""
 
 
 # ---------------------------------------------------------------------------
@@ -926,6 +1098,9 @@ Instructions:
    - Nationality questions: use the NOUN form of the country (e.g., "Armenia" not "Armenian") \
 unless the question explicitly asks for the adjective.
    - Use the FULL name as it appears in the evidence, not abbreviated or partial.
+   - Preserve any title, rank, or honorific that appears in the evidence \
+(e.g., "Captain John Smith" not "John Smith"). If the question asks for a \
+specific role (e.g. "Which Captain..."), include that role in the answer.
 3. Check if the answer is COMPLETE — not truncated or missing key parts.
 
 Output rules:
@@ -1041,7 +1216,7 @@ async def run_single(
     searcher: Any,
     llm: Any,
     cfg: ExperimentConfig,
-    semaphore: asyncio.Semaphore,
+    semaphore: "AdaptiveSemaphore | asyncio.Semaphore",
 ) -> Dict[str, Any]:
     """Run search on one HotpotQA question against the global wiki corpus."""
     qid = entry["_id"]
@@ -1102,18 +1277,22 @@ async def run_single(
                 evidence_texts = _collect_evidence_texts(cluster, result)
                 _reasoning_texts = list(getattr(result, "reasoning_texts", None) or [])
 
-                titles, predicted_sp, sp_candidates = await _extract_sp_with_llm(
-                    question, raw_answer, files_read, llm,
-                    evidence_texts=evidence_texts,
-                    reasoning_texts=_reasoning_texts,
+                titles, predicted_sp, sp_candidates, combined_answer = (
+                    await _extract_sp_with_llm(
+                        question, raw_answer, files_read, llm,
+                        evidence_texts=evidence_texts,
+                        reasoning_texts=_reasoning_texts,
+                        extract_answer=cfg.extract_answer,
+                    )
                 )
                 retrieved_titles = list(titles)
 
                 if cfg.extract_answer and raw_answer:
-                    answer = ""
+                    # Use the combined answer from SP extraction (saves 1 LLM call)
+                    answer = combined_answer or ""
 
-                    # Primary: evidence-grounded extraction (uses SP sentences)
-                    if predicted_sp and sp_candidates:
+                    # Fallback: evidence-grounded extraction if combined failed
+                    if not answer and predicted_sp and sp_candidates:
                         answer = await _extract_grounded_answer(
                             question, predicted_sp, sp_candidates,
                             raw_answer, llm,
@@ -1148,6 +1327,8 @@ async def run_single(
                 error = str(e)
 
             elapsed = time.time() - t0
+            if hasattr(semaphore, "record_duration"):
+                semaphore.record_duration(elapsed)
             if cfg.request_delay > 0:
                 await asyncio.sleep(cfg.request_delay)
 
@@ -1222,7 +1403,7 @@ async def run_batch(
         title_lookup_fn=lookup_title_files if _WIKI_TITLE_INDEX else None,
     )
 
-    semaphore = asyncio.Semaphore(cfg.max_concurrent)
+    semaphore = AdaptiveSemaphore(cfg.max_concurrent)
     total = len(samples)
     completed = 0
 
@@ -1235,10 +1416,11 @@ async def run_batch(
         n_titles = len(r.get("retrieved_titles", []))
         n_sp = len(r.get("predicted_sp", []))
         extract_tag = " [ext]" if r.get("prediction") != r.get("raw_prediction") else ""
+        conc_tag = f" conc={semaphore.effective}" if semaphore.effective != cfg.max_concurrent else ""
         print(f"  [{completed}/{total}] {r['_id']}  "
               f"{r['elapsed']:.1f}s  tok={t.get('total_tokens', 0)}  "
               f"loops={t.get('loop_count', 0)}  titles={n_titles}  "
-              f"sp={n_sp}  {status}{extract_tag}")
+              f"sp={n_sp}  {status}{extract_tag}{conc_tag}")
         return r
 
     tasks = [_tracked(s) for s in samples]

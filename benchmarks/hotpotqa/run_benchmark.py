@@ -438,6 +438,13 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
                 pass
         if n_injected:
             print(f"[memory] Injected evaluation feedback for {n_injected} samples")
+        # Trigger distillation sweep now that ground-truth is available
+        try:
+            n_distilled = await searcher.trigger_distillation_sweep()
+            if n_distilled:
+                print(f"[memory] Distillation sweep: {n_distilled} type(s) distilled")
+        except Exception:
+            pass
         await searcher.flush_memory()
     elif searcher:
         await searcher.flush_memory()
