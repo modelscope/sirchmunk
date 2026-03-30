@@ -329,10 +329,13 @@ class BeliefState:
         """Heuristic stopping signal based on evidence concentration.
 
         Returns True when beliefs are concentrated on <=2 files and
-        enough files have been explored to be confident.
+        enough files have been explored *through actual observations*
+        (not just warm-start priors) to be confident.
         """
         n = len(self._beliefs)
         if n < 3:
+            return False
+        if self._actions < 3:
             return False
         ess = self.compute_ess()
         n_read = sum(1 for v in self._reads.values() if v > 0)
@@ -366,9 +369,11 @@ class BeliefState:
             )
             parts.append(f"Promising unread: {names}")
 
-        # ESS-based concentration signal
+        # ESS-based concentration signal — only after real observations
+        # (not just warm_start priors) to prevent premature termination
         n = len(self._beliefs)
-        if n >= 3:
+        n_read = sum(1 for v in self._reads.values() if v > 0)
+        if n >= 3 and self._actions >= 2 and n_read >= 2:
             ess = self.compute_ess()
             if ess / n < 0.3:
                 parts.append("Evidence concentrated — consider answering")

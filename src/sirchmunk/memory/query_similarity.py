@@ -123,13 +123,25 @@ class QuerySimilarityIndex:
     def _validate_useful_files(
         files: Optional[List[str]],
     ) -> List[str]:
-        """Keep only entries that look like filesystem paths."""
+        """Keep only entries that look like filesystem paths.
+
+        Accepts both absolute paths and relative paths with directory
+        components.  Also accepts bare filenames with common extensions
+        as a fallback (e.g., ``article.txt``).
+        """
         if not files:
             return []
-        return [
-            f for f in files
-            if isinstance(f, str) and ("/" in f or "\\" in f)
-        ][:20]
+        _PATH_EXTENSIONS = {".txt", ".md", ".json", ".jsonl", ".csv", ".tsv", ".html", ".xml"}
+        result = []
+        for f in files:
+            if not isinstance(f, str) or not f.strip():
+                continue
+            f = f.strip()
+            if "/" in f or "\\" in f:
+                result.append(f)
+            elif "." in f and any(f.endswith(ext) for ext in _PATH_EXTENSIONS):
+                result.append(f)
+        return result[:20]
 
     def record(
         self,
@@ -235,28 +247,55 @@ class QuerySimilarityIndex:
         query: str,
         new_confidence: float,
     ) -> bool:
-        """Update confidence of the matching entry in-place.
+        """Update confidence using Bayesian visit-count dampening.
 
-        Called by ``inject_evaluation`` after ground-truth scores are
-        available.  Forces an immediate save since this is an infrequent
-        but high-importance operation.
+        Instead of overwriting with the raw ground-truth value (which
+        would be 0.0 or 1.0 for EM), blend the new observation with
+        the existing estimate weighted by the number of observations.
+        A single observation is clamped to [0.3, 0.7] to avoid
+        over-commitment from sparse data.
         """
         with self._lock:
             idx = self._find_entry_index(query)
             if idx < 0:
                 return False
-            self._entries[idx]["confidence"] = round(new_confidence, 4)
+            entry = self._entries[idx]
+            old_conf = entry.get("confidence", 0.5)
+            n_evals = entry.get("eval_count", 0) + 1
+            entry["eval_count"] = n_evals
+
+            if n_evals <= 1:
+                blended = 0.3 * old_conf + 0.7 * new_confidence
+                blended = max(0.3, min(0.7, blended))
+            else:
+                w_new = 1.0 / n_evals
+                blended = (1.0 - w_new) * old_conf + w_new * new_confidence
+                blended = max(0.05, min(0.95, blended))
+
+            entry["confidence"] = round(blended, 4)
             self._dirty = True
         self._save()
         return True
 
-    def record_avoid_files(self, query: str) -> bool:
-        """Move ``useful_files`` to ``avoid_files`` for a failed query.
+    def record_avoid_files(
+        self,
+        query: str,
+        belief_snapshot: Optional[Dict[str, float]] = None,
+    ) -> bool:
+        """Selectively move low-belief files to ``avoid_files``.
 
-        Called when evaluation shows the query's result was incorrect.
-        Subsequent warm_starts will inject negative beliefs for these files.
-        Forces an immediate save.
+        Only files whose belief at termination was below
+        ``_AVOID_BELIEF_THRESHOLD`` are marked as avoid.  Files with
+        moderate-to-high belief are preserved in ``useful_files`` because
+        a failed answer does not imply the *files* were wrong — the LLM
+        reasoning may have been the weak link.
+
+        When *belief_snapshot* is unavailable, falls back to moving at
+        most ``_AVOID_MAX_BLIND`` files (conservative).
         """
+        _AVOID_BELIEF_THRESHOLD = 0.25
+        _AVOID_MAX_BLIND = 5
+
         with self._lock:
             idx = self._find_entry_index(query)
             if idx < 0:
@@ -264,9 +303,20 @@ class QuerySimilarityIndex:
             entry = self._entries[idx]
             current_useful = entry.get("useful_files", [])
             current_avoid = entry.get("avoid_files", [])
-            merged = list(dict.fromkeys(current_avoid + current_useful))[:20]
-            entry["avoid_files"] = merged
-            entry["useful_files"] = []
+
+            if belief_snapshot:
+                new_avoid = [
+                    fp for fp in current_useful
+                    if belief_snapshot.get(fp, 0.5) < _AVOID_BELIEF_THRESHOLD
+                ]
+                kept = [fp for fp in current_useful if fp not in set(new_avoid)]
+            else:
+                new_avoid = current_useful[:_AVOID_MAX_BLIND]
+                kept = current_useful[_AVOID_MAX_BLIND:]
+
+            merged_avoid = list(dict.fromkeys(current_avoid + new_avoid))[:20]
+            entry["avoid_files"] = merged_avoid
+            entry["useful_files"] = kept
             self._dirty = True
         self._save()
         return True

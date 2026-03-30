@@ -148,6 +148,7 @@ class RetrievalMemory:
 
         self._feedback_count = 0
         self._feedback_lock = threading.Lock()
+        self._belief_cache: Dict[str, Dict[str, float]] = {}
 
         # ── Register atexit to flush dirty state ──────────────────────
         atexit.register(self._atexit_flush)
@@ -243,7 +244,7 @@ class RetrievalMemory:
         self,
         query: str,
         top_k: int = 3,
-        min_similarity: float = 0.55,
+        min_similarity: float = 0.45,
     ) -> List[SimilarQueryHint]:
         """QuerySimilarityIndex → hints from similar historical queries."""
         try:
@@ -410,6 +411,10 @@ class RetrievalMemory:
         except Exception as exc:
             logger.debug(f"[memory:dispatch] FailureMemory failed: {exc}")
 
+        # Cache belief_snapshot for later use by inject_evaluation → record_avoid_files
+        if signal.belief_snapshot:
+            self._belief_cache[signal.query] = dict(signal.belief_snapshot)
+
         # 6b. BA-ReAct: fine-grained PathMemory from belief snapshot
         #     Skip paths already recorded in step 5 to avoid double-counting.
         if signal.belief_snapshot:
@@ -457,11 +462,12 @@ class RetrievalMemory:
                 )
 
         # 7. QuerySimilarityIndex — record for future similarity lookup
-        # Prefer high_value_files (belief-confirmed useful) over raw lists
+        # Prefer high_value_files (belief-confirmed useful), then discovered, then read
         _useful = (
             signal.high_value_files
-            if signal.high_value_files
-            else (signal.files_discovered if signal.files_discovered else signal.files_read)
+            or signal.files_discovered
+            or signal.files_read
+            or []
         )
         try:
             self._query_similarity.record(
@@ -689,10 +695,14 @@ class RetrievalMemory:
         except Exception as exc:
             logger.debug(f"[memory:inject] QuerySimilarity update failed: {exc}")
 
-        # 4. For clearly failed queries, record avoid_files (negative memory)
+        # 4. For clearly failed queries, selectively record avoid_files
+        #    Pass belief_snapshot so only low-belief files are blacklisted
         if ground_truth_conf < 0.25:
             try:
-                self._query_similarity.record_avoid_files(query)
+                belief_snapshot = self._belief_cache.pop(query, None)
+                self._query_similarity.record_avoid_files(
+                    query, belief_snapshot=belief_snapshot,
+                )
                 logger.debug(
                     "[memory:inject] Recorded avoid_files for '{}' (conf={:.3f})",
                     query[:50], ground_truth_conf,

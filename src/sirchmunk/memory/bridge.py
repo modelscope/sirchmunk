@@ -159,9 +159,11 @@ class MemoryBridge:
                         prior.similar_query_files[fp] = max(
                             existing, hint.confidence,
                         )
-                # Collect avoid_files from all hints (regardless of confidence)
-                for fp in getattr(hint, "avoid_files", None) or []:
-                    prior.avoid_files.add(fp)
+                # Only propagate avoid_files from near-exact matches
+                # (similarity >= 0.95) to prevent over-generalization
+                if hint.similarity >= 0.95:
+                    for fp in getattr(hint, "avoid_files", None) or []:
+                        prior.avoid_files.add(fp)
         except Exception:
             pass
 
