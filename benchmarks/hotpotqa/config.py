@@ -122,6 +122,10 @@ class ExperimentConfig:
     sample_max_retries: int
     map_timeout_sec: float
 
+    # SP extraction token budget
+    sp_max_articles: int
+    sp_max_tokens: int
+
     def __post_init__(self) -> None:
         self.dataset_dir = Path(self.dataset_dir).resolve()
         self.wiki_corpus_dir = Path(self.wiki_corpus_dir).resolve()
@@ -194,6 +198,8 @@ def get_config(
         "request_delay": float(os.getenv("HOTPOT_REQUEST_DELAY", "0.5")),
         "sample_max_retries": int(os.getenv("HOTPOT_SAMPLE_MAX_RETRIES", "2")),
         "map_timeout_sec": float(os.getenv("HOTPOT_MAP_TIMEOUT_SEC", "8")),
+        "sp_max_articles": int(os.getenv("HOTPOT_SP_MAX_ARTICLES", "5")),
+        "sp_max_tokens": int(os.getenv("HOTPOT_SP_MAX_TOKENS", "5000")),
     }
 
     for k, v in overrides.items():

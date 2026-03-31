@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -12,6 +13,25 @@ from openai import AsyncOpenAI, OpenAI
 from sirchmunk.utils import LogCallback, create_logger
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Global LLM concurrency control
+# ---------------------------------------------------------------------------
+# Default max concurrent LLM calls across all OpenAIChat instances.
+# Configurable via SIRCHMUNK_LLM_MAX_CONCURRENT environment variable.
+_DEFAULT_LLM_MAX_CONCURRENT = 2
+
+def _get_llm_max_concurrent() -> int:
+    """Read max concurrent LLM calls from environment, with validation."""
+    try:
+        value = int(os.environ.get("SIRCHMUNK_LLM_MAX_CONCURRENT", _DEFAULT_LLM_MAX_CONCURRENT))
+        return max(1, value)  # Ensure at least 1
+    except (ValueError, TypeError):
+        return _DEFAULT_LLM_MAX_CONCURRENT
+
+# Global semaphore for async LLM calls. Python 3.10+ asyncio.Semaphore
+# can be created without an event loop, so module-level creation is safe.
+_llm_semaphore: asyncio.Semaphore = asyncio.Semaphore(_get_llm_max_concurrent())
 
 # Transient error types that warrant automatic retry.
 # - APIConnectionError / APITimeoutError: network-level failures.
@@ -541,34 +561,44 @@ class OpenAIChat:
             stream: bool,
             request_kwargs: Dict[str, Any],
     ) -> OpenAIChatResponse:
-        """Single-attempt asynchronous chat completion (no retry)."""
-        resp = await self._async_client.chat.completions.create(
-            model=self._model, messages=messages, stream=stream, **request_kwargs
-        )
+        """Single-attempt asynchronous chat completion (no retry).
 
-        if not stream:
-            result = self._parse_non_stream_response(resp)
-            await self._logger_async.info(f"[role={result.role}] {result.content}")
-            return result
+        Uses global semaphore to limit concurrent LLM calls across all
+        OpenAIChat instances, preventing API throttling cascades.
+        """
+        # Log when we need to wait for a semaphore slot
+        if _llm_semaphore.locked():
+            logger.debug("[LLM] Waiting for semaphore slot (max_concurrent=%d)...",
+                         _get_llm_max_concurrent())
 
-        acc = _StreamAccumulator(model=self._model)
-        in_thinking = False
-        async for chunk in resp:
-            role_delta, content_delta, thinking_delta = self._process_stream_chunk(chunk, acc)
-            if role_delta:
-                await self._logger_async.info(f"[role={role_delta}] ", end="", flush=True)
-            if thinking_delta:
-                if not in_thinking:
-                    await self._logger_async.info("<think>", end="", flush=True)
-                    in_thinking = True
-                await self._logger_async.info(thinking_delta, end="", flush=True)
-            if content_delta:
-                if in_thinking:
-                    await self._logger_async.info("</think>\n", end="", flush=True)
-                    in_thinking = False
-                await self._logger_async.info(content_delta, end="", flush=True)
-        if in_thinking:
-            await self._logger_async.info("</think>\n", end="", flush=True)
-        await self._logger_async.info("", end="\n", flush=True)
+        async with _llm_semaphore:
+            resp = await self._async_client.chat.completions.create(
+                model=self._model, messages=messages, stream=stream, **request_kwargs
+            )
 
-        return acc.to_response()
+            if not stream:
+                result = self._parse_non_stream_response(resp)
+                await self._logger_async.info(f"[role={result.role}] {result.content}")
+                return result
+
+            acc = _StreamAccumulator(model=self._model)
+            in_thinking = False
+            async for chunk in resp:
+                role_delta, content_delta, thinking_delta = self._process_stream_chunk(chunk, acc)
+                if role_delta:
+                    await self._logger_async.info(f"[role={role_delta}] ", end="", flush=True)
+                if thinking_delta:
+                    if not in_thinking:
+                        await self._logger_async.info("<think>", end="", flush=True)
+                        in_thinking = True
+                    await self._logger_async.info(thinking_delta, end="", flush=True)
+                if content_delta:
+                    if in_thinking:
+                        await self._logger_async.info("</think>\n", end="", flush=True)
+                        in_thinking = False
+                    await self._logger_async.info(content_delta, end="", flush=True)
+            if in_thinking:
+                await self._logger_async.info("</think>\n", end="", flush=True)
+            await self._logger_async.info("", end="\n", flush=True)
+
+            return acc.to_response()

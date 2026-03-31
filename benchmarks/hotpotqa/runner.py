@@ -883,6 +883,149 @@ def _select_candidate_articles(
     return dict(list(candidates.items())[:_MAX_CANDIDATE_ARTICLES])
 
 
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count using simple word split."""
+    return len(text.split())
+
+
+def _compute_article_score(
+    title: str,
+    sentences: List[str],
+    query: str,
+    answer: str,
+) -> float:
+    """Compute relevance score for an article based on query/answer overlap.
+
+    Score components:
+    - Title words appearing in query (0-1)
+    - Title words appearing in answer (0-1)
+    - Proportion of sentences containing answer keywords (0-1)
+    """
+    title_words = set(re.findall(r"\b\w+\b", title.lower()))
+    query_words = set(re.findall(r"\b\w+\b", query.lower()))
+    answer_words = set(re.findall(r"\b\w+\b", answer.lower()))
+
+    # Title-query overlap
+    if title_words:
+        title_query_score = len(title_words & query_words) / len(title_words)
+    else:
+        title_query_score = 0.0
+
+    # Title-answer overlap
+    if title_words:
+        title_answer_score = len(title_words & answer_words) / len(title_words)
+    else:
+        title_answer_score = 0.0
+
+    # Sentence-answer overlap: proportion of sentences containing answer keywords
+    if sentences and answer_words:
+        matching_sents = 0
+        for sent in sentences:
+            sent_words = set(re.findall(r"\b\w+\b", sent.lower()))
+            if sent_words & answer_words:
+                matching_sents += 1
+        sent_answer_score = matching_sents / len(sentences)
+    else:
+        sent_answer_score = 0.0
+
+    # Weighted combination: title overlap is most important
+    return title_query_score * 0.4 + title_answer_score * 0.4 + sent_answer_score * 0.2
+
+
+def _truncate_long_article(
+    sentences: List[str],
+    max_sents: int = 30,
+    head_sents: int = 15,
+    tail_sents: int = 5,
+) -> Tuple[List[str], bool]:
+    """Truncate long articles, keeping head + tail sentences.
+
+    Returns (truncated_sentences, was_truncated).
+    If truncated, inserts "[... X sentences omitted ...]" marker.
+    """
+    if len(sentences) <= max_sents:
+        return sentences, False
+
+    omitted = len(sentences) - head_sents - tail_sents
+    truncated = (
+        sentences[:head_sents]
+        + [f"[... {omitted} sentences omitted ...]"]
+        + sentences[-tail_sents:]
+    )
+    return truncated, True
+
+
+def _budget_candidates_for_sp(
+    candidates: Dict[str, List[str]],
+    query: str,
+    answer: str,
+    max_articles: int,
+    max_tokens: int,
+) -> Tuple[Dict[str, List[str]], int, int, int, int]:
+    """Apply token budget to SP candidate articles.
+
+    Filtering strategy:
+    1. Compute relevance score for each article
+    2. Sort by relevance (descending)
+    3. Truncate long articles (>30 sentences)
+    4. Limit to max_articles
+    5. Limit total tokens to max_tokens
+
+    Returns (filtered_candidates, orig_count, filt_count, orig_tokens, filt_tokens).
+    """
+    if not candidates:
+        return {}, 0, 0, 0, 0
+
+    # Compute original stats
+    orig_count = len(candidates)
+    orig_tokens = sum(
+        _estimate_tokens(title) + sum(_estimate_tokens(s) for s in sents)
+        for title, sents in candidates.items()
+    )
+
+    # Score and sort articles by relevance
+    scored: List[Tuple[float, str, List[str]]] = []
+    for title, sents in candidates.items():
+        score = _compute_article_score(title, sents, query, answer)
+        scored.append((score, title, sents))
+    scored.sort(key=lambda x: -x[0])  # Descending by score
+
+    # Apply truncation and budget limits
+    filtered: Dict[str, List[str]] = {}
+    total_tokens = 0
+
+    for score, title, sents in scored:
+        if len(filtered) >= max_articles:
+            break
+
+        # Truncate long articles
+        truncated_sents, _ = _truncate_long_article(sents)
+
+        # Estimate tokens for this article
+        article_tokens = _estimate_tokens(title) + sum(
+            _estimate_tokens(s) for s in truncated_sents
+        )
+
+        # Check token budget
+        if total_tokens + article_tokens > max_tokens:
+            if filtered:
+                break
+            continue  # skip articles that individually exceed the budget
+
+        filtered[title] = truncated_sents
+        total_tokens += article_tokens
+
+    filt_count = len(filtered)
+    filt_tokens = total_tokens
+
+    logger.info(
+        "SP candidates: %d articles -> %d articles, ~%d tokens -> ~%d tokens",
+        orig_count, filt_count, orig_tokens, filt_tokens,
+    )
+
+    return filtered, orig_count, filt_count, orig_tokens, filt_tokens
+
+
 def _format_candidates_for_llm(
     candidates: Dict[str, List[str]],
 ) -> str:
@@ -963,6 +1106,8 @@ async def _extract_sp_with_llm(
     evidence_texts: Optional[List[str]] = None,
     reasoning_texts: Optional[List[str]] = None,
     extract_answer: bool = False,
+    sp_max_articles: int = 5,
+    sp_max_tokens: int = 5000,
 ) -> Tuple[Set[str], List[List], Dict[str, List[str]], str]:
     """Extract supporting facts (and optionally a grounded answer) via LLM.
 
@@ -1000,6 +1145,13 @@ async def _extract_sp_with_llm(
         _, articles = _parse_wiki_articles(files_read)
 
     candidates = _select_candidate_articles(articles, context)
+
+    # Apply token budget to reduce prompt size
+    candidates, _, _, _, _ = _budget_candidates_for_sp(
+        candidates, question, answer,
+        max_articles=sp_max_articles,
+        max_tokens=sp_max_tokens,
+    )
 
     # Article-level tracking: return only context-relevant titles,
     # falling back to candidate titles if relevance filter was empty.
@@ -1229,6 +1381,8 @@ async def _run_postprocess_pipeline(
         evidence_texts=evidence_texts,
         reasoning_texts=reasoning_texts,
         extract_answer=cfg.extract_answer,
+        sp_max_articles=cfg.sp_max_articles,
+        sp_max_tokens=cfg.sp_max_tokens,
     )
 
     if cfg.extract_answer and raw_answer:
