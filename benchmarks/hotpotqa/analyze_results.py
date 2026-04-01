@@ -59,7 +59,7 @@ def analyze_file(results_path: Path, samples: list, label: str) -> dict:
             "ans_f1": round(ps["ans_f1"], 4) if ps else None,
             "sp_em": ps["sp_em"] if ps else None,
             "sp_f1": round(ps["sp_f1"], 4) if ps else None,
-            "elapsed": r.get("elapsed"),
+            "elapsed": r.get("telemetry", {}).get("stage_seconds", {}).get("search", r.get("elapsed", 0)),
             "loops": telemetry.get("loop_count"),
             "total_tokens": telemetry.get("total_tokens"),
             "error": r.get("error"),

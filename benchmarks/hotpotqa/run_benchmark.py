@@ -270,7 +270,13 @@ def print_report(metrics, results, total_time, judge_results, gpt_acc, cfg):
     ok = [r for r in results if not r.get("error")]
     n = len(ok) or 1
     errors = len(results) - len(ok)
-    avg_time = sum(r["elapsed"] for r in ok) / n
+    # Use telemetry.stage_seconds.search for main-path latency (fallback to elapsed)
+    avg_time = sum(
+        r.get("telemetry", {}).get("stage_seconds", {}).get("search", r.get("elapsed", 0))
+        for r in ok) / n
+    total_search_time = sum(
+        r.get("telemetry", {}).get("stage_seconds", {}).get("search", r.get("elapsed", 0))
+        for r in ok)
     total_tokens = sum(
         r.get("telemetry", {}).get("total_tokens", 0) for r in ok)
     avg_tokens = total_tokens / n
@@ -296,6 +302,7 @@ def print_report(metrics, results, total_time, judge_results, gpt_acc, cfg):
     print(f"    Avg files read:      {avg_files:>8.1f}")
     print(f"    Avg titles retrieved:{avg_titles:>8.0f}")
     print(f"    Avg SP predictions:  {avg_sp:>8.0f}")
+    print(f"    Total search time:   {total_search_time:>8.1f} s")
     print(f"    Total wall time:     {total_time:>8.1f} s")
     print(f"    Errors:              {errors:>5d} / {len(results)}")
 
@@ -554,7 +561,11 @@ async def _main_impl(args, log_path, log_file, orig_stdout, orig_stderr):
         } if cfg.enable_gpt_eval else None,
         "efficiency": {
             "avg_latency_sec": round(
-                sum(r["elapsed"] for r in results) / max(len(results), 1), 2),
+                sum(r.get("telemetry", {}).get("stage_seconds", {}).get("search", r.get("elapsed", 0))
+                    for r in results) / max(len(results), 1), 2),
+            "total_search_time_sec": round(
+                sum(r.get("telemetry", {}).get("stage_seconds", {}).get("search", r.get("elapsed", 0))
+                    for r in results), 2),
             "avg_tokens": round(
                 sum(r.get("telemetry", {}).get("total_tokens", 0)
                     for r in results) / max(len(results), 1)),

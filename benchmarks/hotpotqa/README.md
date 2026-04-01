@@ -121,7 +121,7 @@ AgenticSearch now extracts predicted supporting facts from retrieved wiki files:
 
 | Metric | Description |
 |--------|-------------|
-| **Avg Latency** | Mean seconds per query |
+| **Avg Latency** | Mean AgenticSearch main-path seconds per query (excludes postprocessing) |
 | **Avg Tokens** | Mean LLM tokens per query |
 | **Avg Loops** | Mean ReAct iterations (hops) per query |
 | **Avg Files Read** | Mean wiki corpus files opened per query |
@@ -222,6 +222,7 @@ LinearRAG reports **64.30%** Contain-Acc and **66.50%** GPT-Acc on HotpotQA
     Avg files read:         12.4
     Avg titles retrieved:   89
     Avg SP predictions:     356
+    Total search time:    422.5 s
     Total wall time:       423.5 s
     Errors:                   0 / 50
 ```
