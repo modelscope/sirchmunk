@@ -5,7 +5,8 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import openai
 from openai import AsyncOpenAI, OpenAI
@@ -19,7 +20,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Default max concurrent LLM calls across all OpenAIChat instances.
 # Configurable via SIRCHMUNK_LLM_MAX_CONCURRENT environment variable.
-_DEFAULT_LLM_MAX_CONCURRENT = 2
+_DEFAULT_LLM_MAX_CONCURRENT = 3
+
 
 def _get_llm_max_concurrent() -> int:
     """Read max concurrent LLM calls from environment, with validation."""
@@ -29,9 +31,68 @@ def _get_llm_max_concurrent() -> int:
     except (ValueError, TypeError):
         return _DEFAULT_LLM_MAX_CONCURRENT
 
-# Global semaphore for async LLM calls. Python 3.10+ asyncio.Semaphore
-# can be created without an event loop, so module-level creation is safe.
-_llm_semaphore: asyncio.Semaphore = asyncio.Semaphore(_get_llm_max_concurrent())
+
+def _get_fast_reserved() -> int:
+    """Read reserved FAST slots from environment, with validation."""
+    try:
+        value = int(os.environ.get("SIRCHMUNK_LLM_FAST_RESERVED", "1"))
+        return max(1, value)
+    except (ValueError, TypeError):
+        return 1
+
+
+class PriorityLLMSemaphore:
+    """Two-tier LLM semaphore: FAST gets dedicated slot, NORMAL shares the rest.
+
+    Maintains a total concurrency limit with reserved slots for FAST priority calls.
+    - FAST channel: Reserved for lightweight calls (MAP planning, etc.)
+    - NORMAL channel: For standard calls (ReAct reasoning, batch eval, etc.)
+
+    This prevents starvation of time-sensitive lightweight calls when heavy
+    LLM calls occupy all slots in a FIFO queue.
+    """
+
+    def __init__(self, total: int = 3, fast_reserved: int = 1):
+        self._total = max(2, total)
+        # Clamp fast_reserved into [1, total-1] to ensure at least 1 NORMAL slot
+        self._fast_reserved = min(max(1, fast_reserved), self._total - 1)
+        normal_slots = self._total - self._fast_reserved
+        self._fast_sem = asyncio.Semaphore(self._fast_reserved)
+        self._normal_sem = asyncio.Semaphore(normal_slots)
+
+    @asynccontextmanager
+    async def acquire(self, priority: str = "normal") -> AsyncIterator[None]:
+        """Acquire a slot with the given priority.
+
+        Args:
+            priority: Either "fast" (for lightweight calls) or "normal" (default).
+
+        Yields:
+            None when slot is acquired; releases on exit.
+        """
+        if priority == "fast":
+            logger.debug("[LLM] FAST priority call acquiring slot...")
+            async with self._fast_sem:
+                yield
+        else:
+            if self._normal_sem.locked():
+                logger.debug(
+                    "[LLM] NORMAL priority call waiting for slot (normal_slots=%d)...",
+                    self._total - self._fast_reserved,
+                )
+            async with self._normal_sem:
+                yield
+
+    def locked(self) -> bool:
+        """Return True if all slots (both FAST and NORMAL) are occupied."""
+        return self._fast_sem.locked() and self._normal_sem.locked()
+
+
+# Global semaphore for async LLM calls with priority support.
+_llm_semaphore = PriorityLLMSemaphore(
+    total=_get_llm_max_concurrent(),
+    fast_reserved=_get_fast_reserved(),
+)
 
 # Transient error types that warrant automatic retry.
 # - APIConnectionError / APITimeoutError: network-level failures.
@@ -499,6 +560,7 @@ class OpenAIChat:
             messages: List[Dict[str, Any]],
             stream: bool = True,
             enable_thinking: Optional[bool] = None,
+            priority: str = "normal",
             **kwargs,
     ) -> OpenAIChatResponse:
         """
@@ -513,6 +575,9 @@ class OpenAIChat:
             enable_thinking (Optional[bool]): Whether to enable model thinking/reasoning.
                 Sent via ``extra_body``. Defaults to None (uses instance-level setting
                 from ``extra_body`` if provided, otherwise disabled).
+            priority (str): LLM call priority. "fast" for lightweight time-sensitive
+                calls (e.g., MAP planning), "normal" for standard calls.
+                Defaults to "normal" for backward compatibility.
             **kwargs: Additional keyword arguments merged with instance-level kwargs
                 and forwarded to the OpenAI API. Call-level kwargs take precedence.
 
@@ -524,7 +589,7 @@ class OpenAIChat:
 
         for attempt in range(self._max_retries + 1):
             try:
-                coro = self._do_achat(messages, stream, request_kwargs)
+                coro = self._do_achat(messages, stream, request_kwargs, priority=priority)
                 if self._call_timeout:
                     return await asyncio.wait_for(coro, timeout=self._call_timeout)
                 return await coro
@@ -560,18 +625,17 @@ class OpenAIChat:
             messages: List[Dict[str, Any]],
             stream: bool,
             request_kwargs: Dict[str, Any],
+            priority: str = "normal",
     ) -> OpenAIChatResponse:
         """Single-attempt asynchronous chat completion (no retry).
 
-        Uses global semaphore to limit concurrent LLM calls across all
+        Uses global priority semaphore to limit concurrent LLM calls across all
         OpenAIChat instances, preventing API throttling cascades.
-        """
-        # Log when we need to wait for a semaphore slot
-        if _llm_semaphore.locked():
-            logger.debug("[LLM] Waiting for semaphore slot (max_concurrent=%d)...",
-                         _get_llm_max_concurrent())
 
-        async with _llm_semaphore:
+        Args:
+            priority: "fast" for lightweight time-sensitive calls, "normal" otherwise.
+        """
+        async with _llm_semaphore.acquire(priority=priority):
             resp = await self._async_client.chat.completions.create(
                 model=self._model, messages=messages, stream=stream, **request_kwargs
             )

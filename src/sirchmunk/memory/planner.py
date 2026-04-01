@@ -132,6 +132,7 @@ class MemoryAugmentedPlanner:
             resp = await self._llm.achat(
                 messages=[{"role": "user", "content": prompt}],
                 stream=False,
+                priority="fast",  # MAP uses FAST channel to avoid starvation
             )
             raw = (resp.content or "").strip()
             plan = self._parse_plan(raw)

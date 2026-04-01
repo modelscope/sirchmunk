@@ -196,6 +196,11 @@ class EvidenceSampler:
         all_candidates: List[SampleWindow] = []
         top_seeds: List[SampleWindow] = []
 
+        # Build pre_scores map from scored_chunks for hybrid evaluation
+        pre_scores: Dict[tuple, float] = {
+            (sc.start, sc.end): sc.combined_score for sc in scored_chunks
+        }
+
         for r in range(1, config.max_rounds + 1):
             if self.verbose:
                 await self._log.info(f"--- Round {r}/{config.max_rounds} ---")
@@ -221,7 +226,11 @@ class EvidenceSampler:
                     f"   Evaluating {len(current_samples)} samples with LLM (batch)..."
                 )
 
-            evaluated = await self._evaluator.evaluate(current_samples, query)
+            # Use hybrid evaluation with pre_scores for Round 1 samples
+            # (these come from scored_chunks and have known pre-scores)
+            evaluated = await self._evaluator.evaluate_hybrid(
+                current_samples, query, pre_scores
+            )
             self._collect_usages()
             all_candidates.extend(evaluated)
 

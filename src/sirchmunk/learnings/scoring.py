@@ -13,6 +13,7 @@ Contains two complementary components:
 """
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -176,6 +177,12 @@ class SignalScorer:
 # ===================================================================
 # BatchEvaluator — batched LLM evidence scoring
 # ===================================================================
+
+# Hybrid evaluation thresholds (configurable via environment variables)
+_EVAL_HIGH_THRESHOLD = float(os.getenv("SIRCHMUNK_EVAL_HIGH_THRESHOLD", "0.75"))
+_EVAL_LOW_THRESHOLD = float(os.getenv("SIRCHMUNK_EVAL_LOW_THRESHOLD", "0.25"))
+
+
 class BatchEvaluator:
     """Evaluate multiple text samples in a single LLM call per batch.
 
@@ -245,6 +252,67 @@ class BatchEvaluator:
             f"[Timing] Batch evaluation ({len(samples)} samples, "
             f"{len(batches)} batches, parallel): {_time.time()-_t0:.2f}s"
         )
+        return samples
+
+    async def evaluate_hybrid(
+        self,
+        samples: List[SampleWindow],
+        query: str,
+        pre_scores: Optional[Dict[tuple, float]] = None,
+    ) -> List[SampleWindow]:
+        """Hybrid evaluation: use pre-scores to skip obvious high/low samples.
+
+        Args:
+            samples: Samples to evaluate
+            query: Search query
+            pre_scores: Optional dict mapping sample identifier (start_idx, end_idx)
+                        to pre-computed signal score (0.0-1.0)
+
+        Returns:
+            Updated samples with scores assigned
+        """
+        if not samples:
+            return samples
+
+        # Fallback to standard evaluation if no pre_scores provided
+        if not pre_scores:
+            return await self.evaluate(samples, query)
+
+        high_confidence: List[SampleWindow] = []
+        low_confidence: List[SampleWindow] = []
+        uncertain: List[SampleWindow] = []
+
+        for sample in samples:
+            key = (sample.start_idx, sample.end_idx)
+            pre_score = pre_scores.get(key)
+
+            if pre_score is None:
+                # No pre-score available, send to LLM
+                uncertain.append(sample)
+            elif pre_score >= _EVAL_HIGH_THRESHOLD:
+                # High confidence: assign high score directly
+                sample.score = 8.0
+                sample.reasoning = "High signal score (pre-filtered)"
+                high_confidence.append(sample)
+            elif pre_score <= _EVAL_LOW_THRESHOLD:
+                # Low confidence: assign low score directly
+                sample.score = 2.0
+                sample.reasoning = "Low signal score (pre-filtered)"
+                low_confidence.append(sample)
+            else:
+                # Uncertain: needs LLM evaluation
+                uncertain.append(sample)
+
+        await self._log.info(
+            f"Hybrid eval: {len(samples)} samples -> "
+            f"{len(high_confidence)} high / {len(low_confidence)} low / {len(uncertain)} LLM"
+        )
+
+        # Evaluate uncertain samples with LLM
+        if uncertain:
+            await self.evaluate(uncertain, query)
+
+        # Return all samples (they've been modified in place)
         return samples
 
     # ---- batch evaluation ---------------------------------------------

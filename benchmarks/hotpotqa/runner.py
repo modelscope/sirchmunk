@@ -1041,6 +1041,134 @@ def _format_candidates_for_llm(
     return "\n\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Stop words for heuristic SP extraction
+# ---------------------------------------------------------------------------
+
+_SP_STOP_WORDS = frozenset({
+    "a", "an", "the", "is", "was", "are", "were", "be", "been", "being",
+    "of", "in", "on", "at", "to", "for", "and", "or", "but", "not",
+    "by", "with", "from", "that", "this", "it", "its", "as", "if",
+    "he", "she", "his", "her", "they", "them", "their", "we", "you",
+    "do", "does", "did", "has", "have", "had", "will", "would", "can",
+    "could", "should", "may", "might", "shall",
+})
+
+
+def _extract_sp_heuristic(
+    question: str,
+    answer: str,
+    candidates: Dict[str, List[str]],
+    reasoning_texts: Optional[List[str]] = None,
+) -> Tuple[Set[str], List[List], str]:
+    """Heuristic SP extraction without LLM.
+
+    Uses word overlap scoring to identify supporting facts based on:
+    - Answer word coverage (40%)
+    - Query word coverage (30%)
+    - Position preference for early sentences (15%)
+    - Reasoning chain mentions (15%)
+
+    Returns:
+        (tracked_titles, predicted_sp, grounded_answer)
+    """
+    # Text preprocessing
+    def tokenize_and_filter(text: str) -> Set[str]:
+        words = set(text.lower().split())
+        return words - _SP_STOP_WORDS
+
+    query_words = tokenize_and_filter(question)
+    answer_words = tokenize_and_filter(answer)
+
+    # Merge reasoning texts into one context string
+    reasoning_context = ""
+    if reasoning_texts:
+        reasoning_context = " ".join(reasoning_texts).lower()
+
+    # Score each sentence
+    scored_sentences: List[Tuple[str, int, float]] = []
+
+    for title, sentences in candidates.items():
+        for idx, sent in enumerate(sentences):
+            if not isinstance(sent, str) or not sent.strip():
+                continue
+
+            sent_lower = sent.lower()
+            sent_words = set(sent_lower.split())
+
+            # Answer word coverage (weight 40%)
+            answer_overlap = (
+                len(answer_words & sent_words) / max(len(answer_words), 1)
+            )
+
+            # Query word coverage (weight 30%)
+            query_overlap = (
+                len(query_words & sent_words) / max(len(query_words), 1)
+            )
+
+            # Position preference (weight 15%): first 3 sentences get bonus
+            position_score = 1.0 if idx < 3 else 0.3
+
+            # Reasoning chain mentions (weight 15%)
+            reasoning_score = 0.0
+            if reasoning_context:
+                # Check if key phrases from sentence appear in reasoning
+                key_phrases = [
+                    w for w in sent_words
+                    if len(w) > 3 and w not in _SP_STOP_WORDS
+                ]
+                if key_phrases:
+                    reasoning_score = sum(
+                        1 for p in key_phrases if p in reasoning_context
+                    ) / len(key_phrases)
+
+            total_score = (
+                0.40 * answer_overlap
+                + 0.30 * query_overlap
+                + 0.15 * position_score
+                + 0.15 * reasoning_score
+            )
+
+            scored_sentences.append((title, idx, total_score))
+
+    # Sort by score descending
+    scored_sentences.sort(key=lambda x: -x[2])
+
+    # Select top-K facts (2-5) ensuring diversity across articles
+    predicted_sp: List[List] = []
+    seen_pairs: Set[Tuple[str, int]] = set()
+    articles_covered: Set[str] = set()
+
+    # First pass: pick top scoring facts until we have >= 2 articles or 5 facts
+    for title, idx, score in scored_sentences:
+        if len(predicted_sp) >= 5:
+            break
+        if (title, idx) in seen_pairs:
+            continue
+
+        predicted_sp.append([title, idx])
+        seen_pairs.add((title, idx))
+        articles_covered.add(title)
+
+        # If we have 2+ articles and 2+ facts, we can stop early
+        if len(articles_covered) >= 2 and len(predicted_sp) >= 2:
+            # Continue until we have at least 2 facts per article if possible
+            pass
+
+    # Ensure minimum of 2 facts if available
+    if len(predicted_sp) < 2 and len(scored_sentences) >= 2:
+        for title, idx, score in scored_sentences:
+            if (title, idx) not in seen_pairs:
+                predicted_sp.append([title, idx])
+                seen_pairs.add((title, idx))
+                if len(predicted_sp) >= 2:
+                    break
+
+    tracked_titles = {sp[0] for sp in predicted_sp}
+    # grounded_answer is just the raw answer for heuristic mode
+    return tracked_titles, predicted_sp, answer
+
+
 _SP_EXTRACT_PROMPT = """\
 Given a multi-hop question, its answer, and the search reasoning, identify \
 the supporting facts from the Wikipedia articles below.
@@ -1159,6 +1287,31 @@ async def _extract_sp_with_llm(
 
     if not candidates:
         return tracked_titles, [], {}, ""
+
+    # --- Heuristic SP extraction (fast path) ---
+    heuristic_only = os.getenv("HOTPOT_SP_HEURISTIC_ONLY", "0") == "1"
+
+    h_titles, h_sp, h_answer = _extract_sp_heuristic(
+        question, answer, candidates,
+        reasoning_texts=reasoning_texts,
+    )
+
+    # Check coverage: need SPs from >= 2 different articles
+    unique_articles = len({sp[0] for sp in h_sp})
+
+    if heuristic_only or unique_articles >= 2:
+        logger.info(
+            "SP heuristic: %d facts from %d articles (heuristic_only=%s)",
+            len(h_sp), unique_articles, heuristic_only,
+        )
+        grounded = h_answer if extract_answer else ""
+        return h_titles, h_sp, candidates, grounded
+
+    logger.info(
+        "SP heuristic insufficient (%d articles), falling back to LLM",
+        unique_articles,
+    )
+    # --- End heuristic block; continue to LLM fallback ---
 
     candidates_text = _format_candidates_for_llm(candidates)
 
