@@ -1920,15 +1920,35 @@ class AgenticSearch(BaseSearch):
             if isinstance(ln, int):
                 hit_lines.append(ln)
 
+        # Diagnostic logging when falling back to snippet mode
+        if not hit_lines and match_objects:
+            await self._logger.warning(
+                f"[FAST] No line_number in {len(match_objects)} match(es) for {fname}, "
+                f"falling back to snippet mode"
+            )
+
         # --- Text files: read context windows around hits ---
         if ext in self._FAST_TEXT_EXTENSIONS and hit_lines:
+            # Expand context window for sparse hits
+            window = self._FAST_CONTEXT_WINDOW
+            if len(hit_lines) <= 2:
+                window = max(window, 100)  # ±100 lines for 1-2 hits
             evidence = self._read_context_windows(
                 file_path, hit_lines,
-                window=self._FAST_CONTEXT_WINDOW,
+                window=window,
                 max_chars=self._FAST_MAX_EVIDENCE_CHARS,
             )
             if evidence:
-                return f"[{fname}]\n{evidence}"
+                full_evidence = f"[{fname}]\n{evidence}"
+                if len(full_evidence) < 100:
+                    await self._logger.info(
+                        f"[FAST] Context window evidence too thin ({len(full_evidence)} chars) for {fname}, "
+                        f"attempting file head extraction"
+                    )
+                    head_evidence = await self._fast_read_file_head(file_path)
+                    if head_evidence and len(head_evidence) > len(full_evidence):
+                        return head_evidence
+                return full_evidence
 
         # --- Non-text files or no line numbers: use grep snippets ---
         snippets: List[str] = []
@@ -1943,7 +1963,17 @@ class AgenticSearch(BaseSearch):
                 break
 
         if snippets:
-            return f"[{fname}]\n" + "\n".join(snippets)
+            snippet_evidence = f"[{fname}]\n" + "\n".join(snippets)
+            # If snippet evidence is too thin, try file head for richer context
+            if len(snippet_evidence) < 100:
+                await self._logger.info(
+                    f"[FAST] Evidence too thin ({len(snippet_evidence)} chars) for {fname}, "
+                    f"attempting file head extraction"
+                )
+                head_evidence = await self._fast_read_file_head(file_path)
+                if head_evidence and len(head_evidence) > len(snippet_evidence):
+                    return head_evidence
+            return snippet_evidence
 
         # Last resort: try reading file head
         return await self._fast_read_file_head(file_path)
