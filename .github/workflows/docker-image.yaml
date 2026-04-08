@@ -30,7 +30,7 @@ on:
       node_version:
         description: "Node.js version for the frontend build"
         required: false
-        default: "20"
+        default: "23"
       mirror:
         description: "Mirror profile for builds behind GFW (cn / empty)"
         required: false
