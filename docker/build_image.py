@@ -27,6 +27,7 @@ Usage:
 import argparse
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -187,12 +188,13 @@ class Builder:
     def build(self) -> int:
         """Build Docker image for a single platform (local dev use)."""
         platform = getattr(self.args, "platform", None)
-        platform_flag = f"--platform {platform}" if platform else ""
-        ret = os.system(
-            f"docker build {platform_flag} -t {self.local_image()} -f Dockerfile ."
-        )
+        cmd = ["docker", "build"]
+        if platform:
+            cmd.extend(["--platform", platform])
+        cmd.extend(["-t", self.local_image(), "-f", "Dockerfile", "."])
+        ret = subprocess.run(cmd).returncode
         if ret == 0:
-            os.system(f"docker tag {self.local_image()} sirchmunk:latest")
+            subprocess.run(["docker", "tag", self.local_image(), "sirchmunk:latest"])
         return ret
 
     def build_and_push_multiarch(self) -> int:
@@ -203,22 +205,14 @@ class Builder:
         cannot be loaded locally.
         """
         platform = self.args.platform
-        tags = []
+        cmd = ["docker", "buildx", "build", "--platform", platform]
         tag = self.image_tag()
-        # Tag for each registry
         for registry in self.registries:
-            tags.extend(["-t", f"{registry}:{tag}"])
-            tags.extend(["-t", f"{registry}:{tag}-{TIMESTAMP}"])
-        # Also tag as local reference
-        tags.extend(["-t", self.local_image()])
-
-        tags_str = " ".join(tags)
-        cmd = (
-            f"docker buildx build --platform {platform} "
-            f"{tags_str} --push -f Dockerfile ."
-        )
-        print(f"[build_image] Buildx multi-platform: {cmd}")
-        return os.system(cmd)
+            cmd.extend(["-t", f"{registry}:{tag}"])
+            cmd.extend(["-t", f"{registry}:{tag}-{TIMESTAMP}"])
+        cmd.extend(["--push", "-f", "Dockerfile", "."])
+        print(f"[build_image] Buildx multi-platform: {' '.join(cmd)}")
+        return subprocess.run(cmd).returncode
 
     def push(self) -> int:
         tag = self.image_tag()
@@ -226,16 +220,16 @@ class Builder:
             remote = f"{registry}:{tag}"
             print(f"[build_image] Pushing → {remote}")
 
-            ret = os.system(f"docker tag {self.local_image()} {remote}")
+            ret = subprocess.run(["docker", "tag", self.local_image(), remote]).returncode
             if ret != 0:
                 return ret
-            ret = os.system(f"docker push {remote}")
+            ret = subprocess.run(["docker", "push", remote]).returncode
             if ret != 0:
                 return ret
 
             ts_remote = f"{registry}:{tag}-{TIMESTAMP}"
-            os.system(f"docker tag {self.local_image()} {ts_remote}")
-            os.system(f"docker push {ts_remote}")
+            subprocess.run(["docker", "tag", self.local_image(), ts_remote])
+            subprocess.run(["docker", "push", ts_remote])
 
         return 0
 
