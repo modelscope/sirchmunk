@@ -179,13 +179,46 @@ class Builder:
         dest.write_text(content)
         print(f"[build_image] Generated {dest}")
 
+    def _is_multi_platform(self) -> bool:
+        """Check if multi-platform build is requested (e.g. linux/amd64,linux/arm64)."""
+        platform = getattr(self.args, "platform", None)
+        return bool(platform and "," in platform)
+
     def build(self) -> int:
+        """Build Docker image for a single platform (local dev use)."""
+        platform = getattr(self.args, "platform", None)
+        platform_flag = f"--platform {platform}" if platform else ""
         ret = os.system(
-            f"docker build --platform linux/amd64 -t {self.local_image()} -f Dockerfile ."
+            f"docker build {platform_flag} -t {self.local_image()} -f Dockerfile ."
         )
         if ret == 0:
             os.system(f"docker tag {self.local_image()} sirchmunk:latest")
         return ret
+
+    def build_and_push_multiarch(self) -> int:
+        """Build and push multi-platform image using docker buildx.
+
+        When multiple platforms are specified (e.g. linux/amd64,linux/arm64),
+        buildx creates a manifest list and pushes atomically — the image
+        cannot be loaded locally.
+        """
+        platform = self.args.platform
+        tags = []
+        tag = self.image_tag()
+        # Tag for each registry
+        for registry in self.registries:
+            tags.extend(["-t", f"{registry}:{tag}"])
+            tags.extend(["-t", f"{registry}:{tag}-{TIMESTAMP}"])
+        # Also tag as local reference
+        tags.extend(["-t", self.local_image()])
+
+        tags_str = " ".join(tags)
+        cmd = (
+            f"docker buildx build --platform {platform} "
+            f"{tags_str} --push -f Dockerfile ."
+        )
+        print(f"[build_image] Buildx multi-platform: {cmd}")
+        return os.system(cmd)
 
     def push(self) -> int:
         tag = self.image_tag()
@@ -227,15 +260,25 @@ class Builder:
 
         os.chdir(REPO_ROOT)
 
-        ret = self.build()
-        if ret != 0:
-            raise RuntimeError(f"Docker build failed with exit code {ret}")
-        print(f"[build_image] Built: {self.local_image()}")
-
-        if self.registries:
-            ret = self.push()
+        if self._is_multi_platform():
+            if not self.registries:
+                raise RuntimeError(
+                    "Multi-platform builds require --push with registries "
+                    "(buildx cannot --load multi-platform images locally)"
+                )
+            ret = self.build_and_push_multiarch()
             if ret != 0:
-                raise RuntimeError(f"Docker push failed with exit code {ret}")
+                raise RuntimeError(f"Docker buildx multi-platform build failed with exit code {ret}")
+        else:
+            ret = self.build()
+            if ret != 0:
+                raise RuntimeError(f"Docker build failed with exit code {ret}")
+            print(f"[build_image] Built: {self.local_image()}")
+
+            if self.registries:
+                ret = self.push()
+                if ret != 0:
+                    raise RuntimeError(f"Docker push failed with exit code {ret}")
 
         print(f"[build_image] Done: {self.local_image()}")
 
@@ -296,6 +339,10 @@ def parse_args() -> argparse.Namespace:
                     help="Comma-separated registries to push to (overrides defaults)")
     p.add_argument("--dry_run", type=int, default=0,
                     help="1 = generate Dockerfile only, skip docker build")
+    p.add_argument("--platform", default=None,
+                    help="Target platform(s). Single (e.g. linux/amd64) for local build, "
+                         "or comma-separated (e.g. linux/amd64,linux/arm64) for multi-arch "
+                         "buildx (requires --push)")
     return p.parse_args()
 
 
