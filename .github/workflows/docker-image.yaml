@@ -49,16 +49,16 @@ jobs:
         with:
           ref: ${{ github.event.inputs.sirchmunk_branch }}
 
-      - name: Build and Push Docker Image
+      - name: Generate Dockerfile from template
         run: |
-          VERSION_ARG=""
-          if [ -n "${{ github.event.inputs.sirchmunk_version }}" ]; then
-            VERSION_ARG="--sirchmunk_version ${{ github.event.inputs.sirchmunk_version }}"
-          fi
-
           MIRROR_ARG=""
           if [ -n "${{ github.event.inputs.mirror }}" ]; then
             MIRROR_ARG="--mirror ${{ github.event.inputs.mirror }}"
+          fi
+
+          VERSION_ARG=""
+          if [ -n "${{ github.event.inputs.sirchmunk_version }}" ]; then
+            VERSION_ARG="--sirchmunk_version ${{ github.event.inputs.sirchmunk_version }}"
           fi
 
           python3 docker/build_image.py \
@@ -66,7 +66,34 @@ jobs:
             --ubuntu_version ${{ github.event.inputs.ubuntu_version }} \
             --python_version ${{ github.event.inputs.python_version }} \
             --node_version ${{ github.event.inputs.node_version }} \
-            --sirchmunk_branch ${{ github.event.inputs.sirchmunk_branch }} \
-            --push \
+            --dry_run 1 \
             $VERSION_ARG \
             $MIRROR_ARG
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          PY_TAG="py$(echo '${{ github.event.inputs.python_version }}' | tr -d '.')"
+          VERSION="${{ github.event.inputs.sirchmunk_version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(python3 -c "import re; m=re.search(r\"__version__\s*=\s*['\\\"]([^'\\\"]+)['\\\"]\", open('src/sirchmunk/version.py').read()); print(m.group(1) if m else 'latest')")
+          fi
+          TAG="ubuntu${{ github.event.inputs.ubuntu_version }}-${PY_TAG}-${VERSION}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Computed image tag: ${TAG}"
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:${{ steps.meta.outputs.tag }}

@@ -46,12 +46,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo 'alias la="ls -A"' >> /etc/bash.bashrc \
     && echo 'alias l="ls -CF"' >> /etc/bash.bashrc
 
-# Install ripgrep
-RUN curl -fsSL {github_proxy}https://github.com/BurntSushi/ripgrep/releases/download/{rg_version}/ripgrep_{rg_version}-1_amd64.deb \
-        -o /tmp/rg.deb && dpkg -i /tmp/rg.deb && rm /tmp/rg.deb
-
-# Install ripgrep-all
-RUN curl -fsSL {github_proxy}https://github.com/phiresky/ripgrep-all/releases/download/{rga_version}/ripgrep_all-{rga_version}-x86_64-unknown-linux-musl.tar.gz \
+# Install ripgrep and ripgrep-all (architecture-aware)
+ARG TARGETARCH
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) \
+            curl -fsSL {github_proxy}https://github.com/BurntSushi/ripgrep/releases/download/{rg_version}/ripgrep_{rg_version}-1_amd64.deb \
+                -o /tmp/rg.deb && dpkg -i /tmp/rg.deb && rm /tmp/rg.deb; \
+            RGA_ARCH="x86_64-unknown-linux-musl" ;; \
+        arm64) \
+            curl -fsSL {github_proxy}https://github.com/BurntSushi/ripgrep/releases/download/{rg_version}/ripgrep-{rg_version}-aarch64-unknown-linux-gnu.tar.gz \
+                -o /tmp/rg.tar.gz \
+            && tar -xzf /tmp/rg.tar.gz -C /tmp \
+            && cp /tmp/ripgrep-{rg_version}-aarch64-unknown-linux-gnu/rg /usr/local/bin/ \
+            && rm -rf /tmp/rg*; \
+            RGA_ARCH="aarch64-unknown-linux-gnu" ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
+    esac; \
+    curl -fsSL {github_proxy}https://github.com/phiresky/ripgrep-all/releases/download/{rga_version}/ripgrep_all-{rga_version}-${RGA_ARCH}.tar.gz \
         -o /tmp/rga.tar.gz \
     && tar -xzf /tmp/rga.tar.gz -C /tmp \
     && cp /tmp/ripgrep_all-*/rga /usr/local/bin/ \
