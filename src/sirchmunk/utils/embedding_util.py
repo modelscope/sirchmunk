@@ -104,18 +104,34 @@ class EmbeddingUtil:
         """Download model weights from ModelScope (or HuggingFace fallback)."""
         try:
             from modelscope import snapshot_download
+        except ImportError:
+            raise RuntimeError("modelscope is required. Install with: pip install modelscope")
 
+        ignore = ["openvino/*", "onnx/*", "pytorch_model.bin", "rust_model.ot", "tf_model.h5"]
+
+        # Step 1: offline-first — try loading from local cache
+        try:
             model_dir = snapshot_download(
                 model_id=model_id,
                 cache_dir=cache_dir,
-                ignore_patterns=[
-                    "openvino/*", "onnx/*", "pytorch_model.bin",
-                    "rust_model.ot", "tf_model.h5",
-                ],
+                local_files_only=True,
+                ignore_patterns=ignore,
+            )
+            logger.info(f"Model loaded from cache: {model_dir}")
+            return model_dir
+        except Exception:
+            logger.debug(f"Offline cache miss for {model_id}, trying online download...")
+
+        # Step 2: fallback — online download
+        try:
+            model_dir = snapshot_download(
+                model_id=model_id,
+                cache_dir=cache_dir,
+                local_files_only=False,
+                ignore_patterns=ignore,
             )
             logger.debug(f"Model downloaded: {model_dir}")
             return model_dir
-
         except Exception as e:
             logger.error(f"Failed to download model {model_id}: {e}")
             raise RuntimeError(

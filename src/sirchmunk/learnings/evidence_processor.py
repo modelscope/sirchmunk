@@ -24,6 +24,9 @@ from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import ROI_RESULT_SUMMARY
 from sirchmunk.utils import LogCallback, create_logger
 
+# Small file threshold: skip Monte Carlo sampling and return full content as ROI
+_SMALL_FILE_THRESHOLD = 100_000  # 100K chars
+
 __all__ = [
     "EvidenceSampler",
     "MonteCarloEvidenceSampling",
@@ -86,7 +89,37 @@ class EvidenceSampler:
         confidence_threshold: float = 7.0,
         top_k: int = 5,
     ) -> RoiResult:
+        """Extract the Region of Interest from the document via hybrid adaptive sampling.
+
+        Args:
+            query (str): The user query string.
+            keywords (Dict[str, float], optional): Enhanced keywords with IDF scores for fuzzy matching.
+            confidence_threshold (float): Confidence score threshold for early stopping.
+            top_k (int): Number of top snippets to consider for final summary.
+
+        Returns:
+            RoiResult: The final ROI result with metadata.
+        """
         keywords = keywords or {}
+
+        # Small file fast path: skip sampling for files < 100K chars
+        if self.doc_len < _SMALL_FILE_THRESHOLD:
+            await self._log.info(
+                f"[MC] Small file fast path: {self.doc_len} chars < {_SMALL_FILE_THRESHOLD} threshold, "
+                f"returning full content as ROI"
+            )
+            snippet = {
+                "snippet": self.doc,
+                "start": 0,
+                "end": self.doc_len,
+                "score": 10.0,
+                "reasoning": "Small file - full content returned without sampling",
+            }
+            return RoiResult(
+                summary=self.doc,
+                is_found=True,
+                snippets=[snippet],
+            )
 
         if self.verbose:
             await self._log.info(

@@ -394,7 +394,7 @@ FAST_QUERY_ANALYSIS = """Classify the user query and, if it is a document/file s
 
 ### Output
 Return JSON only, no extra text:
-{{"type": "search", "primary": ["compound phrase"], "fallback": ["term1", "term2"], "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "..."}}
+{{"type": "search", "primary": ["compound phrase"], "fallback": ["term1", "term2"], "idf": {{"compound phrase": 8.0, "term1": 2.5, "term2": 6.0}}, "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "..."}}
 
 Rules:
 - **type**: "search" if the query requires retrieving information from files or documents; "chat" if it is a greeting, small talk, identity question, or any other conversational message that does NOT need file retrieval. When type is "chat", set primary and fallback to empty arrays and put a brief natural reply (same language as the query) in "response". "summary" if the user wants to summarize, review, or analyze entire documents without searching for specific information — set primary/fallback to empty arrays.
@@ -403,18 +403,19 @@ Rules:
 - **primary_alt / fallback_alt**: Cross-lingual equivalents of primary/fallback. If the query is in Chinese, provide English translations; if in English, provide Chinese translations. Only translate the most critical 1-2 terms. Empty arrays if no meaningful translation exists.
 - **file_hints**: filename fragments or glob patterns ONLY if clearly implied; empty array otherwise.
 - **intent**: one sentence describing the query intent.
+- **idf**: Estimated Inverse Document Frequency weight (1.0-10.0 scale) for EVERY keyword in primary, fallback, primary_alt, and fallback_alt. Higher values (7-10) for rare/specific/domain terms; lower values (1-3) for common/generic words. Estimate based on general corpus frequency.
 
 Example: query "How does transformer attention work?"
-→ {{"type": "search", "primary": ["transformer attention"], "fallback": ["attention", "transformer"], "primary_alt": ["注意力机制"], "fallback_alt": ["注意力", "变换器"], "file_hints": [], "intent": "understand transformer attention mechanism"}}
+→ {{"type": "search", "primary": ["transformer attention"], "fallback": ["attention", "transformer"], "idf": {{"transformer attention": 8.5, "attention": 3.0, "transformer": 5.0, "注意力机制": 8.0, "注意力": 3.5, "变换器": 6.0}}, "primary_alt": ["注意力机制"], "fallback_alt": ["注意力", "变换器"], "file_hints": [], "intent": "understand transformer attention mechanism"}}
 
 Example: query "认证机制怎么实现"
-→ {{"type": "search", "primary": ["认证机制"], "fallback": ["认证", "鉴权"], "primary_alt": ["authentication"], "fallback_alt": ["auth"], "file_hints": [], "intent": "了解认证机制的实现方式"}}
+→ {{"type": "search", "primary": ["认证机制"], "fallback": ["认证", "鉴权"], "idf": {{"认证机制": 7.5, "认证": 3.0, "鉴权": 7.0, "authentication": 5.5, "auth": 3.0}}, "primary_alt": ["authentication"], "fallback_alt": ["auth"], "file_hints": [], "intent": "了解认证机制的实现方式"}}
 
 Example: query "你好"
-→ {{"type": "chat", "primary": [], "fallback": [], "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "greeting", "response": "你好！我是 Sirchmunk，一个智能文档搜索助手。有什么可以帮你的？"}}
+→ {{"type": "chat", "primary": [], "fallback": [], "idf": {{}}, "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "greeting", "response": "你好！我是 Sirchmunk，一个智能文档搜索助手。有什么可以帮你的？"}}
 
 Example: query "总结这几篇文档"
-→ {{"type": "summary", "primary": [], "fallback": [], "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "summarize documents"}}
+→ {{"type": "summary", "primary": [], "fallback": [], "idf": {{}}, "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "summarize documents"}}
 """
 
 

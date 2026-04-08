@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -508,12 +509,16 @@ class AgenticSearch(BaseSearch):
         except Exception as e:
             _loguru_logger.warning(f"Failed to load historical knowledge: {e}")
 
-    async def _try_reuse_cluster(self, query: str) -> Optional[KnowledgeCluster]:
+    async def _try_reuse_cluster(self, query: str, paths: Optional[List[str]] = None) -> Optional[KnowledgeCluster]:
         """Try to reuse existing knowledge cluster based on semantic similarity.
 
         The method waits (non-blocking) for the embedding model to become
         ready so that reuse works reliably even on the first search call
         within a process.
+
+        Args:
+            query: The search query string.
+            paths: Optional list of file paths to filter cluster search scope.
 
         Returns:
             KnowledgeCluster if a suitable cached cluster is found, None otherwise.
@@ -540,6 +545,7 @@ class AgenticSearch(BaseSearch):
                 query_embedding=query_embedding,
                 top_k=self.cluster_sim_top_k,
                 similarity_threshold=self.cluster_sim_threshold,
+                search_paths=paths,
             )
 
             if not similar_clusters:
@@ -1536,7 +1542,7 @@ class AgenticSearch(BaseSearch):
         # When reuse_knowledge=True and a similar cluster is found, we
         # return here — Phase 4 (Persistence) is not executed for that path.
         # ==============================================================
-        reused = await self._try_reuse_cluster(query)
+        reused = await self._try_reuse_cluster(query, paths)
         if reused is not None:
             content = reused.content
             if isinstance(content, list):
@@ -2147,6 +2153,7 @@ class AgenticSearch(BaseSearch):
     }
     _FAST_CONTEXT_WINDOW = 30  # ± lines around each grep hit
     _FAST_MAX_EVIDENCE_CHARS = 15_000
+    _FAST_SMALL_FILE_THRESHOLD = 100_000  # 100K chars - read full file instead of grep sampling
 
     async def _search_fast(
         self,
@@ -2180,7 +2187,7 @@ class AgenticSearch(BaseSearch):
         # Step 0: Cluster reuse — instant short-circuit (no LLM cost)
         # When reuse succeeds we return here; no persistence step runs.
         # ==============================================================
-        reused = await self._try_reuse_cluster(query)
+        reused = await self._try_reuse_cluster(query, paths)
         if reused is not None:
             content = reused.content
             if isinstance(content, list):
@@ -2256,6 +2263,12 @@ class AgenticSearch(BaseSearch):
             if fallback_alt:
                 fallback = fallback + fallback_alt
 
+        # --- IDF weights from LLM ---
+        keyword_idfs: Dict[str, float] = analysis.get("idf", {})
+        if not keyword_idfs:
+            all_kws = (primary or []) + (fallback or [])
+            keyword_idfs = {kw: max(0.5, min(1.0, len(kw) / 5.0)) for kw in all_kws}
+
         if not primary and not fallback:
             await self._logger.warning("[FAST] No keywords extracted")
             msg = f"Could not extract search terms from query: '{query}'"
@@ -2280,21 +2293,25 @@ class AgenticSearch(BaseSearch):
             include=include_patterns or None, exclude=exclude,
         )
 
-        best_file: Optional[Dict[str, Any]] = None
+        best_files: Optional[List[Dict[str, Any]]] = None
         used_level = "primary"
 
         if primary:
-            best_file = await self._fast_find_best_file(primary, **rga_kwargs)
+            best_files = await self._fast_find_best_file(
+                primary, top_k=top_k_files, keyword_idfs=keyword_idfs, **rga_kwargs
+            )
 
-        if not best_file and fallback:
+        if not best_files and fallback:
             used_level = "fallback"
             await self._logger.info(
                 "[FAST:Step2] Primary miss, trying fine-grained fallback"
             )
-            best_file = await self._fast_find_best_file(fallback, **rga_kwargs)
+            best_files = await self._fast_find_best_file(
+                fallback, top_k=top_k_files, keyword_idfs=keyword_idfs, **rga_kwargs
+            )
 
         # --- Fallback: use dir_scan only when rga misses and dir scan is enabled ---
-        if not best_file and enable_dir_scan:
+        if not best_files and enable_dir_scan:
             scan_result = await self._probe_dir_scan(paths, enable=True, max_files=300)
             if scan_result is not None:
                 await self._logger.info("[FAST:Step2] rga miss — falling back to dir_scan ranking")
@@ -2303,9 +2320,9 @@ class AgenticSearch(BaseSearch):
                 )
                 if ranked_paths:
                     used_level = "dir_scan"
-                    best_file = {"path": ranked_paths[0], "matches": [], "total_matches": 0}
+                    best_files = [{"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0} for p in ranked_paths[:top_k_files]]
 
-        if not best_file:
+        if not best_files:
             await self._logger.warning(
                 f"[FAST:Step2] No matching files found in paths: {paths}. "
                 "If files are PDFs/DOCX, ensure poppler-utils and pandoc are installed."
@@ -2313,18 +2330,55 @@ class AgenticSearch(BaseSearch):
             msg = f"No relevant content found for query: '{query}'"
             return msg, None, context
 
-        file_path = best_file["path"]
-        match_objects = best_file["matches"]
+        file_path = best_files[0]["path"]
+        match_objects = best_files[0].get("matches", [])
         await self._logger.info(
             f"[FAST:Step2] Best file ({used_level}): {Path(file_path).name} "
-            f"({best_file['total_matches']} hits)"
+            f"({best_files[0].get('total_matches', 0)} hits, score={best_files[0].get('weighted_score', 0):.2f})"
         )
 
         # ==============================================================
         # Step 3: Context sampling around grep hits (no LLM)
+        # Multi-file evidence aggregation
         # ==============================================================
-        evidence = await self._fast_sample_evidence(file_path, match_objects)
-        context.mark_file_read(file_path)
+        evidence_parts = []
+        total_evidence_chars = 0
+        for bf in best_files:
+            if total_evidence_chars >= self._FAST_MAX_EVIDENCE_CHARS:
+                break
+
+            file_path = bf["path"]
+            fname = Path(file_path).name
+            ext = Path(file_path).suffix.lower()
+
+            # Small file short-circuit: read full content instead of grep sampling
+            ev = None
+            if ext in self._FAST_TEXT_EXTENSIONS:
+                try:
+                    file_size = Path(file_path).stat().st_size
+                    if file_size < self._FAST_SMALL_FILE_THRESHOLD:
+                        full_text = Path(file_path).read_text(errors="replace")
+                        if len(full_text) < self._FAST_SMALL_FILE_THRESHOLD:
+                            ev = f"[{fname}]\n{full_text}"
+                            await self._logger.info(
+                                f"[FAST] Small file short-circuit: reading full content of {fname} "
+                                f"({len(full_text)} chars)"
+                            )
+                except Exception:
+                    pass  # Fall through to normal evidence extraction
+
+            # Normal path: grep-based evidence sampling
+            if ev is None:
+                ev = await self._fast_sample_evidence(file_path, bf.get("matches", []))
+
+            if ev:
+                remaining = self._FAST_MAX_EVIDENCE_CHARS - total_evidence_chars
+                chunk = ev[:remaining]
+                evidence_parts.append(chunk)
+                total_evidence_chars += len(chunk)
+                context.mark_file_read(file_path)
+
+        evidence = "\n\n---\n\n".join(evidence_parts)
 
         if not evidence or len(evidence.strip()) < 20:
             await self._logger.warning("[FAST:Step3] No usable evidence extracted")
@@ -2414,6 +2468,142 @@ class AgenticSearch(BaseSearch):
 
     # ---- FAST helpers ----
 
+    @staticmethod
+    def _count_keyword_tf_per_file(raw_results: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Count matches per file from rga JSON output."""
+        counts: Dict[str, int] = {}
+        current_path: Optional[str] = None
+        for item in raw_results:
+            item_type = item.get("type")
+            if item_type == "begin":
+                current_path = item.get("data", {}).get("path", {}).get("text")
+            elif item_type == "match" and current_path is not None:
+                counts[current_path] = counts.get(current_path, 0) + 1
+            elif item_type == "end":
+                current_path = None
+        return counts
+
+    @staticmethod
+    def _dedup_merged_files(
+        merged: List[Dict[str, Any]],
+        per_file_kw_tf: Dict[str, Dict[str, int]],
+        match_limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Deduplicate merged file entries by path, combining matches from
+        multiple keyword searches into a single entry per file.
+
+        When the same file appears in multiple rga begin/end groups (one per
+        keyword search), this merges them so downstream scoring and evidence
+        extraction operate on a single, complete representation.
+
+        Args:
+            merged: File entries from GrepRetriever.merge_results(), may
+                contain duplicates.
+            per_file_kw_tf: Pre-computed per-file keyword TF counts (not
+                modified, used only for reference).
+            match_limit: Maximum matches to keep per file after merging.
+
+        Returns:
+            Deduplicated list with one entry per unique file path.
+        """
+        if not merged:
+            return merged
+
+        seen: Dict[str, int] = {}  # path -> index in deduped
+        deduped: List[Dict[str, Any]] = []
+
+        for entry in merged:
+            fpath = entry["path"]
+            if fpath in seen:
+                # Merge into existing entry
+                idx = seen[fpath]
+                existing = deduped[idx]
+                existing["matches"].extend(entry.get("matches", []))
+                existing["lines"].extend(entry.get("lines", []))
+                existing["total_matches"] += entry.get("total_matches", 0)
+            else:
+                # New file — clone to avoid mutating original
+                seen[fpath] = len(deduped)
+                deduped.append({
+                    "path": fpath,
+                    "matches": list(entry.get("matches", [])),
+                    "lines": list(entry.get("lines", [])),
+                    "total_matches": entry.get("total_matches", 0),
+                    "total_score": entry.get("total_score", 0.0),
+                })
+
+        # Trim matches to limit per file
+        for entry in deduped:
+            if len(entry["matches"]) > match_limit:
+                # Sort by score descending, keep top
+                entry["matches"].sort(
+                    key=lambda x: x.get("score", 0.0), reverse=True
+                )
+                entry["matches"] = entry["matches"][:match_limit]
+
+        return deduped
+
+    @staticmethod
+    def _prune_by_score(
+        candidates: List[Dict[str, Any]],
+        top_k: int = 3,
+        relative_ratio: float = 0.30,
+        gap_ratio: float = 0.50,
+        min_count: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """Dynamically prune ranked file candidates by score distribution.
+
+        Applies a three-stage filter to remove clearly irrelevant files:
+
+        1. **Relative threshold**: Discard files scoring below
+           ``max_score * relative_ratio`` (default 30%).
+        2. **Gap detection**: Scan adjacently ranked files; when the score
+           drop from one to the next exceeds ``prev_score * gap_ratio``
+           (default 50%), truncate the list at that point.
+        3. **Minimum guarantee**: Ensure at least ``min_count`` files
+           survive (default 1).
+
+        Finally the result is capped at ``top_k``.
+
+        Args:
+            candidates: File dicts sorted by ``weighted_score`` descending.
+            top_k: Maximum number of files to return.
+            relative_ratio: Fraction of the top score used as a floor.
+            gap_ratio: Maximum tolerated relative drop between adjacent
+                candidates.
+            min_count: Minimum number of candidates to keep regardless of
+                score.
+
+        Returns:
+            Pruned list of candidates (length in [min_count, top_k]).
+        """
+        if not candidates:
+            return []
+
+        max_score = candidates[0].get("weighted_score", 0.0)
+
+        # Step 1: Relative threshold filter
+        threshold = max_score * relative_ratio
+        filtered = [f for f in candidates if f.get("weighted_score", 0.0) >= threshold]
+        if not filtered:
+            filtered = candidates[:min_count]
+
+        # Step 2: Gap detection truncation
+        result = [filtered[0]]
+        for i in range(1, len(filtered)):
+            prev_score = filtered[i - 1].get("weighted_score", 0.0)
+            curr_score = filtered[i].get("weighted_score", 0.0)
+            if prev_score > 0 and (prev_score - curr_score) > prev_score * gap_ratio:
+                break
+            result.append(filtered[i])
+
+        # Step 3: Minimum guarantee
+        if len(result) < min_count and len(filtered) >= min_count:
+            result = filtered[:min_count]
+
+        # Cap at top_k
+        return result[:top_k]
+
     async def _fast_find_best_file(
         self,
         keywords: List[str],
@@ -2421,13 +2611,17 @@ class AgenticSearch(BaseSearch):
         max_depth: Optional[int] = 5,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Search per keyword via rga and return the single best-matching file.
+        top_k: int = 1,
+        keyword_idfs: Optional[Dict[str, float]] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Search per keyword via rga and return the top-k best-matching files
+        ranked by IDF-weighted log-TF scoring.
 
         Returns:
-            Merged file dict (path, matches, lines, total_matches) or None.
+            List of merged file dicts (path, matches, lines, total_matches, weighted_score) or None.
         """
         all_raw: List[Dict[str, Any]] = []
+        per_file_kw_tf: Dict[str, Dict[str, int]] = {}  # {file_path: {keyword: count}}
 
         for kw in keywords:
             try:
@@ -2438,6 +2632,10 @@ class AgenticSearch(BaseSearch):
                 )
                 if results:
                     all_raw.extend(results)
+                    # Track per-file TF for this keyword
+                    kw_counts = self._count_keyword_tf_per_file(results)
+                    for fpath, count in kw_counts.items():
+                        per_file_kw_tf.setdefault(fpath, {})[kw] = count
             except Exception as exc:
                 await self._logger.warning(
                     f"[FAST] rga literal search failed for '{kw}': {exc}"
@@ -2455,6 +2653,17 @@ class AgenticSearch(BaseSearch):
                 )
                 if results:
                     all_raw.extend(results)
+                    # For regex OR fallback, attribute matches to individual keywords
+                    # by checking which keywords appear in each match line
+                    # (simplified: count total matches per file, distribute proportionally)
+                    regex_counts = self._count_keyword_tf_per_file(results)
+                    for fpath, count in regex_counts.items():
+                        # Attribute to all keywords equally (approximation for OR regex)
+                        per_kw_share = max(1, count // len(keywords)) if keywords else count
+                        for kw in keywords:
+                            existing = per_file_kw_tf.get(fpath, {}).get(kw, 0)
+                            if existing == 0:  # Only fill if not already set by literal search
+                                per_file_kw_tf.setdefault(fpath, {})[kw] = per_kw_share
             except Exception as exc:
                 await self._logger.warning(
                     f"[FAST] rga regex search failed: {exc}"
@@ -2469,10 +2678,7 @@ class AgenticSearch(BaseSearch):
                     timeout=30.0,
                 )
                 if fn_results:
-                    return {
-                        "path": fn_results[0]["path"],
-                        "matches": [], "lines": [], "total_matches": 0,
-                    }
+                    return [{"path": fn_results[0]["path"], "matches": [], "lines": [], "total_matches": 0, "weighted_score": 0.0}]
             except Exception as exc:
                 await self._logger.warning(
                     f"[FAST] filename search failed: {exc}"
@@ -2485,9 +2691,26 @@ class AgenticSearch(BaseSearch):
         if not merged:
             return None
 
-        # Greedy: pick the file with the most matches
-        merged.sort(key=lambda f: f["total_matches"], reverse=True)
-        return merged[0]
+        # Deduplicate file entries from multi-keyword searches
+        merged = self._dedup_merged_files(merged, per_file_kw_tf)
+
+        # --- IDF × (1 + log TF) weighted scoring ---
+        _idfs = keyword_idfs or {}
+        for f in merged:
+            fpath = f["path"]
+            kw_tf = per_file_kw_tf.get(fpath, {})
+            score = 0.0
+            for kw in keywords:
+                tf = kw_tf.get(kw, 0)
+                if tf > 0:
+                    idf = _idfs.get(kw, max(0.5, min(1.0, len(kw) / 5.0)))
+                    score += idf * (1.0 + math.log(tf))
+            f["weighted_score"] = score
+
+        merged.sort(key=lambda f: f["weighted_score"], reverse=True)
+        pruned = self._prune_by_score(merged, top_k=top_k)
+
+        return pruned if pruned else None
 
     async def _fast_sample_evidence(
         self,
@@ -2514,15 +2737,35 @@ class AgenticSearch(BaseSearch):
             if isinstance(ln, int):
                 hit_lines.append(ln)
 
+        # Diagnostic logging when falling back to snippet mode
+        if not hit_lines and match_objects:
+            await self._logger.warning(
+                f"[FAST] No line_number in {len(match_objects)} match(es) for {fname}, "
+                f"falling back to snippet mode"
+            )
+
         # --- Text files: read context windows around hits ---
         if ext in self._FAST_TEXT_EXTENSIONS and hit_lines:
+            # Expand context window for sparse hits
+            window = self._FAST_CONTEXT_WINDOW
+            if len(hit_lines) <= 2:
+                window = max(window, 100)  # ±100 lines for 1-2 hits
             evidence = self._read_context_windows(
                 file_path, hit_lines,
-                window=self._FAST_CONTEXT_WINDOW,
+                window=window,
                 max_chars=self._FAST_MAX_EVIDENCE_CHARS,
             )
             if evidence:
-                return f"[{fname}]\n{evidence}"
+                full_evidence = f"[{fname}]\n{evidence}"
+                if len(full_evidence) < 100:
+                    await self._logger.info(
+                        f"[FAST] Context window evidence too thin ({len(full_evidence)} chars) for {fname}, "
+                        f"attempting file head extraction"
+                    )
+                    head_evidence = await self._fast_read_file_head(file_path)
+                    if head_evidence and len(head_evidence) > len(full_evidence):
+                        return head_evidence
+                return full_evidence
 
         # --- Non-text files or no line numbers: use grep snippets ---
         snippets: List[str] = []
@@ -2537,7 +2780,17 @@ class AgenticSearch(BaseSearch):
                 break
 
         if snippets:
-            return f"[{fname}]\n" + "\n".join(snippets)
+            snippet_evidence = f"[{fname}]\n" + "\n".join(snippets)
+            # If snippet evidence is too thin, try file head for richer context
+            if len(snippet_evidence) < 100:
+                await self._logger.info(
+                    f"[FAST] Evidence too thin ({len(snippet_evidence)} chars) for {fname}, "
+                    f"attempting file head extraction"
+                )
+                head_evidence = await self._fast_read_file_head(file_path)
+                if head_evidence and len(head_evidence) > len(snippet_evidence):
+                    return head_evidence
+            return snippet_evidence
 
         # Last resort: try reading file head
         return await self._fast_read_file_head(file_path)

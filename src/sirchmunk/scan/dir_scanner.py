@@ -14,11 +14,18 @@ import json
 import logging
 import mimetypes
 import os
+import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+
+try:
+    import pypdf as _pypdf
+except ImportError:
+    _pypdf = None  # type: ignore[assignment]
 
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.utils.file_utils import fast_extract
@@ -255,6 +262,8 @@ class DirectoryScanner:
         small_file_threshold: int = _SMALL_FILE_THRESHOLD,
         max_workers: int = 8,
         exclude_patterns: Optional[List[str]] = None,
+        max_file_size_bytes: Optional[int] = None,
+        oversized_pdf_timeout_s: float = 1.0,
     ) -> None:
         self.llm = llm
         self.max_depth = max_depth
@@ -264,6 +273,8 @@ class DirectoryScanner:
         self.max_workers = max_workers
         self.exclude_patterns = set(exclude_patterns) if exclude_patterns else set()
         self.exclude_patterns.update(self.DEFAULT_EXCLUDE)
+        self.max_file_size_bytes = max_file_size_bytes
+        self.oversized_pdf_timeout_s = oversized_pdf_timeout_s
 
     # ---- Public API ----
 
@@ -504,6 +515,11 @@ class DirectoryScanner:
         stat = file_path.stat()
         ext = file_path.suffix.lower()
 
+        # For files exceeding the size cap, do a lightweight sample instead of
+        # full metadata extraction (which can be very slow for large PDFs).
+        if self.max_file_size_bytes is not None and stat.st_size > self.max_file_size_bytes:
+            return self._extract_oversized(file_path, stat, ext)
+
         candidate = FileCandidate(
             path=str(file_path),
             filename=file_path.name,
@@ -533,6 +549,120 @@ class DirectoryScanner:
             self._try_load_full_content(file_path, candidate)
 
         return candidate
+
+    # ---- Oversized file lightweight sampling ----
+
+    def _extract_oversized(
+        self, file_path: Path, stat: os.stat_result, ext: str
+    ) -> Optional["FileCandidate"]:
+        """Lightweight extraction for files exceeding ``max_file_size_bytes``.
+
+        Avoids full parsing (which can stall on corrupt or very large files).
+        Strategy per format:
+        - PDF: attempt first-page text extraction with a hard wall-clock timeout;
+               fall back to filename-only on failure or timeout.
+        - Text files: read the first ``max_preview_chars`` bytes directly.
+        - Everything else: filename + size only (no IO beyond stat).
+        """
+        candidate = FileCandidate(
+            path=str(file_path),
+            filename=file_path.name,
+            extension=ext,
+            size_bytes=stat.st_size,
+            modified_at=datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            created_at=datetime.fromtimestamp(stat.st_ctime).isoformat(),
+            mime_type=_MIME_MAP.get(
+                ext,
+                mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+            ),
+        )
+
+        if ext == ".pdf":
+            self._extract_pdf_first_page(file_path, candidate, timeout_s=self.oversized_pdf_timeout_s)
+        elif ext in _TEXT_EXTENSIONS:
+            self._extract_text_head(file_path, candidate)
+
+        logger.debug(
+            f"[DirScanner] Oversized file sampled "
+            f"({stat.st_size / 1024 / 1024:.1f}MB): {file_path.name} "
+            f"preview_len={len(candidate.preview)}"
+        )
+        return candidate
+
+    def _extract_pdf_first_page(
+        self, path: Path, candidate: FileCandidate, timeout_s: float = 1.0
+    ) -> None:
+        """Extract first-page text from a PDF with a wall-clock timeout.
+
+        Uses a daemon thread so the timeout is truly enforced: on expiry the
+        thread is abandoned (daemon threads do not block process exit) and the
+        candidate retains its stat-only fields.
+
+        Logger suppression is managed in the *calling* thread with a
+        try/finally block so the original level is always restored, even when
+        the worker thread times out or the caller raises.
+        """
+        if _pypdf is None:
+            return
+
+        result_box: list = []
+
+        # Suppress noisy pypdf warnings in the calling thread before spawning,
+        # so the suppression covers the thread's lifetime and is always undone.
+        _pypdf_reader_logger = logging.getLogger("pypdf._reader")
+        _pypdf_logger = logging.getLogger("pypdf")
+        _prev_reader_level = _pypdf_reader_logger.level
+        _prev_level = _pypdf_logger.level
+        _pypdf_reader_logger.setLevel(logging.ERROR)
+        _pypdf_logger.setLevel(logging.ERROR)
+
+        def _read():
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore")
+                    with open(path, "rb") as f:
+                        reader = _pypdf.PdfReader(f, strict=False)
+                        page_count = len(reader.pages)
+                        text = reader.pages[0].extract_text() if page_count > 0 else ""
+                    result_box.append((page_count, text or ""))
+            except Exception as exc:
+                result_box.append(exc)
+
+        t = threading.Thread(target=_read, daemon=True)
+        try:
+            t.start()
+            t.join(timeout=timeout_s)
+        finally:
+            _pypdf_reader_logger.setLevel(_prev_reader_level)
+            _pypdf_logger.setLevel(_prev_level)
+
+        if not result_box:
+            logger.debug(f"[DirScanner] PDF first-page timed out ({timeout_s}s): {path.name}")
+            return
+        val = result_box[0]
+        if isinstance(val, Exception):
+            logger.debug(f"[DirScanner] PDF first-page failed: {path.name}: {val}")
+            return
+        page_count, text = val
+        candidate.page_count = page_count
+        candidate.preview = text[: self.max_preview_chars].strip()
+
+    def _extract_text_head(self, path: Path, candidate: FileCandidate) -> None:
+        """Read the first ``max_preview_chars`` bytes of a text file."""
+        try:
+            raw = path.read_bytes()[: self.max_preview_chars * 4]
+            enc = self._detect_encoding(raw[:4096]) or "utf-8"
+            text = raw.decode(enc, errors="replace")
+            lines = text.split("\n")
+            for line in lines:
+                stripped = line.strip().lstrip("#").strip()
+                if stripped and len(stripped) > 2:
+                    candidate.title = stripped[:120]
+                    break
+            candidate.preview = text[: self.max_preview_chars].strip()
+            candidate.encoding = enc
+        except Exception as exc:
+            logger.debug(f"[DirScanner] Text head extraction failed: {path.name}: {exc}")
 
     # ---- Text files ----
 

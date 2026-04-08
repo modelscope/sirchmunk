@@ -40,7 +40,7 @@ _NEXT_BUILD_STATIC_ENV = "NEXT_BUILD_STATIC"
 #  Utility helpers
 # ---------------------------------------------------------------------------
 
-def _print(msg: str):
+def _print(msg: str = "") -> None:
     """Print with flush for real-time output."""
     print(msg, flush=True)
 
