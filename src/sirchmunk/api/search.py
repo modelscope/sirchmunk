@@ -87,6 +87,10 @@ class SearchRequest(BaseModel):
         default=False,
         description="Return full SearchContext with KnowledgeCluster, answer, and telemetry"
     )
+    llm_fallback: bool = Field(
+        default=False,
+        description="When True, if no relevant documents are found, the LLM will attempt to answer from its own knowledge"
+    )
 
 
 class SearchResponse(BaseModel):
@@ -250,6 +254,7 @@ def _build_search_kwargs(request: SearchRequest) -> dict:
         "mode": request.mode,
         "enable_dir_scan": request.enable_dir_scan,
         "return_context": request.return_context,
+        "llm_fallback": request.llm_fallback,
     }
     if request.max_depth is not None:
         kwargs["max_depth"] = request.max_depth

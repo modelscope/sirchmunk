@@ -79,6 +79,8 @@ _CHAT_RESPONSE_SYSTEM = (
     "Reply in the same language as the user's message."
 )
 
+_NO_RESULTS_MESSAGE = "No results found."
+
 
 class AgenticSearch(BaseSearch):
 
@@ -733,31 +735,36 @@ class AgenticSearch(BaseSearch):
             return []
 
     @staticmethod
-    def _parse_summary_response(llm_response: str) -> Tuple[str, bool]:
+    def _parse_summary_response(llm_response: str) -> Tuple[str, bool, bool]:
         """
-        Parse LLM response to extract summary and save decision.
+        Parse LLM response to extract summary and quality decisions.
 
         Args:
-            llm_response: Raw LLM response containing SUMMARY and SHOULD_SAVE tags
+            llm_response: Raw LLM response containing SUMMARY, SHOULD_ANSWER and SHOULD_SAVE tags
 
         Returns:
-            Tuple of (summary_text, should_save_flag)
+            Tuple of (summary_text, should_save_flag, should_answer_flag)
         """
-        # Extract SUMMARY content
-        summary_fields = extract_fields(content=llm_response, tags=["SUMMARY", "SHOULD_SAVE"])
+        summary_fields = extract_fields(
+            content=llm_response,
+            tags=["SUMMARY", "SHOULD_ANSWER", "SHOULD_SAVE"],
+        )
 
-        summary = summary_fields.get("summary", "").strip()
-        should_save_str = summary_fields.get("should_save", "true").strip().lower()
+        summary = str(summary_fields.get("summary") or "").strip()
+        should_answer_str = str(summary_fields.get("should_answer") or "false").strip().lower()
+        should_save_str = str(summary_fields.get("should_save") or "false").strip().lower()
 
-        # Parse should_save flag
+        should_answer = should_answer_str in ["true", "yes", "1"]
         should_save = should_save_str in ["true", "yes", "1"]
 
-        # If extraction failed, use entire response as summary and assume should save
+        # If extraction failed, use entire response as summary and default to conservative:
+        # not answerable and not saveable.
         if not summary:
             summary = llm_response.strip()
-            should_save = True
+            should_answer = False
+            should_save = False
 
-        return summary, should_save
+        return summary, should_save, should_answer
 
     @staticmethod
     def _extract_and_validate_multi_level_keywords(
@@ -932,6 +939,7 @@ class AgenticSearch(BaseSearch):
         return_context: bool = False,
         spec_stale_hours: float = 72.0,
         chat_history: Optional[List[Dict[str, str]]] = None,
+        llm_fallback: bool = False,
     ) -> Union[str, SearchContext, List[Dict[str, Any]]]:
         """Perform intelligent search with multi-mode support.
 
@@ -1013,6 +1021,10 @@ class AgenticSearch(BaseSearch):
                 that carries ``answer``, ``cluster`` (KnowledgeCluster),
                 and full pipeline telemetry (LLM usage, files read, etc.).
             spec_stale_hours: Hours before spec cache is stale (default: 72).
+            chat_history: Optional list of chat messages for context (DEEP mode).
+            llm_fallback: When True, if no relevant documents are found,
+                the LLM will attempt to answer the query from its own
+                knowledge. Default False.
 
         Returns:
             - ``str``: Answer summary (default).
@@ -1059,6 +1071,7 @@ class AgenticSearch(BaseSearch):
                 query=query, paths=paths, max_depth=max_depth,
                 top_k_files=top_k_files, enable_dir_scan=enable_dir_scan,
                 include=include, exclude=exclude,
+                llm_fallback=llm_fallback,
             )
         else:
             answer, cluster, context = await self._search_deep(
@@ -1068,12 +1081,16 @@ class AgenticSearch(BaseSearch):
                 enable_dir_scan=enable_dir_scan,
                 include=include, exclude=exclude,
                 spec_stale_hours=spec_stale_hours,
+                llm_fallback=llm_fallback,
             )
 
         # ---- Unified return wrapping ----
         if return_context:
             prefix = "FS" if mode == "FAST" else "DS"
             context.answer = answer
+            if (answer or "").strip().lower() == _NO_RESULTS_MESSAGE.lower():
+                context.cluster = cluster
+                return context
             # Use read_file_ids from context if available, otherwise empty
             fallback_files = list(context.read_file_ids) if context.read_file_ids else None
             context.cluster = cluster or self._make_answer_cluster(
@@ -1099,6 +1116,7 @@ class AgenticSearch(BaseSearch):
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         spec_stale_hours: float = 72.0,
+        llm_fallback: bool = False,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Parallel multi-path retrieval pipeline (Phases 0a–5).
 
@@ -1230,12 +1248,23 @@ class AgenticSearch(BaseSearch):
 
         if cluster and cluster.content:
             await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
-            answer, should_save = await self._summarise_cluster(query, cluster)
+            answer, should_save, should_answer = await self._summarise_cluster(query, cluster)
+            if not llm_fallback and not should_answer:
+                await self._logger.warning(
+                    "[Phase 4] Summary gate rejected evidence and llm_fallback=False "
+                    "→ returning no results"
+                )
+                return _NO_RESULTS_MESSAGE, None, context
             if not cluster.search_results:
                 cluster.search_results = list(merged_files)
+        elif llm_fallback:
+            await self._logger.info(
+                "[Phase 4] Evidence insufficient, llm_fallback=True \u2192 LLM summary"
+            )
+            answer, should_save = await self._summarise_cluster_fallback(query)
         else:
             await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
-            answer, context = await self._react_refinement(
+            react_answer, context = await self._react_refinement(
                 query=query, paths=paths,
                 initial_keywords=initial_keywords, spec_context=spec_context,
                 enable_dir_scan=enable_dir_scan,
@@ -1245,11 +1274,27 @@ class AgenticSearch(BaseSearch):
 
             if not cluster:
                 cluster = await self._build_cluster_from_context(
-                    query=query, answer=answer, context=context,
+                    query=query, answer=react_answer, context=context,
                     query_keywords=query_keywords, top_k_files=top_k_files,
                 )
-            elif answer and not cluster.content:
-                cluster.content = answer
+            elif react_answer and not cluster.content:
+                cluster.content = react_answer
+
+            if not cluster:
+                await self._logger.warning(
+                    "[Phase 4] ReAct found no buildable evidence and llm_fallback=False "
+                    "→ returning no results"
+                )
+                return _NO_RESULTS_MESSAGE, None, context
+
+            # Final DEEP decision is always made in the summary call.
+            answer, should_save, should_answer = await self._summarise_cluster(query, cluster)
+            if not llm_fallback and not should_answer:
+                await self._logger.warning(
+                    "[Phase 4] Final summary gate rejected evidence and llm_fallback=False "
+                    "→ returning no results"
+                )
+                return _NO_RESULTS_MESSAGE, None, context
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -1540,6 +1585,14 @@ class AgenticSearch(BaseSearch):
     _FAST_MAX_EVIDENCE_CHARS = 15_000
     _FAST_SMALL_FILE_THRESHOLD = 100_000  # 100K chars - read full file instead of grep sampling
 
+    _LLM_FALLBACK_EVIDENCE = (
+        "[No relevant documents found]\n\n"
+        "The search did not find relevant content in the available documents. "
+        "Please answer the user's question based on your own knowledge. "
+        "Clearly indicate that this answer is from LLM knowledge, "
+        "not from retrieved documents."
+    )
+
     async def _search_fast(
         self,
         query: str,
@@ -1550,6 +1603,7 @@ class AgenticSearch(BaseSearch):
         enable_dir_scan: bool = False,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
+        llm_fallback: bool = False,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Greedy search: 2-3 LLM calls, single best file, focused evidence.
 
@@ -1675,6 +1729,7 @@ class AgenticSearch(BaseSearch):
 
         best_files: Optional[List[Dict[str, Any]]] = None
         used_level = "primary"
+        evidence = ""
 
         if primary:
             best_files = await self._fast_find_best_file(
@@ -1703,71 +1758,84 @@ class AgenticSearch(BaseSearch):
                     best_files = [{"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0} for p in ranked_paths[:top_k_files]]
 
         if not best_files:
-            await self._logger.warning(
-                f"[FAST:Step2] No matching files found in paths: {paths}. "
-                "If files are PDFs/DOCX, ensure poppler-utils and pandoc are installed."
+            if llm_fallback:
+                await self._logger.info(
+                    "[FAST:Step2] No files found, llm_fallback=True \u2192 skip to LLM summary"
+                )
+                evidence = self._LLM_FALLBACK_EVIDENCE
+            else:
+                await self._logger.warning(
+                    f"[FAST:Step2] No matching files found in paths: {paths}. "
+                    "If files are PDFs/DOCX, ensure poppler-utils and pandoc are installed."
+                )
+                return _NO_RESULTS_MESSAGE, None, context
+
+        if best_files:
+            file_path = best_files[0]["path"]
+            match_objects = best_files[0].get("matches", [])
+            await self._logger.info(
+                f"[FAST:Step2] Best file ({used_level}): {Path(file_path).name} "
+                f"({best_files[0].get('total_matches', 0)} hits, score={best_files[0].get('weighted_score', 0):.2f})"
             )
-            msg = f"No relevant content found for query: '{query}'"
-            return msg, None, context
 
-        file_path = best_files[0]["path"]
-        match_objects = best_files[0].get("matches", [])
-        await self._logger.info(
-            f"[FAST:Step2] Best file ({used_level}): {Path(file_path).name} "
-            f"({best_files[0].get('total_matches', 0)} hits, score={best_files[0].get('weighted_score', 0):.2f})"
-        )
+            # ==============================================================
+            # Step 3: Context sampling around grep hits (no LLM)
+            # Multi-file evidence aggregation
+            # ==============================================================
+            evidence_parts = []
+            total_evidence_chars = 0
+            for bf in best_files:
+                if total_evidence_chars >= self._FAST_MAX_EVIDENCE_CHARS:
+                    break
 
-        # ==============================================================
-        # Step 3: Context sampling around grep hits (no LLM)
-        # Multi-file evidence aggregation
-        # ==============================================================
-        evidence_parts = []
-        total_evidence_chars = 0
-        for bf in best_files:
-            if total_evidence_chars >= self._FAST_MAX_EVIDENCE_CHARS:
-                break
+                file_path = bf["path"]
+                fname = Path(file_path).name
+                ext = Path(file_path).suffix.lower()
 
-            file_path = bf["path"]
-            fname = Path(file_path).name
-            ext = Path(file_path).suffix.lower()
+                # Small file short-circuit: read full content instead of grep sampling
+                ev = None
+                if ext in self._FAST_TEXT_EXTENSIONS:
+                    try:
+                        file_size = Path(file_path).stat().st_size
+                        if file_size < self._FAST_SMALL_FILE_THRESHOLD:
+                            full_text = Path(file_path).read_text(errors="replace")
+                            if len(full_text) < self._FAST_SMALL_FILE_THRESHOLD:
+                                ev = f"[{fname}]\n{full_text}"
+                                await self._logger.info(
+                                    f"[FAST] Small file short-circuit: reading full content of {fname} "
+                                    f"({len(full_text)} chars)"
+                                )
+                    except Exception:
+                        pass  # Fall through to normal evidence extraction
 
-            # Small file short-circuit: read full content instead of grep sampling
-            ev = None
-            if ext in self._FAST_TEXT_EXTENSIONS:
-                try:
-                    file_size = Path(file_path).stat().st_size
-                    if file_size < self._FAST_SMALL_FILE_THRESHOLD:
-                        full_text = Path(file_path).read_text(errors="replace")
-                        if len(full_text) < self._FAST_SMALL_FILE_THRESHOLD:
-                            ev = f"[{fname}]\n{full_text}"
-                            await self._logger.info(
-                                f"[FAST] Small file short-circuit: reading full content of {fname} "
-                                f"({len(full_text)} chars)"
-                            )
-                except Exception:
-                    pass  # Fall through to normal evidence extraction
+                # Normal path: grep-based evidence sampling
+                if ev is None:
+                    ev = await self._fast_sample_evidence(file_path, bf.get("matches", []))
 
-            # Normal path: grep-based evidence sampling
-            if ev is None:
-                ev = await self._fast_sample_evidence(file_path, bf.get("matches", []))
+                if ev:
+                    remaining = self._FAST_MAX_EVIDENCE_CHARS - total_evidence_chars
+                    chunk = ev[:remaining]
+                    evidence_parts.append(chunk)
+                    total_evidence_chars += len(chunk)
+                    context.mark_file_read(file_path)
 
-            if ev:
-                remaining = self._FAST_MAX_EVIDENCE_CHARS - total_evidence_chars
-                chunk = ev[:remaining]
-                evidence_parts.append(chunk)
-                total_evidence_chars += len(chunk)
-                context.mark_file_read(file_path)
+            evidence = "\n\n---\n\n".join(evidence_parts)
 
-        evidence = "\n\n---\n\n".join(evidence_parts)
+            if not evidence or len(evidence.strip()) < 20:
+                if llm_fallback:
+                    await self._logger.info(
+                        "[FAST:Step3] No usable evidence, llm_fallback=True \u2192 LLM summary"
+                    )
+                    evidence = self._LLM_FALLBACK_EVIDENCE
+                else:
+                    await self._logger.warning("[FAST:Step3] No usable evidence extracted")
+                    return _NO_RESULTS_MESSAGE, None, context
 
-        if not evidence or len(evidence.strip()) < 20:
-            await self._logger.warning("[FAST:Step3] No usable evidence extracted")
-            msg = f"Found file but could not extract content for query: '{query}'"
-            return msg, None, context
+            await self._logger.info(
+                f"[FAST:Step3] Evidence: {len(evidence)} chars from {Path(file_path).name}"
+            )
 
-        await self._logger.info(
-            f"[FAST:Step3] Evidence: {len(evidence)} chars from {Path(file_path).name}"
-        )
+        keywords_used = primary if used_level == "primary" else fallback
 
         # ==============================================================
         # Step 4: LLM answer from focused evidence (single call)
@@ -1786,9 +1854,15 @@ class AgenticSearch(BaseSearch):
                 answer_resp.usage.get("total_tokens", 0), usage=answer_resp.usage,
             )
 
-        answer, should_save = self._parse_summary_response(answer_resp.content or "")
-        keywords_used = primary if used_level == "primary" else fallback
-
+        answer, should_save, should_answer = self._parse_summary_response(
+            answer_resp.content or ""
+        )
+        if not llm_fallback and not should_answer:
+            await self._logger.warning(
+                "[FAST:Step4] Summary gate rejected evidence and llm_fallback=False "
+                "→ returning no results"
+            )
+            return _NO_RESULTS_MESSAGE, None, context
         if not should_save:
             await self._logger.info("[FAST] Quality gate: low-quality answer, skipping cluster save")
             await self._logger.success("[FAST] Search complete (2 LLM calls, no persist)")
@@ -2591,12 +2665,13 @@ class AgenticSearch(BaseSearch):
 
     async def _summarise_cluster(
         self, query: str, cluster: KnowledgeCluster,
-    ) -> Tuple[str, bool]:
+    ) -> Tuple[str, bool, bool]:
         """Generate a final answer summary from a KnowledgeCluster.
 
         Returns:
-            ``(summary_text, should_save)`` — *should_save* is the LLM's
-            quality verdict on whether the result is worth persisting.
+            ``(summary_text, should_save, should_answer)`` where:
+            - should_save: quality verdict for persistence
+            - should_answer: evidence sufficiency verdict for answering
         """
         sep = "\n"
         cluster_text_content = (
@@ -2617,8 +2692,28 @@ class AgenticSearch(BaseSearch):
         )
         self.llm_usages.append(response.usage)
 
-        summary, should_save = self._parse_summary_response(response.content)
-        return summary, should_save
+        summary, should_save, should_answer = self._parse_summary_response(response.content)
+        return summary, should_save, should_answer
+
+    async def _summarise_cluster_fallback(self, query: str) -> Tuple[str, bool]:
+        """Generate an answer using the DEEP summary prompt with fallback evidence.
+
+        Reuses the existing ``SEARCH_RESULT_SUMMARY`` prompt, feeding it the
+        standard fallback text so that the LLM answers from its own knowledge
+        without adding an extra LLM call to the pipeline.
+        """
+        result_sum_prompt = SEARCH_RESULT_SUMMARY.format(
+            user_input=query,
+            text_content=self._LLM_FALLBACK_EVIDENCE,
+        )
+        await self._logger.info("[Phase 4] Generating fallback summary from LLM knowledge...")
+        response = await self.llm.achat(
+            messages=[{"role": "user", "content": result_sum_prompt}],
+            stream=True,
+        )
+        self.llm_usages.append(response.usage)
+        summary, _, _ = self._parse_summary_response(response.content)
+        return summary, False  # Never save fallback answers
 
     async def _react_refinement(
         self,
