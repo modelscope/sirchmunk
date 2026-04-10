@@ -70,6 +70,7 @@ def _load_env_file(env_file: Path) -> bool:
     except ImportError:
         # Fallback: manual parsing if python-dotenv not installed
         try:
+            _PATH_KEYS = {"SIRCHMUNK_WORK_PATH", "EMBEDDING_CACHE_DIR"}
             with open(env_file, "r") as f:
                 for line in f:
                     line = line.strip()
@@ -78,7 +79,15 @@ def _load_env_file(env_file: Path) -> bool:
                         key = key.strip()
                         value = value.strip().strip('"').strip("'")
                         if key and key not in os.environ:
-                            os.environ[key] = os.path.expanduser(value)
+                            if key in _PATH_KEYS:
+                                os.environ[key] = os.path.expanduser(value)
+                            else:
+                                os.environ[key] = value
+            # Expand ~ in path keys regardless of source (matching dotenv block behavior)
+            for key in _PATH_KEYS:
+                val = os.environ.get(key)
+                if val and "~" in val:
+                    os.environ[key] = os.path.expanduser(val)
             return True
         except Exception:
             return False

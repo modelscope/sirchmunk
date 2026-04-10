@@ -1249,12 +1249,18 @@ class AgenticSearch(BaseSearch):
         if cluster and cluster.content:
             await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
             answer, should_save, should_answer = await self._summarise_cluster(query, cluster)
-            if not llm_fallback and not should_answer:
-                await self._logger.warning(
-                    "[Phase 4] Summary gate rejected evidence and llm_fallback=False "
-                    "→ returning no results"
-                )
-                return _NO_RESULTS_MESSAGE, None, context
+            if not should_answer:
+                if llm_fallback:
+                    await self._logger.info(
+                        "[Phase 4] Summary gate rejected evidence, llm_fallback=True → LLM fallback"
+                    )
+                    answer, should_save = await self._summarise_cluster_fallback(query)
+                else:
+                    await self._logger.warning(
+                        "[Phase 4] Summary gate rejected evidence and llm_fallback=False "
+                        "→ returning no results"
+                    )
+                    return _NO_RESULTS_MESSAGE, None, context
             if not cluster.search_results:
                 cluster.search_results = list(merged_files)
         elif llm_fallback:
@@ -1289,12 +1295,18 @@ class AgenticSearch(BaseSearch):
 
             # Final DEEP decision is always made in the summary call.
             answer, should_save, should_answer = await self._summarise_cluster(query, cluster)
-            if not llm_fallback and not should_answer:
-                await self._logger.warning(
-                    "[Phase 4] Final summary gate rejected evidence and llm_fallback=False "
-                    "→ returning no results"
-                )
-                return _NO_RESULTS_MESSAGE, None, context
+            if not should_answer:
+                if llm_fallback:
+                    await self._logger.info(
+                        "[Phase 4] Final summary gate rejected evidence, llm_fallback=True → LLM fallback"
+                    )
+                    answer, should_save = await self._summarise_cluster_fallback(query)
+                else:
+                    await self._logger.warning(
+                        "[Phase 4] Final summary gate rejected evidence and llm_fallback=False "
+                        "→ returning no results"
+                    )
+                    return _NO_RESULTS_MESSAGE, None, context
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -1857,12 +1869,18 @@ class AgenticSearch(BaseSearch):
         answer, should_save, should_answer = self._parse_summary_response(
             answer_resp.content or ""
         )
-        if not llm_fallback and not should_answer:
-            await self._logger.warning(
-                "[FAST:Step4] Summary gate rejected evidence and llm_fallback=False "
-                "→ returning no results"
-            )
-            return _NO_RESULTS_MESSAGE, None, context
+        if not should_answer:
+            if llm_fallback:
+                await self._logger.info(
+                    "[FAST:Step4] Summary gate rejected evidence, llm_fallback=True → LLM fallback"
+                )
+                answer, should_save = await self._summarise_fast_fallback(query, context)
+            else:
+                await self._logger.warning(
+                    "[FAST:Step4] Summary gate rejected evidence and llm_fallback=False "
+                    "→ returning no results"
+                )
+                return _NO_RESULTS_MESSAGE, None, context
         if not should_save:
             await self._logger.info("[FAST] Quality gate: low-quality answer, skipping cluster save")
             await self._logger.success("[FAST] Search complete (2 LLM calls, no persist)")
@@ -2714,6 +2732,30 @@ class AgenticSearch(BaseSearch):
         self.llm_usages.append(response.usage)
         summary, _, _ = self._parse_summary_response(response.content)
         return summary, False  # Never save fallback answers
+
+    async def _summarise_fast_fallback(
+        self, query: str, context: "SearchContext",
+    ) -> Tuple[str, bool]:
+        """Generate an answer using the FAST summary prompt with fallback evidence.
+
+        Reuses the existing ``ROI_RESULT_SUMMARY`` prompt, feeding it the
+        standard fallback text so that the LLM answers from its own knowledge.
+        """
+        answer_prompt = ROI_RESULT_SUMMARY.format(
+            user_input=query,
+            text_content=self._LLM_FALLBACK_EVIDENCE,
+        )
+        answer_resp = await self.llm.achat(
+            messages=[{"role": "user", "content": answer_prompt}],
+            stream=True,
+        )
+        self.llm_usages.append(answer_resp.usage)
+        if answer_resp.usage and isinstance(answer_resp.usage, dict):
+            context.add_llm_tokens(
+                answer_resp.usage.get("total_tokens", 0), usage=answer_resp.usage,
+            )
+        answer, _, _ = self._parse_summary_response(answer_resp.content or "")
+        return answer, False  # Never save fallback answers
 
     async def _react_refinement(
         self,
