@@ -32,5 +32,5 @@ services:
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_MODEL_NAME=${LLM_MODEL_NAME:-gpt-5.2}
       - SIRCHMUNK_UPLOAD_ENABLED=true
-      - SIRCHMUNK_UPLOAD_MAX_FILE_SIZE=1073741824
+      - SIRCHMUNK_UPLOAD_MAX_FILE_SIZE=1024
     restart: unless-stopped

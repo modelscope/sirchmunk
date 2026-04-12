@@ -88,12 +88,16 @@ class FileStorageService:
             upload_root = work_path / "uploads"
 
         self._upload_root = Path(upload_root).resolve()
-        self._max_file_size = max_file_size or int(
-            os.getenv("SIRCHMUNK_UPLOAD_MAX_FILE_SIZE", str(1 * 1024**3))  # 1 GB
-        )
-        self._max_total_size = max_total_size or int(
-            os.getenv("SIRCHMUNK_UPLOAD_MAX_TOTAL", str(10 * 1024**3))  # 10 GB
-        )
+
+        # Values are in MB; convert to bytes
+        self._max_file_size = (max_file_size or int(
+            os.getenv("SIRCHMUNK_UPLOAD_MAX_FILE_SIZE", "1024")
+        )) * 1024 * 1024  # Convert MB to bytes
+
+        self._max_total_size = (max_total_size or int(
+            os.getenv("SIRCHMUNK_UPLOAD_MAX_TOTAL", "10240")
+        )) * 1024 * 1024  # Convert MB to bytes
+
         self._upload_root.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -126,8 +130,8 @@ class FileStorageService:
             )
         if size > self._max_file_size:
             raise ValueError(
-                f"File size {size:,} bytes exceeds limit of "
-                f"{self._max_file_size:,} bytes"
+                f"File size {size / (1024*1024):.1f} MB exceeds limit of "
+                f"{self._max_file_size / (1024*1024):.0f} MB"
             )
 
     # ------------------------------------------------------------------
@@ -139,7 +143,7 @@ class FileStorageService:
         if current + additional_bytes > self._max_total_size:
             raise ValueError(
                 f"Upload would exceed total quota: "
-                f"{current + additional_bytes:,} > {self._max_total_size:,} bytes"
+                f"{(current + additional_bytes) / (1024*1024):.1f} MB > {self._max_total_size / (1024*1024):.0f} MB"
             )
 
     def _compute_total_usage(self) -> int:
