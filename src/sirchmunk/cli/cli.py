@@ -140,6 +140,12 @@ SIRCHMUNK_VERBOSE=false
 # When set, acts as the default for search(..., paths=...) if none are provided.
 SIRCHMUNK_SEARCH_PATHS=
 
+# Maximum chat history turns for multi-turn context (0 = disabled)
+CHAT_HISTORY_MAX_TURNS=5
+
+# Maximum tokens for chat history context
+CHAT_HISTORY_MAX_TOKENS=32000
+
 # Maximum directory depth to search
 DEFAULT_MAX_DEPTH=5
 
@@ -188,6 +194,38 @@ EMBEDDING_MODEL_ID=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 
 # Embedding model cache directory
 EMBEDDING_CACHE_DIR=${SIRCHMUNK_WORK_PATH}/.cache/models
+
+# ===== File Upload Settings =====
+# Enable file upload endpoint (true/false)
+SIRCHMUNK_UPLOAD_ENABLED=true
+
+# Maximum single file size in MB (default: 1024 MB = 1GB)
+SIRCHMUNK_UPLOAD_MAX_FILE_SIZE=1024
+
+# Maximum total upload storage in MB (default: 10240 MB = 10GB)
+SIRCHMUNK_UPLOAD_MAX_TOTAL=10240
+
+# ===== Security Settings =====
+
+# API authentication token (leave empty to disable auth)
+# When set, all API requests must include "Authorization: Bearer <token>"
+SIRCHMUNK_API_TOKEN=
+
+# Allowed CORS origins, comma-separated (default: * allows all origins)
+# Example: http://localhost:3000,https://myapp.example.com
+SIRCHMUNK_ALLOWED_ORIGINS=
+
+# Allowed file browser paths, comma-separated (default: unrestricted)
+# When set, the /file-browser endpoint can only access these directories and their children
+# Example: /home/user/docs,/data/shared
+SIRCHMUNK_ALLOWED_PATHS=
+
+# Enable API documentation (Swagger UI at /docs, ReDoc at /redoc)
+# Set to "true" for development, "false" (default) for production
+SIRCHMUNK_DEBUG=false
+
+# Maximum concurrent WebSocket connections (default: 100)
+SIRCHMUNK_MAX_WS_CONNECTIONS=100
 """
 
     # Replace default paths with actual work_path
