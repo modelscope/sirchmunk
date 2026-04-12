@@ -94,6 +94,7 @@ export default function HomePage() {
   const [showUpload, setShowUpload] = useState(false);
   const [showCollectionBrowser, setShowCollectionBrowser] = useState(false);
   const [manualPath, setManualPath] = useState("");
+  const [pathError, setPathError] = useState<string | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -350,6 +351,22 @@ export default function HomePage() {
     );
   };
 
+  const isValidServerPath = (path: string): boolean => {
+    if (!path || path.trim().length === 0) return false;
+    const trimmed = path.trim();
+    // Must be absolute path
+    if (!trimmed.startsWith("/")) return false;
+    // Reject dangerous patterns
+    const dangerous = [
+      /\.\./, // relative traversal
+      /^~/, // home directory
+      /[;&|`$(){}]/, // shell special chars
+      /\0/, // null byte
+      /[\r\n]/, // line endings
+    ];
+    return !dangerous.some((p) => p.test(trimmed));
+  };
+
   const quickActions = [
     {
       icon: Calculator,
@@ -579,40 +596,63 @@ export default function HomePage() {
                 <svg className="w-6 h-6 text-purple-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
                 </svg>
-                <input
-                  type="text"
-                  value={manualPath}
-                  onChange={(e) => setManualPath(e.target.value)}
-                  placeholder={t("Enter server path (e.g., /data/docs)")}
-                  className="flex-1 px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && manualPath.trim()) {
-                      const path = manualPath.trim();
-                      if (!selectedPaths.includes(path)) {
-                        setSelectedPaths(prev => [...prev, path]);
+                <div className="flex-1">
+                  <input
+                    type="text"
+                    value={manualPath}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setManualPath(val);
+                      if (val.trim() && !isValidServerPath(val)) {
+                        setPathError("Invalid path (must be absolute, no .., ~, or shell characters)");
+                      } else {
+                        setPathError(null);
                       }
-                      setSelectedPath(path);
-                      setChatState(prev => ({ ...prev, enableRag: true, selectedKb: path }));
-                      setManualPath("");
-                      setShowFileSelector(false);
-                    }
-                  }}
-                />
+                    }}
+                    placeholder={t("Enter server path (e.g., /data/docs)")}
+                    className="w-full px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && manualPath.trim()) {
+                        if (!isValidServerPath(manualPath)) {
+                          setPathError("Invalid path (must be absolute, no .., ~, or shell characters)");
+                          return;
+                        }
+                        const path = manualPath.trim();
+                        if (!selectedPaths.includes(path)) {
+                          setSelectedPaths(prev => [...prev, path]);
+                        }
+                        setSelectedPath(path);
+                        setChatState(prev => ({ ...prev, enableRag: true, selectedKb: path }));
+                        setManualPath("");
+                        setPathError(null);
+                        setShowFileSelector(false);
+                      }
+                    }}
+                  />
+                  {pathError && (
+                    <p className="text-red-400 text-xs mt-1">{pathError}</p>
+                  )}
+                </div>
                 <button
                   onClick={() => {
                     const path = manualPath.trim();
                     if (path) {
+                      if (!isValidServerPath(manualPath)) {
+                        setPathError("Invalid path (must be absolute, no .., ~, or shell characters)");
+                        return;
+                      }
                       if (!selectedPaths.includes(path)) {
                         setSelectedPaths(prev => [...prev, path]);
                       }
                       setSelectedPath(path);
                       setChatState(prev => ({ ...prev, enableRag: true, selectedKb: path }));
                       setManualPath("");
+                      setPathError(null);
                       setShowFileSelector(false);
                     }
                   }}
-                  disabled={!manualPath.trim()}
-                  className="px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium"
+                  disabled={!manualPath.trim() || !!pathError}
+                  className={`px-4 py-2 bg-blue-500 text-white rounded-md hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium ${(!manualPath.trim() || pathError) ? "opacity-50 cursor-not-allowed" : ""}`}
                 >
                   {t("Add")}
                 </button>

@@ -25,7 +25,13 @@ from sirchmunk.search import AgenticSearch
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.api.components.history_storage import HistoryStorage
 from sirchmunk.api.components.monitor_tracker import llm_usage_tracker
-from sirchmunk.api.security import is_path_allowed, verify_ws_token
+from sirchmunk.api.security import (
+    is_path_allowed,
+    verify_ws_token,
+    validate_user_path,
+    file_browser_limiter,
+    audit_logger,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,16 +79,25 @@ def _classify_error(exc: Exception) -> str:
 def _resolve_rag_paths(kb_name: str) -> Tuple[List[str], str]:
     """Resolve RAG search paths from frontend kb_name or SIRCHMUNK_SEARCH_PATHS.
 
-    When the user has set SIRCHMUNK_SEARCH_PATHS in settings, it takes effect
-    when the chat does not send a specific kb_name (e.g. no path selected in UI).
-    Returns (paths_list, display_name_for_sources).
+    User-provided paths are validated against the whitelist and filesystem
+    constraints.  Invalid entries are silently dropped.
     """
     def _parse(s: str) -> List[str]:
         return [p.strip() for p in (s or "").split(",") if p.strip()]
 
     if kb_name and _parse(kb_name):
-        paths = _parse(kb_name)
-        return paths, kb_name
+        raw_paths = _parse(kb_name)
+        validated: List[str] = []
+        for rp in raw_paths:
+            ok, result = validate_user_path(rp)
+            if ok:
+                validated.append(result)
+            else:
+                logger.debug("Rejected user path %r: %s", rp, result)
+        if validated:
+            return validated, ", ".join(os.path.basename(p) for p in validated)
+
+    # Fallback to environment variable
     env_paths = os.getenv("SIRCHMUNK_SEARCH_PATHS", "")
     paths = _parse(env_paths)
     display = ", ".join(paths) if paths else ""
@@ -1355,16 +1370,32 @@ async def get_file_picker_status(request: Request):
 
 
 @router.get("/file-browser")
-async def browse_files(path: str = "/", show_hidden: bool = False):
+async def browse_files(request: Request, path: str = "/", show_hidden: bool = False):
     """List files and directories at the given path (headless-safe alternative to Tkinter)"""
+    client_ip = request.client.host if request.client else "unknown"
+
+    # P1.2: Rate limiting
+    if not file_browser_limiter.is_allowed(client_ip):
+        return {"success": False, "error": "Too many requests, please try again later"}
+
     try:
+        # P0.1: Remote mode requires SIRCHMUNK_ALLOWED_PATHS
+        is_remote = client_ip not in ("127.0.0.1", "::1", "localhost")
+        if is_remote:
+            env_raw = os.getenv("SIRCHMUNK_ALLOWED_PATHS", "").strip()
+            if not env_raw:
+                audit_logger.log(client_ip=client_ip, action="browse", path=path, result="denied_no_config")
+                return {"success": False, "error": "File browser is not available. Please contact the administrator."}
+
         abs_path = os.path.abspath(path)
         if not is_path_allowed(abs_path):
-            return {"success": False, "error": "Access denied: path not in allowed list"}
+            logger.warning("File browser access denied: %s from %s", abs_path, client_ip)
+            audit_logger.log(client_ip=client_ip, action="browse", path=path, result="denied")
+            return {"success": False, "error": "Access denied"}
         if not os.path.exists(abs_path):
-            return {"success": False, "error": "Path does not exist"}
+            return {"success": False, "error": "The specified path is not accessible"}
         if not os.path.isdir(abs_path):
-            return {"success": False, "error": "Path is not a directory"}
+            return {"success": False, "error": "The specified path is not accessible"}
 
         items = []
         for entry in os.scandir(abs_path):
@@ -1384,6 +1415,7 @@ async def browse_files(path: str = "/", show_hidden: bool = False):
 
         items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
 
+        audit_logger.log(client_ip=client_ip, action="browse", path=path, result="success")
         return {
             "success": True,
             "data": {
@@ -1393,9 +1425,13 @@ async def browse_files(path: str = "/", show_hidden: bool = False):
             }
         }
     except PermissionError:
-        return {"success": False, "error": "Permission denied"}
+        logger.warning("Permission denied for path %s from %s", abs_path, client_ip)
+        audit_logger.log(client_ip=client_ip, action="browse", path=path, result="permission_denied")
+        return {"success": False, "error": "Access denied"}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        logger.exception("Unexpected error in file browser")
+        audit_logger.log(client_ip=client_ip, action="browse", path=path, result="error")
+        return {"success": False, "error": "An error occurred"}
 
 # Chat session management endpoints
 @router.get("/chat/sessions")
