@@ -27,6 +27,7 @@ from sirchmunk.api.components.history_storage import HistoryStorage
 from sirchmunk.api.components.monitor_tracker import llm_usage_tracker
 from sirchmunk.api.security import (
     is_path_allowed,
+    is_path_allowed_strict,
     verify_ws_token,
     validate_user_path,
     file_browser_limiter,
@@ -1391,24 +1392,26 @@ async def browse_files(request: Request, path: str = "", show_hidden: bool = Fal
         return {"success": False, "error": "Too many requests, please try again later"}
 
     try:
-        # Default path: work_path/data
+        # Resolve default path first
         if not path or not path.strip():
             work_path = os.getenv("SIRCHMUNK_WORK_PATH", os.path.expanduser("~/.sirchmunk"))
             path = os.path.join(work_path, "data")
 
-        # P0.1: Remote mode requires SIRCHMUNK_ALLOWED_PATHS
+        abs_path = os.path.abspath(path)
+
         is_remote = client_ip not in ("127.0.0.1", "::1", "localhost")
         if is_remote:
-            env_raw = os.getenv("SIRCHMUNK_ALLOWED_PATHS", "").strip()
-            if not env_raw:
-                audit_logger.log(client_ip=client_ip, action="browse", path=path, result="denied_no_config")
-                return {"success": False, "error": "Permission denied: path access is restricted in remote mode"}
-
-        abs_path = os.path.abspath(path)
-        if not is_path_allowed(abs_path):
-            logger.warning("File browser access denied: %s from %s", abs_path, client_ip)
-            audit_logger.log(client_ip=client_ip, action="browse", path=path, result="denied")
-            return {"success": False, "error": "Permission denied: path is not in the allowed list"}
+            # Remote mode: always enforce allowed paths (includes default data/uploads)
+            if not is_path_allowed_strict(abs_path):
+                logger.warning("Remote file browser access denied: %s from %s", abs_path, client_ip)
+                audit_logger.log(client_ip=client_ip, action="browse", path=path, result="denied")
+                return {"success": False, "error": "Permission denied: path is not in the allowed list"}
+        else:
+            # Local mode: unrestricted when SIRCHMUNK_ALLOWED_PATHS not configured
+            if not is_path_allowed(abs_path):
+                logger.warning("File browser access denied: %s from %s", abs_path, client_ip)
+                audit_logger.log(client_ip=client_ip, action="browse", path=path, result="denied")
+                return {"success": False, "error": "Permission denied: path is not in the allowed list"}
         if not os.path.exists(abs_path):
             return {"success": False, "error": "The specified path is not accessible"}
         if not os.path.isdir(abs_path):

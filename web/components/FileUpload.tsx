@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 
 // File System Access API types for drag-and-drop folder support
 interface FileSystemEntry {
@@ -96,7 +96,10 @@ export default function FileUpload({
   const [result, setResult] = useState<UploadResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [showPickerMenu, setShowPickerMenu] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+  const dropZoneRef = useRef<HTMLDivElement>(null);
 
   const addFilesDeduped = useCallback(
     (newFiles: FileWithPath[]) => {
@@ -162,7 +165,38 @@ export default function FileUpload({
       setResult(null);
       setError(null);
     }
+    setShowPickerMenu(false);
   };
+
+  const handleFolderSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const fileList = e.target.files;
+    if (!fileList) return;
+
+    const newFiles: FileWithPath[] = [];
+    for (let i = 0; i < fileList.length; i++) {
+      const file = fileList[i];
+      const relativePath = file.webkitRelativePath || file.name;
+      newFiles.push({ file, relativePath });
+    }
+
+    addFilesDeduped(newFiles);
+    setResult(null);
+    setError(null);
+    e.target.value = "";
+    setShowPickerMenu(false);
+  };
+
+  // Close picker menu when clicking outside the drop zone
+  useEffect(() => {
+    if (!showPickerMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (dropZoneRef.current && !dropZoneRef.current.contains(e.target as Node)) {
+        setShowPickerMenu(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showPickerMenu]);
 
 
   const removeFile = (index: number) => {
@@ -271,11 +305,19 @@ export default function FileUpload({
 
           {/* Drop Zone */}
           <div
+            ref={dropZoneRef}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
+            onDragEnter={(e) => {
+              e.preventDefault();
+              setShowPickerMenu(false);
+            }}
             onDrop={handleDrop}
-            onClick={() => fileInputRef.current?.click()}
-            className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors ${
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowPickerMenu(!showPickerMenu);
+            }}
+            className={`relative border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors ${
               isDragOver
                 ? "border-blue-500 bg-blue-50 dark:bg-blue-900/20"
                 : "border-gray-300 dark:border-gray-600 hover:border-blue-400 hover:bg-gray-700/50"
@@ -288,7 +330,7 @@ export default function FileUpload({
               Drag and drop files or folders here
             </p>
             <p className="text-gray-400 text-xs mt-2">
-              Click to select files · Drag & drop files or folders
+              Click to select · Drag & drop files or folders
             </p>
             <p className="text-gray-500 text-xs mt-1">
               Max 1 GB per file · 10 GB total
@@ -302,6 +344,48 @@ export default function FileUpload({
               style={{ display: 'none' }}
               accept=".pdf,.docx,.doc,.xlsx,.xls,.pptx,.txt,.md,.csv,.json,.html,.xml,.rtf,.epub,.yaml,.yml,.log,.tsv"
             />
+            <input
+              type="file"
+              ref={folderInputRef}
+              className="hidden"
+              // @ts-ignore
+              webkitdirectory=""
+              directory=""
+              multiple
+              onChange={handleFolderSelect}
+              onClick={(e) => e.stopPropagation()}
+            />
+            {showPickerMenu && (
+              <div
+                className="absolute z-10 mt-2 bg-gray-700 border border-gray-600 rounded-lg shadow-lg overflow-hidden"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <button
+                  className="w-full px-4 py-2 text-left text-sm text-gray-200 hover:bg-gray-600 transition-colors flex items-center gap-2"
+                  onClick={() => {
+                    fileInputRef.current?.click();
+                    setShowPickerMenu(false);
+                  }}
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                  </svg>
+                  Select Files
+                </button>
+                <button
+                  className="w-full px-4 py-2 text-left text-sm text-gray-200 hover:bg-gray-600 transition-colors flex items-center gap-2"
+                  onClick={() => {
+                    folderInputRef.current?.click();
+                    setShowPickerMenu(false);
+                  }}
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                  </svg>
+                  Select Folder
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Selected Files List */}

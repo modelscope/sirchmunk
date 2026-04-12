@@ -112,6 +112,22 @@ def is_path_allowed(requested: str) -> bool:
     return any(_is_subpath(target, base) for base in allowed)
 
 
+def is_path_allowed_strict(requested: str) -> bool:
+    """Check whether *requested* falls under an allowed base path.
+
+    Unlike ``is_path_allowed``, this ALWAYS enforces the allowed-paths list
+    (including the implicit defaults ``data/`` and ``uploads/``), even when
+    ``SIRCHMUNK_ALLOWED_PATHS`` is not explicitly configured.  Use this for
+    remote-mode access control.
+    """
+    if _has_symlink_in_chain(requested):
+        logger.warning("Symlink detected in path: %s", requested)
+        return False
+    allowed = get_allowed_paths()
+    target = Path(requested).resolve()
+    return any(_is_subpath(target, base) for base in allowed)
+
+
 def _is_subpath(child: Path, parent: Path) -> bool:
     """Return True if *child* is equal to or a descendant of *parent*."""
     try:
