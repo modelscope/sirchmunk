@@ -152,6 +152,11 @@
 
 ## 🎉 News
 
+* 🚀 **2026年4月13日**: Sirchmunk v0.0.7
+  - **C/S 部署加固**：远程模式下严格的 `allowed_paths` 路径约束与符号链接检测；按 IP 速率限制与 JSON Lines 审计日志；本地模式保持向后兼容。
+  - **远程文件上传**：三种上传模式（选择文件 / 选择文件夹 / 拖拽上传）；服务端上传前重复检测，支持跳过/覆盖；基于 manifest 的存储统计。
+  - **服务端文件浏览**：`FileBrowser` 默认打开服务端 `data/` 目录；手动路径输入校验 `allowed_paths`；远程访问的权限感知错误提示。
+  - **Init 对齐**：`sirchmunk init` 生成与 `config/env.example` 完全对齐的 `.env`，覆盖所有 C/S 部署变量。
 * 🚀 **2026年3月31日**: Sirchmunk v0.0.6post3
   - **Docker 多架构支持**：通过 Docker Buildx 原生构建 `linux/amd64` 和 `linux/arm64` 镜像；CI 自动构建双架构。
   - **FAST 模式优化**：`_fast_find_best_file` 新增文件级去重与动态分数剪枝；知识集群复用增加搜索范围感知。

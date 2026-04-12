@@ -156,6 +156,11 @@ It serves as a unified intelligent hub for AI agents, delivering deep insights a
 
 ## 🎉 News
 
+* 🚀 **Apr 13, 2026**: Sirchmunk v0.0.7
+  - **C/S deployment hardening**: Strict `allowed_paths` enforcement with symlink detection for remote mode; per-IP rate limiting and JSON Lines audit logging; local mode remains unrestricted for backward compatibility.
+  - **Remote file upload**: Three-mode upload UI (Select Files / Select Folder / drag-and-drop); server-side pre-upload duplicate detection with skip/overwrite options; manifest-based storage accounting.
+  - **Server file browser**: `FileBrowser` defaults to server `data/` directory; manual path input validated against `allowed_paths`; permission-aware error messages for remote access control.
+  - **Init alignment**: `sirchmunk init` generates `.env` fully aligned with `config/env.example`, covering all C/S deployment variables.
 * 🚀 **Mar 31, 2026**: Sirchmunk v0.0.6post3
   - **Docker multi-arch**: Native `linux/amd64` and `linux/arm64` images via Docker Buildx; CI builds both architectures automatically.
   - **FAST mode**: File-level deduplication and dynamic score pruning in `_fast_find_best_file`; scope-aware knowledge cluster reuse.
