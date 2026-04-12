@@ -223,9 +223,21 @@ class Config(BaseModel):
         work_path = Path(os.getenv("SIRCHMUNK_WORK_PATH", str(Path.home() / ".sirchmunk")))
         work_path = work_path.expanduser().resolve()
         env_file = work_path / ".env"
-        
+
         if env_file.exists():
             load_dotenv(env_file, override=False)
+
+        # Expand ~ in path-related env vars after dotenv load, mirroring
+        # sirchmunk.cli._load_env_file. The default .env template uses
+        # `EMBEDDING_CACHE_DIR=${SIRCHMUNK_WORK_PATH}/.cache/models` with
+        # `SIRCHMUNK_WORK_PATH=~/.sirchmunk`; python-dotenv interpolates the
+        # `${...}` but does NOT expand `~`, so downstream consumers that skip
+        # `os.path.expanduser` end up creating a literal `~` directory in the
+        # process CWD. Normalising here once fixes every consumer.
+        for _key in ("SIRCHMUNK_WORK_PATH", "EMBEDDING_CACHE_DIR"):
+            _val = os.environ.get(_key)
+            if _val and "~" in _val:
+                os.environ[_key] = os.path.expanduser(_val)
         
         # LLM configuration
         llm_config = LLMConfig(
