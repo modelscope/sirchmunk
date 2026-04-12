@@ -44,6 +44,7 @@ def _check_enabled() -> None:
 async def upload_files(
     files: List[UploadFile] = File(..., description="One or more files to upload"),
     collection: str = Form(default="default", description="Collection name (alphanumeric, dashes, underscores)"),
+    paths: List[str] = Form(default=[], description="Relative paths preserving directory structure"),
 ):
     """Batch upload files to a named collection."""
     _check_enabled()
@@ -57,10 +58,16 @@ async def upload_files(
     results: List[dict] = []
     errors: List[dict] = []
 
-    for upload_file in files:
+    for i, upload_file in enumerate(files):
         try:
             content = await upload_file.read()
-            meta = await svc.save_file(collection, upload_file.filename or "unnamed", content)
+            relative_path = paths[i] if i < len(paths) else None
+            meta = await svc.save_file(
+                collection,
+                upload_file.filename or "unnamed",
+                content,
+                relative_path=relative_path,
+            )
             results.append(meta.model_dump())
         except ValueError as e:
             errors.append({"name": upload_file.filename, "error": str(e)})

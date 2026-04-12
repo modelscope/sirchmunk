@@ -511,8 +511,13 @@ def cmd_search(args: argparse.Namespace) -> int:
         Exit code (0 for success, non-zero for failure)
     """
     try:
-        # Load environment
-        work_path = _get_default_work_path().expanduser().resolve()
+        # Resolve work path from --work-path or default
+        work_path = Path(
+            getattr(args, "work_path", None) or str(_get_default_work_path())
+        ).expanduser().resolve()
+        os.environ["SIRCHMUNK_WORK_PATH"] = str(work_path)
+
+        # Load environment from work path .env
         env_file = work_path / ".env"
         if env_file.exists():
             _load_env_file(env_file)
@@ -537,6 +542,7 @@ def cmd_search(args: argparse.Namespace) -> int:
                 mode=args.mode,
                 output_format=args.output,
                 verbose=args.verbose,
+                work_path=work_path,
             ))
 
     except KeyboardInterrupt:
@@ -554,6 +560,7 @@ async def _search_local(
     mode: str = "FAST",
     output_format: str = "text",
     verbose: bool = False,
+    work_path: Optional[Path] = None,
 ) -> int:
     """Execute search locally using AgenticSearch.
 
@@ -563,6 +570,7 @@ async def _search_local(
         mode: Search mode (FAST, DEEP, FILENAME_ONLY)
         output_format: Output format (text, json)
         verbose: Enable verbose output
+        work_path: Resolved working directory path
 
     Returns:
         Exit code
@@ -588,8 +596,9 @@ async def _search_local(
         model=llm_model_name,
     )
 
-    # Create search instance
-    work_path = _get_default_work_path()
+    # Create search instance with resolved work path
+    if work_path is None:
+        work_path = _get_default_work_path()
     searcher = AgenticSearch(
         llm=llm,
         work_path=str(work_path),
@@ -1382,6 +1391,11 @@ Examples:
     search_parser.add_argument("--api", action="store_true", help="Use API server instead of local search")
     search_parser.add_argument("--api-url", default="http://localhost:8584", help="API server URL")
     search_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    search_parser.add_argument(
+        "--work-path",
+        default=None,
+        help="Working directory (default: ~/.sirchmunk)",
+    )
     search_parser.set_defaults(func=cmd_search)
 
     # === web command group ===

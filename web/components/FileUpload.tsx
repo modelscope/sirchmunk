@@ -7,6 +7,7 @@ interface FileSystemEntry {
   isFile: boolean;
   isDirectory: boolean;
   name: string;
+  fullPath: string;
 }
 interface FileSystemFileEntry extends FileSystemEntry {
   file(successCallback: (file: File) => void, errorCallback?: (error: Error) => void): void;
@@ -18,15 +19,21 @@ interface FileSystemDirectoryReader {
   readEntries(successCallback: (entries: FileSystemEntry[]) => void, errorCallback?: (error: Error) => void): void;
 }
 
-async function readAllEntries(entries: FileSystemEntry[]): Promise<File[]> {
-  const files: File[] = [];
+interface FileWithPath {
+  file: File;
+  relativePath: string; // e.g. "src/data/file.pdf" or just "file.pdf" for flat files
+}
+
+async function readAllEntries(entries: FileSystemEntry[]): Promise<FileWithPath[]> {
+  const files: FileWithPath[] = [];
 
   async function processEntry(entry: FileSystemEntry): Promise<void> {
     if (entry.isFile) {
       const file = await new Promise<File>((resolve, reject) => {
         (entry as FileSystemFileEntry).file(resolve, reject);
       });
-      files.push(file);
+      const relativePath = entry.fullPath.replace(/^\//, '') || file.name;
+      files.push({ file, relativePath });
     } else if (entry.isDirectory) {
       const reader = (entry as FileSystemDirectoryEntry).createReader();
       let batch: FileSystemEntry[];
@@ -83,14 +90,25 @@ export default function FileUpload({
   onUploadComplete,
 }: FileUploadProps) {
   const [collection, setCollection] = useState("default");
-  const [uploadMode, setUploadMode] = useState<"files" | "folder">("files");
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [selectedFiles, setSelectedFiles] = useState<FileWithPath[]>([]);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [result, setResult] = useState<UploadResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+
+  const addFilesDeduped = useCallback(
+    (newFiles: FileWithPath[]) => {
+      setSelectedFiles((prev) => {
+        const existing = new Set(prev.map((f) => f.relativePath));
+        const unique = newFiles.filter((f) => !existing.has(f.relativePath));
+        return [...prev, ...unique];
+      });
+    },
+    [],
+  );
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -117,24 +135,43 @@ export default function FileUpload({
     }
 
     if (entries.length > 0) {
-      readAllEntries(entries).then((files) => {
-        if (files.length > 0) {
-          setSelectedFiles((prev) => [...prev, ...files]);
+      readAllEntries(entries).then((filesWithPaths) => {
+        if (filesWithPaths.length > 0) {
+          addFilesDeduped(filesWithPaths);
         }
       });
     } else {
-      // Fallback: use dataTransfer.files directly
+      // Fallback: use dataTransfer.files directly (flat files only)
       const droppedFiles = Array.from(e.dataTransfer.files);
       if (droppedFiles.length > 0) {
-        setSelectedFiles((prev) => [...prev, ...droppedFiles]);
+        const filesWithPaths = droppedFiles.map((f) => ({
+          file: f,
+          relativePath: f.name,
+        }));
+        addFilesDeduped(filesWithPaths);
       }
     }
-  }, []);
+  }, [addFilesDeduped]);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
-      const newFiles = Array.from(e.target.files);
-      setSelectedFiles((prev) => [...prev, ...newFiles]);
+      const filesWithPaths = Array.from(e.target.files).map((f) => ({
+        file: f,
+        relativePath: f.name,
+      }));
+      addFilesDeduped(filesWithPaths);
+      setResult(null);
+      setError(null);
+    }
+  };
+
+  const handleFolderSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) {
+      const filesWithPaths = Array.from(e.target.files).map((f) => ({
+        file: f,
+        relativePath: (f as any).webkitRelativePath || f.name,
+      }));
+      addFilesDeduped(filesWithPaths);
       setResult(null);
       setError(null);
     }
@@ -162,8 +199,9 @@ export default function FileUpload({
 
     const formData = new FormData();
     formData.append("collection", collection);
-    selectedFiles.forEach((file) => {
+    selectedFiles.forEach(({ file, relativePath }) => {
       formData.append("files", file);
+      formData.append("paths", relativePath);
     });
 
     try {
@@ -202,7 +240,7 @@ export default function FileUpload({
 
   if (!isOpen) return null;
 
-  const totalSize = selectedFiles.reduce((sum, f) => sum + f.size, 0);
+  const totalSize = selectedFiles.reduce((sum, f) => sum + f.file.size, 0);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
@@ -243,37 +281,12 @@ export default function FileUpload({
             </p>
           </div>
 
-          {/* Upload Mode Toggle */}
-          <div className="flex gap-2 mb-3">
-            <button
-              onClick={() => setUploadMode("files")}
-              className={`px-3 py-1.5 text-sm rounded-md font-medium transition-colors ${
-                uploadMode === "files"
-                  ? "bg-blue-500 text-white"
-                  : "bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600"
-              }`}
-            >
-              Files
-            </button>
-            <button
-              onClick={() => setUploadMode("folder")}
-              className={`px-3 py-1.5 text-sm rounded-md font-medium transition-colors ${
-                uploadMode === "folder"
-                  ? "bg-blue-500 text-white"
-                  : "bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600"
-              }`}
-            >
-              Folder
-            </button>
-          </div>
-
           {/* Drop Zone */}
           <div
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
-            onClick={() => fileInputRef.current?.click()}
-            className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors ${
+            className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
               isDragOver
                 ? "border-blue-500 bg-blue-50 dark:bg-blue-900/20"
                 : "border-gray-300 dark:border-gray-600 hover:border-gray-400 dark:hover:border-gray-500"
@@ -283,22 +296,42 @@ export default function FileUpload({
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
             </svg>
             <p className="mt-2 text-sm text-gray-600 dark:text-gray-400">
-              {uploadMode === "folder"
-                ? "Drag and drop a folder here, or click to select"
-                : "Drag and drop files here, or click to select"}
+              Drag and drop files or folders here, or
             </p>
-            <p className="mt-1 text-xs text-gray-500">
+            <div className="mt-3 flex items-center justify-center gap-3">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="px-3 py-1.5 text-sm rounded-md font-medium bg-blue-500 text-white hover:bg-blue-600 transition-colors"
+              >
+                Select Files
+              </button>
+              <button
+                type="button"
+                onClick={() => folderInputRef.current?.click()}
+                className="px-3 py-1.5 text-sm rounded-md font-medium bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+              >
+                Select Folder
+              </button>
+            </div>
+            <p className="mt-2 text-xs text-gray-500">
               PDF, DOCX, XLSX, TXT, MD, CSV, JSON, HTML, XML, PPTX
             </p>
             <input
-              key={uploadMode}
               ref={fileInputRef}
               type="file"
               multiple
               onChange={handleFileSelect}
-              className="hidden"
+              style={{ display: 'none' }}
               accept=".pdf,.docx,.doc,.xlsx,.xls,.pptx,.txt,.md,.csv,.json,.html,.xml,.rtf,.epub,.yaml,.yml,.log,.tsv"
-              {...(uploadMode === "folder" ? { webkitdirectory: "", directory: "" } as any : {})}
+            />
+            <input
+              ref={folderInputRef}
+              type="file"
+              multiple
+              {...({ webkitdirectory: "", directory: "" } as any)}
+              onChange={handleFolderSelect}
+              style={{ display: 'none' }}
             />
           </div>
 
@@ -317,13 +350,13 @@ export default function FileUpload({
                 </button>
               </div>
               <div className="max-h-40 overflow-y-auto space-y-1">
-                {selectedFiles.map((file, idx) => (
+                {selectedFiles.map(({ file, relativePath }, idx) => (
                   <div
-                    key={`${file.name}-${idx}`}
+                    key={`${relativePath}-${idx}`}
                     className="flex items-center justify-between py-1 px-2 rounded bg-gray-50 dark:bg-gray-700/50 text-sm"
                   >
-                    <span className="truncate text-gray-700 dark:text-gray-300 flex-1 mr-2">
-                      {file.name}
+                    <span className="truncate text-gray-700 dark:text-gray-300 flex-1 mr-2" title={relativePath}>
+                      {relativePath}
                     </span>
                     <span className="text-gray-500 text-xs whitespace-nowrap mr-2">
                       {formatSize(file.size)}

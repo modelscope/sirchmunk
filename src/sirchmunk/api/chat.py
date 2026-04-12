@@ -564,6 +564,7 @@ def get_search_instance(log_callback=None):
             reuse_knowledge=enable_cluster_reuse,
             cluster_sim_threshold=cluster_sim_threshold,
             cluster_sim_top_k=cluster_sim_top_k,
+            work_path=os.getenv("SIRCHMUNK_WORK_PATH") or None,
         )
         _chat_search_config = current_config
         return _chat_search_instance
@@ -1502,7 +1503,9 @@ async def get_search_suggestions(query: str, kb_name: str = "", limit: int = 8):
         if not paths:
             return {"success": True, "data": [], "query": query}
 
-        retriever = GrepRetriever(work_path=DEFAULT_SIRCHMUNK_WORK_PATH)
+        retriever = GrepRetriever(
+            work_path=os.getenv("SIRCHMUNK_WORK_PATH") or DEFAULT_SIRCHMUNK_WORK_PATH
+        )
         escaped = _re.escape(query.strip())
         results = await retriever.retrieve_by_filename(
             patterns=[escaped],

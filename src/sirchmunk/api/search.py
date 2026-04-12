@@ -33,6 +33,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["search"])
 
 
+def _resolve_work_path() -> str:
+    """Return the effective work path from the environment or default."""
+    env_wp = os.getenv("SIRCHMUNK_WORK_PATH")
+    return os.path.expanduser(env_wp) if env_wp else DEFAULT_SIRCHMUNK_WORK_PATH
+
+
 # ===================================================================
 #  Request / Response models
 # ===================================================================
@@ -147,7 +153,7 @@ def _get_search_instance() -> AgenticSearch:
 
     _search_instance = AgenticSearch(
         llm=llm,
-        work_path=DEFAULT_SIRCHMUNK_WORK_PATH,
+        work_path=_resolve_work_path(),
         verbose=False,
         reuse_knowledge=enable_cluster_reuse,
         cluster_sim_threshold=cluster_sim_threshold,
@@ -190,7 +196,7 @@ def _create_search_instance(log_callback=None) -> AgenticSearch:
 
     return AgenticSearch(
         llm=llm,
-        work_path=DEFAULT_SIRCHMUNK_WORK_PATH,
+        work_path=_resolve_work_path(),
         verbose=False,
         log_callback=log_callback,
         reuse_knowledge=enable_cluster_reuse,

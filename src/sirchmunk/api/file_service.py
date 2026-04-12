@@ -189,6 +189,7 @@ class FileStorageService:
         collection: str,
         filename: str,
         content: bytes,
+        relative_path: Optional[str] = None,
     ) -> FileMetadata:
         """Save an uploaded file into *collection*, returning its metadata."""
         self.validate_collection_name(collection)
@@ -196,20 +197,38 @@ class FileStorageService:
         self.validate_file(filename, len(content))
         self._check_total_quota(len(content))
 
+        # Build target path preserving directory structure if relative_path provided
+        if relative_path:
+            # Sanitize each path component individually
+            parts = Path(relative_path).parts
+            safe_parts = []
+            for part in parts[:-1]:  # All but the last (which is the filename)
+                part = re.sub(r'[<>:"|?*\x00-\x1f]', '_', part)
+                if part in ('.', '..', '') or part.startswith('.'):
+                    continue  # Skip traversal attempts and hidden dirs
+                safe_parts.append(part)
+            sub_dir = Path(*safe_parts) if safe_parts else Path()
+        else:
+            sub_dir = Path()
+
         col_dir = self._collection_dir(collection)
-        col_dir.mkdir(parents=True, exist_ok=True)
+        target_dir = col_dir / sub_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
 
         # Deduplicate filename: if exists, append _1, _2, etc.
+        target = target_dir / filename
         stem = Path(filename).stem
         ext = Path(filename).suffix
-        target = col_dir / filename
         counter = 1
         while target.exists():
-            target = col_dir / f"{stem}_{counter}{ext}"
+            target = target_dir / f"{stem}_{counter}{ext}"
             counter += 1
 
         # Write file
         target.write_bytes(content)
+
+        # Relative name for display/manifest
+        rel_name = str(sub_dir / target.name) if sub_dir != Path() else target.name
 
         # Compute hash
         sha256 = hashlib.sha256(content).hexdigest()
@@ -219,7 +238,7 @@ class FileStorageService:
         now = datetime.now(timezone.utc).isoformat()
         meta = FileMetadata(
             file_id=file_id,
-            name=target.name,
+            name=rel_name,
             size_bytes=len(content),
             sha256=sha256,
             upload_time=now,
