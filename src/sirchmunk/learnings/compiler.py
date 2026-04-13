@@ -380,10 +380,13 @@ class KnowledgeCompiler:
         await self._log.info("[Compile] Phase 4: Building cross-references")
         report.cross_refs_built = await self._build_cross_references(results)
 
-        # Phase 5: persist manifest
+        # Phase 5: persist manifest + document catalog
         manifest.last_compile_at = datetime.now(timezone.utc).isoformat()
         self._save_manifest(manifest)
         self._storage.force_sync()
+
+        # Generate document catalog for search-time routing
+        self._build_document_catalog(manifest)
 
         report.elapsed_seconds = time.monotonic() - t0
         await self._log.info(
@@ -838,3 +841,57 @@ class KnowledgeCompiler:
 
     def _save_manifest(self, manifest: CompileManifest) -> None:
         self._manifest_path.write_text(manifest.to_json(), encoding="utf-8")
+
+    # ------------------------------------------------------------------ #
+    #  Document catalog for search-time routing                           #
+    # ------------------------------------------------------------------ #
+
+    def _build_document_catalog(self, manifest: CompileManifest) -> None:
+        """Generate a lightweight catalog mapping files to their tree root summaries.
+
+        The catalog is consumed by FAST search to fuse query analysis with
+        LLM-driven document routing in a single prompt.  Each entry carries
+        the filename and a truncated root summary (≤250 chars).
+        """
+        tree_cache = self._compile_dir / "trees"
+        entries: List[Dict[str, str]] = []
+
+        for file_path, entry in manifest.files.items():
+            summary = ""
+            if entry.has_tree and tree_cache.exists():
+                tree_file = tree_cache / f"{entry.file_hash}.json"
+                if tree_file.exists():
+                    try:
+                        tree = DocumentTree.from_json(
+                            tree_file.read_text(encoding="utf-8"),
+                        )
+                        if tree.root and tree.root.summary:
+                            summary = tree.root.summary[:250]
+                    except Exception:
+                        pass
+
+            if not summary:
+                # Fallback: use first cluster's description
+                for cid in entry.cluster_ids[:1]:
+                    try:
+                        import asyncio
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            break
+                        c = loop.run_until_complete(self._storage.get(cid))
+                        if c and c.description:
+                            summary = str(c.description[0])[:250]
+                    except Exception:
+                        break
+
+            entries.append({
+                "path": file_path,
+                "name": Path(file_path).name,
+                "summary": summary,
+            })
+
+        catalog_path = self._compile_dir / "document_catalog.json"
+        catalog_path.write_text(
+            json.dumps(entries, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )

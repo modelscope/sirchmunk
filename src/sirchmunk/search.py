@@ -20,6 +20,7 @@ from sirchmunk.llm.prompts import (
     KEYWORD_QUERY_PLACEHOLDER,
     generate_keyword_extraction_prompt,
     FAST_QUERY_ANALYSIS,
+    FAST_QUERY_ANALYSIS_WITH_CATALOG,
     ROI_RESULT_SUMMARY,
     SEARCH_RESULT_SUMMARY,
     DOC_SUMMARY,
@@ -1940,9 +1941,26 @@ class AgenticSearch(BaseSearch):
         soft_hit = await self._try_soft_reuse(query, paths)
 
         # ==============================================================
-        # Step 1: LLM query analysis only (dir scan deferred until needed)
+        # Step 1: Fused LLM query analysis + document routing
+        # When a compiled document catalog exists, the LLM sees all
+        # document summaries and selects the most relevant ones in the
+        # same call that extracts keywords (zero extra LLM cost).
         # ==============================================================
-        prompt = FAST_QUERY_ANALYSIS.format(user_input=query)
+        catalog = self._load_document_catalog()
+        catalog_routed_files: List[str] = []
+        catalog_confidence: str = "low"
+
+        if catalog:
+            listing = "\n".join(
+                f"[{i}] {e['name']}: {e['summary'][:200]}"
+                for i, e in enumerate(catalog)
+            )
+            prompt = FAST_QUERY_ANALYSIS_WITH_CATALOG.format(
+                user_input=query, document_listing=listing,
+            )
+        else:
+            prompt = FAST_QUERY_ANALYSIS.format(user_input=query)
+
         resp = await self.llm.achat(
             messages=[{"role": "user", "content": prompt}],
             stream=False,
@@ -1956,6 +1974,21 @@ class AgenticSearch(BaseSearch):
         analysis = self._parse_fast_json(resp.content)
         query_type = analysis.get("type", "search")
         file_hints = analysis.get("file_hints", [])
+
+        # Extract catalog-routed files from the fused response
+        if catalog:
+            selected_indices = analysis.get("selected_docs", [])
+            catalog_confidence = analysis.get("doc_confidence", "low")
+            for idx in selected_indices:
+                if isinstance(idx, int) and 0 <= idx < len(catalog):
+                    fp = catalog[idx]["path"]
+                    if Path(fp).exists():
+                        catalog_routed_files.append(fp)
+            if catalog_routed_files:
+                await self._logger.info(
+                    f"[FAST:Step1] Catalog routing ({catalog_confidence}): "
+                    f"{[Path(p).name for p in catalog_routed_files]}"
+                )
 
         if query_type == "chat":
             chat_reply = analysis.get("response", "")
@@ -2017,6 +2050,7 @@ class AgenticSearch(BaseSearch):
 
         # ==============================================================
         # Step 1.5: Compile-aware enrichment (P2 + P4, zero LLM calls)
+        # Catalog-routed files from the fused Step 1 are merged here.
         # ==============================================================
         all_kw_set = set(primary + fallback)
 
@@ -2037,13 +2071,26 @@ class AgenticSearch(BaseSearch):
                 keyword_idfs.setdefault(kw, 0.5)
 
         compile_hint_files: List[str] = []
+        # Catalog-routed files get highest priority
+        seen_hint_paths: set = set()
+        for fp in catalog_routed_files:
+            if fp not in seen_hint_paths:
+                seen_hint_paths.add(fp)
+                compile_hint_files.append(fp)
         if soft_hit:
-            compile_hint_files.extend(soft_hit.file_paths)
-        compile_hint_files.extend(compile_hints.file_paths)
+            for fp in soft_hit.file_paths:
+                if fp not in seen_hint_paths:
+                    seen_hint_paths.add(fp)
+                    compile_hint_files.append(fp)
+        for fp in compile_hints.file_paths:
+            if fp not in seen_hint_paths:
+                seen_hint_paths.add(fp)
+                compile_hint_files.append(fp)
 
         if compile_hint_files:
             await self._logger.info(
-                f"[FAST:Step1.5] Compile hints: {len(compile_hint_files)} files, "
+                f"[FAST:Step1.5] Compile hints: {len(compile_hint_files)} files "
+                f"(catalog={len(catalog_routed_files)}, soft={len(soft_hit.file_paths) if soft_hit else 0}), "
                 f"{len(compile_hints.extra_keywords)} extra keywords"
             )
 
@@ -2053,7 +2100,9 @@ class AgenticSearch(BaseSearch):
 
         # ==============================================================
         # Step 2: rga cascade — primary first, fallback only if needed
-        # Dir scan runs only when enabled, for fallback when rga misses.
+        # When catalog routing has high confidence, catalog-routed files
+        # are used directly (skipping rga) to avoid noise from unrelated
+        # files.  Otherwise rga runs first and catalog acts as fallback.
         # ==============================================================
         context.add_search(query)
         include_patterns = list(include or [])
@@ -2070,7 +2119,19 @@ class AgenticSearch(BaseSearch):
         used_level = "primary"
         evidence = ""
 
-        if primary:
+        # High-confidence catalog routing: skip rga, use catalog directly
+        if catalog_routed_files and catalog_confidence == "high":
+            used_level = "catalog_route"
+            await self._logger.info(
+                f"[FAST:Step2] High-confidence catalog routing → "
+                f"{[Path(p).name for p in catalog_routed_files[:top_k_files]]}"
+            )
+            best_files = [
+                {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
+                for p in catalog_routed_files[:top_k_files]
+            ]
+
+        if not best_files and primary:
             best_files = await self._fast_find_best_file(
                 primary, top_k=top_k_files, keyword_idfs=keyword_idfs, **rga_kwargs
             )
@@ -2084,7 +2145,7 @@ class AgenticSearch(BaseSearch):
                 fallback, top_k=top_k_files, keyword_idfs=keyword_idfs, **rga_kwargs
             )
 
-        # --- Fallback: compile-hint files when rga misses (P2+P4) ---
+        # --- Fallback: compile-hint files when rga misses (catalog + P2 + P4) ---
         if not best_files and compile_hint_files:
             used_level = "compile_hint"
             await self._logger.info(
@@ -2128,52 +2189,59 @@ class AgenticSearch(BaseSearch):
             )
 
             # ==============================================================
-            # Step 3: Context sampling around grep hits (no LLM)
-            # Multi-file evidence aggregation
+            # Step 2.5 + Step 3: Tree navigation (1 LLM call) runs in
+            # parallel with rga evidence sampling (0 LLM).  The merged
+            # result is higher quality than either alone.
             # ==============================================================
-            evidence_parts = []
-            total_evidence_chars = 0
-            for bf in best_files:
-                if total_evidence_chars >= self._FAST_MAX_EVIDENCE_CHARS:
-                    break
 
-                file_path = bf["path"]
-                fname = Path(file_path).name
-                ext = Path(file_path).suffix.lower()
+            async def _rga_evidence() -> str:
+                """Collect rga-based evidence from best_files (zero LLM)."""
+                parts: List[str] = []
+                chars = 0
+                for bf in best_files:
+                    if chars >= self._FAST_MAX_EVIDENCE_CHARS:
+                        break
+                    fp = bf["path"]
+                    fn = Path(fp).name
+                    ext = Path(fp).suffix.lower()
+                    ev = None
+                    if ext in self._FAST_TEXT_EXTENSIONS:
+                        try:
+                            sz = Path(fp).stat().st_size
+                            if sz < self._FAST_SMALL_FILE_THRESHOLD:
+                                full = Path(fp).read_text(errors="replace")
+                                if len(full) < self._FAST_SMALL_FILE_THRESHOLD:
+                                    ev = f"[{fn}]\n{full}"
+                        except Exception:
+                            pass
+                    if ev is None:
+                        ev = await self._fast_sample_evidence(fp, bf.get("matches", []))
+                    if ev:
+                        remaining = self._FAST_MAX_EVIDENCE_CHARS - chars
+                        parts.append(ev[:remaining])
+                        chars += len(parts[-1])
+                        context.mark_file_read(fp)
+                return "\n\n---\n\n".join(parts)
 
-                # Small file short-circuit: read full content instead of grep sampling
-                ev = None
-                if ext in self._FAST_TEXT_EXTENSIONS:
-                    try:
-                        file_size = Path(file_path).stat().st_size
-                        if file_size < self._FAST_SMALL_FILE_THRESHOLD:
-                            full_text = Path(file_path).read_text(errors="replace")
-                            if len(full_text) < self._FAST_SMALL_FILE_THRESHOLD:
-                                ev = f"[{fname}]\n{full_text}"
-                                await self._logger.info(
-                                    f"[FAST] Small file short-circuit: reading full content of {fname} "
-                                    f"({len(full_text)} chars)"
-                                )
-                    except Exception:
-                        pass  # Fall through to normal evidence extraction
+            # Launch tree navigation for the primary file alongside rga
+            tree_nav_target = best_files[0]["path"]
+            rga_task = _rga_evidence()
+            tree_task = self._navigate_tree_for_evidence(tree_nav_target, query)
 
-                # Normal path: grep-based evidence sampling
-                if ev is None:
-                    ev = await self._fast_sample_evidence(file_path, bf.get("matches", []))
+            rga_ev, tree_ev = await asyncio.gather(rga_task, tree_task)
 
-                if ev:
-                    remaining = self._FAST_MAX_EVIDENCE_CHARS - total_evidence_chars
-                    chunk = ev[:remaining]
-                    evidence_parts.append(chunk)
-                    total_evidence_chars += len(chunk)
-                    context.mark_file_read(file_path)
-
-            evidence = "\n\n---\n\n".join(evidence_parts)
+            # Merge: tree evidence first (highest quality), then rga
+            evidence_parts_final: List[str] = []
+            if tree_ev:
+                evidence_parts_final.append(tree_ev)
+            if rga_ev:
+                evidence_parts_final.append(rga_ev)
+            evidence = "\n\n---\n\n".join(evidence_parts_final)
 
             if not evidence or len(evidence.strip()) < 20:
                 if llm_fallback:
                     await self._logger.info(
-                        "[FAST:Step3] No usable evidence, llm_fallback=True \u2192 LLM summary"
+                        "[FAST:Step3] No usable evidence, llm_fallback=True → LLM summary"
                     )
                     evidence = self._LLM_FALLBACK_EVIDENCE
                 else:
@@ -2181,7 +2249,8 @@ class AgenticSearch(BaseSearch):
                     return _NO_RESULTS_MESSAGE, None, context
 
             await self._logger.info(
-                f"[FAST:Step3] Evidence: {len(evidence)} chars from {Path(file_path).name}"
+                f"[FAST:Step3] Evidence: {len(evidence)} chars "
+                f"(tree={'yes' if tree_ev else 'no'}, rga={'yes' if rga_ev else 'no'})"
             )
 
         keywords_used = primary if used_level == "primary" else fallback
@@ -2206,21 +2275,52 @@ class AgenticSearch(BaseSearch):
         answer, should_save, should_answer = self._parse_summary_response(
             answer_resp.content or ""
         )
+
+        # ==============================================================
+        # Step 5: Self-correction retry (conditional, ≤1 extra LLM call)
+        # When the answer gate rejects the first attempt, try alternative
+        # evidence sources before giving up.
+        # ==============================================================
+        if not should_answer:
+            retry_evidence = await self._fast_self_correct(
+                query, best_files, catalog_routed_files, context,
+            )
+            if retry_evidence:
+                await self._logger.info(
+                    f"[FAST:Step5] Retrying with {len(retry_evidence)} chars of alternative evidence"
+                )
+                retry_prompt = ROI_RESULT_SUMMARY.format(
+                    user_input=query, text_content=retry_evidence,
+                )
+                retry_resp = await self.llm.achat(
+                    messages=[{"role": "user", "content": retry_prompt}],
+                    stream=True,
+                )
+                self.llm_usages.append(retry_resp.usage)
+                if retry_resp.usage and isinstance(retry_resp.usage, dict):
+                    context.add_llm_tokens(
+                        retry_resp.usage.get("total_tokens", 0), usage=retry_resp.usage,
+                    )
+                answer, should_save, should_answer = self._parse_summary_response(
+                    retry_resp.content or ""
+                )
+
         if not should_answer:
             if llm_fallback:
                 await self._logger.info(
-                    "[FAST:Step4] Summary gate rejected evidence, llm_fallback=True → LLM fallback"
+                    "[FAST:Step5] Retry also rejected, llm_fallback=True → LLM fallback"
                 )
                 answer, should_save = await self._summarise_fast_fallback(query, context)
             else:
                 await self._logger.warning(
-                    "[FAST:Step4] Summary gate rejected evidence and llm_fallback=False "
+                    "[FAST:Step5] Evidence rejected after retry, llm_fallback=False "
                     "→ returning no results"
                 )
                 return _NO_RESULTS_MESSAGE, None, context
+
         if not should_save:
             await self._logger.info("[FAST] Quality gate: low-quality answer, skipping cluster save")
-            await self._logger.success("[FAST] Search complete (2 LLM calls, no persist)")
+            await self._logger.success("[FAST] Search complete (no persist)")
             return answer, None, context
 
         cluster = self._build_fast_cluster(
@@ -2234,7 +2334,7 @@ class AgenticSearch(BaseSearch):
                 f"[FAST] Failed to save cluster with embedding: {exc}"
             )
 
-        await self._logger.success("[FAST] Search complete (2 LLM calls)")
+        await self._logger.success("[FAST] Search complete")
         return answer, cluster, context
 
     # ---- FAST helpers ----
@@ -2633,6 +2733,136 @@ class AgenticSearch(BaseSearch):
         except Exception:
             pass
         return ""
+
+    def _load_document_catalog(self) -> Optional[List[Dict[str, str]]]:
+        """Load the compiled document catalog for fused query+route prompt.
+
+        Returns None when compile has not been run or catalog is missing.
+        """
+        catalog_path = self.work_path / ".cache" / "compile" / "document_catalog.json"
+        if not catalog_path.exists():
+            return None
+        try:
+            entries = json.loads(catalog_path.read_text(encoding="utf-8"))
+            if isinstance(entries, list) and entries:
+                return entries
+        except Exception:
+            pass
+        return None
+
+    async def _navigate_tree_for_evidence(
+        self, file_path: str, query: str,
+    ) -> Optional[str]:
+        """LLM-driven tree navigation: select relevant sections and read leaf content.
+
+        Uses 1 LLM call to drill into the compiled tree index for
+        *file_path*, returning concatenated leaf content as evidence.
+        Returns None when no tree cache is available.
+        """
+        indexer = self._get_tree_indexer()
+        if indexer is None:
+            return None
+        tree = indexer.load_tree(file_path)
+        if tree is None or tree.root is None:
+            return None
+
+        try:
+            leaves = await indexer.navigate(tree, query, max_results=3)
+        except Exception:
+            return None
+
+        if not leaves:
+            return None
+
+        fname = Path(file_path).name
+        # Read leaf content from the original document via char_range
+        parts: List[str] = []
+        try:
+            from sirchmunk.utils.file_utils import fast_extract
+            extraction = await fast_extract(file_path=file_path)
+            full_text = extraction.content or ""
+        except Exception:
+            full_text = ""
+
+        for leaf in leaves:
+            start, end = leaf.char_range
+            if full_text and end > start:
+                segment = full_text[start:end]
+            else:
+                segment = leaf.summary or ""
+            if segment.strip():
+                header = f"[{fname} → {leaf.title}]"
+                parts.append(f"{header}\n{segment[:3000]}")
+
+        if not parts:
+            return None
+
+        evidence = "\n\n".join(parts)
+        await self._logger.info(
+            f"[FAST:TreeNav] Extracted {len(parts)} sections, "
+            f"{len(evidence)} chars from {fname}"
+        )
+        return evidence
+
+    async def _fast_self_correct(
+        self,
+        query: str,
+        best_files: Optional[List[Dict[str, Any]]],
+        catalog_routed_files: List[str],
+        context: SearchContext,
+    ) -> Optional[str]:
+        """Attempt to gather alternative evidence when the first answer is rejected.
+
+        Three strategies tried in order:
+        A) Tree-navigate a 2nd catalog-routed file not yet tried.
+        B) Retrieve the most semantically similar compiled cluster's content.
+        C) Tree-navigate the 2nd-best rga file if available.
+
+        Returns alternative evidence string, or None if all strategies fail.
+        """
+        first_file = best_files[0]["path"] if best_files else ""
+
+        # Strategy A: 2nd catalog-routed file via tree navigation
+        for fp in catalog_routed_files:
+            if fp == first_file:
+                continue
+            tree_ev = await self._navigate_tree_for_evidence(fp, query)
+            if tree_ev and len(tree_ev.strip()) > 50:
+                context.mark_file_read(fp)
+                return tree_ev
+
+        # Strategy B: cluster content from knowledge storage
+        if self.embedding_client and self.knowledge_storage:
+            try:
+                qe = self.embedding_client.encode(query)
+                if qe is not None:
+                    vec = qe.tolist() if hasattr(qe, "tolist") else list(qe)
+                    hits = await self.knowledge_storage.search_similar_clusters(
+                        query_embedding=vec, top_k=2, similarity_threshold=0.50,
+                    )
+                    if hits:
+                        parts: List[str] = []
+                        for h in hits[:2]:
+                            c = await self.knowledge_storage.get(h["id"])
+                            if c and c.content:
+                                parts.append(str(c.content)[:3000])
+                                for ev in (c.evidences or [])[:3]:
+                                    for s in (ev.snippets or [])[:2]:
+                                        parts.append(s[:500])
+                        if parts:
+                            return "\n\n---\n\n".join(parts)
+            except Exception:
+                pass
+
+        # Strategy C: 2nd rga file via tree navigation
+        if best_files and len(best_files) > 1:
+            fp2 = best_files[1]["path"]
+            tree_ev = await self._navigate_tree_for_evidence(fp2, query)
+            if tree_ev and len(tree_ev.strip()) > 50:
+                context.mark_file_read(fp2)
+                return tree_ev
+
+        return None
 
     @staticmethod
     def _parse_fast_json(text: str) -> Dict[str, Any]:

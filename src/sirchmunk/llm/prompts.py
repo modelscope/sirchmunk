@@ -389,6 +389,31 @@ Example: query "总结这几篇文档"
 """
 
 
+FAST_QUERY_ANALYSIS_WITH_CATALOG = """Classify the user query, extract search terms, AND select the most relevant document(s) from the compiled index.
+
+### User Query
+{user_input}
+
+### Compiled Document Index
+{document_listing}
+
+### Output
+Return JSON only, no extra text:
+{{"type": "search", "primary": ["compound phrase"], "fallback": ["term1", "term2"], "idf": {{"compound phrase": 8.0, "term1": 2.5}}, "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "...", "selected_docs": [0, 2], "doc_confidence": "high"}}
+
+Rules:
+- **type**: "search" if the query requires retrieving information from files or documents; "chat" if it is a greeting, small talk, or conversational message — set primary/fallback to empty arrays, put a brief reply in "response". "summary" if the user wants to summarize entire documents.
+- **primary**: 1 compound phrase (2-3 words) most likely to appear **verbatim** in the target document.
+- **fallback**: 1-3 single-word atomic terms. Tried only if primary misses.
+- **primary_alt / fallback_alt**: Cross-lingual equivalents (Chinese↔English). Only the most critical 1-2 terms.
+- **file_hints**: filename fragments or glob patterns ONLY if clearly implied; empty array otherwise.
+- **intent**: one sentence describing the query intent.
+- **idf**: IDF weight (1.0-10.0) for EVERY keyword. Higher for rare terms.
+- **selected_docs**: Index numbers (from the Compiled Document Index above) of the 1-3 most relevant documents for this query. Consider BOTH the filename and the summary. Choose documents whose content is most likely to answer the query.
+- **doc_confidence**: "high" if you are very confident the selected documents contain the answer; "medium" if likely but uncertain; "low" if guessing.
+"""
+
+
 ROI_RESULT_SUMMARY = """
 ### Task
 Analyze the provided {text_content} and generate a concise summary in the form of a Markdown Briefing.
