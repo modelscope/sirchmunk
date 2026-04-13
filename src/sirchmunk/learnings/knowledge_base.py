@@ -208,6 +208,7 @@ class KnowledgeBase:
         top_k_snippets: Optional[int] = 5,
         confidence_threshold: Optional[float] = 8.0,
         verbose: bool = True,
+        tree_indexer=None,
     ) -> Union[KnowledgeCluster, None]:
         """Build a knowledge cluster from retrieved information and metadata.
 
@@ -223,6 +224,8 @@ class KnowledgeBase:
             top_k_snippets: Max evidence snippets per file.
             confidence_threshold: Min confidence for evidence acceptance.
             verbose: Enable verbose logging.
+            tree_indexer: Optional DocumentTreeIndexer for tree-navigated
+                evidence extraction (uses compiled tree indices when available).
 
         Returns:
             KnowledgeCluster on success, None if no evidence found.
@@ -250,6 +253,7 @@ class KnowledgeBase:
                 confidence_threshold=confidence_threshold,
                 top_k_snippets=top_k_snippets,
                 verbose=verbose,
+                tree_indexer=tree_indexer,
             )
             for info in retrieved_infos
         ]

@@ -37,6 +37,36 @@ The module fuses insights from three frameworks:
 
 Compile products are automatically leveraged by search when present, but search functions independently without them.
 
+### How Search Consumes Compile Products
+
+```
+Compile products             Search consumption path
+─────────────────            ──────────────────────────────────────────────
+KnowledgeCluster             ─┬─ FAST + DEEP Phase 0: embedding similarity
+  .content                    │   reuse (instant short-circuit, no LLM cost)
+  .embedding                  │   → enriched with evidence snippets
+  .evidences[].file_or_url    │
+                              ├─ DEEP Phase 1: _probe_knowledge_cache()
+                              │   fuzzy text search → file path discovery
+                              │
+WeakSemanticEdge              ├─ DEEP Phase 1: one-hop graph expansion
+  .related_clusters           │   follows edges to gather neighbour files
+                              │
+DocumentTree (.json)          └─ DEEP Phase 3: tree-navigated evidence
+  via tree_indexer                 _build_cluster() → knowledge_base.build()
+                                   → _extract_evidence_for_file(tree_indexer)
+                                   → narrows doc to relevant sections before
+                                     Monte Carlo sampling
+```
+
+| Compile product | FAST | DEEP |
+|-----------------|------|------|
+| Cluster embedding reuse | Yes | Yes |
+| Evidence snippets in reused content | Yes | Yes |
+| Fuzzy cluster → file path hints | — | Yes |
+| Graph edge expansion (neighbours) | — | Yes |
+| Tree-navigated evidence extraction | — | Yes |
+
 ---
 
 ## Components

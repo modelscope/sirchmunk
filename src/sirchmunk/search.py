@@ -8,6 +8,7 @@ import math
 import os
 import re
 import traceback
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
@@ -80,6 +81,43 @@ _CHAT_RESPONSE_SYSTEM = (
 )
 
 _NO_RESULTS_MESSAGE = "No results found."
+
+# Soft-similarity threshold for gradient cluster reuse (P2)
+_SOFT_SIM_THRESHOLD = 0.65
+
+
+@dataclass
+class SoftClusterHit:
+    """Signals from clusters that are related but below the hard reuse threshold.
+
+    Carries structured hints (keywords, file paths, background context) that
+    downstream retrieval phases can exploit without short-circuiting the search.
+    """
+
+    patterns: List[str]
+    file_paths: List[str]
+    context_summary: str
+    cluster_ids: List[str]
+
+
+@dataclass
+class KnowledgeProbeResult:
+    """Rich result from knowledge cache probing (P3).
+
+    Replaces the flat ``List[str]`` that ``_probe_knowledge_cache`` used to return.
+    """
+
+    file_paths: List[str]
+    extra_keywords: List[str]
+    background_context: str
+
+
+@dataclass
+class CompileHints:
+    """Zero-LLM hints gathered from compile manifest and tree cache (P4)."""
+
+    file_paths: List[str]
+    extra_keywords: List[str]
 
 
 class AgenticSearch(BaseSearch):
@@ -460,6 +498,72 @@ class AgenticSearch(BaseSearch):
             )
             return None
 
+    async def _try_soft_reuse(
+        self, query: str, paths: Optional[List[str]] = None,
+    ) -> Optional[SoftClusterHit]:
+        """Gradient reuse: extract structured hints from moderately similar clusters.
+
+        Called when ``_try_reuse_cluster`` misses (similarity < hard threshold).
+        Uses a softer threshold to find clusters that are *related* but not
+        close enough for full reuse.  Returns patterns, file paths, and a
+        background context summary that downstream phases can exploit.
+        """
+        if not self.embedding_client or not self.embedding_client.is_ready():
+            return None
+
+        try:
+            query_embedding = (await self.embedding_client.embed([query]))[0]
+            similar = await self.knowledge_storage.search_similar_clusters(
+                query_embedding=query_embedding,
+                top_k=5,
+                similarity_threshold=_SOFT_SIM_THRESHOLD,
+                search_paths=paths,
+            )
+            if not similar:
+                return None
+
+            patterns: List[str] = []
+            file_paths: List[str] = []
+            context_parts: List[str] = []
+            cluster_ids: List[str] = []
+            seen_paths: set = set()
+
+            for match in similar:
+                cid = match["id"]
+                cluster_ids.append(cid)
+                c = await self.knowledge_storage.get(cid)
+                if not c:
+                    continue
+                for p in getattr(c, "patterns", []) or []:
+                    if p and p not in patterns:
+                        patterns.append(p)
+                for ev in getattr(c, "evidences", []):
+                    fp = str(getattr(ev, "file_or_url", ""))
+                    if fp and fp not in seen_paths and Path(fp).exists():
+                        seen_paths.add(fp)
+                        file_paths.append(fp)
+                content = c.content
+                if isinstance(content, list):
+                    content = "\n".join(content)
+                if content:
+                    context_parts.append(str(content)[:500])
+
+            if not patterns and not file_paths:
+                return None
+
+            await self._logger.info(
+                f"[SoftReuse] {len(similar)} soft hits: "
+                f"{len(patterns)} patterns, {len(file_paths)} files"
+            )
+            return SoftClusterHit(
+                patterns=patterns[:10],
+                file_paths=file_paths[:10],
+                context_summary="\n\n".join(context_parts[:3]),
+                cluster_ids=cluster_ids,
+            )
+        except Exception:
+            return None
+
     def _add_query_to_cluster(self, cluster: KnowledgeCluster, query: str) -> None:
         """
         Add query to cluster's queries list with FIFO strategy.
@@ -477,6 +581,36 @@ class AgenticSearch(BaseSearch):
         if len(cluster.queries) > self.max_queries_per_cluster:
             # Remove oldest queries (from the beginning)
             cluster.queries = cluster.queries[-self.max_queries_per_cluster:]
+
+    @staticmethod
+    def _enrich_reused_content(cluster: KnowledgeCluster) -> str:
+        """Build the answer text from a reused cluster.
+
+        When the cluster carries compiled evidence with non-empty snippets
+        (populated during ``sirchmunk compile``), appends them as supporting
+        excerpts so the user sees both the summary and the underlying source
+        material.
+        """
+        content = cluster.content
+        if isinstance(content, list):
+            content = "\n".join(content)
+        content = str(content or "")
+
+        evidence_parts: List[str] = []
+        for ev in getattr(cluster, "evidences", []):
+            snippets = getattr(ev, "snippets", None)
+            if not snippets:
+                continue
+            source = str(getattr(ev, "file_or_url", "unknown"))
+            for snip in snippets:
+                text = snip if isinstance(snip, str) else snip.get("snippet", "")
+                if text and text.strip():
+                    evidence_parts.append(f"[{Path(source).name}] {text.strip()}")
+
+        if evidence_parts:
+            content += "\n\n---\nSupporting evidence:\n" + "\n\n".join(evidence_parts[:5])
+
+        return content
 
     async def _save_cluster_with_embedding(self, cluster: KnowledgeCluster) -> None:
         """Save knowledge cluster to persistent storage, compute embedding, and flush to parquet.
@@ -1256,17 +1390,17 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         reused = await self._try_reuse_cluster(query, paths)
         if reused is not None:
-            content = reused.content
-            if isinstance(content, list):
-                content = "\n".join(content)
-            return str(content), reused, context
+            return self._enrich_reused_content(reused), reused, context
+
+        # P2: gradient reuse — extract hints from moderately similar clusters
+        soft_hit = await self._try_soft_reuse(query, paths)
 
         await self._logger.info(f"[search] Starting multi-path retrieval for: '{query[:80]}'")
 
         # ==============================================================
-        # Phase 1: Parallel probing — all four paths fire concurrently
+        # Phase 1: Parallel probing — five paths fire concurrently
         # ==============================================================
-        await self._logger.info("[Phase 1] Parallel probing: keywords + dir_scan + knowledge + spec_cache")
+        await self._logger.info("[Phase 1] Parallel probing: keywords + dir_scan + knowledge + spec_cache + tree_index")
         context.increment_loop()
 
         phase1_results = await asyncio.gather(
@@ -1274,24 +1408,53 @@ class AgenticSearch(BaseSearch):
             self._probe_dir_scan(paths, enable_dir_scan),
             self._probe_knowledge_cache(query),
             self._load_spec_context(paths, stale_hours=spec_stale_hours),
+            self._probe_tree_index(query),
             return_exceptions=True,
         )
 
         kw_result = phase1_results[0] if not isinstance(phase1_results[0], Exception) else ({}, [])
         scan_result = phase1_results[1] if not isinstance(phase1_results[1], Exception) else None
-        knowledge_hits = phase1_results[2] if not isinstance(phase1_results[2], Exception) else []
+        knowledge_probe = phase1_results[2] if not isinstance(phase1_results[2], Exception) else KnowledgeProbeResult([], [], "")
         spec_context = phase1_results[3] if not isinstance(phase1_results[3], Exception) else ""
+        tree_hits = phase1_results[4] if not isinstance(phase1_results[4], Exception) else []
 
-        for i, label in enumerate(["keywords", "dir_scan", "knowledge", "spec_cache"]):
+        for i, label in enumerate(["keywords", "dir_scan", "knowledge", "spec_cache", "tree_index"]):
             if isinstance(phase1_results[i], Exception):
                 await self._logger.warning(f"[Phase 1] {label} probe failed: {phase1_results[i]}")
 
+        # Backwards compat: knowledge_probe may be a plain list from old code paths
+        if isinstance(knowledge_probe, list):
+            knowledge_probe = KnowledgeProbeResult(file_paths=knowledge_probe, extra_keywords=[], background_context="")
+
         query_keywords, initial_keywords = kw_result if isinstance(kw_result, tuple) else ({}, [])
+
+        # P2: inject soft-hit patterns into keywords
+        if soft_hit:
+            for p in soft_hit.patterns:
+                if p not in initial_keywords:
+                    initial_keywords.append(p)
+                if p not in query_keywords:
+                    query_keywords[p] = 0.6
+
+        # P3: inject extra keywords from structured knowledge probe
+        for kw in knowledge_probe.extra_keywords:
+            if kw not in initial_keywords:
+                initial_keywords.append(kw)
+            if kw not in query_keywords:
+                query_keywords[kw] = 0.5
+
+        # P2 + P3: append background context for Phase 4 LLM prompt
+        if soft_hit and soft_hit.context_summary:
+            spec_context = f"{spec_context}\n\n{soft_hit.context_summary}" if spec_context else soft_hit.context_summary
+        if knowledge_probe.background_context:
+            spec_context = f"{spec_context}\n\n{knowledge_probe.background_context}" if spec_context else knowledge_probe.background_context
 
         await self._logger.info(
             f"[Phase 1] Results: keywords={len(initial_keywords)}, "
             f"dir_scan={'OK' if scan_result else 'N/A'}, "
-            f"knowledge_hits={len(knowledge_hits)}, "
+            f"knowledge_files={len(knowledge_probe.file_paths)}, "
+            f"tree_hits={len(tree_hits)}, "
+            f"soft_hit={'YES' if soft_hit else 'NO'}, "
             f"spec_cache={'YES' if spec_context else 'NO'}"
         )
 
@@ -1336,12 +1499,16 @@ class AgenticSearch(BaseSearch):
 
         # ==============================================================
         # Phase 3: Merge file paths + build KnowledgeCluster
+        # P1 tree hits get highest priority; P2 soft-hit files next
         # ==============================================================
         context.increment_loop()
+        extra_knowledge_files = knowledge_probe.file_paths
+        if soft_hit:
+            extra_knowledge_files = soft_hit.file_paths + extra_knowledge_files
         merged_files = self._merge_file_paths(
-            keyword_files=keyword_files,
+            keyword_files=list(tree_hits) + keyword_files,
             dir_scan_files=dir_scan_files,
-            knowledge_hits=knowledge_hits,
+            knowledge_hits=extra_knowledge_files,
         )
         await self._logger.info(f"[Phase 3] Merged {len(merged_files)} unique candidate files")
 
@@ -1351,6 +1518,19 @@ class AgenticSearch(BaseSearch):
                 query=query, file_paths=merged_files,
                 query_keywords=query_keywords, top_k_files=top_k_files,
             )
+
+        # ==============================================================
+        # Phase 3.5: Graph context enrichment (P5)
+        # Append related knowledge from graph neighbours to cluster content
+        # so the answer-generation LLM has richer context.
+        # ==============================================================
+        graph_ctx = ""
+        if cluster:
+            graph_ctx = await self._gather_graph_context(cluster)
+            if graph_ctx and cluster.content:
+                if isinstance(cluster.content, list):
+                    cluster.content = "\n".join(cluster.content)
+                cluster.content = f"{cluster.content}\n\n{graph_ctx}"
 
         # ==============================================================
         # Phase 4: Generate answer — cluster summary or ReAct refinement
@@ -1383,9 +1563,11 @@ class AgenticSearch(BaseSearch):
             answer, should_save = await self._summarise_cluster_fallback(query)
         else:
             await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
+            # P5: enrich ReAct context with graph knowledge
+            react_spec = f"{spec_context}\n\n{graph_ctx}" if graph_ctx else spec_context
             react_answer, context = await self._react_refinement(
                 query=query, paths=paths,
-                initial_keywords=initial_keywords, spec_context=spec_context,
+                initial_keywords=initial_keywords, spec_context=react_spec,
                 enable_dir_scan=enable_dir_scan,
                 max_loops=max_loops, max_token_budget=max_token_budget,
                 max_depth=max_depth, include=include, exclude=exclude,
@@ -1751,11 +1933,11 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         reused = await self._try_reuse_cluster(query, paths)
         if reused is not None:
-            content = reused.content
-            if isinstance(content, list):
-                content = "\n".join(content)
             await self._logger.success("[FAST] Reused cached knowledge cluster")
-            return str(content), reused, context
+            return self._enrich_reused_content(reused), reused, context
+
+        # P2: gradient reuse — structured hints from moderately similar clusters
+        soft_hit = await self._try_soft_reuse(query, paths)
 
         # ==============================================================
         # Step 1: LLM query analysis only (dir scan deferred until needed)
@@ -1833,6 +2015,38 @@ class AgenticSearch(BaseSearch):
             msg = f"Could not extract search terms from query: '{query}'"
             return msg, None, context
 
+        # ==============================================================
+        # Step 1.5: Compile-aware enrichment (P2 + P4, zero LLM calls)
+        # ==============================================================
+        all_kw_set = set(primary + fallback)
+
+        # P2: inject soft-hit patterns as fallback keywords
+        if soft_hit:
+            for p in soft_hit.patterns:
+                if p not in all_kw_set:
+                    fallback.append(p)
+                    all_kw_set.add(p)
+                    keyword_idfs.setdefault(p, 0.6)
+
+        # P4: compile hints from manifest + tree cache
+        compile_hints = await self._probe_compile_hints(primary + fallback)
+        for kw in compile_hints.extra_keywords:
+            if kw not in all_kw_set:
+                fallback.append(kw)
+                all_kw_set.add(kw)
+                keyword_idfs.setdefault(kw, 0.5)
+
+        compile_hint_files: List[str] = []
+        if soft_hit:
+            compile_hint_files.extend(soft_hit.file_paths)
+        compile_hint_files.extend(compile_hints.file_paths)
+
+        if compile_hint_files:
+            await self._logger.info(
+                f"[FAST:Step1.5] Compile hints: {len(compile_hint_files)} files, "
+                f"{len(compile_hints.extra_keywords)} extra keywords"
+            )
+
         await self._logger.info(
             f"[FAST:Step1] Primary: {primary}, Fallback: {fallback}"
         )
@@ -1869,6 +2083,17 @@ class AgenticSearch(BaseSearch):
             best_files = await self._fast_find_best_file(
                 fallback, top_k=top_k_files, keyword_idfs=keyword_idfs, **rga_kwargs
             )
+
+        # --- Fallback: compile-hint files when rga misses (P2+P4) ---
+        if not best_files and compile_hint_files:
+            used_level = "compile_hint"
+            await self._logger.info(
+                f"[FAST:Step2] rga miss — using {len(compile_hint_files)} compile-hint files"
+            )
+            best_files = [
+                {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
+                for p in compile_hint_files[:top_k_files]
+            ]
 
         # --- Fallback: use dir_scan only when rga misses and dir scan is enabled ---
         if not best_files and enable_dir_scan:
@@ -2592,31 +2817,250 @@ class AgenticSearch(BaseSearch):
 
     async def _probe_knowledge_cache(
         self, query: str,
-    ) -> List[str]:
-        """Search knowledge cache for related clusters, return known file paths.
+    ) -> KnowledgeProbeResult:
+        """Structured knowledge probe: embedding search with graph expansion.
 
-        Returns:
-            List of file paths from previously cached clusters.
+        Uses embedding similarity (threshold 0.50) when available, falling back
+        to SQL LIKE.  Extracts file paths, topic keywords, and background
+        context from matched clusters and their graph neighbours.
         """
+        empty = KnowledgeProbeResult([], [], "")
         try:
-            clusters = await self.knowledge_storage.find(query, limit=3)
-            if not clusters:
-                return []
+            clusters: List[KnowledgeCluster] = []
 
+            # Prefer embedding search for semantic quality
+            if self.embedding_client and self.embedding_client.is_ready():
+                try:
+                    qe = (await self.embedding_client.embed([query]))[0]
+                    similar = await self.knowledge_storage.search_similar_clusters(
+                        query_embedding=qe, top_k=5, similarity_threshold=0.50,
+                    )
+                    for m in (similar or []):
+                        c = await self.knowledge_storage.get(m["id"])
+                        if c:
+                            clusters.append(c)
+                except Exception:
+                    pass
+
+            # Fallback to SQL LIKE when embedding unavailable or empty
+            if not clusters:
+                clusters = await self.knowledge_storage.find(query, limit=3)
+
+            if not clusters:
+                return empty
+
+            seen_paths: set = set()
             file_paths: List[str] = []
-            for c in clusters:
+            extra_keywords: List[str] = []
+            context_parts: List[str] = []
+            seen_kw: set = set()
+
+            def _collect_cluster(c: KnowledgeCluster) -> None:
                 for ev in getattr(c, "evidences", []):
                     fp = str(getattr(ev, "file_or_url", ""))
-                    if fp and Path(fp).exists():
+                    if fp and fp not in seen_paths and Path(fp).exists():
+                        seen_paths.add(fp)
                         file_paths.append(fp)
+                for p in getattr(c, "patterns", []) or []:
+                    if p and p.lower() not in seen_kw:
+                        seen_kw.add(p.lower())
+                        extra_keywords.append(p)
+                content = c.content
+                if isinstance(content, list):
+                    content = "\n".join(content)
+                if content:
+                    context_parts.append(str(content)[:500])
+
+            for c in clusters:
+                _collect_cluster(c)
+
+            # One-hop graph expansion via WeakSemanticEdge
+            neighbour_ids: set = set()
+            for c in clusters:
+                for edge in getattr(c, "related_clusters", []):
+                    tid = getattr(edge, "target_cluster_id", None)
+                    if tid and tid not in neighbour_ids:
+                        neighbour_ids.add(tid)
+
+            for nid in list(neighbour_ids)[:6]:
+                try:
+                    neighbour = await self.knowledge_storage.get(nid)
+                    if neighbour:
+                        _collect_cluster(neighbour)
+                except Exception:
+                    pass
 
             if file_paths:
                 await self._logger.info(
-                    f"[Probe:Knowledge] Found {len(file_paths)} files from cached clusters"
+                    f"[Probe:Knowledge] {len(file_paths)} files, "
+                    f"{len(extra_keywords)} keywords from "
+                    f"{len(clusters)} clusters + {len(neighbour_ids)} neighbours"
                 )
-            return file_paths
+
+            return KnowledgeProbeResult(
+                file_paths=file_paths,
+                extra_keywords=extra_keywords[:15],
+                background_context="\n\n".join(context_parts[:3]),
+            )
+        except Exception:
+            return empty
+
+    async def _probe_tree_index(self, query: str) -> List[str]:
+        """LLM-driven file discovery via compiled tree root summaries (PageIndex).
+
+        Loads all cached document trees, presents their root summaries to the
+        LLM, and asks it to select the most relevant 1-3 documents.  For
+        selected trees, optionally drills one level deeper into children.
+
+        Returns file paths of the most relevant documents.
+        """
+        tree_cache = self.work_path / ".cache" / "compile" / "trees"
+        if not tree_cache.exists():
+            return []
+
+        try:
+            from sirchmunk.learnings.tree_indexer import DocumentTree
+
+            trees: List[DocumentTree] = []
+            for tree_file in sorted(tree_cache.glob("*.json"))[:50]:
+                try:
+                    t = DocumentTree.from_json(
+                        tree_file.read_text(encoding="utf-8")
+                    )
+                    if t.root and t.file_path:
+                        trees.append(t)
+                except Exception:
+                    continue
+
+            if not trees:
+                return []
+
+            # If few trees, return all without LLM
+            if len(trees) <= 2:
+                return [t.file_path for t in trees if Path(t.file_path).exists()]
+
+            # LLM-driven selection among tree roots
+            listing = "\n".join(
+                f"[{i}] {Path(t.file_path).name}: {(t.root.summary or '')[:200]}"
+                for i, t in enumerate(trees)
+            )
+            prompt = (
+                f'Given the query: "{query}"\n\n'
+                f"Select the 1-3 most relevant documents (by index number):\n{listing}\n\n"
+                f"Return ONLY a JSON array of index numbers, e.g. [0, 2]"
+            )
+            resp = await self.llm.achat([{"role": "user", "content": prompt}])
+            self.llm_usages.append(resp.usage)
+
+            selected_indices: List[int] = []
+            try:
+                raw = resp.content.strip()
+                m = re.search(r"\[[\d\s,]+\]", raw)
+                if m:
+                    selected_indices = [
+                        idx for idx in json.loads(m.group())
+                        if isinstance(idx, int) and 0 <= idx < len(trees)
+                    ]
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            if not selected_indices:
+                selected_indices = list(range(min(2, len(trees))))
+
+            result_paths: List[str] = []
+            for idx in selected_indices:
+                fp = trees[idx].file_path
+                if Path(fp).exists():
+                    result_paths.append(fp)
+
+            if result_paths:
+                await self._logger.info(
+                    f"[Probe:TreeIndex] LLM selected {len(result_paths)} documents "
+                    f"from {len(trees)} tree indices"
+                )
+            return result_paths
         except Exception:
             return []
+
+    async def _probe_compile_hints(self, keywords: List[str]) -> CompileHints:
+        """Zero-LLM enrichment from compile manifest and tree cache.
+
+        Scans the compile manifest for clusters whose patterns overlap with
+        the query keywords, and scans cached tree root summaries for keyword
+        matches.  No LLM calls — only local JSON reads and in-memory DB lookups.
+        """
+        empty = CompileHints([], [])
+        if not keywords:
+            return empty
+
+        kw_lower = {k.lower() for k in keywords}
+        file_paths: List[str] = []
+        extra_keywords: List[str] = []
+        seen_paths: set = set()
+        seen_kw: set = set(kw_lower)
+
+        # --- Cluster pattern matching via manifest ---
+        manifest_path = self.work_path / ".cache" / "compile" / "manifest.json"
+        if manifest_path.exists():
+            try:
+                from sirchmunk.learnings.compiler import CompileManifest
+                manifest = CompileManifest.from_json(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+                cluster_ids: set = set()
+                for entry in manifest.files.values():
+                    cluster_ids.update(entry.cluster_ids)
+
+                for cid in list(cluster_ids)[:50]:
+                    try:
+                        c = await self.knowledge_storage.get(cid)
+                    except Exception:
+                        continue
+                    if not c:
+                        continue
+                    cluster_patterns = [
+                        p.lower() for p in (getattr(c, "patterns", []) or []) if p
+                    ]
+                    if kw_lower & set(cluster_patterns):
+                        for ev in getattr(c, "evidences", []):
+                            fp = str(getattr(ev, "file_or_url", ""))
+                            if fp and fp not in seen_paths and Path(fp).exists():
+                                seen_paths.add(fp)
+                                file_paths.append(fp)
+                        for p in cluster_patterns:
+                            if p not in seen_kw:
+                                seen_kw.add(p)
+                                extra_keywords.append(p)
+            except Exception:
+                pass
+
+        # --- Tree root summary scanning (keyword substring match) ---
+        tree_cache = self.work_path / ".cache" / "compile" / "trees"
+        if tree_cache.exists():
+            try:
+                from sirchmunk.learnings.tree_indexer import DocumentTree
+                for tree_file in sorted(tree_cache.glob("*.json"))[:100]:
+                    try:
+                        tree = DocumentTree.from_json(
+                            tree_file.read_text(encoding="utf-8")
+                        )
+                    except Exception:
+                        continue
+                    if not tree.root or not tree.file_path:
+                        continue
+                    summary_lower = (tree.root.summary or "").lower()
+                    if any(kw in summary_lower for kw in kw_lower):
+                        fp = tree.file_path
+                        if fp not in seen_paths and Path(fp).exists():
+                            seen_paths.add(fp)
+                            file_paths.append(fp)
+            except Exception:
+                pass
+
+        return CompileHints(
+            file_paths=file_paths[:15],
+            extra_keywords=extra_keywords[:10],
+        )
 
     @staticmethod
     async def _async_noop(default=None):
@@ -2744,6 +3188,20 @@ class AgenticSearch(BaseSearch):
 
         return merged
 
+    def _get_tree_indexer(self):
+        """Lazily construct a DocumentTreeIndexer for search-time tree navigation."""
+        from sirchmunk.learnings.tree_indexer import DocumentTreeIndexer
+
+        tree_cache = self.work_path / ".cache" / "compile" / "trees"
+        if not tree_cache.exists():
+            return None
+        _cb = getattr(self._logger, 'log_callback', None)
+        return DocumentTreeIndexer(
+            llm=self.llm,
+            cache_dir=tree_cache,
+            log_callback=_cb,
+        )
+
     async def _build_cluster(
         self,
         query: str,
@@ -2755,7 +3213,9 @@ class AgenticSearch(BaseSearch):
         """Build a KnowledgeCluster via knowledge_base.build().
 
         Constructs the Request wrapper and delegates to the knowledge
-        base for parallel Monte Carlo evidence sampling.
+        base for parallel Monte Carlo evidence sampling.  When compiled
+        tree indices exist, passes a ``tree_indexer`` so that evidence
+        extraction can navigate to relevant sections before sampling.
         """
         try:
             request = Request(
@@ -2775,6 +3235,7 @@ class AgenticSearch(BaseSearch):
                 top_k_files=top_k_files,
                 top_k_snippets=top_k_snippets,
                 verbose=self.verbose,
+                tree_indexer=self._get_tree_indexer(),
             )
             self.llm_usages.extend(self.knowledge_base.llm_usages)
             self.knowledge_base.llm_usages.clear()
@@ -2788,6 +3249,47 @@ class AgenticSearch(BaseSearch):
         except Exception as exc:
             await self._logger.warning(f"[Phase 3] knowledge_base.build() failed: {exc}")
             return None
+
+    async def _gather_graph_context(self, cluster: KnowledgeCluster) -> str:
+        """Enrich answer context with knowledge from graph neighbours.
+
+        Traverses the cluster's ``related_clusters`` edges (sorted by weight),
+        fetches the top neighbours, and returns a joined summary string that
+        can be appended to the cluster content before answer generation.
+        """
+        edges = sorted(
+            getattr(cluster, "related_clusters", []) or [],
+            key=lambda e: getattr(e, "weight", 0),
+            reverse=True,
+        )
+        if not edges:
+            return ""
+
+        parts: List[str] = []
+        for edge in edges[:3]:
+            tid = getattr(edge, "target_cluster_id", None)
+            if not tid:
+                continue
+            try:
+                neighbour = await self.knowledge_storage.get(tid)
+            except Exception:
+                continue
+            if not neighbour:
+                continue
+            content = neighbour.content
+            if isinstance(content, list):
+                content = "\n".join(content)
+            name = getattr(neighbour, "name", "") or ""
+            snippet = str(content or "")[:300]
+            if snippet:
+                parts.append(f"- {name}: {snippet}")
+
+        if not parts:
+            return ""
+        await self._logger.info(
+            f"[Phase 3.5] Graph context: {len(parts)} neighbour summaries"
+        )
+        return "Related knowledge:\n" + "\n".join(parts)
 
     # ------------------------------------------------------------------
     # Phase 4: Answer generation
