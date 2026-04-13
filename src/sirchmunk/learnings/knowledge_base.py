@@ -120,11 +120,14 @@ class KnowledgeBase:
         confidence_threshold: float,
         top_k_snippets: int,
         verbose: bool,
+        tree_indexer=None,
     ) -> Optional[EvidenceUnit]:
-        """Extract evidence from a single file via Monte Carlo sampling.
+        """Extract evidence from a single file.
 
-        Performs text extraction followed by LLM-driven region-of-interest
-        identification.  Designed to run concurrently for multiple files.
+        When a tree index exists for the file, uses LLM-driven tree navigation
+        to locate relevant sections precisely, then runs Monte Carlo sampling
+        within those narrowed regions.  Falls back to full-document Monte
+        Carlo sampling otherwise.
 
         Args:
             file_path_or_url: Absolute path or URL to the document.
@@ -133,6 +136,7 @@ class KnowledgeBase:
             confidence_threshold: Minimum confidence for evidence acceptance.
             top_k_snippets: Maximum evidence snippets per document.
             verbose: Whether to enable verbose logging.
+            tree_indexer: Optional DocumentTreeIndexer for tree-based navigation.
 
         Returns:
             EvidenceUnit on success, None on extraction failure.
@@ -140,6 +144,28 @@ class KnowledgeBase:
         try:
             extraction_result = await fast_extract(file_path=file_path_or_url)
             doc_content: str = extraction_result.content
+
+            tree_path_ids = None
+
+            # Try tree-based navigation for focused extraction
+            if tree_indexer is not None:
+                tree = tree_indexer.load_tree(file_path_or_url)
+                if tree is not None:
+                    await self._log.info(
+                        f"[KnowledgeBase] Using tree index for {Path(file_path_or_url).name}"
+                    )
+                    leaves = await tree_indexer.navigate(tree, query)
+                    if leaves:
+                        # Narrow doc_content to matched regions
+                        tree_path_ids = [n.node_id for n in leaves]
+                        segments = []
+                        for node in leaves:
+                            start, end = node.char_range
+                            segment = doc_content[start:end]
+                            if segment.strip():
+                                segments.append(segment)
+                        if segments:
+                            doc_content = "\n\n---\n\n".join(segments)
 
             sampler = MonteCarloEvidenceSampling(
                 llm=self.llm,
@@ -162,6 +188,7 @@ class KnowledgeBase:
                 snippets=roi_result.snippets,
                 extracted_at=datetime.now(),
                 conflict_group=[],
+                tree_path=tree_path_ids,
             )
             self.llm_usages.extend(sampler.llm_usages)
             return evidence_unit

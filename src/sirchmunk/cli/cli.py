@@ -6,6 +6,7 @@ Usage:
     sirchmunk init              - Initialize working directory + generate .env
     sirchmunk serve             - Start the API server (backend only)
     sirchmunk search            - Perform a search query
+    sirchmunk compile           - Compile documents into knowledge indices
     sirchmunk web init          - Build WebUI frontend (requires Node.js)
     sirchmunk web serve         - Start API + WebUI (single port)
     sirchmunk web serve --dev   - Start API + Next.js dev server (dual port)
@@ -1226,6 +1227,207 @@ def cmd_mcp_version(args: argparse.Namespace) -> int:
 
 
 # ------------------------------------------------------------------
+# sirchmunk compile
+# ------------------------------------------------------------------
+
+def cmd_compile(args: argparse.Namespace) -> int:
+    """Compile document collections into structured knowledge indices.
+
+    Builds PageIndex-style tree indices and LLM Wiki-style knowledge
+    clusters for downstream search acceleration.
+
+    Args:
+        args: Command-line arguments
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
+    try:
+        work_path = Path(
+            getattr(args, "work_path", None) or str(_get_default_work_path())
+        ).expanduser().resolve()
+        os.environ["SIRCHMUNK_WORK_PATH"] = str(work_path)
+
+        env_file = work_path / ".env"
+        if env_file.exists():
+            _load_env_file(env_file)
+
+        paths = args.paths or None
+        if not paths:
+            print("  Error: --paths is required for compile.")
+            print("   Usage: sirchmunk compile --paths /data/docs")
+            return 1
+
+        # Status mode
+        if getattr(args, "status", False):
+            return asyncio.run(_compile_status(paths, work_path))
+
+        # Lint mode
+        if getattr(args, "lint", False):
+            return asyncio.run(_compile_lint(
+                work_path, auto_fix=getattr(args, "fix", False),
+            ))
+
+        # Normal compile
+        incremental = not getattr(args, "full", False)
+        return asyncio.run(_compile_run(
+            paths=paths,
+            work_path=work_path,
+            incremental=incremental,
+            max_files=getattr(args, "max_files", None),
+            concurrency=getattr(args, "concurrency", 3),
+            shallow=getattr(args, "shallow", False),
+        ))
+
+    except KeyboardInterrupt:
+        print("\n  Compile cancelled.")
+        return 130
+    except Exception as e:
+        logger.error(f"Compile failed: {e}", exc_info=True)
+        print(f"  Compile error: {e}")
+        return 1
+
+
+async def _compile_run(
+    paths: list,
+    work_path: Path,
+    incremental: bool = True,
+    max_files: Optional[int] = None,
+    concurrency: int = 3,
+    shallow: bool = False,
+) -> int:
+    """Execute compile using AgenticSearch."""
+    from sirchmunk.search import AgenticSearch
+    from sirchmunk.llm.openai_chat import OpenAIChat
+
+    llm_api_key = os.getenv("LLM_API_KEY", "")
+    if not llm_api_key:
+        print("  LLM_API_KEY is not set.")
+        print("   Configure it in ~/.sirchmunk/.env or set the environment variable.")
+        return 1
+
+    llm = OpenAIChat(
+        base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
+        api_key=llm_api_key,
+        model=os.getenv("LLM_MODEL_NAME", "gpt-5.2"),
+    )
+
+    searcher = AgenticSearch(llm=llm, work_path=str(work_path))
+
+    print("=" * 60)
+    print("  Sirchmunk Knowledge Compile")
+    print("=" * 60)
+    print()
+    print(f"  Paths: {', '.join(paths)}")
+    print(f"  Incremental: {incremental}")
+    if shallow:
+        print("  Mode: shallow (tree indexing skipped)")
+    if max_files:
+        print(f"  Max files: {max_files} (importance sampling)")
+    print()
+
+    report = await searcher.compile(
+        paths=paths,
+        incremental=incremental,
+        shallow=shallow,
+        max_files=max_files,
+        concurrency=concurrency,
+    )
+
+    print()
+    print("=" * 60)
+    print("  Compile Report")
+    print("=" * 60)
+    print()
+    print(f"  Total files:      {report.get('total_files', 0)}")
+    print(f"  Files added:      {report.get('files_added', 0)}")
+    print(f"  Files modified:   {report.get('files_modified', 0)}")
+    print(f"  Files skipped:    {report.get('files_skipped', 0)}")
+    if report.get("files_sampled"):
+        print(f"  Files sampled:    {report['files_sampled']}")
+    print(f"  Trees built:      {report.get('trees_built', 0)}")
+    print(f"  Clusters created: {report.get('clusters_created', 0)}")
+    print(f"  Clusters merged:  {report.get('clusters_merged', 0)}")
+    print(f"  Cross-refs:       {report.get('cross_refs_built', 0)}")
+    print(f"  Elapsed:          {report.get('elapsed_seconds', 0):.1f}s")
+    if report.get("errors"):
+        print(f"  Errors:           {len(report['errors'])}")
+        for err in report["errors"][:5]:
+            print(f"    - {err}")
+    print()
+
+    return 0
+
+
+async def _compile_status(paths: list, work_path: Path) -> int:
+    """Show compile status."""
+    from sirchmunk.search import AgenticSearch
+    from sirchmunk.llm.openai_chat import OpenAIChat
+
+    llm = OpenAIChat(
+        base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
+        api_key=os.getenv("LLM_API_KEY", ""),
+        model=os.getenv("LLM_MODEL_NAME", "gpt-5.2"),
+    )
+
+    searcher = AgenticSearch(llm=llm, work_path=str(work_path))
+    status = await searcher.compile_status(paths=paths)
+
+    print("=" * 60)
+    print("  Compile Status")
+    print("=" * 60)
+    print()
+    print(f"  Compiled files: {status.get('total_compiled_files', 0)}")
+    print(f"  Tree indices:   {status.get('total_trees', 0)}")
+    print(f"  Clusters:       {status.get('total_clusters', 0)}")
+    print(f"  Last compile:   {status.get('last_compile_at', 'Never')}")
+    print()
+
+    return 0
+
+
+async def _compile_lint(work_path: Path, auto_fix: bool = False) -> int:
+    """Run knowledge lint checks."""
+    from sirchmunk.search import AgenticSearch
+    from sirchmunk.llm.openai_chat import OpenAIChat
+
+    llm = OpenAIChat(
+        base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
+        api_key=os.getenv("LLM_API_KEY", ""),
+        model=os.getenv("LLM_MODEL_NAME", "gpt-5.2"),
+    )
+
+    searcher = AgenticSearch(llm=llm, work_path=str(work_path))
+    report = await searcher.compile_lint(auto_fix=auto_fix)
+
+    print("=" * 60)
+    print("  Knowledge Lint Report")
+    print("=" * 60)
+    print()
+    print(f"  Clusters checked: {report.get('total_clusters_checked', 0)}")
+    print(f"  Trees checked:    {report.get('total_trees_checked', 0)}")
+    print(f"  Errors:           {report.get('errors', 0)}")
+    print(f"  Warnings:         {report.get('warnings', 0)}")
+    if auto_fix:
+        print(f"  Auto-fixes:       {report.get('auto_fixes_applied', 0)}")
+    print()
+
+    issues = report.get("issues", [])
+    if issues:
+        for issue in issues[:20]:
+            severity = issue.get("severity", "info").upper()
+            msg = issue.get("message", "")
+            cid = issue.get("cluster_id", "")
+            fixed = " [FIXED]" if issue.get("auto_fixed") else ""
+            print(f"  [{severity}] {msg} {f'(cluster={cid})' if cid else ''}{fixed}")
+        if len(issues) > 20:
+            print(f"  ... and {len(issues) - 20} more")
+        print()
+
+    return 0
+
+
+# ------------------------------------------------------------------
 # sirchmunk upload
 # ------------------------------------------------------------------
 
@@ -1434,6 +1636,54 @@ Examples:
         help="Working directory (default: ~/.sirchmunk)",
     )
     search_parser.set_defaults(func=cmd_search)
+
+    # === compile command ===
+    compile_parser = subparsers.add_parser(
+        "compile",
+        help="Compile document collections into knowledge indices",
+        description=(
+            "Compile documents into structured knowledge indices (tree + clusters). "
+            "Optional step after 'sirchmunk init'."
+        ),
+    )
+    compile_parser.add_argument(
+        "--paths", nargs="+", required=True,
+        help="Directories or files to compile",
+    )
+    compile_parser.add_argument(
+        "--full", action="store_true", default=False,
+        help="Force full recompile (ignore incremental cache)",
+    )
+    compile_parser.add_argument(
+        "--max-files", type=int, default=None,
+        help="Max files to process (triggers importance sampling for large sets)",
+    )
+    compile_parser.add_argument(
+        "--concurrency", type=int, default=3,
+        help="Max parallel file compilations (default: 3)",
+    )
+    compile_parser.add_argument(
+        "--shallow", action="store_true", default=False,
+        help="Skip tree indexing — use direct LLM summarisation only (faster)",
+    )
+    compile_parser.add_argument(
+        "--status", action="store_true", default=False,
+        help="Show compile status instead of running compile",
+    )
+    compile_parser.add_argument(
+        "--lint", action="store_true", default=False,
+        help="Run knowledge health checks",
+    )
+    compile_parser.add_argument(
+        "--fix", action="store_true", default=False,
+        help="Auto-fix lint issues (use with --lint)",
+    )
+    compile_parser.add_argument(
+        "--work-path",
+        default=None,
+        help="Working directory (default: ~/.sirchmunk)",
+    )
+    compile_parser.set_defaults(func=cmd_compile)
 
     # === web command group ===
     web_parser = subparsers.add_parser(

@@ -107,6 +107,10 @@ class KnowledgeStorage:
         variable-length ``FLOAT[]`` from Parquet's list encoding, breaking
         ``list_cosine_similarity`` which requires matching fixed-size types.
 
+        Handles schema evolution gracefully: if the parquet file has fewer
+        columns than the current schema (e.g., missing ``merge_count``),
+        missing columns are filled with defaults instead of failing.
+
         Also records the file's modification time so that
         ``_check_and_reload()`` can detect external changes later.
         """
@@ -117,11 +121,38 @@ class KnowledgeStorage:
                 self.db.drop_table(self.table_name, if_exists=True)
                 # Create table with explicit schema (preserves FLOAT[384])
                 self._create_table()
-                # Insert data from parquet — DuckDB casts to the declared types
-                self.db.execute(
-                    f"INSERT INTO {self.table_name} "
-                    f"SELECT * FROM read_parquet('{self.parquet_file}')"
-                )
+                # Detect parquet columns to handle schema evolution
+                try:
+                    pq_cols = self.db.fetch_all(
+                        f"SELECT column_name FROM parquet_schema('{self.parquet_file}')"
+                    )
+                    pq_col_names = {row[0] for row in pq_cols}
+                except Exception:
+                    pq_col_names = None
+
+                if pq_col_names is not None:
+                    # Build column-by-column SELECT with defaults for missing cols
+                    schema_cols = list(self._get_schema_columns())
+                    select_parts = []
+                    for col_name in schema_cols:
+                        if col_name in pq_col_names:
+                            select_parts.append(col_name)
+                        elif col_name == "merge_count":
+                            select_parts.append("0 AS merge_count")
+                        else:
+                            select_parts.append(f"NULL AS {col_name}")
+                    select_clause = ", ".join(select_parts)
+                    self.db.execute(
+                        f"INSERT INTO {self.table_name} "
+                        f"SELECT {select_clause} FROM read_parquet('{self.parquet_file}')"
+                    )
+                else:
+                    # Fallback: try direct SELECT * (works when schemas match)
+                    self.db.execute(
+                        f"INSERT INTO {self.table_name} "
+                        f"SELECT * FROM read_parquet('{self.parquet_file}')"
+                    )
+
                 count = self.db.get_table_count(self.table_name)
                 # Record mtime for stale-detection
                 self._parquet_loaded_mtime = pq.stat().st_mtime
@@ -137,6 +168,18 @@ class KnowledgeStorage:
             self.db.drop_table(self.table_name, if_exists=True)
             self._create_table()
             self._parquet_loaded_mtime = 0.0
+
+    def _get_schema_columns(self) -> List[str]:
+        """Return the ordered list of column names in the canonical schema."""
+        return [
+            "id", "name", "description", "content", "scripts", "resources",
+            "evidences", "patterns", "constraints", "confidence",
+            "abstraction_level", "landmark_potential", "hotness", "lifecycle",
+            "create_time", "last_modified", "version", "related_clusters",
+            "search_results", "queries", "merge_count",
+            "embedding_vector", "embedding_model", "embedding_timestamp",
+            "embedding_text_hash",
+        ]
 
     def _check_and_reload(self):
         """Check if the parquet file was modified externally and reload if so.
@@ -190,6 +233,7 @@ class KnowledgeStorage:
             "related_clusters": "VARCHAR",  # JSON array
             "search_results": "VARCHAR",  # JSON array
             "queries": "VARCHAR",  # JSON array of historical queries
+            "merge_count": "INTEGER",  # compile merge counter
             "embedding_vector": "FLOAT[384]",  # 384-dim embedding vector
             "embedding_model": "VARCHAR",  # Model identifier
             "embedding_timestamp": "TIMESTAMP",  # Embedding computation time
@@ -338,21 +382,22 @@ class KnowledgeStorage:
             "related_clusters": json.dumps([rc.to_dict() for rc in cluster.related_clusters]),
             "search_results": json.dumps(cluster.search_results) if cluster.search_results else None,
             "queries": json.dumps(cluster.queries) if cluster.queries else None,
+            "merge_count": cluster.merge_count or 0,
         }
 
     def _row_to_cluster(self, row: tuple) -> KnowledgeCluster:
         """
         Convert database row to KnowledgeCluster.
 
-        Expected row structure (24 columns):
+        Expected row structure (25 columns):
         id, name, description, content, scripts, resources, evidences, patterns,
         constraints, confidence, abstraction_level, landmark_potential, hotness,
         lifecycle, create_time, last_modified, version, related_clusters, search_results, queries,
-        embedding_vector, embedding_model, embedding_timestamp, embedding_text_hash
+        merge_count, embedding_vector, embedding_model, embedding_timestamp, embedding_text_hash
         """
-        if len(row) != 24:
+        if len(row) != 25:
             raise ValueError(
-                f"Expected 24 columns in knowledge_clusters row, got {len(row)}. "
+                f"Expected 25 columns in knowledge_clusters row, got {len(row)}. "
                 f"Please ensure the table schema is up to date."
             )
 
@@ -361,6 +406,7 @@ class KnowledgeStorage:
             id, name, description, content, scripts, resources, evidences, patterns,
             constraints, confidence, abstraction_level, landmark_potential, hotness,
             lifecycle, create_time, last_modified, version, related_clusters, search_results, queries,
+            merge_count,
             _embedding_vector, _embedding_model, _embedding_timestamp, _embedding_text_hash
         ) = row
 
@@ -400,7 +446,9 @@ class KnowledgeStorage:
                     is_found=ev_dict["is_found"],
                     snippets=ev_dict["snippets"],
                     extracted_at=extracted_at_parsed or datetime.now(),
-                    conflict_group=ev_dict.get("conflict_group")
+                    conflict_group=ev_dict.get("conflict_group"),
+                    tree_path=ev_dict.get("tree_path"),
+                    page_range=ev_dict.get("page_range"),
                 ))
 
         # Parse constraints
@@ -463,6 +511,7 @@ class KnowledgeStorage:
             related_clusters=related_clusters_parsed,
             search_results=search_results_parsed,
             queries=queries_parsed,
+            merge_count=merge_count or 0,
         )
 
     # ------------------------------------------------------------------ #

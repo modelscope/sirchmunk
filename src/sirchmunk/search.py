@@ -920,6 +920,119 @@ class AgenticSearch(BaseSearch):
         return registry
 
     # ------------------------------------------------------------------
+    # Knowledge compile entry point
+    # ------------------------------------------------------------------
+
+    async def compile(
+        self,
+        paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
+        *,
+        incremental: bool = True,
+        shallow: bool = False,
+        max_files: Optional[int] = None,
+        concurrency: int = 3,
+    ) -> Dict[str, Any]:
+        """Compile document collections into structured knowledge indices.
+
+        Optional offline pre-processing step that builds tree indices and
+        knowledge clusters.  Products are automatically leveraged by
+        subsequent search() calls.
+
+        Args:
+            paths: Directories or files to compile. Falls back to self.paths.
+            incremental: Skip unchanged files (default True).
+            shallow: Skip tree building — use direct LLM summarisation only.
+            max_files: Cap on files — triggers importance sampling for large sets.
+            concurrency: Max parallel file compilations.
+
+        Returns:
+            CompileReport as a dict.
+        """
+        from sirchmunk.learnings.compiler import KnowledgeCompiler
+        from sirchmunk.learnings.tree_indexer import DocumentTreeIndexer
+
+        resolved = self._resolve_paths(paths)
+        await self._logger.info(
+            f"[Compile] Starting compile for {len(resolved)} path(s)"
+        )
+
+        tree_cache = self.work_path / ".cache" / "compile" / "trees"
+        _cb = getattr(self._logger, 'log_callback', None)
+        tree_indexer = DocumentTreeIndexer(
+            llm=self.llm,
+            cache_dir=tree_cache,
+            log_callback=_cb,
+        )
+
+        compiler = KnowledgeCompiler(
+            llm=self.llm,
+            embedding_client=self.embedding_client,
+            knowledge_storage=self.knowledge_storage,
+            tree_indexer=tree_indexer,
+            work_path=self.work_path,
+            log_callback=_cb,
+        )
+
+        report = await compiler.compile(
+            paths=resolved,
+            incremental=incremental,
+            shallow=shallow,
+            max_files=max_files,
+            concurrency=concurrency,
+        )
+
+        return report.to_dict()
+
+    async def compile_status(
+        self,
+        paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
+    ) -> Dict[str, Any]:
+        """Return current compile status for the given paths."""
+        from sirchmunk.learnings.compiler import KnowledgeCompiler
+        from sirchmunk.learnings.tree_indexer import DocumentTreeIndexer
+
+        resolved = self._resolve_paths(paths)
+
+        tree_cache = self.work_path / ".cache" / "compile" / "trees"
+        tree_indexer = DocumentTreeIndexer(
+            llm=self.llm, cache_dir=tree_cache,
+        )
+
+        compiler = KnowledgeCompiler(
+            llm=self.llm,
+            embedding_client=self.embedding_client,
+            knowledge_storage=self.knowledge_storage,
+            tree_indexer=tree_indexer,
+            work_path=self.work_path,
+        )
+
+        status = await compiler.get_status(resolved)
+        return {
+            "total_compiled_files": status.total_compiled_files,
+            "total_clusters": status.total_clusters,
+            "total_trees": status.total_trees,
+            "last_compile_at": status.last_compile_at,
+            "manifest_path": status.manifest_path,
+        }
+
+    async def compile_lint(
+        self,
+        *,
+        auto_fix: bool = False,
+    ) -> Dict[str, Any]:
+        """Run knowledge health checks and optionally auto-fix issues."""
+        from sirchmunk.learnings.lint import KnowledgeLint
+
+        linter = KnowledgeLint(
+            knowledge_storage=self.knowledge_storage,
+            work_path=self.work_path,
+            log_callback=getattr(self._logger, 'log_callback', None),
+        )
+
+        report = await linter.run(auto_fix=auto_fix)
+        return report.to_dict()
+
+    # ------------------------------------------------------------------
     # Unified search entry point
     # ------------------------------------------------------------------
 

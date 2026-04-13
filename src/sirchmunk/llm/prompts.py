@@ -423,3 +423,90 @@ Evaluate based on:
 <SHOULD_ANSWER>true/false</SHOULD_ANSWER>
 <SHOULD_SAVE>true/false</SHOULD_SAVE>
 """
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Compile prompts
+# ---------------------------------------------------------------------------
+
+COMPILE_TREE_STRUCTURE = """Analyze the following document and identify its natural hierarchical structure (chapters, sections, subsections).
+
+### Document Content (may be truncated)
+{document_content}
+
+### Output Requirements
+Return a JSON array of top-level sections. Each section object must have:
+- "title": Section heading or descriptive title
+- "summary": 1-2 sentence summary of the section content
+- "start_marker": A short text string (5-15 words) that appears verbatim at the start of this section in the document
+- "end_marker": A short text string that appears at the start of the NEXT section (empty for the last section)
+
+Maximum {max_sections} sections. Identify only the most significant structural boundaries.
+
+### Output Format
+Return ONLY a JSON array, no extra text:
+[
+  {{"title": "...", "summary": "...", "start_marker": "...", "end_marker": "..."}},
+  ...
+]
+"""
+
+
+COMPILE_SYNTHESIZE_SUMMARY = """Synthesize a comprehensive document summary from the following section summaries.
+
+### Section Summaries
+{sections}
+
+### Output
+Provide a unified, coherent summary in 3-8 sentences that captures the document's overall topic, key arguments, and conclusions. Do not simply list the sections — weave them into a natural narrative.
+Write in the same language as the section summaries."""
+
+
+COMPILE_DOC_SUMMARY = """Summarize the following document concisely, capturing the key topics, arguments, conclusions, and important details.
+
+### File: {file_name}
+
+### Document Content (may be truncated)
+{document_content}
+
+### Output
+Provide a comprehensive summary in 3-8 sentences. Focus on:
+1. What is this document about (main topic/purpose)
+2. Key findings, arguments, or conclusions
+3. Important details, data points, or methodologies
+
+Write the summary in the same language as the document content."""
+
+
+COMPILE_TOPIC_EXTRACTION = """Extract the 3-5 most important topics, concepts, or entities from the following summary.
+
+### Summary
+{summary}
+
+### Output
+Return ONLY a JSON array of topic strings, no extra text:
+["topic1", "topic2", "topic3"]
+
+Rules:
+- Each topic should be 1-4 words
+- Prefer specific, domain-relevant terms over generic ones
+- Use the same language as the summary"""
+
+
+COMPILE_MERGE_KNOWLEDGE = """You are merging new information into an existing knowledge cluster.
+
+### Existing Knowledge
+{existing_content}
+
+### New Information
+{new_summary}
+
+### Task
+Produce an updated, unified summary that:
+1. Preserves all important information from the existing knowledge
+2. Integrates the new information, avoiding redundancy
+3. Highlights any contradictions or complementary perspectives
+4. Maintains a coherent, well-structured narrative
+
+### Output
+Return ONLY the merged summary text (no extra tags or metadata). Keep the same language as the inputs."""
