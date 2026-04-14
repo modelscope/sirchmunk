@@ -1910,18 +1910,18 @@ class AgenticSearch(BaseSearch):
     _FAST_SMALL_FILE_THRESHOLD = 100_000  # 100K chars - read full file instead of grep sampling
 
     # --- Wiki-enhanced ranking constants ---
-    _WIKI_BLEND_ALPHA = 0.7
+    _WIKI_BLEND_ALPHA = 0.85
     """TF-IDF weight in the hybrid score; Wiki weight = 1 - alpha."""
     _WIKI_MAX_SCORE = 10.0
     """Upper bound for the wiki relevance score."""
     _WIKI_CATALOG_KEYWORD_OVERLAP_MAX = 5.0
     """Maximum sub-score for catalog summary keyword overlap."""
-    _WIKI_TREE_AVAILABILITY_BONUS = 2.0
-    """Bonus for files that have a compiled tree index."""
-    _WIKI_CATALOG_PRESENCE_FULL = 3.0
+    _WIKI_TREE_AVAILABILITY_BONUS = 0.5
+    """Bonus for files that have a compiled tree index (weak signal)."""
+    _WIKI_CATALOG_PRESENCE_FULL = 2.0
     """Catalog presence bonus for summaries > 100 chars."""
-    _WIKI_CATALOG_PRESENCE_MEDIUM = 2.0
-    """Catalog presence bonus for summaries > 30 chars."""
+    _WIKI_CATALOG_PRESENCE_MEDIUM = 1.5
+    """Catalog presence bonus for summaries > 30 chars (must be < FULL)."""
     _WIKI_CATALOG_PRESENCE_MINIMAL = 1.0
     """Catalog presence bonus for summaries > 0 chars."""
     _TREE_CACHE_SCAN_LIMIT = 200

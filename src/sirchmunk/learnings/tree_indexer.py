@@ -21,6 +21,11 @@ from sirchmunk.utils.file_utils import get_fast_hash
 # File-size threshold: skip tree indexing for small files
 _TREE_MIN_CHARS = 50_000  # 50 K characters
 
+# Adaptive preview window for LLM structure analysis
+_TREE_PREVIEW_MIN = 12_000    # Minimum preview window (chars)
+_TREE_PREVIEW_MAX = 50_000    # Maximum preview window (~12K tokens)
+_TREE_PREVIEW_RATIO = 0.15    # Fraction of document to preview
+
 # Extensions eligible for tree indexing
 _TREE_EXTENSIONS = {
     ".pdf", ".docx", ".doc", ".md", ".markdown",
@@ -260,7 +265,8 @@ class DocumentTreeIndexer:
         """Recursively build tree nodes via LLM structure analysis."""
         from sirchmunk.llm.prompts import COMPILE_TREE_STRUCTURE
 
-        preview = text[:12000] if len(text) > 12000 else text
+        preview_size = self._compute_preview_size(len(text))
+        preview = text[:preview_size]
         prompt = COMPILE_TREE_STRUCTURE.format(
             document_content=preview,
             max_sections=8,
@@ -426,6 +432,19 @@ class DocumentTreeIndexer:
     # ------------------------------------------------------------------ #
     #  Helpers                                                            #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _compute_preview_size(text_len: int) -> int:
+        """Compute adaptive preview window size for LLM structure analysis.
+
+        Scales with document length: at least *_TREE_PREVIEW_MIN* chars,
+        up to *_TREE_PREVIEW_MAX*, using *_TREE_PREVIEW_RATIO* of the
+        document length as the baseline.
+        """
+        return max(
+            _TREE_PREVIEW_MIN,
+            min(int(text_len * _TREE_PREVIEW_RATIO), _TREE_PREVIEW_MAX),
+        )
 
     @staticmethod
     def _count_nodes(node: TreeNode) -> int:

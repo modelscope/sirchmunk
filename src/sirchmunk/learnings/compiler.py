@@ -40,6 +40,16 @@ _DEFAULT_CONCURRENCY = 3
 # Similarity threshold for merging into existing clusters during compile
 _MERGE_SIMILARITY_THRESHOLD = 0.75
 
+# Max chars for manifest-persisted document summary (used in Phase 2 & catalog)
+_MANIFEST_SUMMARY_MAX_LEN = 250
+
+# Preview window for direct LLM summarisation (no tree), ~4K tokens
+_SUMMARY_PREVIEW_CHARS = 16_000
+
+# Multi-section sampling for large documents without a tree index
+_SUMMARY_SAMPLE_SECTIONS = 3          # Number of sections to sample for large docs
+_SUMMARY_SAMPLE_SECTION_CHARS = 5_000  # Chars per sampled section
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -54,6 +64,7 @@ class FileManifestEntry:
     has_tree: bool
     cluster_ids: List[str]
     size_bytes: int
+    summary: str = ""  # 新增：存储编译期生成的文档摘要
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -62,6 +73,7 @@ class FileManifestEntry:
             "has_tree": self.has_tree,
             "cluster_ids": self.cluster_ids,
             "size_bytes": self.size_bytes,
+            "summary": self.summary,
         }
 
     @classmethod
@@ -72,6 +84,7 @@ class FileManifestEntry:
             has_tree=data.get("has_tree", False),
             cluster_ids=data.get("cluster_ids", []),
             size_bytes=data.get("size_bytes", 0),
+            summary=data.get("summary", ""),
         )
 
 
@@ -365,6 +378,7 @@ class KnowledgeCompiler:
                     has_tree=result.tree is not None,
                     cluster_ids=result.cluster_ids,
                     size_bytes=Path(result.path).stat().st_size if Path(result.path).exists() else 0,
+                    summary=result.summary[:_MANIFEST_SUMMARY_MAX_LEN] if result.summary else "",
                 )
 
         # Phase 3: aggregate results into knowledge network
@@ -516,8 +530,12 @@ class KnowledgeCompiler:
                     entry.path, content,
                 )
 
+            # Enrich content with structural metadata for non-text types
+            metadata_prefix = self._extract_structured_metadata(entry.path, content)
+            enriched_content = metadata_prefix + content if metadata_prefix else content
+
             result.summary = await self._extract_summary(
-                entry.path, content, result.tree,
+                entry.path, enriched_content, result.tree,
             )
             result.topics = await self._extract_topics(result.summary)
             result.evidence = self._build_evidence(entry, content, result)
@@ -539,11 +557,14 @@ class KnowledgeCompiler:
         When a tree is available its root already contains an LLM-synthesized
         summary (produced by ``_synthesize_root_summary`` during tree build),
         so we reuse it directly — no redundant LLM call.
+
+        For large documents without a tree, uses multi-section sampling
+        (beginning, middle, end) to capture the full scope of the document.
         """
         if tree and tree.root and tree.root.summary:
             return tree.root.summary
 
-        preview = content[:16000] if len(content) > 16000 else content
+        preview = self._build_summary_preview(content)
         from sirchmunk.llm.prompts import COMPILE_DOC_SUMMARY
         prompt = COMPILE_DOC_SUMMARY.format(
             file_name=Path(file_path).name,
@@ -551,6 +572,100 @@ class KnowledgeCompiler:
         )
         resp = await self._llm.achat([{"role": "user", "content": prompt}])
         return resp.content.strip()
+
+    @staticmethod
+    def _build_summary_preview(content: str) -> str:
+        """Build a representative preview for LLM summarisation.
+
+        For short documents (≤ _SUMMARY_PREVIEW_CHARS), returns the full
+        content.  For large documents, samples the beginning, middle, and
+        end to capture the document's full scope within the token budget.
+        """
+        if len(content) <= _SUMMARY_PREVIEW_CHARS:
+            return content
+
+        section_size = _SUMMARY_SAMPLE_SECTION_CHARS
+        mid_start = max(section_size, (len(content) - section_size) // 2)
+
+        head = content[:section_size]
+        middle = content[mid_start:mid_start + section_size]
+        tail = content[-section_size:]
+
+        return (
+            f"[Beginning of document]\n{head}\n\n"
+            f"[... content omitted ...]\n\n"
+            f"[Middle of document]\n{middle}\n\n"
+            f"[... content omitted ...]\n\n"
+            f"[End of document]\n{tail}"
+        )
+
+    @staticmethod
+    def _extract_structured_metadata(file_path: str, content: str) -> str:
+        """Extract structural metadata for non-text document types.
+
+        For spreadsheets and presentations, prepend a structural overview
+        (sheet names, column headers, slide titles) so the LLM summariser
+        has better context than raw extracted text alone.
+
+        Returns a metadata prefix string (may be empty for unsupported types).
+        """
+        ext = Path(file_path).suffix.lower()
+
+        if ext == ".xlsx":
+            return KnowledgeCompiler._extract_xlsx_metadata(file_path)
+        if ext == ".pptx":
+            return KnowledgeCompiler._extract_pptx_metadata(file_path)
+
+        return ""
+
+    @staticmethod
+    def _extract_xlsx_metadata(file_path: str) -> str:
+        """Extract structural metadata from Excel files.
+
+        Reads sheet names, row counts, and column headers (first row) to
+        provide the LLM with a structural overview of the workbook.
+        Caps at 10 sheets and 15 columns per sheet for bounded output.
+        """
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+            lines: List[str] = ["[Excel Workbook Structure]"]
+            for sheet_name in wb.sheetnames[:10]:  # Cap at 10 sheets
+                ws = wb[sheet_name]
+                # Extract column headers (first row)
+                headers: List[str] = []
+                for cell in ws.iter_rows(min_row=1, max_row=1, values_only=True):
+                    headers = [str(h) for h in cell if h is not None]
+                    break
+                row_count = ws.max_row or 0
+                header_str = ", ".join(headers[:15]) if headers else "no headers"
+                lines.append(f"- Sheet '{sheet_name}': {row_count} rows, columns: [{header_str}]")
+            wb.close()
+            return "\n".join(lines) + "\n\n"
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _extract_pptx_metadata(file_path: str) -> str:
+        """Extract structural metadata from PowerPoint files.
+
+        Reads slide count and titles (from the title placeholder) to give
+        the LLM a table-of-contents-like overview of the presentation.
+        Caps at 20 slides for bounded output.
+        """
+        try:
+            from pptx import Presentation
+            prs = Presentation(file_path)
+            lines: List[str] = [f"[PowerPoint Structure: {len(prs.slides)} slides]"]
+            for i, slide in enumerate(prs.slides[:20], 1):  # Cap at 20 slides
+                title = ""
+                if slide.shapes.title:
+                    title = slide.shapes.title.text.strip()
+                if title:
+                    lines.append(f"- Slide {i}: {title}")
+            return "\n".join(lines) + "\n\n"
+        except Exception:
+            return ""
 
     def _build_evidence(
         self,
@@ -851,14 +966,19 @@ class KnowledgeCompiler:
 
         The catalog is consumed by FAST search to fuse query analysis with
         LLM-driven document routing in a single prompt.  Each entry carries
-        the filename and a truncated root summary (≤250 chars).
+        the filename and a truncated root summary (<= _MANIFEST_SUMMARY_MAX_LEN chars).
+
+        Summary is sourced from the manifest (populated during Phase 2 compile),
+        with a tree-root fallback for backward compatibility.
         """
         tree_cache = self._compile_dir / "trees"
         entries: List[Dict[str, str]] = []
 
         for file_path, entry in manifest.files.items():
-            summary = ""
-            if entry.has_tree and tree_cache.exists():
+            summary = entry.summary  # Primary: manifest-persisted summary
+
+            # Fallback: read from tree root if manifest summary is empty
+            if not summary and entry.has_tree and tree_cache.exists():
                 tree_file = tree_cache / f"{entry.file_hash}.json"
                 if tree_file.exists():
                     try:
@@ -866,23 +986,9 @@ class KnowledgeCompiler:
                             tree_file.read_text(encoding="utf-8"),
                         )
                         if tree.root and tree.root.summary:
-                            summary = tree.root.summary[:250]
+                            summary = tree.root.summary[:_MANIFEST_SUMMARY_MAX_LEN]
                     except Exception:
                         pass
-
-            if not summary:
-                # Fallback: use first cluster's description
-                for cid in entry.cluster_ids[:1]:
-                    try:
-                        import asyncio
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            break
-                        c = loop.run_until_complete(self._storage.get(cid))
-                        if c and c.description:
-                            summary = str(c.description[0])[:250]
-                    except Exception:
-                        break
 
             entries.append({
                 "path": file_path,
