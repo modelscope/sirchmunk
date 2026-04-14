@@ -1935,6 +1935,14 @@ class AgenticSearch(BaseSearch):
     _CATALOG_SUMMARY_TRUNCATE = 200
     """Max chars of catalog summary shown in the listing."""
 
+    # --- Tree-guided sampling constants ---
+    _TREE_SAMPLE_MAX_SECTIONS = 3
+    """Max tree sections to include per file in tree-guided sampling."""
+    _TREE_SAMPLE_SECTION_MAX_CHARS = 3000
+    """Max chars per tree section."""
+    _TREE_SAMPLE_RGA_SUPPLEMENT = True
+    """Whether to append rga evidence after tree sections as supplementary context."""
+
     _LLM_FALLBACK_EVIDENCE = (
         "[No relevant documents found]\n\n"
         "The search did not find relevant content in the available documents. "
@@ -2249,10 +2257,24 @@ class AgenticSearch(BaseSearch):
             # Step 2.5 + Step 3: Tree navigation (1 LLM call) runs in
             # parallel with rga evidence sampling (0 LLM).  The merged
             # result is higher quality than either alone.
+            # Tree-guided sampling is integrated into _rga_evidence() for
+            # secondary files; the primary file gets a dedicated parallel
+            # tree_task to avoid blocking rga.
             # ==============================================================
 
+            # Track files already receiving parallel tree navigation to
+            # avoid duplicate LLM calls inside _rga_evidence().
+            tree_nav_done: Set[str] = set()
+            tree_nav_target = best_files[0]["path"]
+
+            if artifacts and tree_nav_target in artifacts.tree_available_paths:
+                tree_task = self._navigate_tree_for_evidence(tree_nav_target, query)
+                tree_nav_done.add(tree_nav_target)
+            else:
+                tree_task = self._async_noop(None)
+
             async def _rga_evidence() -> str:
-                """Collect rga-based evidence from best_files (zero LLM)."""
+                """Collect evidence from best_files: tree-guided when available, rga fallback."""
                 parts: List[str] = []
                 chars = 0
                 for bf in best_files:
@@ -2262,6 +2284,8 @@ class AgenticSearch(BaseSearch):
                     fn = Path(fp).name
                     ext = Path(fp).suffix.lower()
                     ev = None
+
+                    # 1. Small file: read entirely (existing logic)
                     if ext in self._FAST_TEXT_EXTENSIONS:
                         try:
                             sz = Path(fp).stat().st_size
@@ -2271,8 +2295,35 @@ class AgenticSearch(BaseSearch):
                                     ev = f"[{fn}]\n{full}"
                         except Exception:
                             pass
+
+                    # 2. Tree-guided sampling (adaptive, skip files handled
+                    #    by the parallel tree_task to avoid duplicate LLM)
+                    if (
+                        ev is None
+                        and artifacts
+                        and fp in artifacts.tree_available_paths
+                        and fp not in tree_nav_done
+                    ):
+                        try:
+                            tree_ev_inner = await self._tree_guided_sample(
+                                fp, query,
+                                match_objects=bf.get("matches", []),
+                                max_chars=self._FAST_MAX_EVIDENCE_CHARS - chars,
+                                artifacts=artifacts,
+                            )
+                            if tree_ev_inner:
+                                ev = tree_ev_inner
+                                await self._logger.info(
+                                    f"[FAST:Step3] Tree-guided sample for {fn} "
+                                    f"({len(tree_ev_inner)} chars)"
+                                )
+                        except Exception:
+                            pass
+
+                    # 3. Fallback: rga sampling (existing logic)
                     if ev is None:
                         ev = await self._fast_sample_evidence(fp, bf.get("matches", []))
+
                     if ev:
                         remaining = self._FAST_MAX_EVIDENCE_CHARS - chars
                         parts.append(ev[:remaining])
@@ -2281,9 +2332,7 @@ class AgenticSearch(BaseSearch):
                 return "\n\n---\n\n".join(parts)
 
             # Launch tree navigation for the primary file alongside rga
-            tree_nav_target = best_files[0]["path"]
             rga_task = _rga_evidence()
-            tree_task = self._navigate_tree_for_evidence(tree_nav_target, query)
 
             rga_ev, tree_ev = await asyncio.gather(rga_task, tree_task)
 
@@ -3142,6 +3191,142 @@ class AgenticSearch(BaseSearch):
         if not summary:
             return None
         return f"Source Document: {name}\nDocument Overview: {summary}"
+
+    async def _tree_guided_sample(
+        self,
+        file_path: str,
+        query: str,
+        *,
+        match_objects: Optional[List[Dict[str, Any]]] = None,
+        max_chars: int = 0,
+        artifacts: Optional["CompileArtifacts"] = None,
+        pre_navigated_leaves: Optional[List[Any]] = None,
+    ) -> Optional[str]:
+        """Tree-guided evidence sampling: use compiled tree index to locate
+        relevant sections, then read precise char_range content.
+
+        Falls back to None when no tree index is available, letting callers
+        use their default sampling strategy (rga windows, Monte Carlo, etc.).
+
+        This method is designed to be called from both FAST and DEEP modes:
+        - FAST: called inside _rga_evidence() per-file loop
+        - DEEP: called before/alongside Monte Carlo sampling
+
+        Args:
+            file_path: Absolute path to the target file.
+            query: User query for LLM-driven branch selection.
+            match_objects: Optional rga match objects for hybrid evidence.
+            max_chars: Character budget for this file's evidence.
+                Uses ``_FAST_MAX_EVIDENCE_CHARS`` when 0.
+            artifacts: Compile artifact context; when None, probes lazily.
+            pre_navigated_leaves: Pre-computed leaf nodes from a prior
+                ``navigate()`` call.  When provided the method skips the
+                LLM navigation step (avoids duplicate LLM calls).
+
+        Returns:
+            Formatted evidence string with tree-navigated sections, or None
+            when tree index is unavailable (caller should fall back).
+        """
+        if max_chars <= 0:
+            max_chars = self._FAST_MAX_EVIDENCE_CHARS
+
+        # --- Guard: tree availability ---
+        if artifacts is not None:
+            if file_path not in artifacts.tree_available_paths:
+                return None
+        else:
+            # Lazy probe when artifacts not provided (DEEP mode entry)
+            indexer = self._get_tree_indexer()
+            if indexer is None or not indexer.has_tree(file_path):
+                return None
+
+        fname = Path(file_path).name
+
+        # --- Obtain leaf nodes ---
+        leaves = pre_navigated_leaves
+        if leaves is None:
+            try:
+                indexer = self._get_tree_indexer()
+                if indexer is None:
+                    return None
+                tree = indexer.load_tree(file_path)
+                if tree is None or tree.root is None:
+                    return None
+                leaves = await indexer.navigate(
+                    tree, query,
+                    max_results=self._TREE_SAMPLE_MAX_SECTIONS,
+                )
+            except Exception:
+                return None
+
+        if not leaves:
+            return None
+
+        # --- Read full text once for char_range slicing ---
+        try:
+            from sirchmunk.utils.file_utils import fast_extract
+            extraction = await fast_extract(file_path=file_path)
+            full_text = extraction.content or ""
+        except Exception:
+            full_text = ""
+
+        # --- Extract tree sections ---
+        parts: List[str] = []
+        total_chars = 0
+        for leaf in leaves[: self._TREE_SAMPLE_MAX_SECTIONS]:
+            start, end = leaf.char_range
+            if full_text and end > start:
+                segment = full_text[start:end]
+            else:
+                segment = leaf.summary or ""
+            segment = segment[: self._TREE_SAMPLE_SECTION_MAX_CHARS]
+            if not segment.strip():
+                continue
+            header = f"[{fname} \u2192 {leaf.title}]"
+            chunk = f"{header}\n{segment}"
+            if total_chars + len(chunk) > max_chars:
+                remaining = max_chars - total_chars
+                if remaining > 200:
+                    parts.append(chunk[:remaining])
+                    total_chars += remaining
+                break
+            parts.append(chunk)
+            total_chars += len(chunk)
+
+        # --- Optional rga supplement ---
+        if (
+            self._TREE_SAMPLE_RGA_SUPPLEMENT
+            and match_objects
+            and total_chars < max_chars
+        ):
+            hit_lines: List[int] = []
+            for m in match_objects:
+                ln = m.get("data", {}).get("line_number")
+                if isinstance(ln, int):
+                    hit_lines.append(ln)
+            if hit_lines:
+                ext = Path(file_path).suffix.lower()
+                if ext in self._FAST_TEXT_EXTENSIONS:
+                    rga_ctx = self._read_context_windows(
+                        file_path, hit_lines,
+                        window=self._FAST_CONTEXT_WINDOW,
+                        max_chars=max_chars - total_chars,
+                    )
+                    if rga_ctx:
+                        rga_section = f"[{fname} \u2192 rga hits]\n{rga_ctx}"
+                        parts.append(rga_section)
+                        total_chars += len(rga_section)
+
+        if not parts:
+            return None
+
+        evidence = "\n\n".join(parts)
+        await self._logger.info(
+            f"[TreeSample] {fname}: "
+            f"{len(parts)} sections, {total_chars} chars "
+            f"(pre_nav={'yes' if pre_navigated_leaves else 'no'})"
+        )
+        return evidence
 
     async def _navigate_tree_for_evidence(
         self, file_path: str, query: str,
