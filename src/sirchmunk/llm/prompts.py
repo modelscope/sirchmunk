@@ -449,6 +449,45 @@ Evaluate based on:
 <SHOULD_SAVE>true/false</SHOULD_SAVE>
 """
 
+ROI_RESULT_SUMMARY_WITH_CONTEXT = """
+### Task
+Analyze the provided evidence and generate a concise summary in the form of a Markdown Briefing.
+Leverage the document context below for better understanding of the source material's structure and purpose.
+
+### Constraints
+1. **Language Continuity**: The output must be in the SAME language as the User Input.
+2. **Format**: Use Markdown (headings, bullet points, and bold text) for high readability.
+3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
+
+### Document Context
+{document_context}
+
+### Input Data
+- **User Input**: {user_input}
+- **Search Result Text**: {text_content}
+
+### Quality Evaluation
+After generating the summary, make TWO decisions:
+1) whether the query can be answered from the provided evidence;
+2) whether this result is worth caching.
+
+Evaluate based on:
+1. Does the search result contain substantial, relevant information for the user input?
+2. Is the content meaningful and not just error messages or "no information found"?
+3. Are there sufficient evidences and context to answer the user's query?
+
+- <SHOULD_ANSWER>: output "true" only if the evidence is sufficient to answer the query.
+- <SHOULD_SAVE>: output "true" only if the evidence is sufficient AND the result is worth caching.
+- If evidence is insufficient or irrelevant, both SHOULD_ANSWER and SHOULD_SAVE MUST be "false".
+
+### Output Format
+<SUMMARY>
+[Generate the Markdown Briefing here]
+</SUMMARY>
+<SHOULD_ANSWER>true/false</SHOULD_ANSWER>
+<SHOULD_SAVE>true/false</SHOULD_SAVE>
+"""
+
 
 # ---------------------------------------------------------------------------
 # Knowledge Compile prompts

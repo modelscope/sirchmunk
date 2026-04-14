@@ -11,7 +11,7 @@ import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 from sirchmunk.base import BaseSearch
 from sirchmunk.learnings.knowledge_base import KnowledgeBase
@@ -119,6 +119,22 @@ class CompileHints:
 
     file_paths: List[str]
     extra_keywords: List[str]
+
+
+@dataclass
+class CompileArtifacts:
+    """Compile artifact availability context for adaptive activation in FAST mode.
+
+    Created once at the start of ``_search_fast()`` via
+    ``_detect_compile_artifacts()`` and threaded through all pipeline steps.
+    Each step checks the relevant field and falls back gracefully when the
+    artifact is absent.
+    """
+
+    catalog: Optional[List[Dict[str, str]]]
+    catalog_map: Dict[str, Dict[str, str]]  # path -> catalog entry for O(1) lookup
+    tree_indexer: Optional[Any]  # DocumentTreeIndexer (lazy import)
+    tree_available_paths: Set[str]  # file paths that have cached tree indices
 
 
 class AgenticSearch(BaseSearch):
@@ -1893,6 +1909,32 @@ class AgenticSearch(BaseSearch):
     _FAST_MAX_EVIDENCE_CHARS = 15_000
     _FAST_SMALL_FILE_THRESHOLD = 100_000  # 100K chars - read full file instead of grep sampling
 
+    # --- Wiki-enhanced ranking constants ---
+    _WIKI_BLEND_ALPHA = 0.7
+    """TF-IDF weight in the hybrid score; Wiki weight = 1 - alpha."""
+    _WIKI_MAX_SCORE = 10.0
+    """Upper bound for the wiki relevance score."""
+    _WIKI_CATALOG_KEYWORD_OVERLAP_MAX = 5.0
+    """Maximum sub-score for catalog summary keyword overlap."""
+    _WIKI_TREE_AVAILABILITY_BONUS = 2.0
+    """Bonus for files that have a compiled tree index."""
+    _WIKI_CATALOG_PRESENCE_FULL = 3.0
+    """Catalog presence bonus for summaries > 100 chars."""
+    _WIKI_CATALOG_PRESENCE_MEDIUM = 2.0
+    """Catalog presence bonus for summaries > 30 chars."""
+    _WIKI_CATALOG_PRESENCE_MINIMAL = 1.0
+    """Catalog presence bonus for summaries > 0 chars."""
+    _TREE_CACHE_SCAN_LIMIT = 200
+    """Max tree JSON files to parse during artifact detection."""
+    _CATALOG_LISTING_MAX_ENTRIES = 20
+    """Max catalog entries in the enriched listing for Step 1."""
+    _CATALOG_KEYWORD_MIN_LEN = 2
+    """Minimum character length for a catalog keyword token."""
+    _CATALOG_KEYWORD_MAX_LEN = 20
+    """Maximum character length for a catalog keyword token."""
+    _CATALOG_SUMMARY_TRUNCATE = 200
+    """Max chars of catalog summary shown in the listing."""
+
     _LLM_FALLBACK_EVIDENCE = (
         "[No relevant documents found]\n\n"
         "The search did not find relevant content in the available documents. "
@@ -1928,6 +1970,15 @@ class AgenticSearch(BaseSearch):
         context = SearchContext()
         await self._logger.info(f"[FAST] Starting greedy search for: '{query[:80]}'")
 
+        # --- Adaptive compile artifact detection (one-shot, zero LLM) ---
+        artifacts = self._detect_compile_artifacts()
+        if artifacts.catalog or artifacts.tree_available_paths:
+            await self._logger.info(
+                f"[FAST:Artifacts] catalog={'yes' if artifacts.catalog else 'no'} "
+                f"({len(artifacts.catalog) if artifacts.catalog else 0} docs), "
+                f"trees={len(artifacts.tree_available_paths)}"
+            )
+
         # ==============================================================
         # Step 0: Cluster reuse — instant short-circuit (no LLM cost)
         # When reuse succeeds we return here; no persistence step runs.
@@ -1946,15 +1997,12 @@ class AgenticSearch(BaseSearch):
         # document summaries and selects the most relevant ones in the
         # same call that extracts keywords (zero extra LLM cost).
         # ==============================================================
-        catalog = self._load_document_catalog()
+        catalog = artifacts.catalog
         catalog_routed_files: List[str] = []
         catalog_confidence: str = "low"
 
         if catalog:
-            listing = "\n".join(
-                f"[{i}] {e['name']}: {e['summary'][:200]}"
-                for i, e in enumerate(catalog)
-            )
+            listing = self._build_enriched_catalog_listing(catalog)
             prompt = FAST_QUERY_ANALYSIS_WITH_CATALOG.format(
                 user_input=query, document_listing=listing,
             )
@@ -2118,6 +2166,7 @@ class AgenticSearch(BaseSearch):
         best_files: Optional[List[Dict[str, Any]]] = None
         used_level = "primary"
         evidence = ""
+        file_path: Optional[str] = None  # set when best_files found
 
         # High-confidence catalog routing: skip rga, use catalog directly
         if catalog_routed_files and catalog_confidence == "high":
@@ -2133,7 +2182,9 @@ class AgenticSearch(BaseSearch):
 
         if not best_files and primary:
             best_files = await self._fast_find_best_file(
-                primary, top_k=top_k_files, keyword_idfs=keyword_idfs, **rga_kwargs
+                primary, top_k=top_k_files, keyword_idfs=keyword_idfs,
+                query=query, artifacts=artifacts,
+                **rga_kwargs,
             )
 
         if not best_files and fallback:
@@ -2142,7 +2193,9 @@ class AgenticSearch(BaseSearch):
                 "[FAST:Step2] Primary miss, trying fine-grained fallback"
             )
             best_files = await self._fast_find_best_file(
-                fallback, top_k=top_k_files, keyword_idfs=keyword_idfs, **rga_kwargs
+                fallback, top_k=top_k_files, keyword_idfs=keyword_idfs,
+                query=query, artifacts=artifacts,
+                **rga_kwargs,
             )
 
         # --- Fallback: compile-hint files when rga misses (catalog + P2 + P4) ---
@@ -2183,9 +2236,13 @@ class AgenticSearch(BaseSearch):
         if best_files:
             file_path = best_files[0]["path"]
             match_objects = best_files[0].get("matches", [])
+            wiki_info = ""
+            if best_files[0].get("wiki_relevance") is not None:
+                wiki_info = f", wiki={best_files[0]['wiki_relevance']:.1f}"
             await self._logger.info(
                 f"[FAST:Step2] Best file ({used_level}): {Path(file_path).name} "
-                f"({best_files[0].get('total_matches', 0)} hits, score={best_files[0].get('weighted_score', 0):.2f})"
+                f"({best_files[0].get('total_matches', 0)} hits, "
+                f"score={best_files[0].get('weighted_score', 0):.2f}{wiki_info})"
             )
 
             # ==============================================================
@@ -2248,20 +2305,35 @@ class AgenticSearch(BaseSearch):
                     await self._logger.warning("[FAST:Step3] No usable evidence extracted")
                     return _NO_RESULTS_MESSAGE, None, context
 
+            tree_available = file_path in artifacts.tree_available_paths if artifacts else False
             await self._logger.info(
                 f"[FAST:Step3] Evidence: {len(evidence)} chars "
-                f"(tree={'yes' if tree_ev else 'no'}, rga={'yes' if rga_ev else 'no'})"
+                f"(tree={'yes' if tree_ev else 'no'}, rga={'yes' if rga_ev else 'no'}, "
+                f"tree_indexed={'yes' if tree_available else 'no'})"
             )
 
         keywords_used = primary if used_level == "primary" else fallback
 
         # ==============================================================
         # Step 4: LLM answer from focused evidence (single call)
+        # Wiki-enhanced: inject document context when catalog available.
         # ==============================================================
-        answer_prompt = ROI_RESULT_SUMMARY.format(
-            user_input=query,
-            text_content=evidence,
-        )
+        doc_context = self._build_answer_context(file_path, artifacts) if best_files else None
+        if doc_context:
+            from sirchmunk.llm.prompts import ROI_RESULT_SUMMARY_WITH_CONTEXT
+            answer_prompt = ROI_RESULT_SUMMARY_WITH_CONTEXT.format(
+                user_input=query,
+                text_content=evidence,
+                document_context=doc_context,
+            )
+            await self._logger.info(
+                f"[FAST:Step4] Wiki-enhanced answer generation with catalog context"
+            )
+        else:
+            answer_prompt = ROI_RESULT_SUMMARY.format(
+                user_input=query,
+                text_content=evidence,
+            )
         answer_resp = await self.llm.achat(
             messages=[{"role": "user", "content": answer_prompt}],
             stream=True,
@@ -2324,7 +2396,7 @@ class AgenticSearch(BaseSearch):
             return answer, None, context
 
         cluster = self._build_fast_cluster(
-            query, answer, file_path, evidence, keywords_used,
+            query, answer, file_path or "", evidence, keywords_used,
         )
         self._add_query_to_cluster(cluster, query)
         try:
@@ -2475,6 +2547,86 @@ class AgenticSearch(BaseSearch):
         # Cap at top_k
         return result[:top_k]
 
+    @staticmethod
+    def _compute_wiki_relevance(
+        file_path: str,
+        query: str,
+        keywords: List[str],
+        catalog_map: Dict[str, Dict[str, str]],
+        tree_available_paths: Set[str],
+    ) -> float:
+        """Compute wiki-based relevance score for a candidate file (0-10 scale).
+
+        Uses three sub-scores derived from compile artifacts:
+
+        1. **Catalog summary overlap** (0-``_WIKI_CATALOG_KEYWORD_OVERLAP_MAX``):
+           proportion of query keywords that appear in the catalog entry's
+           summary.  When *keywords* is empty, falls back to whole-query
+           substring matching against the summary to avoid returning 0 for
+           valid queries.
+        2. **Tree availability bonus** (0-``_WIKI_TREE_AVAILABILITY_BONUS``):
+           a file with a compiled tree index likely has rich structure.
+        3. **Catalog presence bonus** (0-``_WIKI_CATALOG_PRESENCE_FULL``):
+           files important enough to be in the catalog get a baseline boost.
+
+        All scoring is pure text matching — no LLM, no embedding.
+
+        Args:
+            file_path: Absolute path of the candidate file.
+            query: Original user query.
+            keywords: Extracted search keywords from FAST Step 1.
+            catalog_map: ``{path: catalog_entry}`` from CompileArtifacts.
+            tree_available_paths: Set of file paths with cached tree indices.
+
+        Returns:
+            Float in [0, 10] representing wiki-derived relevance.
+        """
+        cls = AgenticSearch  # access class constants from static method
+        score = 0.0
+
+        entry = catalog_map.get(file_path)
+
+        # Sub-score 1: Catalog summary keyword overlap
+        if entry:
+            summary_lower = (entry.get("summary", "") + " " + entry.get("name", "")).lower()
+            query_lower = query.lower()
+            matches = 0
+            total = 0
+            for kw in keywords:
+                if kw:
+                    total += 1
+                    if kw.lower() in summary_lower:
+                        matches += 1
+            # Also check whole query as a substring
+            if len(query_lower) >= 2 and query_lower in summary_lower:
+                matches += 1
+                total += 1
+            # When keywords list is empty but query is non-empty, fall back to
+            # character-level overlap so the sub-score is not silently 0.
+            if total == 0 and query_lower:
+                # Simple overlap: count how many query chars appear in summary
+                overlap = sum(1 for ch in query_lower if ch in summary_lower)
+                ratio = overlap / max(len(query_lower), 1)
+                score += ratio * cls._WIKI_CATALOG_KEYWORD_OVERLAP_MAX
+            elif total > 0:
+                score += (matches / total) * cls._WIKI_CATALOG_KEYWORD_OVERLAP_MAX
+
+        # Sub-score 2: Tree availability bonus
+        if file_path in tree_available_paths:
+            score += cls._WIKI_TREE_AVAILABILITY_BONUS
+
+        # Sub-score 3: Catalog presence bonus
+        if entry:
+            summary_len = len(entry.get("summary", ""))
+            if summary_len > 100:
+                score += cls._WIKI_CATALOG_PRESENCE_FULL
+            elif summary_len > 30:
+                score += cls._WIKI_CATALOG_PRESENCE_MEDIUM
+            elif summary_len > 0:
+                score += cls._WIKI_CATALOG_PRESENCE_MINIMAL
+
+        return min(score, cls._WIKI_MAX_SCORE)
+
     async def _fast_find_best_file(
         self,
         keywords: List[str],
@@ -2484,9 +2636,23 @@ class AgenticSearch(BaseSearch):
         exclude: Optional[List[str]] = None,
         top_k: int = 1,
         keyword_idfs: Optional[Dict[str, float]] = None,
+        query: str = "",
+        artifacts: Optional["CompileArtifacts"] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Search per keyword via rga and return the top-k best-matching files
-        ranked by IDF-weighted log-TF scoring.
+        ranked by IDF-weighted log-TF scoring, optionally enhanced with
+        wiki-derived relevance from compile artifacts.
+
+        Args:
+            keywords: Search keywords from FAST Step 1.
+            paths: Search paths.
+            max_depth: Maximum directory depth for rga.
+            include: Glob patterns to include.
+            exclude: Glob patterns to exclude.
+            top_k: Number of top files to return.
+            keyword_idfs: Pre-computed IDF values for keywords.
+            query: Original user query (used for wiki relevance scoring).
+            artifacts: Compile artifacts for adaptive wiki-enhanced ranking.
 
         Returns:
             List of merged file dicts (path, matches, lines, total_matches, weighted_score) or None.
@@ -2575,6 +2741,25 @@ class AgenticSearch(BaseSearch):
                     idf = _idfs.get(kw, max(0.5, min(1.0, len(kw) / 5.0)))
                     score += idf * (1.0 + math.log(tf))
             f["weighted_score"] = score
+
+        # --- Wiki-enhanced hybrid scoring (adaptive: only when artifacts exist) ---
+        if artifacts and artifacts.catalog_map:
+            # Normalize TF-IDF scores to [0, 10] to align with Wiki score range
+            max_tf_idf = max((f["weighted_score"] for f in merged), default=1.0)
+            if max_tf_idf <= 0:
+                max_tf_idf = 1.0
+            for f in merged:
+                wiki_score = self._compute_wiki_relevance(
+                    f["path"], query, keywords,
+                    artifacts.catalog_map, artifacts.tree_available_paths,
+                )
+                f["wiki_relevance"] = wiki_score
+                # Normalize TF-IDF to [0, 10] before blending
+                tf_idf_norm = (f["weighted_score"] / max_tf_idf) * self._WIKI_MAX_SCORE
+                f["weighted_score"] = (
+                    self._WIKI_BLEND_ALPHA * tf_idf_norm
+                    + (1 - self._WIKI_BLEND_ALPHA) * wiki_score
+                )
 
         merged.sort(key=lambda f: f["weighted_score"], reverse=True)
         pruned = self._prune_by_score(merged, top_k=top_k)
@@ -2749,6 +2934,183 @@ class AgenticSearch(BaseSearch):
         except Exception:
             pass
         return None
+
+    def _detect_compile_artifacts(self) -> CompileArtifacts:
+        """One-shot probe of all compile artifacts for adaptive FAST activation.
+
+        Reads the document catalog and scans the tree cache directory to
+        determine which compile products are available.  Called once at the
+        start of ``_search_fast()``; the result is passed to downstream
+        helpers so they can enable enhanced logic only when artifacts exist.
+
+        Cost: one JSON read (catalog) + one directory listing (tree cache).
+        Tree path results are cached in ``_tree_paths_cache`` so subsequent
+        calls within the same instance avoid re-parsing every JSON file.
+        Returns a ``CompileArtifacts`` with ``None``/empty fields when
+        compile has not been run.
+        """
+        catalog = self._load_document_catalog()
+        catalog_map: Dict[str, Dict[str, str]] = {}
+        if catalog:
+            for entry in catalog:
+                p = entry.get("path", "")
+                if p:
+                    catalog_map[p] = entry
+
+        indexer = self._get_tree_indexer()
+        # Use cached tree paths when available to avoid re-parsing all JSONs
+        tree_paths: Set[str] = getattr(self, "_tree_paths_cache", None) or set()
+        if indexer is not None and not tree_paths:
+            tree_cache = self.work_path / ".cache" / "compile" / "trees"
+            if tree_cache.exists():
+                try:
+                    from sirchmunk.learnings.tree_indexer import DocumentTree
+                    for tf in sorted(tree_cache.glob("*.json"))[:self._TREE_CACHE_SCAN_LIMIT]:
+                        try:
+                            tree = DocumentTree.from_json(
+                                tf.read_text(encoding="utf-8")
+                            )
+                            if tree.file_path:
+                                tree_paths.add(tree.file_path)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            # Cache for future calls within this instance
+            self._tree_paths_cache = tree_paths
+
+        return CompileArtifacts(
+            catalog=catalog,
+            catalog_map=catalog_map,
+            tree_indexer=indexer,
+            tree_available_paths=tree_paths,
+        )
+
+    @staticmethod
+    def _extract_catalog_keywords(summary: str, max_kw: int = 3) -> List[str]:
+        """Extract salient keywords from a catalog summary via simple heuristics.
+
+        Uses word-length filtering, Chinese character detection, and CJK n-gram
+        extraction to pick the most informative tokens.  For CJK-heavy text
+        (which does not use whitespace word boundaries), consecutive CJK
+        character runs are extracted as additional candidate tokens.
+
+        No LLM or embedding involved.
+
+        Args:
+            summary: Document summary text from the compiled catalog.
+            max_kw: Maximum number of keywords to return.
+
+        Returns:
+            List of up to *max_kw* keywords.
+        """
+        cls = AgenticSearch
+        if not summary:
+            return []
+        import re as _re
+
+        # Split on whitespace and common punctuation (incl. CJK punctuation)
+        tokens = _re.split(
+            r'[\s,;\uff0c\uff1b\u3001\u3002\uff1a:!?\uff01\uff1f()\[\]{}\u201c\u201d\u2018\u2019\u0022\u0027]+',
+            summary,
+        )
+
+        # For CJK text, also extract consecutive CJK character runs (2-6 chars)
+        # so that e.g. "停车位申请条件" yields ["停车位申请条件", "停车位", "申请条件", ...]
+        cjk_runs = _re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]{2,}', summary)
+        # Generate sub-phrases from long CJK runs (bigrams/trigrams/4-grams)
+        cjk_ngrams: List[str] = []
+        for run in cjk_runs:
+            cjk_ngrams.append(run)
+            if len(run) > 4:
+                # Extract 2-4 char sub-phrases from each run
+                for n in (4, 3, 2):
+                    for i in range(len(run) - n + 1):
+                        cjk_ngrams.append(run[i:i + n])
+
+        tokens = tokens + cjk_ngrams
+
+        # Filter: keep tokens with appropriate length and not purely numeric
+        candidates = [
+            t for t in tokens
+            if len(t) >= cls._CATALOG_KEYWORD_MIN_LEN
+            and not t.isdigit()
+            and len(t) <= cls._CATALOG_KEYWORD_MAX_LEN
+        ]
+        # Prefer longer tokens (more specific)
+        candidates.sort(key=len, reverse=True)
+        # Deduplicate case-insensitively
+        seen: Set[str] = set()
+        result: List[str] = []
+        for c in candidates:
+            lower = c.lower()
+            if lower not in seen:
+                seen.add(lower)
+                result.append(c)
+            if len(result) >= max_kw:
+                break
+        return result
+
+    def _build_enriched_catalog_listing(
+        self,
+        catalog: List[Dict[str, str]],
+        max_entries: Optional[int] = None,
+    ) -> str:
+        """Build an enriched catalog listing with keywords for FAST Step 1.
+
+        Compared to the plain ``[i] name: summary[:200]`` format, this adds
+        extracted keywords to help the LLM make more informed document
+        selections.
+
+        Args:
+            catalog: Entries from ``document_catalog.json``.
+            max_entries: Cap to prevent prompt overflow.
+
+        Returns:
+            Formatted listing string for injection into the FAST query
+            analysis prompt.
+        """
+        lines: List[str] = []
+        _max = max_entries if max_entries is not None else self._CATALOG_LISTING_MAX_ENTRIES
+        _trunc = self._CATALOG_SUMMARY_TRUNCATE
+        for i, entry in enumerate(catalog[:_max]):
+            name = entry.get("name", "")
+            summary = entry.get("summary", "")
+            kws = AgenticSearch._extract_catalog_keywords(summary)
+            kw_str = ", ".join(kws) if kws else ""
+            if kw_str:
+                lines.append(f"[{i}] {name}: {summary[:_trunc]}  [Keywords: {kw_str}]")
+            else:
+                lines.append(f"[{i}] {name}: {summary[:_trunc]}")
+        return "\n".join(lines)
+
+    def _build_answer_context(
+        self,
+        best_file_path: str,
+        artifacts: CompileArtifacts,
+    ) -> Optional[str]:
+        """Build document context from catalog for wiki-enhanced answer generation.
+
+        Returns a short context string describing the source document, or
+        None when no catalog entry exists for *best_file_path*.
+
+        Args:
+            best_file_path: Path of the top-ranked file from Step 2.
+            artifacts: Compile artifact availability context.
+
+        Returns:
+            Context string or None.
+        """
+        if not artifacts.catalog_map:
+            return None
+        entry = artifacts.catalog_map.get(best_file_path)
+        if not entry:
+            return None
+        name = entry.get("name", Path(best_file_path).name)
+        summary = entry.get("summary", "")
+        if not summary:
+            return None
+        return f"Source Document: {name}\nDocument Overview: {summary}"
 
     async def _navigate_tree_for_evidence(
         self, file_path: str, query: str,
