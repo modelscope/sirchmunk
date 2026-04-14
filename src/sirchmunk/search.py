@@ -3005,47 +3005,64 @@ class AgenticSearch(BaseSearch):
             List of up to *max_kw* keywords.
         """
         cls = AgenticSearch
-        if not summary:
+        if max_kw <= 0:
+            return []
+        summary_text = str(summary or "").strip()
+        if not summary_text:
             return []
         import re as _re
 
         # Split on whitespace and common punctuation (incl. CJK punctuation)
         tokens = _re.split(
-            r'[\s,;\uff0c\uff1b\u3001\u3002\uff1a:!?\uff01\uff1f()\[\]{}\u201c\u201d\u2018\u2019\u0022\u0027]+',
-            summary,
+            r'[\s,;\uff0c\uff1b\u3001\u3002\uff1a:!?\uff01\uff1f()\[\]{}\u201c\u201d\u2018\u2019\u0022\u0027/\\|`~@#$%^&*=+<>]+',
+            summary_text,
         )
 
         # For CJK text, also extract consecutive CJK character runs (2-6 chars)
         # so that e.g. "停车位申请条件" yields ["停车位申请条件", "停车位", "申请条件", ...]
-        cjk_runs = _re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]{2,}', summary)
+        cjk_runs = _re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]{2,}', summary_text)
         # Generate sub-phrases from long CJK runs (bigrams/trigrams/4-grams)
         cjk_ngrams: List[str] = []
+        max_ngram_per_run = 40
         for run in cjk_runs:
             cjk_ngrams.append(run)
             if len(run) > 4:
                 # Extract 2-4 char sub-phrases from each run
+                added = 0
                 for n in (4, 3, 2):
                     for i in range(len(run) - n + 1):
                         cjk_ngrams.append(run[i:i + n])
+                        added += 1
+                        if added >= max_ngram_per_run:
+                            break
+                    if added >= max_ngram_per_run:
+                        break
 
         tokens = tokens + cjk_ngrams
 
         # Filter: keep tokens with appropriate length and not purely numeric
         candidates = [
             t for t in tokens
-            if len(t) >= cls._CATALOG_KEYWORD_MIN_LEN
+            if t
+            and len(t) >= cls._CATALOG_KEYWORD_MIN_LEN
             and not t.isdigit()
             and len(t) <= cls._CATALOG_KEYWORD_MAX_LEN
+            and not _re.fullmatch(r"[_\-.]+", t)
         ]
         # Prefer longer tokens (more specific)
         candidates.sort(key=len, reverse=True)
         # Deduplicate case-insensitively
         seen: Set[str] = set()
+        chosen_norms: List[str] = []
         result: List[str] = []
         for c in candidates:
             lower = c.lower()
             if lower not in seen:
+                # Avoid noisy micro-fragments when a longer token already exists.
+                if len(lower) <= 4 and any(lower in kept for kept in chosen_norms):
+                    continue
                 seen.add(lower)
+                chosen_norms.append(lower)
                 result.append(c)
             if len(result) >= max_kw:
                 break
@@ -3070,18 +3087,32 @@ class AgenticSearch(BaseSearch):
             Formatted listing string for injection into the FAST query
             analysis prompt.
         """
+        if not isinstance(catalog, list) or not catalog:
+            return ""
         lines: List[str] = []
         _max = max_entries if max_entries is not None else self._CATALOG_LISTING_MAX_ENTRIES
+        if _max <= 0:
+            return ""
         _trunc = self._CATALOG_SUMMARY_TRUNCATE
         for i, entry in enumerate(catalog[:_max]):
-            name = entry.get("name", "")
-            summary = entry.get("summary", "")
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or entry.get("path") or "")
+            summary = str(entry.get("summary") or "")
+            # Keep one-line prompt entries to avoid accidental prompt pollution.
+            name = " ".join(name.split())
+            summary = " ".join(summary.split())
+            if not name:
+                name = f"doc_{i}"
             kws = AgenticSearch._extract_catalog_keywords(summary)
             kw_str = ", ".join(kws) if kws else ""
+            shown_summary = summary[:_trunc]
+            if len(summary) > _trunc:
+                shown_summary += "..."
             if kw_str:
-                lines.append(f"[{i}] {name}: {summary[:_trunc]}  [Keywords: {kw_str}]")
+                lines.append(f"[{i}] {name}: {shown_summary}  [Keywords: {kw_str}]")
             else:
-                lines.append(f"[{i}] {name}: {summary[:_trunc]}")
+                lines.append(f"[{i}] {name}: {shown_summary}")
         return "\n".join(lines)
 
     def _build_answer_context(
