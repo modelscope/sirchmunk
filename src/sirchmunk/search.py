@@ -135,6 +135,7 @@ class CompileArtifacts:
     catalog_map: Dict[str, Dict[str, str]]  # path -> catalog entry for O(1) lookup
     tree_indexer: Optional[Any]  # DocumentTreeIndexer (lazy import)
     tree_available_paths: Set[str]  # file paths that have cached tree indices
+    manifest_map: Dict[str, Any] = field(default_factory=dict)  # {path: FileManifestEntry}
 
 
 class AgenticSearch(BaseSearch):
@@ -1426,6 +1427,7 @@ class AgenticSearch(BaseSearch):
             self._probe_knowledge_cache(query),
             self._load_spec_context(paths, stale_hours=spec_stale_hours),
             self._probe_tree_index(query),
+            self._probe_compile_hints(initial_keywords if initial_keywords else [query]),
             return_exceptions=True,
         )
 
@@ -1434,8 +1436,9 @@ class AgenticSearch(BaseSearch):
         knowledge_probe = phase1_results[2] if not isinstance(phase1_results[2], Exception) else KnowledgeProbeResult([], [], "")
         spec_context = phase1_results[3] if not isinstance(phase1_results[3], Exception) else ""
         tree_hits = phase1_results[4] if not isinstance(phase1_results[4], Exception) else []
+        compile_hints = phase1_results[5] if not isinstance(phase1_results[5], Exception) else CompileHints([], [])
 
-        for i, label in enumerate(["keywords", "dir_scan", "knowledge", "spec_cache", "tree_index"]):
+        for i, label in enumerate(["keywords", "dir_scan", "knowledge", "spec_cache", "tree_index", "compile_hints"]):
             if isinstance(phase1_results[i], Exception):
                 await self._logger.warning(f"[Phase 1] {label} probe failed: {phase1_results[i]}")
 
@@ -1471,6 +1474,7 @@ class AgenticSearch(BaseSearch):
             f"dir_scan={'OK' if scan_result else 'N/A'}, "
             f"knowledge_files={len(knowledge_probe.file_paths)}, "
             f"tree_hits={len(tree_hits)}, "
+            f"compile_hints={len(compile_hints.file_paths)}, "
             f"soft_hit={'YES' if soft_hit else 'NO'}, "
             f"spec_cache={'YES' if spec_context else 'NO'}"
         )
@@ -1523,7 +1527,7 @@ class AgenticSearch(BaseSearch):
         if soft_hit:
             extra_knowledge_files = soft_hit.file_paths + extra_knowledge_files
         merged_files = self._merge_file_paths(
-            keyword_files=list(tree_hits) + keyword_files,
+            keyword_files=list(tree_hits) + compile_hints.file_paths + keyword_files,
             dir_scan_files=dir_scan_files,
             knowledge_hits=extra_knowledge_files,
         )
@@ -2285,22 +2289,9 @@ class AgenticSearch(BaseSearch):
                     ext = Path(fp).suffix.lower()
                     ev = None
 
-                    # 1. Small file: read entirely (existing logic)
-                    if ext in self._FAST_TEXT_EXTENSIONS:
-                        try:
-                            sz = Path(fp).stat().st_size
-                            if sz < self._FAST_SMALL_FILE_THRESHOLD:
-                                full = Path(fp).read_text(errors="replace")
-                                if len(full) < self._FAST_SMALL_FILE_THRESHOLD:
-                                    ev = f"[{fn}]\n{full}"
-                        except Exception:
-                            pass
-
-                    # 2. Tree-guided sampling (adaptive, skip files handled
-                    #    by the parallel tree_task to avoid duplicate LLM)
+                    # 1. Tree-guided sampling FIRST for tree-indexed files
                     if (
-                        ev is None
-                        and artifacts
+                        artifacts
                         and fp in artifacts.tree_available_paths
                         and fp not in tree_nav_done
                     ):
@@ -2317,6 +2308,17 @@ class AgenticSearch(BaseSearch):
                                     f"[FAST:Step3] Tree-guided sample for {fn} "
                                     f"({len(tree_ev_inner)} chars)"
                                 )
+                        except Exception:
+                            pass
+
+                    # 2. Small file: read entirely (only if tree didn't provide evidence)
+                    if ev is None and ext in self._FAST_TEXT_EXTENSIONS:
+                        try:
+                            sz = Path(fp).stat().st_size
+                            if sz < self._FAST_SMALL_FILE_THRESHOLD:
+                                full = Path(fp).read_text(errors="replace")
+                                if len(full) < self._FAST_SMALL_FILE_THRESHOLD:
+                                    ev = f"[{fn}]\n{full}"
                         except Exception:
                             pass
 
@@ -2641,11 +2643,15 @@ class AgenticSearch(BaseSearch):
             query_lower = query.lower()
             matches = 0
             total = 0
+            summary_tokens = cls._tokenize_for_matching(summary_lower)
             for kw in keywords:
                 if kw:
                     total += 1
-                    if kw.lower() in summary_lower:
-                        matches += 1
+                    kw_low = kw.lower()
+                    if kw_low in summary_tokens:
+                        matches += 1          # Full token match
+                    elif kw_low in summary_lower:
+                        matches += 0.5        # Substring-only match (lower confidence)
             # Also check whole query as a substring
             if len(query_lower) >= 2 and query_lower in summary_lower:
                 matches += 1
@@ -3006,25 +3012,43 @@ class AgenticSearch(BaseSearch):
                 if p:
                     catalog_map[p] = entry
 
+        # Load manifest for rich metadata (size, has_tree, cluster_ids)
+        manifest_map: Dict[str, Any] = {}
+        manifest_path = self.work_path / ".cache" / "compile" / "manifest.json"
+        if manifest_path.exists():
+            try:
+                from sirchmunk.learnings.compiler import CompileManifest
+                manifest = CompileManifest.from_json(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+                manifest_map = manifest.files  # {file_path: FileManifestEntry}
+            except Exception:
+                pass
+
         indexer = self._get_tree_indexer()
         # Use cached tree paths when available to avoid re-parsing all JSONs
         tree_paths: Set[str] = getattr(self, "_tree_paths_cache", None) or set()
-        if indexer is not None and not tree_paths:
-            tree_cache = self.work_path / ".cache" / "compile" / "trees"
-            if tree_cache.exists():
-                try:
-                    from sirchmunk.learnings.tree_indexer import DocumentTree
-                    for tf in sorted(tree_cache.glob("*.json"))[:self._TREE_CACHE_SCAN_LIMIT]:
-                        try:
-                            tree = DocumentTree.from_json(
-                                tf.read_text(encoding="utf-8")
-                            )
-                            if tree.file_path:
-                                tree_paths.add(tree.file_path)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+        if not tree_paths:
+            # Prefer manifest-based detection (fast, O(1) per file)
+            if manifest_map:
+                tree_paths = {fp for fp, entry in manifest_map.items() if entry.has_tree}
+            # Fallback: scan tree cache directory (legacy path)
+            elif indexer is not None:
+                tree_cache = self.work_path / ".cache" / "compile" / "trees"
+                if tree_cache.exists():
+                    try:
+                        from sirchmunk.learnings.tree_indexer import DocumentTree
+                        for tf in sorted(tree_cache.glob("*.json"))[:self._TREE_CACHE_SCAN_LIMIT]:
+                            try:
+                                tree = DocumentTree.from_json(
+                                    tf.read_text(encoding="utf-8")
+                                )
+                                if tree.file_path:
+                                    tree_paths.add(tree.file_path)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             # Cache for future calls within this instance
             self._tree_paths_cache = tree_paths
 
@@ -3033,7 +3057,30 @@ class AgenticSearch(BaseSearch):
             catalog_map=catalog_map,
             tree_indexer=indexer,
             tree_available_paths=tree_paths,
+            manifest_map=manifest_map,
         )
+
+    @staticmethod
+    def _tokenize_for_matching(text: str) -> Set[str]:
+        """Tokenize text into meaningful units for keyword matching.
+
+        Splits on whitespace and CJK/Latin punctuation boundaries, then
+        generates 2-3 char n-grams for CJK-heavy tokens to handle
+        unsegmented Chinese text.  Returns a set of lowercased tokens.
+        """
+        import re
+        tokens: Set[str] = set()
+        raw = re.split(r'[\s,;.!?，；。！？：:、\u201c\u201d\u2018\u2019（）()\[\]{}<>《》\-/]+', text.lower())
+        for t in raw:
+            t = t.strip()
+            if not t:
+                continue
+            tokens.add(t)
+            if len(t) >= 2 and any('\u4e00' <= c <= '\u9fff' for c in t):
+                for n in (2, 3):
+                    for i in range(len(t) - n + 1):
+                        tokens.add(t[i:i + n])
+        return tokens
 
     @staticmethod
     def _extract_catalog_keywords(summary: str, max_kw: int = 3) -> List[str]:
