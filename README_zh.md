@@ -374,11 +374,15 @@ pip install sirchmunk[mcp]
 
 # 初始化（生成 .env 和 mcp_config.json）
 sirchmunk init
+# 可选：使用自定义工作目录
+# sirchmunk init --work-path /path/to/your_work_path
 
 # 编辑 ~/.sirchmunk/.env 配置 LLM API Key
 
 # 使用 MCP Inspector 测试
 npx @modelcontextprotocol/inspector sirchmunk mcp serve
+# 可选：本次 MCP 运行使用自定义工作目录
+# npx @modelcontextprotocol/inspector sirchmunk mcp serve --work-path /path/to/your_work_path
 ```
 
 ### `mcp_config.json` 配置
@@ -394,7 +398,8 @@ npx @modelcontextprotocol/inspector sirchmunk mcp serve
       "command": "sirchmunk",
       "args": ["mcp", "serve"],
       "env": {
-        "SIRCHMUNK_SEARCH_PATHS": "/path/to/your_docs,/another/path"
+        "SIRCHMUNK_SEARCH_PATHS": "",
+        "SIRCHMUNK_WORK_PATH": "/path/to/your_work_path"
       }
     }
   }
@@ -406,9 +411,11 @@ npx @modelcontextprotocol/inspector sirchmunk mcp serve
 | `command` | 启动 MCP 服务器的命令。如果在虚拟环境中运行，请使用完整路径（如 `/path/to/venv/bin/sirchmunk`）。 |
 | `args` | 命令参数。`["mcp", "serve"]` 以 stdio 模式启动 MCP 服务器。 |
 | `env.SIRCHMUNK_SEARCH_PATHS` | 默认文档搜索目录（逗号分隔）。同时支持英文逗号 `,` 和中文逗号 `，` 作为分隔符。设置后，若工具调用时未提供 `paths` 参数，将使用这些路径作为默认值。 |
+| `env.SIRCHMUNK_WORK_PATH` | 指定 MCP 服务器使用的 Sirchmunk 工作目录（`.env`、缓存、知识库、历史记录）。推荐在持久化 MCP 客户端中配置。 |
 
 > **提示**：MCP Inspector 非常适合在连接 AI 助手之前测试集成是否正常。
 > 在 MCP Inspector 中：**Connect** → **Tools** → **List Tools** → `sirchmunk_search` → 输入参数（`query` 和 `paths`，如 `["/path/to/your_docs"]`）→ **Run Tool**。
+> 也可通过 `sirchmunk mcp serve --work-path /path/to/your_work_path` 临时覆盖工作目录。
 
 ### 特性
 
@@ -484,12 +491,12 @@ python scripts/stop_web.py
 
 | 区域 | 镜像                                                                                                      |
 |---|---------------------------------------------------------------------------------------------------------|
-| 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3`  |
-| 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3` |
+| 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.7`  |
+| 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.7` |
 
 ```bash
 # 拉取镜像（根据地理位置选择最近的 Registry）
-docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3
+docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.7
 
 # 启动服务
 docker run -d \
@@ -508,7 +515,7 @@ docker run -d \
   -e SIRCHMUNK_SEARCH_PATHS=/mnt/docs \
   -v /path/to/your_work_path:/data/sirchmunk \
   -v /path/to/your/docs:/mnt/docs:ro \
-  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3
+  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.7
   
 # 停止和删除容器
 docker stop sirchmunk && docker rm sirchmunk
@@ -520,6 +527,8 @@ docker stop sirchmunk && docker rm sirchmunk
 
 | 版本 | 区域 | 镜像 |
 |---|---|---|
+| v0.0.6post3 | 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3` |
+| v0.0.6post3 | 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3` |
 | v0.0.4 | 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
 | v0.0.4 | 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
 

@@ -375,11 +375,15 @@ pip install sirchmunk[mcp]
 
 # Initialize (generates .env and mcp_config.json)
 sirchmunk init
+# Optional: use a custom work path
+# sirchmunk init --work-path /path/to/your_work_path
 
 # Edit ~/.sirchmunk/.env with your LLM API key
 
 # Test with MCP Inspector
 npx @modelcontextprotocol/inspector sirchmunk mcp serve
+# Optional: use a custom work path for this MCP run
+# npx @modelcontextprotocol/inspector sirchmunk mcp serve --work-path /path/to/your_work_path
 ```
 
 ### `mcp_config.json` Configuration
@@ -395,7 +399,8 @@ After running `sirchmunk init`, a `~/.sirchmunk/mcp_config.json` file is generat
       "command": "sirchmunk",
       "args": ["mcp", "serve"],
       "env": {
-        "SIRCHMUNK_SEARCH_PATHS": "/path/to/your_docs,/another/path"
+        "SIRCHMUNK_SEARCH_PATHS": "",
+        "SIRCHMUNK_WORK_PATH": "/path/to/your_work_path"
       }
     }
   }
@@ -407,9 +412,11 @@ After running `sirchmunk init`, a `~/.sirchmunk/mcp_config.json` file is generat
 | `command` | The command to start the MCP server. Use full path (e.g. `/path/to/venv/bin/sirchmunk`) if running in a virtual environment. |
 | `args` | Command arguments. `["mcp", "serve"]` starts the MCP server in stdio mode. |
 | `env.SIRCHMUNK_SEARCH_PATHS` | Default document search directories (comma-separated). Supports both English `,` and Chinese `，` as delimiters. When set, these paths are used as default if no `paths` parameter is provided during tool invocation. |
+| `env.SIRCHMUNK_WORK_PATH` | Sets the Sirchmunk working directory used by MCP server (`.env`, cache, knowledge, history). Recommended for persistent MCP clients. |
 
 > **Tip**: MCP Inspector is a great way to test the integration before connecting to your AI assistant.
 > In MCP Inspector: **Connect** → **Tools** → **List Tools** → `sirchmunk_search` → Input parameters (`query` and `paths`, e.g. `["/path/to/your_docs"]`) → **Run Tool**.
+> You can override the working directory temporarily with `sirchmunk mcp serve --work-path /path/to/your_work_path`.
 
 ### Features
 
@@ -485,12 +492,12 @@ Pre-built Docker images are available on Alibaba Cloud Container Registry:
 
 | Region | Image                                                                                                   |
 |---|---------------------------------------------------------------------------------------------------------|
-| US West | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3`  |
-| China Beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3` |
+| US West | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.7`  |
+| China Beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.7` |
 
 ```bash
 # Pull the image
-docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3
+docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.7
 
 # Start the service
 docker run -d \
@@ -509,7 +516,7 @@ docker run -d \
   -e SIRCHMUNK_SEARCH_PATHS=/mnt/docs \
   -v /path/to/your_work_path:/data/sirchmunk \
   -v /path/to/your/docs:/mnt/docs:ro \
-  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3
+  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.7
   
 # Stop and remove the service
 docker stop sirchmunk && docker rm sirchmunk
@@ -521,6 +528,8 @@ docker stop sirchmunk && docker rm sirchmunk
 
 | Version | Region | Image |
 |---|---|---|
+| v0.0.6post3 | US West | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3` |
+| v0.0.6post3 | China Beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3` |
 | v0.0.4 | US West | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
 | v0.0.4 | China Beijing | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
 

@@ -390,19 +390,22 @@ def _run_base_init(work_path: Path) -> int:
     # Generate MCP client config example
     mcp_config_file = work_path / "mcp_config.json"
     if not mcp_config_file.exists():
-        mcp_config_content = """\
-{
-  "mcpServers": {
-    "sirchmunk": {
-      "command": "sirchmunk",
-      "args": ["mcp", "serve"],
-      "env": {
-        "SIRCHMUNK_SEARCH_PATHS": ""
-      }
-    }
-  }
-}
-"""
+        mcp_config_content = json.dumps(
+            {
+                "mcpServers": {
+                    "sirchmunk": {
+                        "command": "sirchmunk",
+                        "args": ["mcp", "serve"],
+                        "env": {
+                            "SIRCHMUNK_SEARCH_PATHS": "",
+                            "SIRCHMUNK_WORK_PATH": str(work_path),
+                        },
+                    }
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
         mcp_config_file.write_text(mcp_config_content)
         print(f"  ✓ Generated MCP client config: {mcp_config_file}")
     else:
@@ -424,7 +427,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         Exit code (0 for success, non-zero for failure)
     """
     try:
-        work_path = Path(args.work_path).expanduser().resolve()
+        work_path = Path(
+            getattr(args, "work_path", None) or str(_get_default_work_path())
+        ).expanduser().resolve()
 
         print("=" * 60)
         print("  Sirchmunk Initialization")
@@ -1084,7 +1089,6 @@ def _setup_stdio_safe_environment():
     Any non-JSON output to stdout will break the protocol.
     """
     os.environ["MODELSCOPE_LOG_LEVEL"] = str(logging.ERROR)
-    os.environ["MODELSCOPE_CACHE"] = os.path.expanduser("~/.sirchmunk/.cache/models")
     os.environ["TRANSFORMERS_VERBOSITY"] = "error"
     os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -1103,6 +1107,15 @@ def cmd_mcp_serve(args: argparse.Namespace) -> int:
         Exit code
     """
     try:
+        # Resolve work path from --work-path or default
+        work_path = Path(
+            getattr(args, "work_path", None) or str(_get_default_work_path())
+        ).expanduser().resolve()
+        os.environ["SIRCHMUNK_WORK_PATH"] = str(work_path)
+        # Keep model cache path consistent with the selected work path
+        # for both stdio and HTTP transports.
+        os.environ["MODELSCOPE_CACHE"] = str(work_path / ".cache" / "models")
+
         # Override transport from command-line if specified
         if args.transport:
             os.environ["MCP_TRANSPORT"] = args.transport
@@ -1122,7 +1135,6 @@ def cmd_mcp_serve(args: argparse.Namespace) -> int:
             _setup_stdio_safe_environment()
 
         # Load .env before importing config (so env vars are available)
-        work_path = _get_default_work_path().expanduser().resolve()
         env_file = work_path / ".env"
         if env_file.exists():
             _load_env_file(env_file)
@@ -1584,6 +1596,12 @@ Examples:
         action="store_true",
         help="Show version and exit",
     )
+    parser.add_argument(
+        "--work-path",
+        dest="global_work_path",
+        default=None,
+        help="Global working directory (can be used before sub-commands).",
+    )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -1595,7 +1613,7 @@ Examples:
     )
     init_parser.add_argument(
         "--work-path",
-        default=str(_get_default_work_path()),
+        default=None,
         help="Working directory path (default: ~/.sirchmunk)",
     )
     init_parser.set_defaults(func=cmd_init)
@@ -1612,7 +1630,7 @@ Examples:
     serve_parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     serve_parser.add_argument(
         "--work-path",
-        default=str(_get_default_work_path()),
+        default=None,
         help="Working directory (default: ~/.sirchmunk)",
     )
     serve_parser.set_defaults(func=cmd_serve)
@@ -1719,7 +1737,7 @@ Examples:
     web_serve_parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     web_serve_parser.add_argument(
         "--work-path",
-        default=str(_get_default_work_path()),
+        default=None,
         help="Working directory (default: ~/.sirchmunk)",
     )
     web_serve_parser.set_defaults(func=cmd_web_serve)
@@ -1742,6 +1760,11 @@ Examples:
     mcp_serve_parser.add_argument("--host", help="Host for HTTP transport (default: localhost)")
     mcp_serve_parser.add_argument("--port", type=int, help="Port for HTTP transport (default: 8080)")
     mcp_serve_parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    mcp_serve_parser.add_argument(
+        "--work-path",
+        default=None,
+        help="Working directory (default: ~/.sirchmunk)",
+    )
     mcp_serve_parser.set_defaults(func=cmd_mcp_serve)
 
     # sirchmunk mcp version
@@ -1800,6 +1823,12 @@ def run_cmd():
     """Main entry point for the CLI."""
     parser = create_parser()
     args = parser.parse_args()
+
+    # Allow --work-path both before and after sub-commands.
+    # Sub-command specific --work-path still works as before.
+    if getattr(args, "global_work_path", None):
+        if getattr(args, "work_path", None) is None:
+            setattr(args, "work_path", args.global_work_path)
 
     # Handle --version flag
     if args.version:
