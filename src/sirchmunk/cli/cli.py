@@ -389,20 +389,22 @@ def _run_base_init(work_path: Path) -> int:
     # Generate MCP client config example
     mcp_config_file = work_path / "mcp_config.json"
     if not mcp_config_file.exists():
-        mcp_config_content = """\
-{
-  "mcpServers": {
-    "sirchmunk": {
-      "command": "sirchmunk",
-      "args": ["mcp", "serve"],
-      "env": {
-        "SIRCHMUNK_SEARCH_PATHS": "",
-        "SIRCHMUNK_WORK_PATH": "/path/to/your_work_path"
-      }
-    }
-  }
-}
-"""
+        mcp_config_content = json.dumps(
+            {
+                "mcpServers": {
+                    "sirchmunk": {
+                        "command": "sirchmunk",
+                        "args": ["mcp", "serve"],
+                        "env": {
+                            "SIRCHMUNK_SEARCH_PATHS": "",
+                            "SIRCHMUNK_WORK_PATH": str(work_path),
+                        },
+                    }
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
         mcp_config_file.write_text(mcp_config_content)
         print(f"  ✓ Generated MCP client config: {mcp_config_file}")
     else:
@@ -1079,14 +1081,13 @@ def _serve_dev_mode(args: argparse.Namespace, work_path: Path) -> int:
 # sirchmunk mcp serve
 # ------------------------------------------------------------------
 
-def _setup_stdio_safe_environment(work_path: Path):
+def _setup_stdio_safe_environment():
     """Configure environment for safe stdio MCP communication.
 
     In MCP stdio mode, stdout is reserved exclusively for JSON-RPC messages.
     Any non-JSON output to stdout will break the protocol.
     """
     os.environ["MODELSCOPE_LOG_LEVEL"] = str(logging.ERROR)
-    os.environ["MODELSCOPE_CACHE"] = str(work_path / ".cache" / "models")
     os.environ["TRANSFORMERS_VERBOSITY"] = "error"
     os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -1110,6 +1111,9 @@ def cmd_mcp_serve(args: argparse.Namespace) -> int:
             getattr(args, "work_path", None) or str(_get_default_work_path())
         ).expanduser().resolve()
         os.environ["SIRCHMUNK_WORK_PATH"] = str(work_path)
+        # Keep model cache path consistent with the selected work path
+        # for both stdio and HTTP transports.
+        os.environ["MODELSCOPE_CACHE"] = str(work_path / ".cache" / "models")
 
         # Override transport from command-line if specified
         if args.transport:
@@ -1127,7 +1131,7 @@ def cmd_mcp_serve(args: argparse.Namespace) -> int:
         # Set up safe environment BEFORE any sirchmunk imports for stdio mode
         if transport == "stdio":
             os.environ["MCP_TRANSPORT"] = "stdio"
-            _setup_stdio_safe_environment(work_path)
+            _setup_stdio_safe_environment()
 
         # Load .env before importing config (so env vars are available)
         env_file = work_path / ".env"
@@ -1573,7 +1577,7 @@ def run_cmd():
     # Allow --work-path both before and after sub-commands.
     # Sub-command specific --work-path still works as before.
     if getattr(args, "global_work_path", None):
-        if not hasattr(args, "work_path") or getattr(args, "work_path", None) is None:
+        if getattr(args, "work_path", None) is None:
             setattr(args, "work_path", args.global_work_path)
 
     # Handle --version flag
