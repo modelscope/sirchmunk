@@ -491,12 +491,12 @@ python scripts/stop_web.py
 
 | 区域 | 镜像                                                                                                      |
 |---|---------------------------------------------------------------------------------------------------------|
-| 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3`  |
-| 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3` |
+| 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.7`  |
+| 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.7` |
 
 ```bash
 # 拉取镜像（根据地理位置选择最近的 Registry）
-docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3
+docker pull modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.7
 
 # 启动服务
 docker run -d \
@@ -515,7 +515,7 @@ docker run -d \
   -e SIRCHMUNK_SEARCH_PATHS=/mnt/docs \
   -v /path/to/your_work_path:/data/sirchmunk \
   -v /path/to/your/docs:/mnt/docs:ro \
-  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3
+  modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.7
   
 # 停止和删除容器
 docker stop sirchmunk && docker rm sirchmunk
@@ -527,6 +527,8 @@ docker stop sirchmunk && docker rm sirchmunk
 
 | 版本 | 区域 | 镜像 |
 |---|---|---|
+| v0.0.6post3 | 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3` |
+| v0.0.6post3 | 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.6post3` |
 | v0.0.4 | 美西 | `modelscope-registry.us-west-1.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
 | v0.0.4 | 北京 | `modelscope-registry.cn-beijing.cr.aliyuncs.com/modelscope-repo/sirchmunk:ubuntu22.04-py312-0.0.4` |
 
