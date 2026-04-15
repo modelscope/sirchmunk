@@ -4,7 +4,8 @@
       "command": "sirchmunk",
       "args": ["mcp", "serve"],
       "env": {
-        "SIRCHMUNK_SEARCH_PATHS": ""
+        "SIRCHMUNK_SEARCH_PATHS": "",
+        "SIRCHMUNK_WORK_PATH": "/path/to/your_work_path"
       }
     }
   }
