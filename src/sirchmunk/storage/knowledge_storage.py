@@ -124,7 +124,7 @@ class KnowledgeStorage:
                 # Detect parquet columns to handle schema evolution
                 try:
                     pq_cols = self.db.fetch_all(
-                        f"SELECT column_name FROM parquet_schema('{self.parquet_file}')"
+                        f"SELECT name FROM parquet_schema('{self.parquet_file}')"
                     )
                     pq_col_names = {row[0] for row in pq_cols}
                 except Exception:
