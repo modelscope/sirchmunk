@@ -41,7 +41,7 @@ _DEFAULT_CONCURRENCY = 3
 _MERGE_SIMILARITY_THRESHOLD = 0.75
 
 # Max chars for manifest-persisted document summary (used in Phase 2 & catalog)
-_MANIFEST_SUMMARY_MAX_LEN = 250
+_MANIFEST_SUMMARY_MAX_LEN = 500
 
 # Preview window for direct LLM summarisation (no tree), ~4K tokens
 _SUMMARY_PREVIEW_CHARS = 16_000
@@ -49,6 +49,13 @@ _SUMMARY_PREVIEW_CHARS = 16_000
 # Multi-section sampling for large documents without a tree index
 _SUMMARY_SAMPLE_SECTIONS = 3          # Number of sections to sample for large docs
 _SUMMARY_SAMPLE_SECTION_CHARS = 5_000  # Chars per sampled section
+
+# Excel table-level adaptive sampling constants
+_XLSX_TOTAL_ROW_BUDGET = 100       # Total sampled rows budget across all sheets
+_XLSX_MIN_ROWS_PER_SHEET = 3       # Minimum sampled rows per sheet
+_XLSX_MAX_ROWS_PER_SHEET = 50      # Maximum sampled rows per sheet
+_XLSX_MAX_SHEETS = 10              # Maximum number of sheets to process
+_XLSX_MAX_COLS_DISPLAY = 20        # Maximum columns to display per sheet
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +74,7 @@ class FileManifestEntry:
     summary: str = ""  # 新增：存储编译期生成的文档摘要
     has_explicit_toc: bool = False  # Whether a native TOC was extracted from the file
     tree_node_count: int = 0  # Number of nodes in the tree index (quality metric)
+    has_xlsx_digest: bool = False  # Whether a pre-compiled Excel evidence digest exists
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -78,6 +86,7 @@ class FileManifestEntry:
             "summary": self.summary,
             "has_explicit_toc": self.has_explicit_toc,
             "tree_node_count": self.tree_node_count,
+            "has_xlsx_digest": self.has_xlsx_digest,
         }
 
     @classmethod
@@ -91,6 +100,7 @@ class FileManifestEntry:
             summary=data.get("summary", ""),
             has_explicit_toc=data.get("has_explicit_toc", False),
             tree_node_count=data.get("tree_node_count", 0),
+            has_xlsx_digest=data.get("has_xlsx_digest", False),
         )
 
 
@@ -155,6 +165,7 @@ class FileCompileResult:
     error: Optional[str] = None
     has_explicit_toc: bool = False  # Whether TOC was extracted from native structure
     tree_node_count: int = 0  # Number of nodes in the tree index
+    has_xlsx_digest: bool = False  # Whether a pre-compiled Excel evidence digest exists
 
 
 @dataclass
@@ -389,6 +400,7 @@ class KnowledgeCompiler:
                     summary=result.summary[:_MANIFEST_SUMMARY_MAX_LEN] if result.summary else "",
                     has_explicit_toc=result.has_explicit_toc,
                     tree_node_count=result.tree_node_count,
+                    has_xlsx_digest=result.has_xlsx_digest,
                 )
 
         # Phase 3: aggregate results into knowledge network
@@ -411,6 +423,9 @@ class KnowledgeCompiler:
 
         # Generate document catalog for search-time routing
         self._build_document_catalog(manifest)
+
+        # Phase: Build summary index for embedding+BM25 fallback (optional, non-blocking)
+        await self._build_summary_index(manifest)
 
         report.elapsed_seconds = time.monotonic() - t0
         await self._log.info(
@@ -556,14 +571,35 @@ class KnowledgeCompiler:
             result.tree_node_count = self._count_tree_nodes(result.tree)
 
             # Enrich content with structural metadata for non-text types
-            metadata_prefix = self._extract_structured_metadata(entry.path, content)
-            enriched_content = metadata_prefix + content if metadata_prefix else content
+            ext = Path(entry.path).suffix.lower()
+            evidence_digest = ""
+
+            if ext in (".xlsx", ".xls"):
+                # Excel: use adaptive sampling for both metadata and evidence
+                metadata_prefix, evidence_digest = self._extract_xlsx_sampling(entry.path)
+                enriched_content = metadata_prefix + content if metadata_prefix else content
+            else:
+                metadata_prefix = self._extract_structured_metadata(entry.path, content)
+                enriched_content = metadata_prefix + content if metadata_prefix else content
 
             result.summary = await self._extract_summary(
                 entry.path, enriched_content, result.tree,
             )
             result.topics = await self._extract_topics(result.summary)
             result.evidence = self._build_evidence(entry, content, result)
+
+            # Persist Excel evidence digest for search-time consumption
+            if evidence_digest.strip():
+                try:
+                    digest_dir = self._compile_dir / "xlsx_digests"
+                    digest_dir.mkdir(parents=True, exist_ok=True)
+                    file_hash = get_fast_hash(entry.path) or ""
+                    if file_hash:
+                        digest_path = digest_dir / f"{file_hash}.txt"
+                        digest_path.write_text(evidence_digest, encoding="utf-8")
+                        result.has_xlsx_digest = True
+                except Exception:
+                    pass
 
         except Exception as exc:
             result.error = str(exc)
@@ -637,38 +673,159 @@ class KnowledgeCompiler:
         ext = Path(file_path).suffix.lower()
 
         if ext == ".xlsx":
-            return KnowledgeCompiler._extract_xlsx_metadata(file_path)
+            metadata, _evidence = KnowledgeCompiler._extract_xlsx_sampling(file_path)
+            return metadata
         if ext == ".pptx":
             return KnowledgeCompiler._extract_pptx_metadata(file_path)
 
         return ""
 
     @staticmethod
-    def _extract_xlsx_metadata(file_path: str) -> str:
-        """Extract structural metadata from Excel files.
+    def _compute_xlsx_sample_rows(total_rows: int, num_sheets: int, sheet_rows: int) -> int:
+        """Compute adaptive sample row count per sheet.
 
-        Reads sheet names, row counts, and column headers (first row) to
-        provide the LLM with a structural overview of the workbook.
-        Caps at 10 sheets and 15 columns per sheet for bounded output.
+        Strategy:
+        - Divides _XLSX_TOTAL_ROW_BUDGET equally across sheets
+        - Small sheets (<=budget) are fully sampled
+        - Large sheets are capped at budget
+        - Result clamped to [_XLSX_MIN_ROWS_PER_SHEET, _XLSX_MAX_ROWS_PER_SHEET]
+        """
+        budget_per_sheet = max(1, _XLSX_TOTAL_ROW_BUDGET // max(1, num_sheets))
+        n = min(sheet_rows, budget_per_sheet)
+        return max(_XLSX_MIN_ROWS_PER_SHEET, min(_XLSX_MAX_ROWS_PER_SHEET, n))
+
+    @staticmethod
+    def _extract_xlsx_sampling(file_path: str) -> Tuple[str, str]:
+        """Extract structural metadata AND sampled content from Excel workbook.
+
+        Performs table-level intelligent sampling with adaptive row counts
+        based on workbook size and sheet complexity.
+
+        Returns:
+            (metadata_prefix, evidence_digest)
+            - metadata_prefix: injected into summary generation context
+            - evidence_digest: structured text usable directly as search evidence
         """
         try:
             import openpyxl
             wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
-            lines: List[str] = ["[Excel Workbook Structure]"]
-            for sheet_name in wb.sheetnames[:10]:  # Cap at 10 sheets
+
+            sheet_names = wb.sheetnames[:_XLSX_MAX_SHEETS]
+            num_sheets = len(sheet_names)
+
+            # Phase 1: Collect sheet statistics
+            sheet_stats: List[Dict[str, Any]] = []
+            for sheet_name in sheet_names:
                 ws = wb[sheet_name]
-                # Extract column headers (first row)
-                headers: List[str] = []
-                for cell in ws.iter_rows(min_row=1, max_row=1, values_only=True):
-                    headers = [str(h) for h in cell if h is not None]
-                    break
                 row_count = ws.max_row or 0
-                header_str = ", ".join(headers[:15]) if headers else "no headers"
-                lines.append(f"- Sheet '{sheet_name}': {row_count} rows, columns: [{header_str}]")
+                col_count = ws.max_column or 0
+                # Read headers (first row)
+                headers: List[str] = []
+                for row in ws.iter_rows(min_row=1, max_row=1, values_only=True):
+                    headers = [str(h) for h in row if h is not None]
+                    break
+                sheet_stats.append({
+                    "name": sheet_name,
+                    "rows": row_count,
+                    "cols": col_count,
+                    "headers": headers[:_XLSX_MAX_COLS_DISPLAY],
+                    "ws": ws,
+                })
+
+            # Phase 2: Calculate total rows for adaptive sampling
+            total_rows = sum(s["rows"] for s in sheet_stats)
+
+            meta_lines: List[str] = ["[Excel Workbook Structure]"]
+            evidence_lines: List[str] = []
+
+            for stat in sheet_stats:
+                ws = stat["ws"]
+                sheet_name = stat["name"]
+                row_count = stat["rows"]
+                col_count = stat["cols"]
+                headers = stat["headers"]
+                header_str = ", ".join(headers) if headers else "no headers"
+
+                # Metadata line
+                meta_lines.append(
+                    f"- Sheet '{sheet_name}': {row_count} rows, {col_count} columns, "
+                    f"headers: [{header_str}]"
+                )
+
+                # Adaptive sampling
+                sample_n = KnowledgeCompiler._compute_xlsx_sample_rows(
+                    total_rows, num_sheets, row_count
+                )
+
+                evidence_lines.append(
+                    f"[Sheet '{sheet_name}' ({row_count} rows, {col_count} columns)]"
+                )
+                evidence_lines.append(f"Columns: {header_str}")
+
+                # Sample rows
+                if row_count <= sample_n:
+                    evidence_lines.append(f"(Full content - {row_count} rows)")
+                else:
+                    evidence_lines.append(f"Sample rows (top {sample_n} of {row_count}):")
+
+                # Build table header
+                display_headers = headers[:_XLSX_MAX_COLS_DISPLAY]
+                if display_headers:
+                    evidence_lines.append("| " + " | ".join(display_headers) + " |")
+                    evidence_lines.append("|" + "|".join(["---"] * len(display_headers)) + "|")
+
+                # Read sample rows (skip header row)
+                numeric_cols: Dict[int, List[float]] = {}  # col_index -> numeric values
+                sampled = 0
+                for row in ws.iter_rows(
+                    min_row=2,
+                    max_row=min(row_count, sample_n + 1),
+                    values_only=True,
+                ):
+                    cells: List[str] = []
+                    for ci, cell_val in enumerate(row):
+                        if ci >= _XLSX_MAX_COLS_DISPLAY:
+                            break
+                        str_val = str(cell_val) if cell_val is not None else ""
+                        cells.append(str_val[:50])  # truncate long cell values
+                        # Track numeric values for statistics
+                        if isinstance(cell_val, (int, float)) and cell_val == cell_val:
+                            numeric_cols.setdefault(ci, []).append(float(cell_val))
+                    if cells:
+                        evidence_lines.append("| " + " | ".join(cells) + " |")
+                    sampled += 1
+
+                # Statistics for numeric columns
+                stat_parts: List[str] = []
+                for ci, values in numeric_cols.items():
+                    if len(values) >= 2 and ci < len(display_headers):
+                        col_name = display_headers[ci]
+                        stat_parts.append(
+                            f"{col_name} range [{min(values):.4g}-{max(values):.4g}]"
+                        )
+                if stat_parts:
+                    evidence_lines.append(f"Statistics: {', '.join(stat_parts[:5])}")
+
+                evidence_lines.append("")  # blank line between sheets
+
             wb.close()
-            return "\n".join(lines) + "\n\n"
+
+            metadata = "\n".join(meta_lines) + "\n\n"
+            evidence = "\n".join(evidence_lines)
+            return metadata, evidence
+
         except Exception:
-            return ""
+            return "", ""
+
+    @staticmethod
+    def _extract_xlsx_metadata(file_path: str) -> str:
+        """Extract structural metadata from Excel files (legacy wrapper).
+
+        Delegates to _extract_xlsx_sampling and returns only the metadata prefix
+        for backward compatibility.
+        """
+        metadata, _evidence = KnowledgeCompiler._extract_xlsx_sampling(file_path)
+        return metadata
 
     @staticmethod
     def _extract_pptx_metadata(file_path: str) -> str:
@@ -982,6 +1139,76 @@ class KnowledgeCompiler:
             return 1 + sum(_count(c) for c in node.children)
 
         return _count(tree.root)
+
+    # ------------------------------------------------------------------ #
+    #  Summary index for embedding + BM25 fallback                        #
+    # ------------------------------------------------------------------ #
+
+    async def _build_summary_index(self, manifest: CompileManifest) -> None:
+        """Build summary embedding + BM25 index for fallback search.
+
+        Creates a lightweight index mapping each compiled file to:
+        - Its summary text
+        - Pre-computed embedding vector (384-dim, if EmbeddingUtil available)
+        - Tokenized summary with term frequencies (via TokenizerUtil)
+
+        The index is saved to .cache/compile/summary_index.json and consumed
+        by search.py as a last-resort fallback when rga keyword search fails.
+
+        Skips gracefully if dependencies (EmbeddingUtil/TokenizerUtil) are unavailable.
+        """
+        try:
+            from sirchmunk.utils.tokenizer_util import TokenizerUtil
+            from sirchmunk.learnings.summary_index import CompileSummaryIndex, SummaryIndexEntry
+
+            entries: List[SummaryIndexEntry] = []
+            summaries: List[str] = []
+
+            for file_path, entry in manifest.files.items():
+                if entry.summary:
+                    entries.append(SummaryIndexEntry(
+                        file_path=file_path,
+                        summary=entry.summary,
+                    ))
+                    summaries.append(entry.summary)
+
+            if not entries:
+                return
+
+            # Tokenize summaries + compute TF (always available)
+            tokenizer = TokenizerUtil()
+            for idx, entry in enumerate(entries):
+                tokens = tokenizer.segment(entry.summary)
+                entry.tokens = tokens
+                entry.token_freqs = {}
+                for t in tokens:
+                    entry.token_freqs[t] = entry.token_freqs.get(t, 0) + 1
+
+            # Compute embeddings (optional — requires EmbeddingUtil)
+            try:
+                from sirchmunk.utils.embedding_util import EmbeddingUtil
+                embedding_util = EmbeddingUtil()
+                embedding_util.start_loading()
+                # Wait up to 60 seconds for model load
+                await embedding_util._ensure_model_async(timeout=60)
+
+                if embedding_util.is_ready():
+                    embeddings = await embedding_util.embed(summaries)
+                    for i, emb in enumerate(embeddings):
+                        entries[i].embedding = emb
+                    await self._log.info(
+                        f"Summary index: computed embeddings for {len(entries)} entries"
+                    )
+            except Exception as emb_exc:
+                await self._log.warning(
+                    f"Summary index: embedding computation skipped: {emb_exc}"
+                )
+
+            index = CompileSummaryIndex(entries)
+            index.save(self._compile_dir / "summary_index.json")
+
+        except Exception as exc:
+            await self._log.warning(f"Failed to build summary index: {exc}")
 
     # ------------------------------------------------------------------ #
     #  Manifest I/O                                                       #

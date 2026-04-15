@@ -136,6 +136,7 @@ class CompileArtifacts:
     tree_indexer: Optional[Any]  # DocumentTreeIndexer (lazy import)
     tree_available_paths: Set[str]  # file paths that have cached tree indices
     manifest_map: Dict[str, Any] = field(default_factory=dict)  # {path: FileManifestEntry}
+    summary_index: Optional[Any] = None  # CompileSummaryIndex (lazy-loaded)
 
 
 class _TreeNavCache:
@@ -1998,6 +1999,8 @@ class AgenticSearch(BaseSearch):
     """Max tree JSON files to parse during artifact detection."""
     _CATALOG_LISTING_MAX_ENTRIES = 20
     """Max catalog entries in the enriched listing for Step 1."""
+    _ENABLE_EMBEDDING_FALLBACK: bool = True
+    """Enable embedding + BM25 hybrid fallback when rga returns zero results."""
     _CATALOG_KEYWORD_MIN_LEN = 2
     """Minimum character length for a catalog keyword token."""
     _CATALOG_KEYWORD_MAX_LEN = 20
@@ -2370,6 +2373,22 @@ class AgenticSearch(BaseSearch):
                     fn = Path(fp).name
                     ext = Path(fp).suffix.lower()
                     ev = None
+
+                    # 0. Excel digest priority (pre-compiled evidence)
+                    if artifacts and artifacts.manifest_map:
+                        manifest_entry = artifacts.manifest_map.get(fp)
+                        if manifest_entry and getattr(manifest_entry, 'has_xlsx_digest', False):
+                            digest_path = (
+                                self.work_path / ".cache" / "compile" / "xlsx_digests"
+                                / f"{manifest_entry.file_hash}.txt"
+                            )
+                            if digest_path.exists():
+                                try:
+                                    digest_content = digest_path.read_text(encoding="utf-8")
+                                    if digest_content.strip():
+                                        ev = f"[{fn} - Pre-compiled Evidence]\n{digest_content}"
+                                except Exception:
+                                    pass
 
                     # 1. Tree-guided sampling FIRST for tree-indexed files
                     if (
@@ -2857,6 +2876,53 @@ class AgenticSearch(BaseSearch):
                 await self._logger.warning(
                     f"[FAST] filename search failed: {exc}"
                 )
+
+        # Layer 4: Embedding + BM25 hybrid fallback
+        # Triggered ONLY when layers 1-3 all return empty results
+        if (not all_raw
+                and self._ENABLE_EMBEDDING_FALLBACK
+                and artifacts is not None
+                and artifacts.summary_index is not None):
+            try:
+                query_emb = None
+                query_tokens: List[str] = []
+
+                # Compute query embedding (if embedding client available)
+                if (self.embedding_client
+                        and self.embedding_client.is_ready()
+                        and artifacts.summary_index.has_embeddings):
+                    query_emb = (await self.embedding_client.embed([query]))[0]
+
+                # Tokenize query for BM25
+                from sirchmunk.utils.tokenizer_util import TokenizerUtil
+                _tokenizer = TokenizerUtil()
+                query_tokens = _tokenizer.segment(query)
+
+                if query_emb is not None or query_tokens:
+                    results = artifacts.summary_index.search(
+                        query_embedding=query_emb,
+                        query_tokens=query_tokens,
+                        top_k=top_k or 3,
+                    )
+
+                    for file_path, score in results:
+                        if Path(file_path).exists():
+                            all_raw.append({
+                                "path": file_path,
+                                "matches": [],
+                                "weighted_score": score * self._WIKI_MAX_SCORE,
+                            })
+
+                    if all_raw:
+                        await self._logger.info(
+                            f"[FAST] Embedding+BM25 fallback found {len(all_raw)} candidates"
+                        )
+            except Exception as exc:
+                await self._logger.warning(
+                    f"[FAST] Embedding+BM25 fallback failed: {exc}"
+                )
+
+        if not all_raw:
             return None
 
         merged = GrepRetriever.merge_results(all_raw, limit=20)
@@ -3134,12 +3200,23 @@ class AgenticSearch(BaseSearch):
             # Cache for future calls within this instance
             self._tree_paths_cache = tree_paths
 
+        # Load summary index for embedding fallback (optional)
+        summary_index = None
+        summary_index_path = self.work_path / ".cache" / "compile" / "summary_index.json"
+        if summary_index_path.exists():
+            try:
+                from sirchmunk.learnings.summary_index import CompileSummaryIndex
+                summary_index = CompileSummaryIndex.load(summary_index_path)
+            except Exception:
+                pass
+
         return CompileArtifacts(
             catalog=catalog,
             catalog_map=catalog_map,
             tree_indexer=indexer,
             tree_available_paths=tree_paths,
             manifest_map=manifest_map,
+            summary_index=summary_index,
         )
 
     def _build_tree_root_hints(self, artifacts: CompileArtifacts) -> str:
