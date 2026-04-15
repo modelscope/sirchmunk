@@ -19,7 +19,18 @@ from sirchmunk.utils import LogCallback, create_logger
 from sirchmunk.utils.file_utils import get_fast_hash
 
 # File-size threshold: skip tree indexing for small files
-_TREE_MIN_CHARS = 50_000  # 50 K characters
+_TREE_MIN_CHARS = 20_000  # 20 K characters (lowered from 50K for broader coverage)
+
+# Adaptive depth thresholds: (min_chars, max_depth) — evaluated top-down;
+# **must** be sorted by min_chars descending so the first match wins.
+_TREE_ADAPTIVE_DEPTH_THRESHOLDS: tuple = (
+    (100_000, 4),
+    (50_000, 3),
+    (20_000, 2),
+)
+
+# Summary snippet length extracted from section content (chars)
+_TOC_NODE_SUMMARY_MAX_CHARS = 300
 
 # Adaptive preview window for LLM structure analysis
 _TREE_PREVIEW_MIN = 12_000    # Minimum preview window (chars)
@@ -153,8 +164,13 @@ class DocumentTreeIndexer:
         max_depth: int = 4,
         force_rebuild: bool = False,
         total_pages: Optional[int] = None,
+        toc_entries: Optional[List[Any]] = None,
     ) -> Optional[DocumentTree]:
         """Build a tree index for a document.
+
+        When *toc_entries* are provided (from TOCExtractor), uses the
+        TOC-accelerated path that skips recursive LLM analysis and builds
+        the tree directly from extracted headings.
 
         Returns None when the document is too small or unstructured.
         """
@@ -175,12 +191,34 @@ class DocumentTreeIndexer:
         if ext not in _TREE_EXTENSIONS:
             return None
 
+        # Use adaptive depth based on document length
+        effective_depth = self._compute_adaptive_depth(len(content))
+
         await self._log.info(
             f"[TreeIndexer] Building tree for {Path(file_path).name} "
-            f"({len(content)} chars, depth={max_depth})"
+            f"({len(content)} chars, depth={effective_depth})"
         )
 
-        root = await self._build_node(content, level=0, max_depth=max_depth)
+        # TOC-accelerated path: skip recursive LLM analysis
+        if toc_entries:
+            root = await self._build_tree_from_toc(toc_entries, content)
+            if root is not None:
+                tree = DocumentTree(
+                    file_path=file_path,
+                    file_hash=file_hash,
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                    total_chars=len(content),
+                    total_pages=total_pages,
+                    root=root,
+                )
+                self._save_cache(file_hash, tree)
+                await self._log.info(
+                    f"[TreeIndexer] Built tree from TOC: {self._count_nodes(root)} nodes"
+                )
+                return tree
+
+        # Fallback: existing recursive LLM path (with adaptive depth)
+        root = await self._build_node(content, level=0, max_depth=effective_depth)
         if root is None:
             return None
 
@@ -257,6 +295,116 @@ class DocumentTreeIndexer:
     # ------------------------------------------------------------------ #
     #  Internals                                                          #
     # ------------------------------------------------------------------ #
+
+    async def _build_tree_from_toc(
+        self,
+        toc_entries: List[Any],
+        content: str,
+    ) -> Optional[TreeNode]:
+        """Build tree directly from extracted TOC entries, avoiding recursive LLM.
+
+        Each TOCEntry becomes a TreeNode with char_range from the entry positions.
+        Only the root summary requires an LLM call (_synthesize_root_summary).
+
+        Args:
+            toc_entries: List of TOCEntry from toc_extractor.
+            content: Full extracted text of the document.
+
+        Returns:
+            Root TreeNode, or None if no children could be created.
+        """
+        seen_ids: set = set()
+        children = self._toc_entries_to_nodes(
+            toc_entries, content, len(content), seen_ids, fallback_level=1,
+        )
+
+        if not children:
+            return None
+
+        root_summary = await self._synthesize_root_summary(children)
+        return TreeNode(
+            node_id=self._unique_node_id(0, seen_ids),
+            title="Document",
+            summary=root_summary,
+            char_range=(0, len(content)),
+            level=0,
+            children=children,
+        )
+
+    @staticmethod
+    def _toc_entries_to_nodes(
+        entries: List[Any],
+        content: str,
+        parent_end: int,
+        seen_ids: set,
+        fallback_level: int,
+    ) -> List["TreeNode"]:
+        """Recursively convert TOCEntry trees into TreeNode trees.
+
+        Handles arbitrary nesting depth and guards against invalid
+        char_start / char_end values.
+        """
+        nodes: List[TreeNode] = []
+        content_len = len(content)
+        for entry in entries:
+            start = max(0, min(entry.char_start, content_len))
+            end = entry.char_end if entry.char_end and entry.char_end > start else parent_end
+            end = min(end, content_len)
+
+            section_text = content[start:min(start + _TOC_NODE_SUMMARY_MAX_CHARS, end)]
+            nid = DocumentTreeIndexer._unique_node_id(start, seen_ids)
+            level = entry.level if entry.level > 0 else fallback_level
+
+            child_nodes: List[TreeNode] = []
+            if entry.children:
+                child_nodes = DocumentTreeIndexer._toc_entries_to_nodes(
+                    entry.children, content, end, seen_ids,
+                    fallback_level=level + 1,
+                )
+
+            node = TreeNode(
+                node_id=nid,
+                title=entry.title,
+                summary=section_text.strip(),
+                char_range=(start, end),
+                level=level,
+                children=child_nodes,
+            )
+            nodes.append(node)
+        return nodes
+
+    @staticmethod
+    def _unique_node_id(start: int, seen_ids: set) -> str:
+        """Generate a unique node_id based on char offset, appending a
+        disambiguator when collisions occur."""
+        base = f"N{start:06d}"
+        if base not in seen_ids:
+            seen_ids.add(base)
+            return base
+        suffix = 1
+        while f"{base}_{suffix}" in seen_ids:
+            suffix += 1
+        nid = f"{base}_{suffix}"
+        seen_ids.add(nid)
+        return nid
+
+    @staticmethod
+    def _compute_adaptive_depth(content_length: int) -> int:
+        """Compute max tree depth based on document length.
+
+        Longer documents get deeper trees for finer-grained navigation.
+        Uses _TREE_ADAPTIVE_DEPTH_THRESHOLDS for threshold-based selection.
+
+        Args:
+            content_length: Character count of the document.
+
+        Returns:
+            Maximum tree depth (2-4).
+        """
+        for threshold, depth in _TREE_ADAPTIVE_DEPTH_THRESHOLDS:
+            if content_length >= threshold:
+                return depth
+        return 2  # minimum depth
 
     async def _build_node(
         self, text: str, level: int, max_depth: int,

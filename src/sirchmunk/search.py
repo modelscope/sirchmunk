@@ -138,6 +138,38 @@ class CompileArtifacts:
     manifest_map: Dict[str, Any] = field(default_factory=dict)  # {path: FileManifestEntry}
 
 
+class _TreeNavCache:
+    """Per-search-session cache for tree navigation results.
+
+    Avoids duplicate LLM navigation calls for the same file+query pair.
+    Created at the start of each ``_search_fast()`` invocation and reset
+    per search session.
+    """
+
+    __slots__ = ("_store",)
+
+    def __init__(self) -> None:
+        self._store: Dict[str, Optional[List[Any]]] = {}
+
+    @staticmethod
+    def _key(file_path: str, query: str) -> str:
+        import hashlib
+        return hashlib.md5(f"{file_path}:{query}".encode()).hexdigest()
+
+    def get(self, file_path: str, query: str) -> Optional[List[Any]]:
+        """Retrieve cached navigation leaves for a file+query pair."""
+        key = self._key(file_path, query)
+        return self._store.get(key)
+
+    def has(self, file_path: str, query: str) -> bool:
+        """Check whether a cached result exists."""
+        return self._key(file_path, query) in self._store
+
+    def put(self, file_path: str, query: str, leaves: Optional[List[Any]]) -> None:
+        """Store navigation leaves for a file+query pair."""
+        self._store[self._key(file_path, query)] = leaves
+
+
 class AgenticSearch(BaseSearch):
 
     def __init__(
@@ -1518,6 +1550,29 @@ class AgenticSearch(BaseSearch):
             f"dir_scan_files={len(dir_scan_files)}"
         )
 
+        # --- Phase 2.5: Parallel tree pre-navigation for top tree hits ---
+        _pre_nav_evidence: Dict[str, str] = {}
+        if tree_hits:
+            _nav_fps = [fp for fp in tree_hits[:self._DEEP_PRE_NAV_MAX_FILES]]
+            if _nav_fps:
+                _nav_results = await asyncio.gather(
+                    *[self._tree_guided_sample(
+                        fp, query, max_chars=self._FAST_MAX_EVIDENCE_CHARS,
+                    ) for fp in _nav_fps],
+                    return_exceptions=True,
+                )
+                for fp, nav_res in zip(_nav_fps, _nav_results):
+                    if isinstance(nav_res, Exception):
+                        await self._logger.warning(
+                            f"[Phase 2.5] Tree pre-nav failed for {Path(fp).name}: {nav_res}"
+                        )
+                    elif isinstance(nav_res, str) and nav_res:
+                        _pre_nav_evidence[fp] = nav_res
+                if _pre_nav_evidence:
+                    await self._logger.info(
+                        f"[Phase 2.5] Pre-navigated {len(_pre_nav_evidence)} tree files"
+                    )
+
         # ==============================================================
         # Phase 3: Merge file paths + build KnowledgeCluster
         # P1 tree hits get highest priority; P2 soft-hit files next
@@ -1547,6 +1602,17 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         graph_ctx = ""
         if cluster:
+            # Merge pre-navigated tree evidence into cluster content
+            if _pre_nav_evidence and cluster.content:
+                pre_nav_parts = []
+                for fp, ev in _pre_nav_evidence.items():
+                    pre_nav_parts.append(f"[Tree evidence: {Path(fp).name}]\n{ev}")
+                if pre_nav_parts:
+                    pre_nav_ctx = "\n\n".join(pre_nav_parts)
+                    if isinstance(cluster.content, list):
+                        cluster.content = "\n".join(cluster.content)
+                    cluster.content = f"{cluster.content}\n\n{pre_nav_ctx}"
+
             graph_ctx = await self._gather_graph_context(cluster)
             if graph_ctx and cluster.content:
                 if isinstance(cluster.content, list):
@@ -1946,6 +2012,10 @@ class AgenticSearch(BaseSearch):
     """Max chars per tree section."""
     _TREE_SAMPLE_RGA_SUPPLEMENT = True
     """Whether to append rga evidence after tree sections as supplementary context."""
+    _TREE_ROOT_HINTS_MAX_FILES = 10
+    """Maximum number of tree roots to include in FAST Step 1 hints."""
+    _DEEP_PRE_NAV_MAX_FILES = 3
+    """Maximum number of tree files to pre-navigate in DEEP Phase 2.5."""
 
     _LLM_FALLBACK_EVIDENCE = (
         "[No relevant documents found]\n\n"
@@ -1982,6 +2052,9 @@ class AgenticSearch(BaseSearch):
         context = SearchContext()
         await self._logger.info(f"[FAST] Starting greedy search for: '{query[:80]}'")
 
+        # Reset per-session tree navigation cache
+        self._tree_nav_cache = _TreeNavCache()
+
         # --- Adaptive compile artifact detection (one-shot, zero LLM) ---
         artifacts = self._detect_compile_artifacts()
         if artifacts.catalog or artifacts.tree_available_paths:
@@ -2013,6 +2086,11 @@ class AgenticSearch(BaseSearch):
         catalog_routed_files: List[str] = []
         catalog_confidence: str = "low"
 
+        # Build tree root hints for enhanced query analysis
+        tree_hints = ""
+        if artifacts and artifacts.tree_available_paths:
+            tree_hints = self._build_tree_root_hints(artifacts)
+
         if catalog:
             listing = self._build_enriched_catalog_listing(catalog)
             prompt = FAST_QUERY_ANALYSIS_WITH_CATALOG.format(
@@ -2020,6 +2098,10 @@ class AgenticSearch(BaseSearch):
             )
         else:
             prompt = FAST_QUERY_ANALYSIS.format(user_input=query)
+
+        # Append tree structure hints to the prompt when available
+        if tree_hints:
+            prompt = prompt + tree_hints
 
         resp = await self.llm.achat(
             messages=[{"role": "user", "content": prompt}],
@@ -3059,6 +3141,35 @@ class AgenticSearch(BaseSearch):
             tree_available_paths=tree_paths,
             manifest_map=manifest_map,
         )
+
+    def _build_tree_root_hints(self, artifacts: CompileArtifacts) -> str:
+        """Build tree root summary hints for FAST Step 1 query analysis.
+
+        Loads root summaries from cached trees and formats them as context
+        for the LLM to understand document-level structure.
+
+        Args:
+            artifacts: Compile artifact context with tree metadata.
+
+        Returns:
+            Formatted hint string, or empty string when no trees are available.
+        """
+        if not artifacts.tree_available_paths:
+            return ""
+        indexer = artifacts.tree_indexer
+        if indexer is None:
+            return ""
+        hints: List[str] = []
+        for i, fp in enumerate(sorted(artifacts.tree_available_paths)):
+            if i >= self._TREE_ROOT_HINTS_MAX_FILES:
+                break
+            tree = indexer.load_tree(fp)
+            if tree and tree.root and tree.root.summary:
+                name = Path(fp).name
+                hints.append(f"[{i}] {name}: {tree.root.summary[:150]}")
+        if not hints:
+            return ""
+        return "\nDocument structure hints:\n" + "\n".join(hints) + "\n"
 
     @staticmethod
     def _tokenize_for_matching(text: str) -> Set[str]:

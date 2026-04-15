@@ -65,6 +65,8 @@ class FileManifestEntry:
     cluster_ids: List[str]
     size_bytes: int
     summary: str = ""  # 新增：存储编译期生成的文档摘要
+    has_explicit_toc: bool = False  # Whether a native TOC was extracted from the file
+    tree_node_count: int = 0  # Number of nodes in the tree index (quality metric)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -74,6 +76,8 @@ class FileManifestEntry:
             "cluster_ids": self.cluster_ids,
             "size_bytes": self.size_bytes,
             "summary": self.summary,
+            "has_explicit_toc": self.has_explicit_toc,
+            "tree_node_count": self.tree_node_count,
         }
 
     @classmethod
@@ -85,6 +89,8 @@ class FileManifestEntry:
             cluster_ids=data.get("cluster_ids", []),
             size_bytes=data.get("size_bytes", 0),
             summary=data.get("summary", ""),
+            has_explicit_toc=data.get("has_explicit_toc", False),
+            tree_node_count=data.get("tree_node_count", 0),
         )
 
 
@@ -147,6 +153,8 @@ class FileCompileResult:
     evidence: Optional[EvidenceUnit] = None
     cluster_ids: List[str] = field(default_factory=list)
     error: Optional[str] = None
+    has_explicit_toc: bool = False  # Whether TOC was extracted from native structure
+    tree_node_count: int = 0  # Number of nodes in the tree index
 
 
 @dataclass
@@ -379,6 +387,8 @@ class KnowledgeCompiler:
                     cluster_ids=result.cluster_ids,
                     size_bytes=Path(result.path).stat().st_size if Path(result.path).exists() else 0,
                     summary=result.summary[:_MANIFEST_SUMMARY_MAX_LEN] if result.summary else "",
+                    has_explicit_toc=result.has_explicit_toc,
+                    tree_node_count=result.tree_node_count,
                 )
 
         # Phase 3: aggregate results into knowledge network
@@ -525,10 +535,25 @@ class KnowledgeCompiler:
                 and DocumentTreeIndexer.should_build_tree(entry.path, len(content))
             )
 
+            # Phase 0.5: TOC extraction (zero LLM calls)
+            toc_entries = None
+            if use_tree:
+                from sirchmunk.learnings.toc_extractor import TOCExtractor
+                toc_entries = TOCExtractor.extract(entry.path, content)
+                if toc_entries:
+                    await self._log.info(
+                        f"[Compile] Extracted TOC with {len(toc_entries)} entries "
+                        f"for {Path(entry.path).name}"
+                    )
+
             if use_tree:
                 result.tree = await self._tree_indexer.build_tree(
-                    entry.path, content,
+                    entry.path, content, toc_entries=toc_entries,
                 )
+
+            # Record TOC / tree metrics on the result for manifest persistence
+            result.has_explicit_toc = toc_entries is not None and len(toc_entries) > 0
+            result.tree_node_count = self._count_tree_nodes(result.tree)
 
             # Enrich content with structural metadata for non-text types
             metadata_prefix = self._extract_structured_metadata(entry.path, content)
@@ -939,6 +964,24 @@ class KnowledgeCompiler:
         cluster.related_clusters.append(
             WeakSemanticEdge(target_cluster_id=target_id, weight=weight, source=source)
         )
+
+    @staticmethod
+    def _count_tree_nodes(tree: Optional[DocumentTree]) -> int:
+        """Count total nodes in a DocumentTree (recursive).
+
+        Args:
+            tree: The tree to count, or None.
+
+        Returns:
+            Total node count, or 0 if tree is None.
+        """
+        if tree is None or tree.root is None:
+            return 0
+
+        def _count(node: Any) -> int:
+            return 1 + sum(_count(c) for c in node.children)
+
+        return _count(tree.root)
 
     # ------------------------------------------------------------------ #
     #  Manifest I/O                                                       #
