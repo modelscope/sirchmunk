@@ -111,6 +111,7 @@ async def run_single(
     llm: Any,
     cfg: FinanceBenchConfig,
     semaphore: asyncio.Semaphore,
+    judge: Any = None,
 ) -> Dict[str, Any]:
     """Execute one FinanceBench question end-to-end."""
     fb_id = entry.get("financebench_id", "")
@@ -188,6 +189,25 @@ async def run_single(
     else:
         ev_recall = None  # mark as unavailable, avoid false 0
 
+    # LLM Judge — independent evaluation dimension
+    # Skip judge for refusals (no point calling LLM on non-answers)
+    llm_judge_correct = None
+    llm_judge_reasoning = None
+    if judge is not None and classification != "refusal":
+        try:
+            judge_result = await judge.judge(
+                prediction=answer,
+                gold_answer=gold,
+                question=question,
+            )
+            llm_judge_correct = judge_result.get("equivalent", False)
+            llm_judge_reasoning = judge_result.get("reasoning", "")
+        except Exception as e:
+            logger.warning("LLM Judge failed for %s: %s", fb_id, e)
+    elif judge is not None and classification == "refusal":
+        llm_judge_correct = False
+        llm_judge_reasoning = "Skipped: prediction classified as refusal"
+
     return {
         "financebench_id": fb_id,
         "question": question,
@@ -204,6 +224,8 @@ async def run_single(
         "em": em,
         "f1": round(f1, 4),
         "evidence_recall": round(ev_recall, 4) if ev_recall is not None else None,
+        "llm_judge_correct": llm_judge_correct,  # None if judge disabled
+        "llm_judge_reasoning": llm_judge_reasoning,
         "error": error,
     }
 
@@ -230,6 +252,13 @@ async def run_batch(
     loader = FinanceBenchLoader(data_dir=cfg.data_dir, pdf_dir=cfg.pdf_dir)
     semaphore = asyncio.Semaphore(cfg.max_concurrent)
 
+    # Initialise LLM Judge (uses the same test model)
+    judge = None
+    if cfg.enable_llm_judge:
+        from judge import FinanceBenchLLMJudge
+        judge = FinanceBenchLLMJudge(llm=llm)
+        logger.info("LLM Judge enabled (independent evaluation dimension)")
+
     # Prepare output directory / file
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -242,14 +271,17 @@ async def run_batch(
 
     async def _run_and_record(entry: Dict[str, Any]) -> Dict[str, Any]:
         nonlocal completed
-        res = await run_single(entry, loader, searcher, llm, cfg, semaphore)
+        res = await run_single(entry, loader, searcher, llm, cfg, semaphore, judge=judge)
         # Incremental save
         with open(out_path, "a", encoding="utf-8") as fp:
             fp.write(json_mod.dumps(res, ensure_ascii=False) + "\n")
         completed += 1
         status = res["classification"]
+        judge_tag = ""
+        if res.get("llm_judge_correct") is not None:
+            judge_tag = " [judge:\u2713]" if res["llm_judge_correct"] else " [judge:\u2717]"
         logger.info(
-            "[%d/%d] %s  %s  EM=%s  F1=%.2f  %.1fs",
+            "[%d/%d] %s  %s  EM=%s  F1=%.2f  %.1fs%s",
             completed,
             total,
             res["financebench_id"],
@@ -257,6 +289,7 @@ async def run_batch(
             res["em"],
             res["f1"],
             res["elapsed"],
+            judge_tag,
         )
         return res
 

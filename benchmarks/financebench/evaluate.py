@@ -34,6 +34,26 @@ _REFUSAL_PHRASES: list[str] = [
     "no relevant information",
     "data not found",
     "unknown",
+    "i'm not able to",
+    "i am not able to",
+    "the document does not contain",
+    "the document doesn't contain",
+    "this information is not disclosed",
+    "not disclosed",
+    "could not find",
+    "couldn't find",
+    "no mention of",
+    "no information about",
+    "not provided in",
+    "not found in the document",
+    "i was unable to",
+    "unable to determine",
+    "unable to find",
+    "unable to locate",
+    "there is no data",
+    "no data available",
+    "not available in",
+    "not specified",
 ]
 
 _F1_CORRECT_THRESHOLD: float = 0.8
@@ -99,8 +119,20 @@ def _normalize_financial_value(text: str) -> str:
     - ``15.3%``     → ``15.3%``
     - ``$1577``     → ``1577``
     - ``1,577``     → ``1577``
+    - ``($500)``    → ``-500``
+    - ``-$500``     → ``-500``
     """
     s = text.strip()
+
+    # Handle accounting bracket notation for negatives: ($500) → -$500
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1]
+
+    # Handle negative sign: remember it, strip it for processing
+    negative = False
+    if s.startswith("-"):
+        negative = True
+        s = s[1:]
 
     # Detect if value looks numeric (possibly with $ / % / commas)
     stripped_for_check = _RE_DOLLAR.sub("", s)
@@ -108,7 +140,8 @@ def _normalize_financial_value(text: str) -> str:
     try:
         float(stripped_for_check)
     except ValueError:
-        return s  # Not a numeric value – return as-is
+        # Not a numeric value – restore negative sign and return as-is
+        return ("-" + s) if negative else s
 
     # Remove dollar sign
     s = _RE_DOLLAR.sub("", s)
@@ -128,6 +161,10 @@ def _normalize_financial_value(text: str) -> str:
     # Re-attach percentage
     if has_pct:
         s = s + "%"
+
+    # Re-attach negative sign
+    if negative and not s.startswith("-"):
+        s = "-" + s
 
     return s
 
@@ -289,6 +326,18 @@ def compute_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     if avg_ev_recall is not None:
         overall["evidence_recall"] = round(avg_ev_recall, 4)
 
+    # --- LLM Judge metrics (independent dimension, NOT fallback) ---
+    judge_results = [r for r in results if r.get("llm_judge_correct") is not None]
+    if judge_results:
+        judge_correct = sum(1 for r in judge_results if r["llm_judge_correct"])
+        overall["llm_judge_accuracy"] = round(judge_correct / len(judge_results) * 100, 2)
+        overall["llm_judge_count"] = len(judge_results)
+        overall["llm_judge_correct"] = judge_correct
+    else:
+        overall["llm_judge_accuracy"] = None
+        overall["llm_judge_count"] = 0
+        overall["llm_judge_correct"] = 0
+
     # --- Breakdowns ---
     overall["by_question_type"] = _breakdown(results, "question_type")
     overall["by_question_reasoning"] = _breakdown(results, "question_reasoning")
@@ -311,7 +360,7 @@ def _breakdown(results: List[Dict[str, Any]], key: str) -> Dict[str, Dict[str, A
             1 for r in items if r.get("classification") == "hallucination"
         )
         g_refusal = sum(1 for r in items if r.get("classification") == "refusal")
-        out[group] = {
+        group_dict: dict[str, Any] = {
             "n": g_n,
             "accuracy": round(g_correct / g_n * 100, 2) if g_n else 0.0,
             "hallucination_rate": round(g_halluc / g_n * 100, 2) if g_n else 0.0,
@@ -320,4 +369,11 @@ def _breakdown(results: List[Dict[str, Any]], key: str) -> Dict[str, Dict[str, A
             "hallucination": g_halluc,
             "refusal": g_refusal,
         }
+        # LLM Judge breakdown
+        g_judge = [r for r in items if r.get("llm_judge_correct") is not None]
+        if g_judge:
+            g_jc = sum(1 for r in g_judge if r["llm_judge_correct"])
+            group_dict["llm_judge_accuracy"] = round(g_jc / len(g_judge) * 100, 2)
+            group_dict["llm_judge_count"] = len(g_judge)
+        out[group] = group_dict
     return out

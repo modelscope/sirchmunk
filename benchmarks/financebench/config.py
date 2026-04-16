@@ -33,8 +33,9 @@ class FinanceBenchConfig:
 
     # Evaluation
     eval_mode: str = "singleDoc"  # singleDoc / sharedCorpus
-    enable_llm_judge: bool = True  # TODO: LLM Judge not yet implemented, reserved for future use
+    enable_llm_judge: bool = True  # Use LLM to judge semantic equivalence (independent metric)
     extract_answer: bool = True
+    judge_f1_threshold: float = 0.8  # F1 threshold for 'correct' classification
 
     # Concurrency
     max_concurrent: int = 3

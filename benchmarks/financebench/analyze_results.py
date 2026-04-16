@@ -69,16 +69,34 @@ def print_breakdown(title: str, breakdown: Dict[str, Dict[str, Any]]) -> None:
         breakdown: ``{group_name: {accuracy, hallucination_rate, ...}}``.
     """
     print(f"\n=== Breakdown by {title} ===\n")
-    header = f"  {'Group':<30} {'Acc%':>6} {'Hallu%':>7} {'Refuse%':>8} {'N':>4}"
-    print(header)
-    print("  " + "-" * (len(header) - 2))
 
-    for group, m in sorted(breakdown.items(), key=lambda kv: -kv[1].get("accuracy", 0)):
-        acc = m.get("accuracy", 0)
-        hal = m.get("hallucination_rate", 0)
-        ref = m.get("refusal_rate", 0)
-        n = m.get("n", 0)
-        print(f"  {group:<30} {acc:>5.1f} {hal:>7.1f} {ref:>7.1f} {n:>4}")
+    # Determine if judge data is available
+    has_judge = any(m.get("llm_judge_accuracy") is not None for m in breakdown.values())
+
+    if has_judge:
+        header = f"  {'Group':<30} {'Acc%':>6} {'Hallu%':>7} {'Refuse%':>8} {'Judge%':>7} {'N':>4}"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+
+        for group, m in sorted(breakdown.items(), key=lambda kv: -kv[1].get("accuracy", 0)):
+            acc = m.get("accuracy", 0)
+            hal = m.get("hallucination_rate", 0)
+            ref = m.get("refusal_rate", 0)
+            n = m.get("n", 0)
+            jdg = m.get("llm_judge_accuracy")
+            jdg_str = f"{jdg:>6.1f}" if jdg is not None else "   N/A"
+            print(f"  {group:<30} {acc:>5.1f} {hal:>7.1f} {ref:>7.1f} {jdg_str} {n:>4}")
+    else:
+        header = f"  {'Group':<30} {'Acc%':>6} {'Hallu%':>7} {'Refuse%':>8} {'N':>4}"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+
+        for group, m in sorted(breakdown.items(), key=lambda kv: -kv[1].get("accuracy", 0)):
+            acc = m.get("accuracy", 0)
+            hal = m.get("hallucination_rate", 0)
+            ref = m.get("refusal_rate", 0)
+            n = m.get("n", 0)
+            print(f"  {group:<30} {acc:>5.1f} {hal:>7.1f} {ref:>7.1f} {n:>4}")
 
 
 def _compute_company_breakdown(
@@ -183,6 +201,12 @@ def print_comparison_with_sota(metrics: Dict[str, Any]) -> None:
     n = metrics.get("n", 0)
     coverage = min(100.0, n / 150.0 * 100)
     print(f"  {'Sirchmunk (This Run)':<30} {f'{acc:.1f}%':>10} {f'{coverage:.0f}%':>10}")
+
+    # Show Judge Accuracy in SOTA table if available
+    judge_acc = metrics.get("llm_judge_accuracy")
+    if judge_acc is not None:
+        print(f"  {'Sirchmunk (Judge Acc)':<30} {f'{judge_acc:.1f}%':>10} {f'{coverage:.0f}%':>10}")
+
     print(f"\n  (This run evaluated {n} questions)")
 
 
@@ -247,6 +271,12 @@ def main() -> None:
         print(f"  Evidence Recall:    N/A (page-level telemetry unavailable)")
     print(f"  Avg Latency:        {avg_latency:.1f}s")
 
+    # LLM Judge independent metrics
+    if metrics.get("llm_judge_accuracy") is not None:
+        print(f"\n  --- LLM Judge (Independent Evaluation) ---")
+        print(f"  Judge Accuracy:    {metrics['llm_judge_accuracy']:.1f}%")
+        print(f"  Judge Correct:     {metrics['llm_judge_correct']}/{metrics['llm_judge_count']}")
+
     # --- Breakdowns ---
     if "by_question_type" in metrics:
         print_breakdown("Question Type", metrics["by_question_type"])
@@ -259,6 +289,20 @@ def main() -> None:
 
     # --- Error cases ---
     print_error_cases(results, max_show=args.max_errors)
+
+    # --- Judge-Rule Discrepancies ---
+    discrepancies = [r for r in results
+                     if r.get("llm_judge_correct") is not None
+                     and r.get("classification") != "correct"
+                     and r.get("llm_judge_correct") is True]
+    if discrepancies:
+        print(f"\n=== Judge-Rule Discrepancies ({len(discrepancies)} cases) ===")
+        print("  (Cases where LLM Judge says correct but EM/F1 says wrong)")
+        for r in discrepancies[:10]:
+            print(f"  {r.get('financebench_id', 'N/A')}: pred='{r.get('prediction', '')[:50]}' gold='{r.get('gold_answer', '')[:50]}'")
+            print(f"    classification={r.get('classification')}, judge_reasoning={r.get('llm_judge_reasoning', '')[:80]}")
+        if len(discrepancies) > 10:
+            print(f"  ... and {len(discrepancies) - 10} more discrepancy(ies) not shown.")
 
     # --- SOTA comparison ---
     print_comparison_with_sota(metrics)

@@ -115,6 +115,13 @@ def _print_summary(
         print(f"  Evidence Recall:    N/A (page-level telemetry unavailable)")
     print(f"  Avg Latency:        {avg_latency:.1f}s")
     print(f"  Total Time:         {total_time:.1f}s")
+
+    # LLM Judge independent metrics
+    if metrics.get("llm_judge_accuracy") is not None:
+        print(f"\n  --- LLM Judge (Independent) ---")
+        print(f"  Judge Accuracy:    {metrics['llm_judge_accuracy']:.1f}%")
+        print(f"  Judge Correct:     {metrics['llm_judge_correct']}/{metrics['llm_judge_count']}")
+
     print(f"\n  Results:  {results_path}")
     print(f"  Metrics:  {metrics_path}")
     print(f"  Log:      {log_path}")
@@ -122,14 +129,28 @@ def _print_summary(
     # Breakdown by question_type
     by_qt = metrics.get("by_question_type")
     if by_qt:
-        print(f"\n  {'Question Type':<25} {'Acc%':>6} {'Hallu%':>7} {'Refuse%':>8} {'N':>4}")
-        print("  " + "-" * 52)
-        for qt, m in sorted(by_qt.items()):
-            qt_acc = m.get("accuracy", 0)
-            qt_hal = m.get("hallucination_rate", 0)
-            qt_ref = m.get("refusal_rate", 0)
-            qt_n = m.get("n", 0)
-            print(f"  {qt:<25} {qt_acc:>5.1f} {qt_hal:>7.1f} {qt_ref:>7.1f} {qt_n:>4}")
+        # Determine if judge data is available
+        has_judge = any(m.get("llm_judge_accuracy") is not None for m in by_qt.values())
+        if has_judge:
+            print(f"\n  {'Question Type':<25} {'Acc%':>6} {'Hallu%':>7} {'Refuse%':>8} {'Judge%':>7} {'N':>4}")
+            print("  " + "-" * 59)
+            for qt, m in sorted(by_qt.items()):
+                qt_acc = m.get("accuracy", 0)
+                qt_hal = m.get("hallucination_rate", 0)
+                qt_ref = m.get("refusal_rate", 0)
+                qt_n = m.get("n", 0)
+                qt_judge = m.get("llm_judge_accuracy")
+                qt_judge_str = f"{qt_judge:>6.1f}" if qt_judge is not None else "   N/A"
+                print(f"  {qt:<25} {qt_acc:>5.1f} {qt_hal:>7.1f} {qt_ref:>7.1f} {qt_judge_str} {qt_n:>4}")
+        else:
+            print(f"\n  {'Question Type':<25} {'Acc%':>6} {'Hallu%':>7} {'Refuse%':>8} {'N':>4}")
+            print("  " + "-" * 52)
+            for qt, m in sorted(by_qt.items()):
+                qt_acc = m.get("accuracy", 0)
+                qt_hal = m.get("hallucination_rate", 0)
+                qt_ref = m.get("refusal_rate", 0)
+                qt_n = m.get("n", 0)
+                print(f"  {qt:<25} {qt_acc:>5.1f} {qt_hal:>7.1f} {qt_ref:>7.1f} {qt_n:>4}")
 
     print("=" * 60)
 
