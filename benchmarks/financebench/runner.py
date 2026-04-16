@@ -248,7 +248,8 @@ async def run_batch(
         base_url=cfg.llm_base_url,
         model=cfg.llm_model,
     )
-    searcher = AgenticSearch(llm=llm, reuse_knowledge=False, verbose=False)
+    work_path = str(Path(cfg.work_path).resolve())
+    searcher = AgenticSearch(llm=llm, work_path=work_path, reuse_knowledge=False, verbose=False)
     loader = FinanceBenchLoader(data_dir=cfg.data_dir, pdf_dir=cfg.pdf_dir)
     semaphore = asyncio.Semaphore(cfg.max_concurrent)
 

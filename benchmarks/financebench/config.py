@@ -6,6 +6,27 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _parse_env_file(path: str) -> dict[str, str]:
+    """Parse a .env file into a dict, handling comments, blank lines, and quotes."""
+    result: dict[str, str] = {}
+    p = Path(path)
+    if not p.exists():
+        return result
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        v = v.strip()
+        # Strip surrounding quotes
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+            v = v[1:-1]
+        result[k.strip()] = v
+    return result
+
+
 @dataclass
 class FinanceBenchConfig:
     """All settings for a FinanceBench evaluation run."""
@@ -41,23 +62,34 @@ class FinanceBenchConfig:
     max_concurrent: int = 3
     request_delay: float = 0.5
 
+    # Experiment isolation
+    work_path: str = "./.work"  # Isolated workspace for this experiment
+
     @classmethod
     def from_env(cls, env_path: str = ".env.financebench") -> "FinanceBenchConfig":
-        """Load config from .env file with ``os.environ`` fallback."""
-        # Read .env file
-        env_vars: dict[str, str] = {}
-        p = Path(env_path)
-        if p.exists():
-            for line in p.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    env_vars[k.strip()] = v.strip()
+        """Load config with layer inheritance.
+
+        Priority (highest to lowest):
+        1. Experiment .env (.env.financebench)
+        2. Platform .env (<work_path>/.env, if exists)
+        3. os.environ
+        4. Dataclass defaults
+        """
+        # Step 0: Pre-read experiment env to determine work_path
+        experiment_vars = _parse_env_file(env_path)
+        work_path = experiment_vars.get(
+            "FB_WORK_PATH", os.environ.get("FB_WORK_PATH", "./.work")
+        )
+
+        # Step 1: Load platform-level env (<work_path>/.env)
+        platform_env_path = Path(work_path) / ".env"
+        platform_vars = _parse_env_file(str(platform_env_path))
+
+        # Step 2: Merge — experiment > platform > os.environ > defaults
+        merged = {**platform_vars, **experiment_vars}
 
         def _get(key: str, default: str = "") -> str:
-            return env_vars.get(key, os.environ.get(key, default))
+            return merged.get(key, os.environ.get(key, default))
 
         def _bool(key: str, default: bool = False) -> bool:
             v = _get(key, str(default)).lower()
@@ -97,4 +129,5 @@ class FinanceBenchConfig:
             extract_answer=_bool("FB_EXTRACT_ANSWER", True),
             max_concurrent=_int("FB_MAX_CONCURRENT", 3),
             request_delay=_float("FB_REQUEST_DELAY", 0.5),
+            work_path=work_path,
         )

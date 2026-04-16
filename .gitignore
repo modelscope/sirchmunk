@@ -271,3 +271,4 @@ benchmarks/*/.env*
 benchmarks/*/logs/
 benchmarks/*/results/
 benchmarks/*/output/
+benchmarks/*/.work/

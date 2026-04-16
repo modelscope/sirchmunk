@@ -187,6 +187,20 @@ def main() -> None:
     log_path = setup_logging(cfg.output_dir)
     logger = logging.getLogger("financebench")
 
+    # Print config source info
+    work_env = Path(cfg.work_path) / ".env"
+    logger.info("=" * 50)
+    logger.info("FinanceBench Configuration")
+    logger.info("=" * 50)
+    logger.info("  Experiment env : %s", args.env)
+    logger.info("  Platform env   : %s (%s)", work_env, "found" if work_env.exists() else "not found")
+    logger.info("  Work path      : %s", Path(cfg.work_path).resolve())
+    logger.info("  LLM            : %s @ %s", cfg.llm_model, cfg.llm_base_url)
+    logger.info("  Eval mode      : %s", cfg.eval_mode)
+    logger.info("  Search mode    : %s, Top-K: %d", cfg.mode, cfg.top_k_files)
+    logger.info("  LLM Judge      : %s", "enabled" if cfg.enable_llm_judge else "disabled")
+    logger.info("=" * 50)
+
     # 3. Load data
     loader = FinanceBenchLoader(cfg.data_dir, cfg.pdf_dir)
     questions = loader.load_questions()

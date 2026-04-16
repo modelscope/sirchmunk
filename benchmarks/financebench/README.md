@@ -40,21 +40,26 @@ Update the paths in your `.env.financebench`:
 
 ### 3. Initialize Workspace
 
-Initialize the Sirchmunk workspace pointing to the PDF corpus directory:
+Initialize the Sirchmunk workspace with an experiment-isolated work path:
 
 ```bash
-sirchmunk init
+cd benchmarks/financebench
+sirchmunk init --work-path ./.work
 ```
+
+This creates a `.work/` directory under the experiment folder, keeping knowledge base
+and cache isolated from the default `~/.sirchmunk`.
 
 ### 4. Compile Knowledge Base
 
-Compile the corpus to build the knowledge base for retrieval:
+Compile the PDF corpus into the experiment workspace:
 
 ```bash
-sirchmunk compile --paths /path/to/financebench/pdf_files
+sirchmunk compile --work-path ./.work --paths <your_pdf_dir>
 ```
 
-> **Note:** The compile step may take some time depending on the corpus size and your LLM provider's rate limits. For FinanceBench's ~41 PDFs (10-K/10-Q filings), expect 10-30 minutes.
+> **Note:** The compile step may take some time depending on the corpus size.
+> For FinanceBench's ~41 PDFs (10-K/10-Q filings), expect 10-30 minutes.
 
 ### 5. Configure Environment
 
@@ -64,6 +69,18 @@ cp .env.example .env.financebench
 ```
 
 ## Quick Start
+
+### Configuration Priority
+
+Configuration loads in this order (later overrides earlier):
+
+1. **Dataclass defaults** — hard-coded in `FinanceBenchConfig`
+2. **Platform .env** — `.work/.env` (created by `sirchmunk init`)
+3. **Experiment .env** — `.env.financebench`
+4. **Command-line** — `--limit N`, `--env <file>`
+
+To reuse platform LLM config, leave `LLM_*` commented in `.env.financebench`.
+To override, uncomment and set different values.
 
 ### 1. Run
 
