@@ -349,11 +349,11 @@ def _breakdown(results: List[Dict[str, Any]], key: str) -> Dict[str, Dict[str, A
     """Compute per-group accuracy / hallucination / refusal breakdown."""
     groups: dict[str, list[dict]] = defaultdict(list)
     for r in results:
-        group = r.get(key, "unknown")
+        group = r.get(key) or "unknown"
         groups[group].append(r)
 
     out: dict[str, dict] = {}
-    for group, items in sorted(groups.items()):
+    for group, items in sorted(groups.items(), key=lambda x: (x[0] is None, x[0] or "")):
         g_n = len(items)
         g_correct = sum(1 for r in items if r.get("classification") == "correct")
         g_halluc = sum(

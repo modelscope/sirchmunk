@@ -20,33 +20,62 @@ with **150 expert-annotated questions** across **40+ US public companies** (10-K
 - **EM / F1**: Exact Match and token-level F1 with financial value normalisation
 - **Evidence Recall**: Retrieved pages vs gold evidence pages
 
-## Quick Start
+## Prerequisites
 
-### 1. Setup
+### 1. Install Sirchmunk
+
+Make sure Sirchmunk is installed and accessible:
 
 ```bash
-cd benchmarks/financebench
-
-# Copy and edit the config file
-cp .env.example .env.financebench
-# Edit .env.financebench — set your LLM_API_KEY at minimum
-
-# Download FinanceBench data
-# Place financebench_open_source.jsonl in ./data/
-# Place PDF corpus (41 files) in ./data/pdfs/
+pip install -e .
 ```
 
-### 2. Run
+### 2. Prepare Corpus
+
+Download the FinanceBench dataset (PDF files and JSONL) and place them in the appropriate directory.
+Update the paths in your `.env.financebench`:
+
+- `FB_PDF_DIR` — path to the directory containing the 10-K/10-Q PDF files
+- `FB_QUESTIONS_FILE` — path to `financebench_open_source.jsonl`
+
+### 3. Initialize Workspace
+
+Initialize the Sirchmunk workspace pointing to the PDF corpus directory:
+
+```bash
+sirchmunk init
+```
+
+### 4. Compile Knowledge Base
+
+Compile the corpus to build the knowledge base for retrieval:
+
+```bash
+sirchmunk compile --paths /path/to/financebench/pdf_files
+```
+
+> **Note:** The compile step may take some time depending on the corpus size and your LLM provider's rate limits. For FinanceBench's ~41 PDFs (10-K/10-Q filings), expect 10-30 minutes.
+
+### 5. Configure Environment
+
+```bash
+cp .env.example .env.financebench
+# Edit .env.financebench with your API keys and paths
+```
+
+## Quick Start
+
+### 1. Run
 
 ```bash
 # Run full benchmark (150 questions)
 python run_benchmark.py
 
 # Run with custom config and question limit
-python run_benchmark.py --env .env.financebench --limit 20
+python run_benchmark.py --env .env.custom --limit 20
 ```
 
-### 3. Analyze
+### 2. Analyze
 
 ```bash
 # Analyze a completed run
