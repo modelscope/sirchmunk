@@ -107,9 +107,11 @@ class KnowledgeStorage:
         variable-length ``FLOAT[]`` from Parquet's list encoding, breaking
         ``list_cosine_similarity`` which requires matching fixed-size types.
 
-        Handles schema evolution gracefully: if the parquet file has fewer
-        columns than the current schema (e.g., missing ``merge_count``),
-        missing columns are filled with defaults instead of failing.
+        Handles schema evolution gracefully with adaptive column mapping:
+        - Forward compatible: old parquet (more cols) → new table (fewer cols),
+          extra columns in parquet are silently ignored.
+        - Backward compatible: new parquet (fewer cols) → old table (more cols),
+          missing columns are filled with defaults.
 
         Also records the file's modification time so that
         ``_check_and_reload()`` can detect external changes later.
@@ -121,37 +123,62 @@ class KnowledgeStorage:
                 self.db.drop_table(self.table_name, if_exists=True)
                 # Create table with explicit schema (preserves FLOAT[384])
                 self._create_table()
-                # Detect parquet columns to handle schema evolution
-                try:
-                    pq_cols = self.db.fetch_all(
-                        f"SELECT name FROM parquet_schema('{self.parquet_file}')"
-                    )
-                    pq_col_names = {row[0] for row in pq_cols}
-                except Exception:
-                    pq_col_names = None
 
-                if pq_col_names is not None:
-                    # Build column-by-column SELECT with defaults for missing cols
-                    schema_cols = list(self._get_schema_columns())
-                    select_parts = []
-                    for col_name in schema_cols:
-                        if col_name in pq_col_names:
-                            select_parts.append(col_name)
-                        elif col_name == "merge_count":
-                            select_parts.append("0 AS merge_count")
-                        else:
-                            select_parts.append(f"NULL AS {col_name}")
-                    select_clause = ", ".join(select_parts)
-                    self.db.execute(
-                        f"INSERT INTO {self.table_name} "
-                        f"SELECT {select_clause} FROM read_parquet('{self.parquet_file}')"
+                # Adaptive column mapping: detect parquet & table columns
+                parquet_cols = self._get_parquet_columns(self.parquet_file)
+                table_cols = self._get_table_columns()
+
+                if not parquet_cols or not table_cols:
+                    logger.warning(
+                        "Could not detect columns for adaptive mapping, "
+                        "skipping parquet load"
                     )
                 else:
-                    # Fallback: try direct SELECT * (works when schemas match)
-                    self.db.execute(
-                        f"INSERT INTO {self.table_name} "
-                        f"SELECT * FROM read_parquet('{self.parquet_file}')"
-                    )
+                    parquet_col_set = set(parquet_cols)
+                    table_col_set = set(table_cols)
+                    # Compute common columns (preserve table column order)
+                    common_cols = [c for c in table_cols if c in parquet_col_set]
+
+                    if not common_cols:
+                        logger.warning(
+                            "No common columns between parquet and table, "
+                            "skipping parquet load"
+                        )
+                    else:
+                        # Log column mismatches as warnings
+                        ignored_cols = parquet_col_set - table_col_set
+                        missing_cols = table_col_set - parquet_col_set
+                        if ignored_cols:
+                            logger.warning(
+                                "Parquet has extra columns (ignored): %s",
+                                ignored_cols,
+                            )
+                        if missing_cols:
+                            logger.warning(
+                                "Table has extra columns (filled with defaults): %s",
+                                missing_cols,
+                            )
+
+                        # Build INSERT with explicit column lists
+                        # For common cols: select directly from parquet
+                        # For missing cols (in table but not in parquet): use defaults
+                        insert_cols = list(table_cols)  # all table columns
+                        select_parts = []
+                        for col_name in table_cols:
+                            if col_name in parquet_col_set:
+                                select_parts.append(col_name)
+                            elif col_name == "merge_count":
+                                select_parts.append("0 AS merge_count")
+                            else:
+                                select_parts.append(f"NULL AS {col_name}")
+
+                        cols_str = ", ".join(insert_cols)
+                        select_clause = ", ".join(select_parts)
+                        self.db.execute(
+                            f"INSERT INTO {self.table_name} ({cols_str}) "
+                            f"SELECT {select_clause} "
+                            f"FROM read_parquet('{self.parquet_file}')"
+                        )
 
                 count = self.db.get_table_count(self.table_name)
                 # Record mtime for stale-detection
@@ -163,10 +190,13 @@ class KnowledgeStorage:
                 self._parquet_loaded_mtime = 0.0
                 logger.info("Created new knowledge clusters table")
         except Exception as e:
-            logger.error(f"Failed to load from parquet: {e}")
-            # Try to recreate table
-            self.db.drop_table(self.table_name, if_exists=True)
-            self._create_table()
+            logger.warning(f"Failed to load from parquet (non-blocking): {e}")
+            # Try to recreate table so retrieval can still work
+            try:
+                self.db.drop_table(self.table_name, if_exists=True)
+                self._create_table()
+            except Exception as recreate_err:
+                logger.warning(f"Failed to recreate table after load failure: {recreate_err}")
             self._parquet_loaded_mtime = 0.0
 
     def _get_schema_columns(self) -> List[str]:
@@ -180,6 +210,42 @@ class KnowledgeStorage:
             "embedding_vector", "embedding_model", "embedding_timestamp",
             "embedding_text_hash",
         ]
+
+    def _get_parquet_columns(self, parquet_path: str) -> List[str]:
+        """Get column names from a parquet file's schema.
+
+        Uses DuckDB's ``parquet_schema()`` function.  The returned metadata
+        rows use a ``name`` field (not ``column_name``).
+
+        Returns:
+            Ordered list of column names, or empty list on failure.
+        """
+        try:
+            rows = self.db.fetch_all(
+                f"SELECT name FROM parquet_schema('{parquet_path}') "
+                f"WHERE name != 'duckdb_schema'"
+            )
+            return [row[0] for row in rows]
+        except Exception as e:
+            logger.warning(f"Failed to read parquet schema: {e}")
+            return []
+
+    def _get_table_columns(self) -> List[str]:
+        """Get column names from the current DuckDB table.
+
+        Returns:
+            Ordered list of column names, or empty list on failure.
+        """
+        try:
+            rows = self.db.fetch_all(
+                "SELECT column_name FROM information_schema.columns "
+                f"WHERE table_name = '{self.table_name}' "
+                "ORDER BY ordinal_position"
+            )
+            return [row[0] for row in rows]
+        except Exception as e:
+            logger.warning(f"Failed to read table columns: {e}")
+            return []
 
     def _check_and_reload(self):
         """Check if the parquet file was modified externally and reload if so.
