@@ -4,17 +4,29 @@ import os
 from pathlib import Path
 from typing import Union
 
-from kreuzberg import ExtractionResult, extract_file
 from loguru import logger
 
+from sirchmunk.utils.document_extractor import (
+    DocumentExtractor,
+    ExtractionOutput,
+)
 
-async def fast_extract(file_path: Union[str, Path]) -> ExtractionResult:
-    """
-    Automatically detects and extracts text content from various file formats like docx, pptx, pdf, xlsx.
-    """
-    result: ExtractionResult = await extract_file(file_path=file_path)
 
-    return result
+async def fast_extract(file_path: Union[str, Path]) -> ExtractionOutput:
+    """Extract text content from a file using kreuzberg.
+
+    This is a backward-compatible wrapper around
+    :meth:`DocumentExtractor.extract` with the ``BASIC`` profile
+    (plain text, no extras).  All callers that only need ``.content``
+    continue to work unchanged.
+
+    Args:
+        file_path: Path to the file to extract.
+
+    Returns:
+        :class:`ExtractionOutput` with ``.content`` populated.
+    """
+    return await DocumentExtractor.extract(file_path)
 
 
 def get_fast_hash(file_path: Union[str, Path], sample_size: int = 8192):

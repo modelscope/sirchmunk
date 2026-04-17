@@ -32,7 +32,8 @@ from sirchmunk.schema.knowledge import (
 )
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
 from sirchmunk.utils import LogCallback, create_logger
-from sirchmunk.utils.file_utils import fast_extract, get_fast_hash
+from sirchmunk.utils.document_extractor import DocumentExtractor
+from sirchmunk.utils.file_utils import get_fast_hash
 
 # Concurrency cap for LLM-heavy file processing
 _DEFAULT_CONCURRENCY = 3
@@ -539,7 +540,9 @@ class KnowledgeCompiler:
         try:
             await self._log.info(f"[Compile] Processing: {Path(entry.path).name}")
 
-            extraction = await fast_extract(file_path=entry.path)
+            extraction = await DocumentExtractor.extract(
+                entry.path, DocumentExtractor.ENHANCED,
+            )
             content = extraction.content
             if not content or len(content.strip()) < 100:
                 result.error = "Insufficient text content"
@@ -550,11 +553,13 @@ class KnowledgeCompiler:
                 and DocumentTreeIndexer.should_build_tree(entry.path, len(content))
             )
 
-            # Phase 0.5: TOC extraction (zero LLM calls)
+            # Phase 0.5: TOC extraction (layers 1-3 are zero LLM calls)
             toc_entries = None
             if use_tree:
                 from sirchmunk.learnings.toc_extractor import TOCExtractor
-                toc_entries = TOCExtractor.extract(entry.path, content)
+                toc_entries = await TOCExtractor.extract(
+                    entry.path, content,
+                )
                 if toc_entries:
                     await self._log.info(
                         f"[Compile] Extracted TOC with {len(toc_entries)} entries "

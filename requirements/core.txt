@@ -5,6 +5,7 @@ openai
 genson
 pillow
 pypdf
+pdfminer.six
 pandas
 parquet
 numpy
