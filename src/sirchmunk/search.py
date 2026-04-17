@@ -1427,6 +1427,9 @@ class AgenticSearch(BaseSearch):
         )
         _llm_usage_start = len(self.llm_usages)
 
+        # --- Adaptive compile artifact detection (shared with FAST) ---
+        artifacts = self._detect_compile_artifacts()
+
         # ==============================================================
         # Phase 0a: Direct document analysis (intent-gated short-circuit)
         # ==============================================================
@@ -1460,7 +1463,9 @@ class AgenticSearch(BaseSearch):
             self._probe_knowledge_cache(query),
             self._load_spec_context(paths, stale_hours=spec_stale_hours),
             self._probe_tree_index(query),
-            self._probe_compile_hints(initial_keywords if initial_keywords else [query]),
+            self._probe_compile_hints([query]),  # query-level hints; keyword-level runs post-Phase 1
+            self._probe_summary_index(query, artifacts),    # GAP 2: zero-LLM BM25
+            self._probe_catalog_for_deep(query, artifacts),  # GAP 4: zero-LLM keyword overlap
             return_exceptions=True,
         )
 
@@ -1470,8 +1475,10 @@ class AgenticSearch(BaseSearch):
         spec_context = phase1_results[3] if not isinstance(phase1_results[3], Exception) else ""
         tree_hits = phase1_results[4] if not isinstance(phase1_results[4], Exception) else []
         compile_hints = phase1_results[5] if not isinstance(phase1_results[5], Exception) else CompileHints([], [])
+        summary_index_hits = phase1_results[6] if not isinstance(phase1_results[6], Exception) else []
+        catalog_deep_hits = phase1_results[7] if not isinstance(phase1_results[7], Exception) else []
 
-        for i, label in enumerate(["keywords", "dir_scan", "knowledge", "spec_cache", "tree_index", "compile_hints"]):
+        for i, label in enumerate(["keywords", "dir_scan", "knowledge", "spec_cache", "tree_index", "compile_hints", "summary_index", "catalog_deep"]):
             if isinstance(phase1_results[i], Exception):
                 await self._logger.warning(f"[Phase 1] {label} probe failed: {phase1_results[i]}")
 
@@ -1508,6 +1515,8 @@ class AgenticSearch(BaseSearch):
             f"knowledge_files={len(knowledge_probe.file_paths)}, "
             f"tree_hits={len(tree_hits)}, "
             f"compile_hints={len(compile_hints.file_paths)}, "
+            f"summary_index={len(summary_index_hits)}, "
+            f"catalog_deep={len(catalog_deep_hits)}, "
             f"soft_hit={'YES' if soft_hit else 'NO'}, "
             f"spec_cache={'YES' if spec_context else 'NO'}"
         )
@@ -1583,7 +1592,7 @@ class AgenticSearch(BaseSearch):
         if soft_hit:
             extra_knowledge_files = soft_hit.file_paths + extra_knowledge_files
         merged_files = self._merge_file_paths(
-            keyword_files=list(tree_hits) + compile_hints.file_paths + keyword_files,
+            keyword_files=list(tree_hits) + catalog_deep_hits + compile_hints.file_paths + summary_index_hits + keyword_files,
             dir_scan_files=dir_scan_files,
             knowledge_hits=extra_knowledge_files,
         )
@@ -1626,6 +1635,22 @@ class AgenticSearch(BaseSearch):
         context.increment_loop()
         answer: str = ""
         should_save: bool = True
+
+        # Inject catalog context for wiki-enhanced answer (GAP 4)
+        if artifacts and artifacts.catalog_map and cluster and cluster.content:
+            _catalog_ctx_parts = []
+            for fp in (cluster.search_results or merged_files)[:3]:
+                ctx = self._build_answer_context(fp, artifacts)
+                if ctx:
+                    _catalog_ctx_parts.append(ctx)
+            if _catalog_ctx_parts:
+                _catalog_context = "\n".join(_catalog_ctx_parts)
+                if isinstance(cluster.content, list):
+                    cluster.content = "\n".join(cluster.content)
+                cluster.content = f"{cluster.content}\n\n[Document Context]\n{_catalog_context}"
+                await self._logger.info(
+                    f"[Phase 4] Injected catalog context for {len(_catalog_ctx_parts)} documents"
+                )
 
         if cluster and cluster.content:
             await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
@@ -2007,6 +2032,10 @@ class AgenticSearch(BaseSearch):
     """Maximum character length for a catalog keyword token."""
     _CATALOG_SUMMARY_TRUNCATE = 200
     """Max chars of catalog summary shown in the listing."""
+    _SUMMARY_INDEX_TOP_K = 3
+    """Maximum files returned by proactive summary index BM25 probe."""
+    _DEEP_CATALOG_TOP_K = 3
+    """Maximum files returned by catalog keyword-overlap probe in DEEP mode."""
 
     # --- Tree-guided sampling constants ---
     _TREE_SAMPLE_MAX_SECTIONS = 3
@@ -2019,6 +2048,8 @@ class AgenticSearch(BaseSearch):
     """Maximum number of tree roots to include in FAST Step 1 hints."""
     _DEEP_PRE_NAV_MAX_FILES = 3
     """Maximum number of tree files to pre-navigate in DEEP Phase 2.5."""
+    _FAST_TREE_PROBE_MAX_FILES = 2
+    """Maximum files returned by active tree probing in FAST mode."""
 
     _LLM_FALLBACK_EVIDENCE = (
         "[No relevant documents found]\n\n"
@@ -2106,10 +2137,33 @@ class AgenticSearch(BaseSearch):
         if tree_hints:
             prompt = prompt + tree_hints
 
-        resp = await self.llm.achat(
+        # Step 1 LLM call + compile hints + tree probe run in parallel
+        # (GAP 3: hints前置化, GAP 1: 树导航主动化)
+        _step1_llm_task = self.llm.achat(
             messages=[{"role": "user", "content": prompt}],
             stream=False,
         )
+        _compile_hints_task = self._probe_compile_hints([query])
+        _tree_probe_task = self._probe_tree_for_fast(query, artifacts)
+
+        _parallel_results = await asyncio.gather(
+            _step1_llm_task, _compile_hints_task, _tree_probe_task,
+            return_exceptions=True,
+        )
+        resp = _parallel_results[0]
+        _early_compile_hints = _parallel_results[1]
+        _tree_probed_files = _parallel_results[2]
+
+        if isinstance(resp, Exception):
+            await self._logger.warning(f"[FAST:Step1] LLM call failed: {resp}")
+            return f"Search analysis failed: {resp}", None, context
+        if isinstance(_early_compile_hints, Exception):
+            await self._logger.warning(f"[FAST:Step1] Compile hints pre-fetch failed: {_early_compile_hints}")
+            _early_compile_hints = CompileHints([], [])
+        if isinstance(_tree_probed_files, Exception):
+            await self._logger.warning(f"[FAST:Step1] Tree probe failed: {_tree_probed_files}")
+            _tree_probed_files = []
+
         self.llm_usages.append(resp.usage)
         if resp.usage and isinstance(resp.usage, dict):
             context.add_llm_tokens(
@@ -2207,8 +2261,9 @@ class AgenticSearch(BaseSearch):
                     all_kw_set.add(p)
                     keyword_idfs.setdefault(p, 0.6)
 
-        # P4: compile hints from manifest + tree cache
-        compile_hints = await self._probe_compile_hints(primary + fallback)
+        # P4: compile hints — pre-fetched (query-level) + keyword-level supplement
+        _kw_compile_hints = await self._probe_compile_hints(primary + fallback)
+        compile_hints = self._merge_compile_hints(_early_compile_hints, _kw_compile_hints)
         for kw in compile_hints.extra_keywords:
             if kw not in all_kw_set:
                 fallback.append(kw)
@@ -2219,6 +2274,17 @@ class AgenticSearch(BaseSearch):
         # Catalog-routed files get highest priority
         seen_hint_paths: set = set()
         for fp in catalog_routed_files:
+            if fp not in seen_hint_paths:
+                seen_hint_paths.add(fp)
+                compile_hint_files.append(fp)
+        # Active tree probe files: second priority (GAP 1)
+        for fp in (_tree_probed_files or []):
+            if fp not in seen_hint_paths:
+                seen_hint_paths.add(fp)
+                compile_hint_files.append(fp)
+        # Summary index BM25 files: proactive zero-LLM discovery (GAP 2)
+        _summary_hint_files = await self._probe_summary_index(query, artifacts)
+        for fp in _summary_hint_files:
             if fp not in seen_hint_paths:
                 seen_hint_paths.add(fp)
                 compile_hint_files.append(fp)
@@ -2235,7 +2301,10 @@ class AgenticSearch(BaseSearch):
         if compile_hint_files:
             await self._logger.info(
                 f"[FAST:Step1.5] Compile hints: {len(compile_hint_files)} files "
-                f"(catalog={len(catalog_routed_files)}, soft={len(soft_hit.file_paths) if soft_hit else 0}), "
+                f"(catalog={len(catalog_routed_files)}, "
+                f"tree={len(_tree_probed_files) if _tree_probed_files else 0}, "
+                f"summary={len(_summary_hint_files)}, "
+                f"soft={len(soft_hit.file_paths) if soft_hit else 0}), "
                 f"{len(compile_hints.extra_keywords)} extra keywords"
             )
 
@@ -4104,6 +4173,214 @@ class AgenticSearch(BaseSearch):
             file_paths=file_paths[:15],
             extra_keywords=extra_keywords[:10],
         )
+
+    @staticmethod
+    def _merge_compile_hints(base: "CompileHints", supplement: "CompileHints") -> "CompileHints":
+        """Merge two CompileHints, deduplicating file paths and keywords."""
+        seen_fps = set(base.file_paths)
+        merged_fps = list(base.file_paths)
+        for fp in supplement.file_paths:
+            if fp not in seen_fps:
+                seen_fps.add(fp)
+                merged_fps.append(fp)
+        seen_kws = set(base.extra_keywords)
+        merged_kws = list(base.extra_keywords)
+        for kw in supplement.extra_keywords:
+            if kw not in seen_kws:
+                seen_kws.add(kw)
+                merged_kws.append(kw)
+        return CompileHints(file_paths=merged_fps[:15], extra_keywords=merged_kws[:10])
+
+    async def _probe_summary_index(
+        self,
+        query: str,
+        artifacts: Optional["CompileArtifacts"] = None,
+    ) -> List[str]:
+        """Zero-LLM file discovery via compile-time summary index (BM25 only).
+
+        Uses the pre-built summary index's BM25 channel to find files whose
+        summaries are lexically similar to the query.  No LLM or embedding
+        calls — pure local computation.
+
+        Args:
+            query: User query string.
+            artifacts: Compile artifacts (uses summary_index field).
+
+        Returns:
+            File paths of top-k matching documents, or empty list.
+        """
+        if artifacts is None or artifacts.summary_index is None:
+            return []
+
+        try:
+            from sirchmunk.utils.tokenizer_util import TokenizerUtil
+            _tokenizer = TokenizerUtil()
+            query_tokens = _tokenizer.segment(query)
+
+            if not query_tokens:
+                return []
+
+            # BM25-only search: pass query_embedding=None to skip embedding channel
+            results = artifacts.summary_index.search(
+                query_embedding=None,
+                query_tokens=query_tokens,
+                top_k=self._SUMMARY_INDEX_TOP_K,
+            )
+
+            file_paths = [
+                fp for fp, score in results
+                if score > 0.0 and Path(fp).exists()
+            ]
+
+            if file_paths:
+                await self._logger.info(
+                    f"[SummaryIndex:BM25] Found {len(file_paths)} files "
+                    f"from {artifacts.summary_index.num_entries} indexed docs"
+                )
+            return file_paths
+        except Exception as exc:
+            await self._logger.warning(f"[SummaryIndex:BM25] Probe failed: {exc}")
+            return []
+
+    async def _probe_catalog_for_deep(
+        self,
+        query: str,
+        artifacts: Optional["CompileArtifacts"] = None,
+    ) -> List[str]:
+        """Zero-LLM file discovery via document catalog keyword overlap.
+
+        Scores each catalog entry by counting query token overlap with the
+        document summary.  Returns top-k file paths sorted by overlap score.
+
+        Args:
+            query: User query string.
+            artifacts: Compile artifacts (uses catalog field).
+
+        Returns:
+            File paths of top-k matching documents, or empty list.
+        """
+        if not artifacts or not artifacts.catalog:
+            return []
+
+        try:
+            query_tokens = self._tokenize_for_matching(query.lower())
+            if not query_tokens:
+                return []
+
+            scored: List[Tuple[str, float]] = []
+            for entry in artifacts.catalog:
+                fp = entry.get("path", "")
+                if not fp or not Path(fp).exists():
+                    continue
+                summary = (entry.get("summary", "") or "").lower()
+                name = (entry.get("name", "") or "").lower()
+                doc_tokens = self._tokenize_for_matching(f"{name} {summary}")
+                overlap = len(query_tokens & doc_tokens)
+                if overlap > 0:
+                    # Normalize by query length to avoid bias toward long summaries
+                    score = overlap / max(1, len(query_tokens))
+                    scored.append((fp, score))
+
+            if not scored:
+                return []
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            result_paths = [fp for fp, _ in scored[:self._DEEP_CATALOG_TOP_K]]
+
+            if result_paths:
+                await self._logger.info(
+                    f"[DEEP:CatalogProbe] Found {len(result_paths)} files "
+                    f"from {len(artifacts.catalog)} catalog entries"
+                )
+            return result_paths
+        except Exception as exc:
+            await self._logger.warning(f"[DEEP:CatalogProbe] Failed: {exc}")
+            return []
+
+    async def _probe_tree_for_fast(
+        self, query: str, artifacts: Optional["CompileArtifacts"] = None,
+    ) -> List[str]:
+        """Active tree-based file discovery for FAST mode (1 LLM call).
+
+        Lightweight wrapper around tree root selection logic.  When compiled
+        tree indices are available and cover more than 2 files, asks the LLM
+        to select the most relevant 1-2 documents from root summaries.
+
+        Returns file paths of selected documents, or empty list when trees
+        are unavailable or cover too few files to justify an LLM call.
+        """
+        if not artifacts or len(artifacts.tree_available_paths) <= 2:
+            return []
+
+        tree_cache = self.work_path / ".cache" / "compile" / "trees"
+        if not tree_cache.exists():
+            return []
+
+        try:
+            from sirchmunk.learnings.tree_indexer import DocumentTree
+
+            trees: List[DocumentTree] = []
+            for tree_file in sorted(tree_cache.glob("*.json"))[:self._TREE_CACHE_SCAN_LIMIT]:
+                try:
+                    t = DocumentTree.from_json(
+                        tree_file.read_text(encoding="utf-8")
+                    )
+                    if t.root and t.file_path and Path(t.file_path).exists():
+                        trees.append(t)
+                except Exception:
+                    continue
+
+            if not trees:
+                return []
+
+            # Few trees: return all without LLM
+            if len(trees) <= self._FAST_TREE_PROBE_MAX_FILES:
+                return [t.file_path for t in trees]
+
+            # LLM-driven selection among tree roots
+            listing = "\n".join(
+                f"[{i}] {Path(t.file_path).name}: {(t.root.summary or '')[:200]}"
+                for i, t in enumerate(trees)
+            )
+            prompt = (
+                f'Given the query: "{query}"\n\n'
+                f"Select the 1-{self._FAST_TREE_PROBE_MAX_FILES} most relevant documents:\n"
+                f"{listing}\n\n"
+                f"Return ONLY a JSON array of index numbers, e.g. [0, 2]"
+            )
+            resp = await self.llm.achat([{"role": "user", "content": prompt}])
+            self.llm_usages.append(resp.usage)
+
+            selected_indices: List[int] = []
+            try:
+                raw = resp.content.strip()
+                m = re.search(r"\[[\d\s,]+\]", raw)
+                if m:
+                    selected_indices = [
+                        idx for idx in json.loads(m.group())
+                        if isinstance(idx, int) and 0 <= idx < len(trees)
+                    ]
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            if not selected_indices:
+                selected_indices = list(range(min(self._FAST_TREE_PROBE_MAX_FILES, len(trees))))
+
+            result_paths = [
+                trees[idx].file_path
+                for idx in selected_indices[:self._FAST_TREE_PROBE_MAX_FILES]
+                if Path(trees[idx].file_path).exists()
+            ]
+
+            if result_paths:
+                await self._logger.info(
+                    f"[FAST:TreeProbe] Selected {len(result_paths)} files "
+                    f"from {len(trees)} tree indices"
+                )
+            return result_paths
+        except Exception as exc:
+            await self._logger.warning(f"[FAST:TreeProbe] Failed: {exc}")
+            return []
 
     @staticmethod
     async def _async_noop(default=None):

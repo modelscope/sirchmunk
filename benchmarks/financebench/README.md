@@ -82,7 +82,7 @@ You **must** set valid LLM credentials here before proceeding.
 vi .work/.env
 ```
 
-### Step 4: Compile Knowledge Base
+### Step 4: Knowledge Compiling
 
 Compile the PDF corpus into the experiment workspace so that Sirchmunk can search it:
 
