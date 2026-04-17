@@ -2050,6 +2050,10 @@ class AgenticSearch(BaseSearch):
     """Maximum number of tree files to pre-navigate in DEEP Phase 2.5."""
     _FAST_TREE_PROBE_MAX_FILES = 2
     """Maximum files returned by active tree probing in FAST mode."""
+    _DEEP_TREE_PROBE_MAX_FILES = 3
+    """Maximum files returned by tree index probing in DEEP mode."""
+    _TREE_ROOT_HINT_TRUNCATE = 150
+    """Max chars of tree root summary in Step 1 structure hints."""
 
     _LLM_FALLBACK_EVIDENCE = (
         "[No relevant documents found]\n\n"
@@ -3312,7 +3316,7 @@ class AgenticSearch(BaseSearch):
             tree = indexer.load_tree(fp)
             if tree and tree.root and tree.root.summary:
                 name = Path(fp).name
-                hints.append(f"[{i}] {name}: {tree.root.summary[:150]}")
+                hints.append(f"[{i}] {name}: {tree.root.summary[:self._TREE_ROOT_HINT_TRUNCATE]}")
         if not hints:
             return ""
         return "\nDocument structure hints:\n" + "\n".join(hints) + "\n"
@@ -4017,80 +4021,110 @@ class AgenticSearch(BaseSearch):
         except Exception:
             return empty
 
-    async def _probe_tree_index(self, query: str) -> List[str]:
-        """LLM-driven file discovery via compiled tree root summaries (PageIndex).
+    def _load_cached_trees(self) -> list:
+        """Load DocumentTree objects from the tree cache directory.
 
-        Loads all cached document trees, presents their root summaries to the
-        LLM, and asks it to select the most relevant 1-3 documents.  For
-        selected trees, optionally drills one level deeper into children.
-
-        Returns file paths of the most relevant documents.
+        Returns a list of ``DocumentTree`` instances whose file paths exist
+        on disk.  Returns an empty list when the tree cache is absent or
+        contains no valid entries.
         """
         tree_cache = self.work_path / ".cache" / "compile" / "trees"
         if not tree_cache.exists():
             return []
-
         try:
             from sirchmunk.learnings.tree_indexer import DocumentTree
 
-            trees: List[DocumentTree] = []
-            for tree_file in sorted(tree_cache.glob("*.json"))[:50]:
+            trees = []
+            for tree_file in sorted(tree_cache.glob("*.json"))[:self._TREE_CACHE_SCAN_LIMIT]:
                 try:
                     t = DocumentTree.from_json(
                         tree_file.read_text(encoding="utf-8")
                     )
-                    if t.root and t.file_path:
+                    if t.root and t.file_path and Path(t.file_path).exists():
                         trees.append(t)
                 except Exception:
                     continue
+            return trees
+        except Exception:
+            return []
 
+    async def _llm_select_from_trees(
+        self, query: str, trees: list, max_select: int,
+    ) -> List[str]:
+        """LLM-driven file selection from tree root summaries.
+
+        Presents root summaries to the LLM and returns the selected file
+        paths.  When the number of trees is at most *max_select*, returns
+        all paths without an LLM call.
+
+        Args:
+            query: User query string.
+            trees: List of ``DocumentTree`` objects (pre-loaded).
+            max_select: Maximum number of files to select.
+
+        Returns:
+            Selected file paths, or empty list.
+        """
+        if not trees:
+            return []
+        if len(trees) <= max_select:
+            return [t.file_path for t in trees]
+
+        listing = "\n".join(
+            f"[{i}] {Path(t.file_path).name}: "
+            f"{(t.root.summary or '')[:self._CATALOG_SUMMARY_TRUNCATE]}"
+            for i, t in enumerate(trees)
+        )
+        prompt = (
+            f'Given the query: "{query}"\n\n'
+            f"Select the 1-{max_select} most relevant documents "
+            f"(by index number):\n{listing}\n\n"
+            f"Return ONLY a JSON array of index numbers, e.g. [0, 2]"
+        )
+        resp = await self.llm.achat([{"role": "user", "content": prompt}])
+        self.llm_usages.append(resp.usage)
+
+        selected_indices: List[int] = []
+        try:
+            raw = resp.content.strip()
+            m = re.search(r"\[[\d\s,]+\]", raw)
+            if m:
+                selected_indices = [
+                    idx for idx in json.loads(m.group())
+                    if isinstance(idx, int) and 0 <= idx < len(trees)
+                ]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        if not selected_indices:
+            selected_indices = list(range(min(max_select, len(trees))))
+
+        return [
+            trees[idx].file_path
+            for idx in selected_indices[:max_select]
+            if Path(trees[idx].file_path).exists()
+        ]
+
+    async def _probe_tree_index(self, query: str) -> List[str]:
+        """LLM-driven file discovery via compiled tree root summaries (PageIndex).
+
+        Loads all cached document trees, presents their root summaries to the
+        LLM, and asks it to select the most relevant documents.  Returns file
+        paths of the most relevant documents.
+        """
+        try:
+            trees = self._load_cached_trees()
             if not trees:
                 return []
-
-            # If few trees, return all without LLM
-            if len(trees) <= 2:
-                return [t.file_path for t in trees if Path(t.file_path).exists()]
-
-            # LLM-driven selection among tree roots
-            listing = "\n".join(
-                f"[{i}] {Path(t.file_path).name}: {(t.root.summary or '')[:200]}"
-                for i, t in enumerate(trees)
+            result = await self._llm_select_from_trees(
+                query, trees, max_select=self._DEEP_TREE_PROBE_MAX_FILES,
             )
-            prompt = (
-                f'Given the query: "{query}"\n\n'
-                f"Select the 1-3 most relevant documents (by index number):\n{listing}\n\n"
-                f"Return ONLY a JSON array of index numbers, e.g. [0, 2]"
-            )
-            resp = await self.llm.achat([{"role": "user", "content": prompt}])
-            self.llm_usages.append(resp.usage)
-
-            selected_indices: List[int] = []
-            try:
-                raw = resp.content.strip()
-                m = re.search(r"\[[\d\s,]+\]", raw)
-                if m:
-                    selected_indices = [
-                        idx for idx in json.loads(m.group())
-                        if isinstance(idx, int) and 0 <= idx < len(trees)
-                    ]
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-            if not selected_indices:
-                selected_indices = list(range(min(2, len(trees))))
-
-            result_paths: List[str] = []
-            for idx in selected_indices:
-                fp = trees[idx].file_path
-                if Path(fp).exists():
-                    result_paths.append(fp)
-
-            if result_paths:
+            if result:
                 await self._logger.info(
-                    f"[Probe:TreeIndex] LLM selected {len(result_paths)} documents "
+                    f"[Probe:TreeIndex] LLM selected {len(result)} documents "
                     f"from {len(trees)} tree indices"
                 )
-            return result_paths
+            return result
         except Exception:
             return []
 
@@ -4302,9 +4336,9 @@ class AgenticSearch(BaseSearch):
     ) -> List[str]:
         """Active tree-based file discovery for FAST mode (1 LLM call).
 
-        Lightweight wrapper around tree root selection logic.  When compiled
-        tree indices are available and cover more than 2 files, asks the LLM
-        to select the most relevant 1-2 documents from root summaries.
+        When compiled tree indices are available and cover more than 2 files,
+        asks the LLM to select the most relevant 1-2 documents from root
+        summaries.  Delegates to the shared ``_llm_select_from_trees`` helper.
 
         Returns file paths of selected documents, or empty list when trees
         are unavailable or cover too few files to justify an LLM call.
@@ -4312,72 +4346,19 @@ class AgenticSearch(BaseSearch):
         if not artifacts or len(artifacts.tree_available_paths) <= 2:
             return []
 
-        tree_cache = self.work_path / ".cache" / "compile" / "trees"
-        if not tree_cache.exists():
-            return []
-
         try:
-            from sirchmunk.learnings.tree_indexer import DocumentTree
-
-            trees: List[DocumentTree] = []
-            for tree_file in sorted(tree_cache.glob("*.json"))[:self._TREE_CACHE_SCAN_LIMIT]:
-                try:
-                    t = DocumentTree.from_json(
-                        tree_file.read_text(encoding="utf-8")
-                    )
-                    if t.root and t.file_path and Path(t.file_path).exists():
-                        trees.append(t)
-                except Exception:
-                    continue
-
+            trees = self._load_cached_trees()
             if not trees:
                 return []
-
-            # Few trees: return all without LLM
-            if len(trees) <= self._FAST_TREE_PROBE_MAX_FILES:
-                return [t.file_path for t in trees]
-
-            # LLM-driven selection among tree roots
-            listing = "\n".join(
-                f"[{i}] {Path(t.file_path).name}: {(t.root.summary or '')[:200]}"
-                for i, t in enumerate(trees)
+            result = await self._llm_select_from_trees(
+                query, trees, max_select=self._FAST_TREE_PROBE_MAX_FILES,
             )
-            prompt = (
-                f'Given the query: "{query}"\n\n'
-                f"Select the 1-{self._FAST_TREE_PROBE_MAX_FILES} most relevant documents:\n"
-                f"{listing}\n\n"
-                f"Return ONLY a JSON array of index numbers, e.g. [0, 2]"
-            )
-            resp = await self.llm.achat([{"role": "user", "content": prompt}])
-            self.llm_usages.append(resp.usage)
-
-            selected_indices: List[int] = []
-            try:
-                raw = resp.content.strip()
-                m = re.search(r"\[[\d\s,]+\]", raw)
-                if m:
-                    selected_indices = [
-                        idx for idx in json.loads(m.group())
-                        if isinstance(idx, int) and 0 <= idx < len(trees)
-                    ]
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-            if not selected_indices:
-                selected_indices = list(range(min(self._FAST_TREE_PROBE_MAX_FILES, len(trees))))
-
-            result_paths = [
-                trees[idx].file_path
-                for idx in selected_indices[:self._FAST_TREE_PROBE_MAX_FILES]
-                if Path(trees[idx].file_path).exists()
-            ]
-
-            if result_paths:
+            if result:
                 await self._logger.info(
-                    f"[FAST:TreeProbe] Selected {len(result_paths)} files "
+                    f"[FAST:TreeProbe] Selected {len(result)} files "
                     f"from {len(trees)} tree indices"
                 )
-            return result_paths
+            return result
         except Exception as exc:
             await self._logger.warning(f"[FAST:TreeProbe] Failed: {exc}")
             return []
