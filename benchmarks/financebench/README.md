@@ -93,6 +93,18 @@ sirchmunk compile --work-path .work --paths data/pdfs
 > **Note:** This step parses, chunks, and indexes all PDFs.
 > For FinanceBench's all PDFs, expect hours of processing time, depending on your LLM speed and compute resources.
 
+#### Shallow Compile (Recommended for First Run)
+
+Use `--shallow` to skip tree indexing and only generate Summary + Topics.
+This reduces LLM calls dramatically and achieves **5–9× speedup**:
+
+```bash
+sirchmunk compile --work-path .work --paths data/pdfs --shallow
+```
+
+> **Tip:** `--shallow` is ideal for quickly compiling a large corpus on the first pass.
+> You can run a normal (full) compile later to incrementally add tree indexes.
+
 ### Step 5: Configure Experiment
 
 Create the **experiment .env** from the template:
