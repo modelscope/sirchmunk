@@ -12,10 +12,11 @@ from __future__ import annotations
 import asyncio
 import json as json_mod
 import logging
+import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from config import FinanceBenchConfig
 from data_loader import FinanceBenchLoader
@@ -38,7 +39,12 @@ _EXTRACT_PROMPT = """\
 Given the financial question and a verbose response, extract ONLY the short factoid answer.
 Rules:
 - Output ONLY the answer value/phrase (1-20 words). No explanation.
-- If the response says it cannot find the answer, output: unknown
+- If the response contains ANY concrete data (dollar amounts, percentages, numbers,
+  company names, yes/no conclusions), extract that data even if the response also
+  expresses uncertainty or says it could not find a "complete" answer.
+- A partial answer with real data is ALWAYS better than "unknown".
+- Output "unknown" ONLY when the response contains absolutely no useful factual
+  information (e.g., a pure apology with zero data points).
 - For monetary values, keep the currency format (e.g., $1,577.00)
 - For percentages, keep the % sign (e.g., 15.3%)
 - For yes/no questions, output: yes or no
@@ -47,6 +53,16 @@ Question: {question}
 Response: {response}
 
 Short answer:"""
+
+# Regex pattern for extracting financial numeric data as fallback
+_NUMERIC_EXTRACTION_PATTERN = (
+    r'\$[\d,]+(?:\.\d+)?\s*(?:million|billion|mn|bn|M|B|K)?'
+    r'|\d+(?:,\d{3})+(?:\.\d+)?\s*(?:million|billion|mn|bn|M|B|%)?'
+    r'|\d+(?:\.\d+)?\s*(?:million|billion|mn|bn|M|B|%)'
+)
+
+# Sentinel values indicating extraction found no useful answer
+_UNKNOWN_SENTINELS = frozenset({"unknown", "n/a", ""})
 
 
 # NOTE: _normalize_prediction removed — use evaluate.normalize_answer instead.
@@ -57,12 +73,26 @@ Short answer:"""
 # ------------------------------------------------------------------
 
 
-async def _extract_short_answer(
+def _extract_numeric_fallback(text: str) -> Optional[str]:
+    """Extract financial figures from *text* using regex patterns.
+
+    Looks for currency amounts ($xxx), percentages, and large numbers
+    with units (million, billion, etc.).
+
+    Returns the first match or ``None``.
+    """
+    match = re.search(_NUMERIC_EXTRACTION_PATTERN, text)
+    if match:
+        return match.group(0).strip()
+    return None
+
+
+async def _llm_extract(
     question: str,
     verbose: str,
     llm: Any,
-) -> str:
-    """Use *llm* to distil *verbose* into a short factoid answer."""
+) -> Optional[str]:
+    """Layer-1: use LLM to distil *verbose* into a short factoid answer."""
     prompt = _EXTRACT_PROMPT.format(question=question, response=verbose[:4000])
     try:
         resp = await llm.achat(
@@ -71,8 +101,35 @@ async def _extract_short_answer(
         )
         return resp.content.strip()
     except Exception:
-        logger.warning("Short-answer extraction failed; falling back to raw answer.")
-        return verbose
+        logger.warning("LLM extraction failed; will try regex fallback.")
+        return None
+
+
+async def _extract_short_answer(
+    question: str,
+    verbose: str,
+    llm: Any,
+) -> str:
+    """Extract a concise answer from verbose LLM analysis.
+
+    Uses a three-layer extraction strategy:
+    1. LLM-based extraction with improved prompt
+    2. Regex-based numeric/financial data extraction as fallback
+    3. Returns 'unknown' only when no useful data is found
+    """
+    # Layer 1: LLM extraction
+    answer = await _llm_extract(question, verbose, llm)
+    if answer and answer.strip().lower() not in _UNKNOWN_SENTINELS:
+        return answer.strip()
+
+    # Layer 2: Regex fallback for numeric/financial data
+    numeric_answer = _extract_numeric_fallback(verbose)
+    if numeric_answer:
+        logger.info("Regex fallback extracted: %s", numeric_answer)
+        return numeric_answer
+
+    # Layer 3: No useful data found
+    return "unknown"
 
 
 # ------------------------------------------------------------------

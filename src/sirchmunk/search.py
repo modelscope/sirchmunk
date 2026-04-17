@@ -2189,9 +2189,9 @@ class AgenticSearch(BaseSearch):
     """Expanded tree sample sections for same-file re-sampling (default uses 3)."""
 
     # --- Evidence acceptance thresholds ---
-    _EVIDENCE_MIN_ACCEPT_LENGTH: int = 1500
+    _EVIDENCE_MIN_ACCEPT_LENGTH: int = 800
     """Minimum evidence character length for heuristic override."""
-    _EVIDENCE_KEYWORD_COVERAGE_THRESHOLD: float = 0.6
+    _EVIDENCE_KEYWORD_COVERAGE_THRESHOLD: float = 0.5
     """Minimum keyword coverage ratio for heuristic override."""
     _NUMERIC_INTENT_KEYWORDS: frozenset = frozenset({
         "revenue", "margin", "ratio", "ebitda", "income", "profit", "loss",
@@ -3231,7 +3231,7 @@ class AgenticSearch(BaseSearch):
 
         # Diagnostic logging when falling back to snippet mode
         if not hit_lines and match_objects:
-            await self._logger.warning(
+            await self._logger.info(
                 f"[FAST] No line_number in {len(match_objects)} match(es) for {fname}, "
                 f"falling back to snippet mode"
             )
