@@ -91,7 +91,7 @@ sirchmunk compile --work-path .work --paths data/pdfs
 ```
 
 > **Note:** This step parses, chunks, and indexes all PDFs.
-> For FinanceBench's ~41 PDFs (10-K/10-Q filings), expect 10–30 minutes.
+> For FinanceBench's all PDFs, expect hours of processing time, depending on your LLM speed and compute resources.
 
 ### Step 5: Configure Experiment
 
