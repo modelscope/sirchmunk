@@ -22,65 +22,172 @@ with **150 expert-annotated questions** across **40+ US public companies** (10-K
 
 ## Prerequisites
 
-### 1. Install Sirchmunk
+### Step 1: Install Sirchmunk
 
-Make sure Sirchmunk is installed and accessible:
+Install Sirchmunk from the repository root so that the `sirchmunk` CLI is available:
 
 ```bash
+# From repository root
 pip install -e .
 ```
 
-### 2. Prepare Corpus
+Verify the installation:
 
-Download the FinanceBench dataset (PDF files and JSONL) and place them in the appropriate directory.
-Update the paths in your `.env.financebench`:
+```bash
+sirchmunk --version
+```
 
-- `FB_PDF_DIR` — path to the directory containing the 10-K/10-Q PDF files
-- `FB_QUESTIONS_FILE` — path to `financebench_open_source.jsonl`
+### Step 2: Prepare Dataset
 
-### 3. Initialize Workspace
+Download the [FinanceBench](https://huggingface.co/datasets/PatronusAI/financebench)
+dataset and place the files under `benchmarks/financebench/data/`:
 
-Initialize the Sirchmunk workspace with an experiment-isolated work path:
+```
+data/
+├── financebench_open_source.jsonl   # 150 expert-annotated QA pairs
+└── pdfs/                            # 41 SEC-filing PDFs (10-K / 10-Q)
+    ├── 3M_2018_10K.pdf
+    ├── AMCOR_2023_10K.pdf
+    └── ...
+```
+
+Each PDF filename must match the `doc_name` field in the JSONL file.
+
+### Step 3: Initialize Experiment Workspace
+
+Initialize an isolated workspace for this experiment. This keeps the knowledge base
+and cache separate from the default `~/.sirchmunk`:
 
 ```bash
 cd benchmarks/financebench
 sirchmunk init --work-path ./.work
 ```
 
-This creates a `.work/` directory under the experiment folder, keeping knowledge base
-and cache isolated from the default `~/.sirchmunk`.
+This creates a `.work/` directory containing a **platform .env** file (`.work/.env`).
 
-### 4. Compile Knowledge Base
+**Configure the platform .env** (`.work/.env`):
 
-Compile the PDF corpus into the experiment workspace:
+This file controls the LLM provider used by Sirchmunk's search engine.
+You **must** set valid LLM credentials here before proceeding.
+
+| Variable | Required | Description | Example |
+|----------|----------|-------------|---------|
+| `LLM_API_KEY` | **Yes** | API key for the LLM provider | `sk-xxx` |
+| `LLM_BASE_URL` | **Yes** | LLM API endpoint | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `LLM_MODEL_NAME` | **Yes** | Model name for search & QA | `qwen3.5-plus` |
+| `LLM_TIMEOUT` | No | Request timeout in seconds | `120` |
 
 ```bash
-sirchmunk compile --work-path ./.work --paths <your_pdf_dir>
+# Edit the platform .env
+vi .work/.env
 ```
 
-> **Note:** The compile step may take some time depending on the corpus size.
-> For FinanceBench's ~41 PDFs (10-K/10-Q filings), expect 10-30 minutes.
+### Step 4: Compile Knowledge Base
 
-### 5. Configure Environment
+Compile the PDF corpus into the experiment workspace so that Sirchmunk can search it:
+
+```bash
+sirchmunk compile --work-path ./.work --paths ./data/pdfs
+```
+
+> **Note:** This step parses, chunks, and indexes all PDFs.
+> For FinanceBench's ~41 PDFs (10-K/10-Q filings), expect 10–30 minutes.
+
+### Step 5: Configure Experiment
+
+Create the **experiment .env** from the template:
 
 ```bash
 cp .env.example .env.financebench
-# Edit .env.financebench with your API keys and paths
 ```
 
-## Quick Start
+**Configure the experiment .env** (`.env.financebench`):
 
-### Configuration Priority
+This file controls FinanceBench-specific evaluation parameters.
 
-Configuration loads in this order (later overrides earlier):
+#### Dataset Paths
 
-1. **Dataclass defaults** — hard-coded in `FinanceBenchConfig`
-2. **Platform .env** — `.work/.env` (created by `sirchmunk init`)
-3. **Experiment .env** — `.env.financebench`
-4. **Command-line** — `--limit N`, `--env <file>`
+| Variable | Required | Description | Default |
+|----------|----------|-------------|---------|
+| `FB_WORK_PATH` | No | Isolated workspace path | `./.work` |
+| `FB_DATA_DIR` | **Yes** | Directory containing `financebench_open_source.jsonl` | `./data` |
+| `FB_PDF_DIR` | **Yes** | Directory containing the 41 PDF files | `./data/pdfs` |
+| `FB_OUTPUT_DIR` | No | Results output directory | `./output` |
 
-To reuse platform LLM config, leave `LLM_*` commented in `.env.financebench`.
-To override, uncomment and set different values.
+#### Dataset Settings
+
+| Variable | Required | Description | Default |
+|----------|----------|-------------|---------|
+| `FB_LIMIT` | No | Number of questions to evaluate (`0` = all 150) | `0` |
+| `FB_SEED` | No | Random seed for reproducibility | `42` |
+
+#### Search Settings
+
+| Variable | Required | Description | Default |
+|----------|----------|-------------|---------|
+| `FB_MODE` | No | Search mode: `FAST` or `DEEP` | `FAST` |
+| `FB_TOP_K_FILES` | No | Max files returned per search | `5` |
+| `FB_MAX_TOKEN_BUDGET` | No | Token budget for search context | `128000` |
+| `FB_ENABLE_DIR_SCAN` | No | Enable directory-level scanning | `true` |
+
+#### Evaluation Settings
+
+| Variable | Required | Description | Default |
+|----------|----------|-------------|---------|
+| `FB_EVAL_MODE` | No | `singleDoc` (per-PDF) or `sharedCorpus` (all PDFs) | `singleDoc` |
+| `FB_ENABLE_LLM_JUDGE` | No | Enable LLM Judge for semantic equivalence | `true` |
+| `FB_EXTRACT_ANSWER` | No | Extract short answer from verbose response | `true` |
+
+#### Concurrency Settings
+
+| Variable | Required | Description | Default |
+|----------|----------|-------------|---------|
+| `FB_MAX_CONCURRENT` | No | Max concurrent evaluation requests | `3` |
+| `FB_REQUEST_DELAY` | No | Delay between requests in seconds | `0.5` |
+
+**Optional LLM Override**: If you want this experiment to use a **different** LLM
+than the platform config, uncomment the `LLM_*` lines in `.env.financebench`.
+Otherwise, the experiment inherits LLM settings from `.work/.env`.
+
+```bash
+# Edit the experiment .env
+vi .env.financebench
+```
+
+## Configuration Architecture
+
+Configuration loads with layered inheritance (highest priority wins):
+
+```
+Priority (highest → lowest):
+┌──────────────────────────────────┐
+│  Command-line args               │  ← --limit N, --env <file>
+├──────────────────────────────────┤
+│  .env.financebench (experiment)  │  ← FB_* params + optional LLM override
+├──────────────────────────────────┤
+│  .work/.env (platform)           │  ← LLM_API_KEY, LLM_MODEL_NAME, etc.
+├──────────────────────────────────┤
+│  Environment variables           │  ← os.environ fallback
+├──────────────────────────────────┤
+│  Defaults                        │  ← Hard-coded in FinanceBenchConfig
+└──────────────────────────────────┘
+```
+
+### What Goes Where?
+
+| Setting | Platform `.work/.env` | Experiment `.env.financebench` |
+|---------|:---------------------:|:------------------------------:|
+| LLM API Key | ✅ (required) | Only if overriding |
+| LLM Model | ✅ (required) | Only if overriding |
+| LLM Base URL | ✅ (required) | Only if overriding |
+| LLM Timeout | Optional | Only if overriding |
+| PDF directory | — | ✅ (required) |
+| Data directory | — | ✅ (required) |
+| Output directory | — | Optional |
+| Eval mode | — | Optional |
+| Search mode | — | Optional |
+| LLM Judge | — | Optional |
+| Concurrency | — | Optional |
 
 ### 1. Run
 
