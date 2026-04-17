@@ -86,6 +86,14 @@ _NO_RESULTS_MESSAGE = "No results found."
 # Soft-similarity threshold for gradient cluster reuse (P2)
 _SOFT_SIM_THRESHOLD = 0.65
 
+# Common English stop-words filtered out during keyword coverage computation.
+_STOP_WORDS: frozenset = frozenset({
+    "the", "is", "a", "an", "of", "in", "for", "to", "and", "or",
+    "what", "how", "which", "does", "was", "were", "has", "have", "had",
+    "do", "did", "are", "be", "been", "by", "with", "from", "this",
+    "that", "it", "its", "on", "at", "as", "not", "no",
+})
+
 
 @dataclass
 class SoftClusterHit:
@@ -951,6 +959,105 @@ class AgenticSearch(BaseSearch):
 
         return summary, should_save, should_answer
 
+    # ------------------------------------------------------------------
+    # Multi-factor evidence acceptance helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_keyword_coverage(query: str, evidence: str) -> float:
+        """Compute the fraction of query keywords found in the evidence text.
+
+        Tokenises *query* into lowercase alpha-numeric words (length >= 2),
+        removes common English stop-words, then checks presence in
+        lower-cased *evidence*.
+
+        Returns:
+            Coverage ratio in [0.0, 1.0].  Returns 0.0 when no valid
+            keywords can be extracted from *query*.
+        """
+        tokens = re.findall(r'\b[a-z0-9]{2,}\b', query.lower())
+        keywords = [t for t in tokens if t not in _STOP_WORDS]
+        if not keywords:
+            return 0.0
+        evidence_lower = evidence.lower()
+        matched = sum(1 for kw in keywords if kw in evidence_lower)
+        return matched / len(keywords)
+
+    @staticmethod
+    def _detect_numeric_evidence(query: str, evidence: str) -> bool:
+        """Detect whether *evidence* contains structured numeric data relevant to *query*.
+
+        Returns True when *query* implies a numeric/financial intent AND
+        *evidence* contains numeric patterns (currency amounts, percentages,
+        financial figures).
+        """
+        query_lower = query.lower()
+        has_intent = any(
+            kw in query_lower
+            for kw in AgenticSearch._NUMERIC_INTENT_KEYWORDS
+        )
+        if not has_intent:
+            return False
+        has_numeric = bool(
+            re.search(
+                r'[\$\u20ac\u00a3]\s?\d'
+                r'|(?<!\w)\d[\d,.]*\s?%'
+                r'|\b\d{1,3}(?:,\d{3})+(?:\.\d+)?',
+                evidence,
+            )
+        )
+        return has_numeric
+
+    @staticmethod
+    def _evaluate_evidence_acceptance(
+        query: str,
+        evidence: str,
+        llm_should_answer: bool,
+    ) -> Tuple[bool, str]:
+        """Multi-factor decision on whether to accept retrieved evidence.
+
+        Combines the LLM's own SHOULD_ANSWER judgment with heuristic
+        signals (evidence length, keyword coverage, numeric-data presence)
+        to reduce false-negative rejections of valid evidence.
+
+        Returns:
+            A tuple of (*accept*, *reason*) where *accept* is the final
+            boolean decision and *reason* is a human-readable string
+            documenting which factor(s) determined the outcome.
+        """
+        # Factor 1: LLM direct acceptance
+        if llm_should_answer:
+            return True, "llm_accepted"
+
+        # Factor 2: Heuristic override — length + keyword coverage
+        evidence_len = len(evidence) if evidence else 0
+        kw_coverage = (
+            AgenticSearch._compute_keyword_coverage(query, evidence)
+            if evidence else 0.0
+        )
+
+        if (
+            evidence_len >= AgenticSearch._EVIDENCE_MIN_ACCEPT_LENGTH
+            and kw_coverage >= AgenticSearch._EVIDENCE_KEYWORD_COVERAGE_THRESHOLD
+        ):
+            return True, (
+                f"heuristic_override(len={evidence_len}, "
+                f"kw_coverage={kw_coverage:.2f})"
+            )
+
+        # Factor 3: Numeric evidence detection
+        if AgenticSearch._detect_numeric_evidence(query, evidence or ""):
+            return True, (
+                f"numeric_evidence(len={evidence_len}, "
+                f"kw_coverage={kw_coverage:.2f})"
+            )
+
+        # All factors negative
+        return False, (
+            f"rejected(llm=false, len={evidence_len}, "
+            f"kw_coverage={kw_coverage:.2f}, numeric=false)"
+        )
+
     @staticmethod
     def _extract_and_validate_multi_level_keywords(
         llm_resp: str,
@@ -1655,7 +1762,17 @@ class AgenticSearch(BaseSearch):
         if cluster and cluster.content:
             await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
             answer, should_save, should_answer = await self._summarise_cluster(query, cluster)
-            if not should_answer:
+
+            # --- Multi-factor evidence acceptance ---
+            cluster_evidence = str(cluster.content) if cluster and cluster.content else ""
+            accepted, accept_reason = self._evaluate_evidence_acceptance(
+                query, cluster_evidence, should_answer,
+            )
+            await self._logger.info(
+                f"[Phase 4] Evidence acceptance: {accepted} ({accept_reason})"
+            )
+
+            if not accepted:
                 if llm_fallback:
                     await self._logger.info(
                         "[Phase 4] Summary gate rejected evidence, llm_fallback=True → LLM fallback"
@@ -1703,7 +1820,17 @@ class AgenticSearch(BaseSearch):
 
             # Final DEEP decision is always made in the summary call.
             answer, should_save, should_answer = await self._summarise_cluster(query, cluster)
-            if not should_answer:
+
+            # --- Multi-factor evidence acceptance ---
+            final_cluster_evidence = str(cluster.content) if cluster and cluster.content else ""
+            final_accepted, final_reason = self._evaluate_evidence_acceptance(
+                query, final_cluster_evidence, should_answer,
+            )
+            await self._logger.info(
+                f"[Phase 4] Final evidence acceptance: {final_accepted} ({final_reason})"
+            )
+
+            if not final_accepted:
                 if llm_fallback:
                     await self._logger.info(
                         "[Phase 4] Final summary gate rejected evidence, llm_fallback=True → LLM fallback"
@@ -2054,6 +2181,25 @@ class AgenticSearch(BaseSearch):
     """Maximum files returned by tree index probing in DEEP mode."""
     _TREE_ROOT_HINT_TRUNCATE = 150
     """Max chars of tree root summary in Step 1 structure hints."""
+
+    # --- Self-correction expanded sampling ---
+    _SELF_CORRECT_EXPANDED_NAV_RESULTS: int = 6
+    """Expanded tree navigation leaf count for same-file re-sampling (default nav uses 3)."""
+    _SELF_CORRECT_EXPANDED_SECTIONS: int = 5
+    """Expanded tree sample sections for same-file re-sampling (default uses 3)."""
+
+    # --- Evidence acceptance thresholds ---
+    _EVIDENCE_MIN_ACCEPT_LENGTH: int = 1500
+    """Minimum evidence character length for heuristic override."""
+    _EVIDENCE_KEYWORD_COVERAGE_THRESHOLD: float = 0.6
+    """Minimum keyword coverage ratio for heuristic override."""
+    _NUMERIC_INTENT_KEYWORDS: frozenset = frozenset({
+        "revenue", "margin", "ratio", "ebitda", "income", "profit", "loss",
+        "cash", "debt", "equity", "eps", "dpo", "growth", "rate",
+        "percentage", "amount", "total", "net", "gross", "cost", "expense",
+        "sales", "fy", "fiscal",
+    })
+    """Keywords indicating numeric/financial intent in a query."""
 
     _LLM_FALLBACK_EVIDENCE = (
         "[No relevant documents found]\n\n"
@@ -2573,12 +2719,20 @@ class AgenticSearch(BaseSearch):
             answer_resp.content or ""
         )
 
+        # --- Multi-factor evidence acceptance (P2+P3+P4) ---
+        accepted, accept_reason = self._evaluate_evidence_acceptance(
+            query, evidence, should_answer,
+        )
+        await self._logger.info(
+            f"[FAST:Step4] Evidence acceptance: {accepted} ({accept_reason})"
+        )
+
         # ==============================================================
         # Step 5: Self-correction retry (conditional, ≤1 extra LLM call)
         # When the answer gate rejects the first attempt, try alternative
         # evidence sources before giving up.
         # ==============================================================
-        if not should_answer:
+        if not accepted:
             retry_evidence = await self._fast_self_correct(
                 query, best_files, catalog_routed_files, context,
             )
@@ -2598,11 +2752,19 @@ class AgenticSearch(BaseSearch):
                     context.add_llm_tokens(
                         retry_resp.usage.get("total_tokens", 0), usage=retry_resp.usage,
                     )
-                answer, should_save, should_answer = self._parse_summary_response(
+                answer, should_save, retry_should_answer = self._parse_summary_response(
                     retry_resp.content or ""
                 )
+                retry_accepted, retry_reason = self._evaluate_evidence_acceptance(
+                    query, retry_evidence, retry_should_answer,
+                )
+                await self._logger.info(
+                    f"[FAST:Step5] Retry evidence acceptance: {retry_accepted} ({retry_reason})"
+                )
+                if retry_accepted:
+                    accepted = True
 
-        if not should_answer:
+        if not accepted:
             if llm_fallback:
                 await self._logger.info(
                     "[FAST:Step5] Retry also rejected, llm_fallback=True → LLM fallback"
@@ -3637,7 +3799,7 @@ class AgenticSearch(BaseSearch):
         return evidence
 
     async def _navigate_tree_for_evidence(
-        self, file_path: str, query: str,
+        self, file_path: str, query: str, *, max_results: int = 3,
     ) -> Optional[str]:
         """LLM-driven tree navigation: select relevant sections and read leaf content.
 
@@ -3653,7 +3815,7 @@ class AgenticSearch(BaseSearch):
             return None
 
         try:
-            leaves = await indexer.navigate(tree, query, max_results=3)
+            leaves = await indexer.navigate(tree, query, max_results=max_results)
         except Exception:
             return None
 
@@ -3699,7 +3861,8 @@ class AgenticSearch(BaseSearch):
     ) -> Optional[str]:
         """Attempt to gather alternative evidence when the first answer is rejected.
 
-        Three strategies tried in order:
+        Four strategies tried in order:
+        D) Re-sample the same primary file with expanded parameters (deeper sampling).
         A) Tree-navigate a 2nd catalog-routed file not yet tried.
         B) Retrieve the most semantically similar compiled cluster's content.
         C) Tree-navigate the 2nd-best rga file if available.
@@ -3707,6 +3870,20 @@ class AgenticSearch(BaseSearch):
         Returns alternative evidence string, or None if all strategies fail.
         """
         first_file = best_files[0]["path"] if best_files else ""
+
+        # Strategy D: Re-sample the SAME primary file with expanded parameters.
+        # The file was correct but the initial sampling may have missed key sections.
+        if first_file:
+            expanded_tree_ev = await self._navigate_tree_for_evidence(
+                first_file, query,
+                max_results=self._SELF_CORRECT_EXPANDED_NAV_RESULTS,
+            )
+            if expanded_tree_ev and len(expanded_tree_ev.strip()) > 50:
+                await self._logger.info(
+                    "[FAST:SelfCorrect] Strategy D succeeded: "
+                    "expanded same-file tree navigation"
+                )
+                return expanded_tree_ev
 
         # Strategy A: 2nd catalog-routed file via tree navigation
         for fp in catalog_routed_files:

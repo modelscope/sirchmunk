@@ -189,7 +189,7 @@ Evaluate based on:
 2. Is the content meaningful and not just error messages or "no information found"?
 3. Are there sufficient evidences and context to answer the user's query?
 
-- <SHOULD_ANSWER>: output "true" only if the evidence is sufficient to answer the query.
+- <SHOULD_ANSWER>: output "true" if the evidence contains relevant information that can help answer the query, even if it requires reasoning, computation, or interpretation. Only output "false" if the evidence is clearly irrelevant or contains no useful information for the query.
 - <SHOULD_SAVE>: output "true" only if the evidence is sufficient AND the result is worth caching.
 - If evidence is insufficient or irrelevant, both SHOULD_ANSWER and SHOULD_SAVE MUST be "false".
 
@@ -437,7 +437,7 @@ Evaluate based on:
 2. Is the content meaningful and not just error messages or "no information found"?
 3. Are there sufficient evidences and context to answer the user's query?
 
-- <SHOULD_ANSWER>: output "true" only if the evidence is sufficient to answer the query.
+- <SHOULD_ANSWER>: output "true" if the evidence contains relevant information that can help answer the query, even if it requires reasoning, computation, or interpretation. Only output "false" if the evidence is clearly irrelevant or contains no useful information for the query.
 - <SHOULD_SAVE>: output "true" only if the evidence is sufficient AND the result is worth caching.
 - If evidence is insufficient or irrelevant, both SHOULD_ANSWER and SHOULD_SAVE MUST be "false".
 
@@ -476,7 +476,7 @@ Evaluate based on:
 2. Is the content meaningful and not just error messages or "no information found"?
 3. Are there sufficient evidences and context to answer the user's query?
 
-- <SHOULD_ANSWER>: output "true" only if the evidence is sufficient to answer the query.
+- <SHOULD_ANSWER>: output "true" if the evidence contains relevant information that can help answer the query, even if it requires reasoning, computation, or interpretation. Only output "false" if the evidence is clearly irrelevant or contains no useful information for the query.
 - <SHOULD_SAVE>: output "true" only if the evidence is sufficient AND the result is worth caching.
 - If evidence is insufficient or irrelevant, both SHOULD_ANSWER and SHOULD_SAVE MUST be "false".
 
