@@ -19,7 +19,7 @@ from sirchmunk.utils import LogCallback, create_logger
 from sirchmunk.utils.file_utils import get_fast_hash
 
 # File-size threshold: skip tree indexing for small files
-_TREE_MIN_CHARS = 20_000  # 20 K characters (lowered from 50K for broader coverage)
+_TREE_MIN_CHARS = 10_000  # 10 K characters (lowered from 20K for broader coverage)
 
 # Adaptive depth thresholds: (min_chars, max_depth) — evaluated top-down;
 # **must** be sorted by min_chars descending so the first match wins.
