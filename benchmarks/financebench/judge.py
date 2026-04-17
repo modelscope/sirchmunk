@@ -1,12 +1,11 @@
-"""LLM-based semantic equivalence judge for FinanceBench.
+"""LLM-based judge for FinanceBench evaluation.
 
-The judge evaluates whether a model's prediction is semantically
-equivalent to the gold answer, operating as an **independent**
-evaluation dimension alongside EM/F1 — not as a fallback.
+The judge drives **all** evaluation decisions:
+- **Accuracy**: whether the prediction is semantically equivalent to the gold answer.
+- **Coverage**: whether the prediction contains any information relevant to the question.
 
-This provides a more nuanced correctness signal for financial QA,
-where formatting differences (e.g., $1.5B vs $1,500M) can cause
-EM/F1 to undercount correct answers.
+This replaces the previous EM/F1 rule-driven pipeline with a single LLM-based
+evaluation authority, providing more nuanced correctness signals for financial QA.
 """
 
 from __future__ import annotations
@@ -155,19 +154,50 @@ _REFUSAL_INDICATORS: frozenset[str] = frozenset(
 
 
 class FinanceBenchLLMJudge:
-    """LLM-based judge for semantic equivalence in financial QA.
+    """LLM-based judge driving all FinanceBench evaluation.
 
-    Operates as an independent evaluation dimension — NOT as a
-    fallback for EM/F1. Each question gets a separate judge verdict
-    that is tracked in its own metrics.
+    Provides two evaluation axes:
+    - ``judge()``: semantic equivalence (Accuracy).
+    - ``judge_coverage()``: information relevance (Coverage).
+
+    Token usage from every LLM call is tracked and returned.
     """
 
     _CONFIDENCE_THRESHOLD: float = 0.7
     _MAX_RETRIES: int = 2
 
+    # Coverage evaluation prompt
+    _COVERAGE_PROMPT: str = """\
+You are evaluating whether a system's response contains ANY useful information \
+relevant to the given financial question.
+
+Question: {question}
+System Response: {prediction}
+
+Task: Determine if the response contains relevant, useful information.
+
+═══════════════════════════════════════════════
+HAS COVERAGE (has_coverage = true) — when ANY of:
+═══════════════════════════════════════════════
+1. Contains specific financial data (dollar amounts, percentages, ratios)
+2. Contains relevant factual statements about the company or topic
+3. Contains partial but concrete information related to the question
+4. Provides a direct answer (even if potentially incorrect)
+
+═══════════════════════════════════════════════
+NO COVERAGE (has_coverage = false) — when ALL of:
+═══════════════════════════════════════════════
+1. Response is a refusal ("I cannot", "No results found", etc.)
+2. Response contains no concrete data related to the question
+3. Response is empty, purely apologetic, or only contains generic filler
+
+Respond ONLY with a JSON object (no markdown, no extra text):
+{{"has_coverage": true or false, "confidence": 0.0 to 1.0, "reasoning": "brief explanation"}}"""
+
     def __init__(self, llm: Any) -> None:
         self._llm = llm
         self._cache: Dict[tuple, Dict[str, Any]] = {}
+        self._total_tokens_used: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -192,7 +222,8 @@ class FinanceBenchLLMJudge:
                 "confidence": float (0-1),
                 "reasoning": str,
                 "cached": bool,
-                "error": Optional[str]
+                "error": Optional[str],
+                "tokens_used": int,
             }
         """
         # --- Refusal short-circuit (saves LLM call) ---
@@ -203,6 +234,7 @@ class FinanceBenchLLMJudge:
                 "reasoning": "Prediction is a refusal — skipped LLM judge.",
                 "cached": False,
                 "error": None,
+                "tokens_used": 0,
             }
 
         # --- Quick exact-match shortcut ---
@@ -215,6 +247,7 @@ class FinanceBenchLLMJudge:
                 "reasoning": "Normalized exact match",
                 "cached": False,
                 "error": None,
+                "tokens_used": 0,
             }
 
         # --- Check cache (key includes question for context-sensitivity) ---
@@ -237,6 +270,7 @@ class FinanceBenchLLMJudge:
 
         result: Dict[str, Any] | None = None
         last_error: str | None = None
+        tokens_used: int = 0
 
         for attempt in range(1, self._MAX_RETRIES + 1):
             try:
@@ -244,6 +278,7 @@ class FinanceBenchLLMJudge:
                     messages=[{"role": "user", "content": prompt}],
                     stream=False,
                 )
+                tokens_used = self._extract_tokens(resp)
                 raw = resp.content.strip()
                 result = self._parse_response(raw)
                 if result.get("error") is None:
@@ -283,6 +318,8 @@ class FinanceBenchLLMJudge:
 
         result.setdefault("cached", False)
         result.setdefault("error", None)
+        result["tokens_used"] = tokens_used
+        self._total_tokens_used += tokens_used
 
         # Cache successful results only
         if result["error"] is None:
@@ -413,6 +450,140 @@ class FinanceBenchLLMJudge:
             if phrase in lower:
                 return True
         return False
+
+    async def judge_coverage(
+        self,
+        prediction: str,
+        question: str,
+    ) -> Dict[str, Any]:
+        """Evaluate whether *prediction* contains relevant information for *question*.
+
+        Returns:
+            {
+                "has_coverage": bool,
+                "confidence": float (0-1),
+                "reasoning": str,
+                "tokens_used": int,
+                "error": Optional[str],
+            }
+        """
+        # --- Refusal short-circuit ---
+        if self._is_refusal(prediction):
+            return {
+                "has_coverage": False,
+                "confidence": 1.0,
+                "reasoning": "Explicit refusal detected.",
+                "tokens_used": 0,
+                "error": None,
+            }
+
+        prompt = self._COVERAGE_PROMPT.format(
+            question=question or "N/A",
+            prediction=prediction[:4000],
+        )
+
+        result: Dict[str, Any] | None = None
+        last_error: str | None = None
+        tokens_used: int = 0
+
+        for attempt in range(1, self._MAX_RETRIES + 1):
+            try:
+                resp = await self._llm.achat(
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=False,
+                )
+                tokens_used = self._extract_tokens(resp)
+                raw = resp.content.strip()
+                result = self._parse_coverage_response(raw)
+                if result.get("error") is None:
+                    break
+                last_error = result.get("error")
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(
+                    "LLM Coverage judge failed (attempt %d/%d): %s",
+                    attempt,
+                    self._MAX_RETRIES,
+                    e,
+                )
+                result = None
+
+        if result is None or result.get("error") is not None:
+            result = {
+                "has_coverage": False,
+                "confidence": 0.0,
+                "reasoning": f"Coverage judge error after {self._MAX_RETRIES} attempts: {last_error}",
+                "error": last_error,
+            }
+
+        result.setdefault("error", None)
+        result["tokens_used"] = tokens_used
+        self._total_tokens_used += tokens_used
+        return result
+
+    # ------------------------------------------------------------------
+    # Coverage response parsing
+    # ------------------------------------------------------------------
+
+    def _parse_coverage_response(self, raw: str) -> Dict[str, Any]:
+        """Parse LLM JSON response for coverage evaluation."""
+        parsed = self._try_parse_json(raw)
+        if parsed is not None:
+            has_coverage = bool(parsed.get("has_coverage", False))
+            try:
+                confidence = float(parsed.get("confidence", 0.0))
+            except (ValueError, TypeError):
+                confidence = 0.0
+            confidence = max(0.0, min(1.0, confidence))
+            reasoning = str(parsed.get("reasoning", ""))
+            return {
+                "has_coverage": has_coverage,
+                "confidence": confidence,
+                "reasoning": reasoning,
+            }
+
+        # Fallback: keyword detection
+        lower = raw.lower()
+        true_match = re.search(r'"has_coverage"\s*:\s*true\b', lower)
+        false_match = re.search(r'"has_coverage"\s*:\s*false\b', lower)
+
+        if false_match and not true_match:
+            return {
+                "has_coverage": False,
+                "confidence": 0.5,
+                "reasoning": f"Keyword fallback (no coverage): {raw[:200]}",
+            }
+        elif true_match and not false_match:
+            return {
+                "has_coverage": True,
+                "confidence": 0.5,
+                "reasoning": f"Keyword fallback (has coverage): {raw[:200]}",
+            }
+
+        logger.warning("Cannot parse coverage response: %s", raw[:200])
+        return {
+            "has_coverage": False,
+            "confidence": 0.0,
+            "reasoning": f"Unparseable response: {raw[:200]}",
+            "error": "parse_error",
+        }
+
+    # ------------------------------------------------------------------
+    # Token tracking
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_tokens(resp: Any) -> int:
+        """Extract total token count from an LLM response."""
+        usage = getattr(resp, "usage", None)
+        if isinstance(usage, dict):
+            return int(usage.get("total_tokens", 0))
+        return 0
+
+    @property
+    def total_tokens_used(self) -> int:
+        """Cumulative tokens consumed by all judge calls."""
+        return self._total_tokens_used
 
     @property
     def cache_size(self) -> int:

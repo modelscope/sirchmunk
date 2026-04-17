@@ -94,33 +94,28 @@ def _print_summary(
     """Print a human-readable run summary to stdout."""
     n = len(results)
     acc = metrics.get("accuracy", 0)
-    hallu = metrics.get("hallucination_rate", 0)
-    refuse = metrics.get("refusal_rate", 0)
-    avg_em = metrics.get("avg_em", 0)
-    avg_f1 = metrics.get("avg_f1", 0)
-    ev_recall = metrics.get("evidence_recall")
+    cov = metrics.get("coverage", 0)
     avg_latency = metrics.get("avg_latency", 0)
+
+    token_usage = metrics.get("token_usage", {})
+    total_tokens = token_usage.get("total_tokens", 0)
+    search_tokens = token_usage.get("search_tokens", 0)
+    judge_tokens = token_usage.get("judge_tokens", 0)
+    avg_tokens_q = token_usage.get("avg_tokens_per_question", 0)
 
     print("\n" + "=" * 60)
     print(f"FinanceBench Results ({n} questions)")
     print("=" * 60)
-    print(f"  Accuracy:           {acc:.1f}%")
-    print(f"  Hallucination Rate: {hallu:.1f}%")
-    print(f"  Refusal Rate:       {refuse:.1f}%")
-    print(f"  Avg EM:             {avg_em:.3f}")
-    print(f"  Avg F1:             {avg_f1:.3f}")
-    if ev_recall is not None:
-        print(f"  Evidence Recall:    {ev_recall:.3f}")
-    else:
-        print(f"  Evidence Recall:    N/A (page-level telemetry unavailable)")
+    print(f"  Accuracy (Judge):   {acc:.1f}%")
+    print(f"  Coverage (Judge):   {cov:.1f}%")
     print(f"  Avg Latency:        {avg_latency:.1f}s")
     print(f"  Total Time:         {total_time:.1f}s")
 
-    # LLM Judge independent metrics
-    if metrics.get("llm_judge_accuracy") is not None:
-        print(f"\n  --- LLM Judge (Independent) ---")
-        print(f"  Judge Accuracy:    {metrics['llm_judge_accuracy']:.1f}%")
-        print(f"  Judge Correct:     {metrics['llm_judge_correct']}/{metrics['llm_judge_count']}")
+    print(f"\n  --- Token Usage ---")
+    print(f"  Total Tokens:      {total_tokens:>,}")
+    print(f"  Search Tokens:     {search_tokens:>,}")
+    print(f"  Judge Tokens:      {judge_tokens:>,}")
+    print(f"  Avg per Question:  {avg_tokens_q:>,.0f}")
 
     print(f"\n  Results:  {results_path}")
     print(f"  Metrics:  {metrics_path}")
@@ -129,28 +124,13 @@ def _print_summary(
     # Breakdown by question_type
     by_qt = metrics.get("by_question_type")
     if by_qt:
-        # Determine if judge data is available
-        has_judge = any(m.get("llm_judge_accuracy") is not None for m in by_qt.values())
-        if has_judge:
-            print(f"\n  {'Question Type':<25} {'Acc%':>6} {'Hallu%':>7} {'Refuse%':>8} {'Judge%':>7} {'N':>4}")
-            print("  " + "-" * 59)
-            for qt, m in sorted(by_qt.items()):
-                qt_acc = m.get("accuracy", 0)
-                qt_hal = m.get("hallucination_rate", 0)
-                qt_ref = m.get("refusal_rate", 0)
-                qt_n = m.get("n", 0)
-                qt_judge = m.get("llm_judge_accuracy")
-                qt_judge_str = f"{qt_judge:>6.1f}" if qt_judge is not None else "   N/A"
-                print(f"  {qt:<25} {qt_acc:>5.1f} {qt_hal:>7.1f} {qt_ref:>7.1f} {qt_judge_str} {qt_n:>4}")
-        else:
-            print(f"\n  {'Question Type':<25} {'Acc%':>6} {'Hallu%':>7} {'Refuse%':>8} {'N':>4}")
-            print("  " + "-" * 52)
-            for qt, m in sorted(by_qt.items()):
-                qt_acc = m.get("accuracy", 0)
-                qt_hal = m.get("hallucination_rate", 0)
-                qt_ref = m.get("refusal_rate", 0)
-                qt_n = m.get("n", 0)
-                print(f"  {qt:<25} {qt_acc:>5.1f} {qt_hal:>7.1f} {qt_ref:>7.1f} {qt_n:>4}")
+        print(f"\n  {'Question Type':<28} {'Acc%':>6} {'Cover%':>7} {'N':>5}")
+        print("  " + "-" * 48)
+        for qt, m in sorted(by_qt.items()):
+            qt_acc = m.get("accuracy", 0)
+            qt_cov = m.get("coverage", 0)
+            qt_n = m.get("n", 0)
+            print(f"  {qt:<28} {qt_acc:>5.1f} {qt_cov:>7.1f} {qt_n:>5}")
 
     print("=" * 60)
 
@@ -222,11 +202,9 @@ def main() -> None:
 
     # 6. Print run config
     logger.info(
-        "Config: mode=%s, eval_mode=%s, extract_answer=%s, "
-        "llm_judge=%s, concurrent=%d, model=%s",
+        "Config: mode=%s, eval_mode=%s, llm_judge=%s, concurrent=%d, model=%s",
         cfg.mode,
         cfg.eval_mode,
-        cfg.extract_answer,
         cfg.enable_llm_judge,
         cfg.max_concurrent,
         cfg.llm_model,
@@ -246,7 +224,6 @@ def main() -> None:
         "eval_mode": cfg.eval_mode,
         "model": cfg.llm_model,
         "top_k_files": cfg.top_k_files,
-        "extract_answer": cfg.extract_answer,
     }
 
     # 9. Save results (JSONL) + metrics (JSON)
