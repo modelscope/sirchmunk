@@ -60,7 +60,7 @@ and cache separate from the default `~/.sirchmunk`:
 
 ```bash
 cd benchmarks/financebench
-sirchmunk init --work-path ./.work
+sirchmunk init --work-path .work
 ```
 
 This creates a `.work/` directory containing a **platform .env** file (`.work/.env`).
@@ -70,12 +70,12 @@ This creates a `.work/` directory containing a **platform .env** file (`.work/.e
 This file controls the LLM provider used by Sirchmunk's search engine.
 You **must** set valid LLM credentials here before proceeding.
 
-| Variable | Required | Description | Example |
-|----------|----------|-------------|---------|
-| `LLM_API_KEY` | **Yes** | API key for the LLM provider | `sk-xxx` |
+| Variable | Required | Description | Example                                             |
+|----------|----------|-------------|-----------------------------------------------------|
+| `LLM_API_KEY` | **Yes** | API key for the LLM provider | `sk-xxx`                                            |
 | `LLM_BASE_URL` | **Yes** | LLM API endpoint | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
-| `LLM_MODEL_NAME` | **Yes** | Model name for search & QA | `qwen3.5-plus` |
-| `LLM_TIMEOUT` | No | Request timeout in seconds | `120` |
+| `LLM_MODEL_NAME` | **Yes** | Model name for search & QA | `qwen3.6-plus`                                      |
+| `LLM_TIMEOUT` | No | Request timeout in seconds | `120`                                               |
 
 ```bash
 # Edit the platform .env
@@ -87,7 +87,7 @@ vi .work/.env
 Compile the PDF corpus into the experiment workspace so that Sirchmunk can search it:
 
 ```bash
-sirchmunk compile --work-path ./.work --paths ./data/pdfs
+sirchmunk compile --work-path .work --paths data/pdfs
 ```
 
 > **Note:** This step parses, chunks, and indexes all PDFs.
