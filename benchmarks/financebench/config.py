@@ -54,9 +54,7 @@ class FinanceBenchConfig:
 
     # Evaluation
     eval_mode: str = "singleDoc"  # singleDoc / sharedCorpus
-    enable_llm_judge: bool = True  # Use LLM to judge semantic equivalence (independent metric)
-    extract_answer: bool = True
-    judge_f1_threshold: float = 0.8  # F1 threshold for 'correct' classification
+    enable_llm_judge: bool = True  # LLM Judge drives Accuracy + Coverage evaluation
 
     # Concurrency
     max_concurrent: int = 3
@@ -126,7 +124,6 @@ class FinanceBenchConfig:
             enable_dir_scan=_bool("FB_ENABLE_DIR_SCAN", True),
             eval_mode=_get("FB_EVAL_MODE", "singleDoc"),
             enable_llm_judge=_bool("FB_ENABLE_LLM_JUDGE", True),
-            extract_answer=_bool("FB_EXTRACT_ANSWER", True),
             max_concurrent=_int("FB_MAX_CONCURRENT", 3),
             request_delay=_float("FB_REQUEST_DELAY", 0.5),
             work_path=work_path,
