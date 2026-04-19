@@ -66,6 +66,7 @@ class TreeNode:
     page_range: Optional[Tuple[int, int]] = None
     children: List["TreeNode"] = field(default_factory=list)
     table_count: int = 0  # Number of tables associated with this node's page range
+    content_type: str = "text"  # "text" | "table"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -77,6 +78,7 @@ class TreeNode:
             "page_range": list(self.page_range) if self.page_range else None,
             "children": [c.to_dict() for c in self.children],
             "table_count": self.table_count,
+            "content_type": self.content_type,
         }
 
     @classmethod
@@ -92,6 +94,7 @@ class TreeNode:
             page_range=tuple(pr) if pr else None,
             children=children,
             table_count=data.get("table_count", 0),
+            content_type=data.get("content_type", "text"),
         )
 
     @property
@@ -214,6 +217,8 @@ class DocumentTreeIndexer:
                 toc_entries, content, total_pages=total_pages,
             )
             if root is not None:
+                await self._deepen_large_leaves(root, content, max_depth=effective_depth)
+                await self._enrich_node_summaries(root, content)
                 tree = DocumentTree(
                     file_path=file_path,
                     file_hash=file_hash,
@@ -232,6 +237,9 @@ class DocumentTreeIndexer:
         root = await self._build_node(content, level=0, max_depth=effective_depth)
         if root is None:
             return None
+
+        await self._deepen_large_leaves(root, content, max_depth=effective_depth)
+        await self._enrich_node_summaries(root, content)
 
         tree = DocumentTree(
             file_path=file_path,
@@ -254,8 +262,12 @@ class DocumentTreeIndexer:
         query: str,
         *,
         max_results: int = 3,
+        max_nav_depth: int = 4,
     ) -> List[TreeNode]:
         """Reasoning-based tree navigation: LLM selects the most relevant branches.
+
+        Iteratively descends through the tree until leaf nodes are reached or
+        *max_nav_depth* selection rounds are exhausted.
 
         Returns up to *max_results* leaf nodes with their char_range for
         precise evidence extraction.
@@ -263,27 +275,35 @@ class DocumentTreeIndexer:
         if tree.root is None:
             return []
 
-        candidates = tree.root.children if tree.root.children else [tree.root]
-        if not candidates:
+        current = tree.root.children if tree.root.children else [tree.root]
+        if not current:
             return [tree.root]
 
-        selected = await self._select_children(candidates, query)
-        if not selected:
-            return []
-
-        result_leaves: List[TreeNode] = []
-        for node in selected:
-            if node.leaf:
-                result_leaves.append(node)
-            else:
-                deeper = await self._select_children(node.children, query)
-                for d in (deeper or node.children[:1]):
-                    result_leaves.extend(d.all_leaves()[:max_results])
+        selected: List[TreeNode] = current
+        for _ in range(max_nav_depth):
+            selected = await self._select_children(current, query)
+            if not selected:
+                break
+            # All leaves — stop descending
+            if all(n.leaf for n in selected):
+                break
+            # Expand non-leaf children, keep leaves as-is
+            next_level: List[TreeNode] = []
+            for n in selected:
+                if n.leaf:
+                    next_level.append(n)
+                else:
+                    next_level.extend(n.children)
+            if not next_level:
+                break
+            current = next_level
+        else:
+            selected = current
 
         # Deduplicate and cap
-        seen_ids = set()
+        seen_ids: set = set()
         unique: List[TreeNode] = []
-        for n in result_leaves:
+        for n in (selected or current):
             if n.node_id not in seen_ids:
                 seen_ids.add(n.node_id)
                 unique.append(n)
@@ -604,12 +624,17 @@ class DocumentTreeIndexer:
 
         listing = "\n".join(
             f"[{i}] {n.title}{self._format_page_range(n.page_range)}"
+            f" [{n.content_type.upper()}]"
             f"{' [' + str(n.table_count) + ' tables]' if n.table_count > 0 else ''}"
-            f": {n.summary[:150]}"
+            f": {n.summary[:200]}"
             for i, n in enumerate(nodes)
         )
         prompt = (
             f"Given the query: \"{query}\"\n\n"
+            "Guidelines:\n"
+            "- For numerical/financial data queries, prefer TABLE nodes and consolidated statements\n"
+            "- Prefer company-wide/consolidated data over segment-level unless query specifies a segment\n"
+            "- When multiple tables exist, select the one most directly answering the query\n\n"
             f"Select the 1-2 most relevant sections (by index number):\n{listing}\n\n"
             f"Return ONLY a JSON array of index numbers, e.g. [0, 2]"
         )
@@ -680,6 +705,229 @@ class DocumentTreeIndexer:
             return ""
         ps, pe = page_range
         return f" [pages {ps}-{pe}]" if ps != pe else f" [page {ps}]"
+
+    # ------------------------------------------------------------------ #
+    #  Leaf deepening & summary enrichment                                #
+    # ------------------------------------------------------------------ #
+
+    async def _deepen_large_leaves(
+        self,
+        node: TreeNode,
+        content: str,
+        *,
+        max_leaf_chars: int = 5000,
+        max_depth: int = 4,
+        _seen_ids: Optional[set] = None,
+    ) -> None:
+        """Recursively deepen leaf nodes whose char_range exceeds *max_leaf_chars* using LLM decomposition."""
+        if _seen_ids is None:
+            _seen_ids = self._collect_node_ids(node)
+
+        if not node.leaf:
+            for child in node.children:
+                await self._deepen_large_leaves(
+                    child, content,
+                    max_leaf_chars=max_leaf_chars,
+                    max_depth=max_depth,
+                    _seen_ids=_seen_ids,
+                )
+            return
+
+        start, end = node.char_range
+        span = end - start
+        if span <= max_leaf_chars or node.level >= max_depth:
+            return
+
+        snippet = self._truncate_snippet(content[start:end])
+
+        prompt = (
+            "Analyze this document section and identify 3-8 logical sub-sections.\n"
+            "For each sub-section, provide:\n"
+            '- "title": descriptive heading (concise)\n'
+            '- "start_text": the first 8-15 words that mark where this sub-section '
+            "begins (must be exact text from the content)\n"
+            '- "content_type": "text" or "table"\n\n'
+            f'Section: "{node.title}"\n---\n{snippet}\n---\n\n'
+            'Return ONLY a JSON array, e.g. '
+            '[{"title": "...", "start_text": "...", "content_type": "text"}, ...]'
+        )
+
+        try:
+            resp = await self._llm.achat([{"role": "user", "content": prompt}])
+            sub_sections = self._parse_json_array(resp.content)
+            if not sub_sections or len(sub_sections) < 2:
+                return
+        except Exception:
+            return
+
+        sub_nodes = self._build_sub_nodes_from_llm(
+            sub_sections, node, content, _seen_ids,
+        )
+        if not sub_nodes:
+            return
+
+        node.children = sub_nodes
+        await self._log.info(
+            f"[TreeIndexer] Deepened '{node.title}' into {len(sub_nodes)} sub-nodes"
+        )
+
+        # Recurse into newly created children
+        for child in node.children:
+            await self._deepen_large_leaves(
+                child, content,
+                max_leaf_chars=max_leaf_chars,
+                max_depth=max_depth,
+                _seen_ids=_seen_ids,
+            )
+
+    def _build_sub_nodes_from_llm(
+        self,
+        sub_sections: List[Dict[str, Any]],
+        parent: TreeNode,
+        content: str,
+        seen_ids: set,
+    ) -> List[TreeNode]:
+        """Create child TreeNodes from LLM-decomposed sub-sections."""
+        parent_start, parent_end = parent.char_range
+        parent_span = max(parent_end - parent_start, 1)
+        parent_ps, parent_pe = parent.page_range if parent.page_range else (0, 0)
+        page_span = parent_pe - parent_ps
+        child_level = parent.level + 1
+
+        # Resolve char_start for each sub-section
+        positions: List[int] = []
+        search_from = parent_start
+        for sec in sub_sections:
+            start_text = sec.get("start_text", "")
+            pos = content.find(start_text, search_from) if start_text else -1
+            if pos < 0 or pos >= parent_end:
+                pos = search_from
+            positions.append(pos)
+            search_from = pos + 1
+
+        nodes: List[TreeNode] = []
+        for i, sec in enumerate(sub_sections):
+            char_start = positions[i]
+            char_end = positions[i + 1] if i + 1 < len(positions) else parent_end
+
+            # Estimate page_range proportionally from parent
+            page_range = None
+            if parent.page_range and parent_span > 0:
+                p_start = parent_ps + (char_start - parent_start) / parent_span * page_span
+                p_end = parent_ps + (char_end - parent_start) / parent_span * page_span
+                page_range = (int(p_start), max(int(p_start), int(p_end)))
+
+            content_type = sec.get("content_type", "text")
+            if content_type not in ("text", "table"):
+                content_type = "text"
+
+            nodes.append(TreeNode(
+                node_id=self._unique_node_id(char_start, seen_ids),
+                title=sec.get("title", f"Sub-section {i + 1}"),
+                summary="",
+                char_range=(char_start, char_end),
+                level=child_level,
+                page_range=page_range,
+                content_type=content_type,
+            ))
+        return nodes
+
+    async def _enrich_node_summaries(
+        self,
+        node: TreeNode,
+        content: str,
+        *,
+        max_summary_len: int = 200,
+    ) -> None:
+        """Post-order traversal to enrich empty summaries: leaf from content, non-leaf via LLM."""
+        # Post-order: process children first
+        for child in node.children:
+            await self._enrich_node_summaries(
+                child, content, max_summary_len=max_summary_len,
+            )
+
+        if self._summary_needs_enrichment(node.summary):
+            if node.leaf:
+                node.summary = self._extract_leaf_summary(
+                    content, node.char_range, max_summary_len,
+                )
+            else:
+                node.summary = await self._generate_nonleaf_summary(
+                    node, max_summary_len,
+                )
+
+    @staticmethod
+    def _summary_needs_enrichment(summary: str) -> bool:
+        """Check whether a summary is empty or too short to be useful."""
+        return not summary or len(summary.strip()) < 10
+
+    @staticmethod
+    def _extract_leaf_summary(
+        content: str,
+        char_range: Tuple[int, int],
+        max_len: int,
+    ) -> str:
+        """Extract a concise summary for a leaf node from its content slice."""
+        start, end = char_range
+        raw = content[start:end][:500]
+        # Clean to single line
+        return " ".join(raw.split())[:max_len]
+
+    async def _generate_nonleaf_summary(
+        self,
+        node: TreeNode,
+        max_summary_len: int,
+    ) -> str:
+        """Generate a summary for a non-leaf node via LLM, with fallback."""
+        children_listing = "\n".join(
+            f"- {c.title}: {c.summary[:100]}" for c in node.children
+        )
+        prompt = (
+            "Summarize this document section in 1-2 concise sentences.\n"
+            f'Section: "{node.title}"\n'
+            f"Sub-sections:\n{children_listing}\n\n"
+            "Return ONLY the summary text."
+        )
+        try:
+            resp = await self._llm.achat([{"role": "user", "content": prompt}])
+            return resp.content.strip()[:max_summary_len]
+        except Exception:
+            # Fallback: concatenate children titles
+            return ", ".join(c.title for c in node.children)[:max_summary_len]
+
+    # ------------------------------------------------------------------ #
+    #  Parsing / snippet helpers                                          #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _truncate_snippet(
+        text: str,
+        *,
+        head_chars: int = 3000,
+        tail_chars: int = 1000,
+    ) -> str:
+        """Truncate a long text snippet keeping head and tail with an ellipsis marker."""
+        if len(text) <= head_chars + tail_chars:
+            return text
+        return text[:head_chars] + "\n...[truncated]...\n" + text[-tail_chars:]
+
+    @staticmethod
+    def _parse_json_array(raw: str) -> List[Dict[str, Any]]:
+        """Extract and parse a JSON array from LLM output."""
+        cleaned = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        cleaned = re.sub(r"```\s*$", "", cleaned, flags=re.MULTILINE).strip()
+        m = re.search(r"\[.*\]", cleaned, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+        return []
+
+    @staticmethod
+    def _collect_node_ids(node: TreeNode) -> set:
+        """Collect all existing node_ids in the subtree."""
+        ids = {node.node_id}
+        for c in node.children:
+            ids.update(DocumentTreeIndexer._collect_node_ids(c))
+        return ids
 
     @staticmethod
     def should_build_tree(file_path: str, content_length: int) -> bool:

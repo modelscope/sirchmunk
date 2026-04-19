@@ -638,9 +638,12 @@ class KnowledgeCompiler:
                 except Exception:
                     pass
 
-            # Annotate tree nodes with table counts for navigation hints
+            # Integrate tables into tree: annotate counts + create table child nodes
             if result.tree and result.tree.root and extraction.tables:
-                self._annotate_tree_with_table_counts(result.tree.root, extraction.tables)
+                self._integrate_tables_into_tree(
+                    result.tree.root, extraction.tables,
+                    content=content, total_pages=extraction.page_count,
+                )
 
         except Exception as exc:
             result.error = str(exc)
@@ -1216,27 +1219,175 @@ class KnowledgeCompiler:
             "tables": digest_tables,
         }
 
-    def _annotate_tree_with_table_counts(
+    def _integrate_tables_into_tree(
         self,
         node: "TreeNode",
         tables: List[Dict[str, Any]],
+        content: str,
+        *,
+        total_pages: Optional[int] = None,
+        _counter: Optional[List[int]] = None,
     ) -> None:
-        """Annotate tree nodes with table count based on page_range overlap.
+        """Integrate tables into tree: annotate counts AND create table child nodes for leaf nodes.
 
-        For each node with a valid page_range, counts how many extracted
-        tables fall within that range and sets node.table_count accordingly.
+        For each node with a valid page_range, counts how many valid extracted
+        tables fall within that range (excluding pseudo-tables with col_count <= 1).
+        For leaf nodes with matching tables, creates dedicated TreeNode children
+        with ``content_type="table"``.
         """
+        from sirchmunk.learnings.tree_indexer import TreeNode
+
         if node is None:
             return
+
+        if _counter is None:
+            _counter = [0]
+
+        # Depth-first: process existing children first
+        for child in list(node.children):
+            self._integrate_tables_into_tree(
+                child, tables, content,
+                total_pages=total_pages, _counter=_counter,
+            )
+
+        # Match valid tables to this node's page_range
+        matched_tables: List[Dict[str, Any]] = []
         if node.page_range:
             ps, pe = node.page_range
-            count = sum(
-                1 for t in tables
-                if t.get("page_number") is not None and ps <= t["page_number"] <= pe
+            for t in tables:
+                pn = t.get("page_number")
+                if pn is None or not (ps <= pn <= pe):
+                    continue
+                # Skip pseudo-tables
+                if self._is_pseudo_table(t):
+                    continue
+                matched_tables.append(t)
+
+        node.table_count = len(matched_tables)
+
+        # Create table child nodes only for leaf nodes with matched tables
+        if not node.children and matched_tables:
+            try:
+                self._spawn_table_children(
+                    node, matched_tables, content, _counter,
+                )
+            except Exception:
+                pass  # Never break compile for table node creation
+
+    @staticmethod
+    def _is_pseudo_table(table: Dict[str, Any]) -> bool:
+        """Return True if the table lacks meaningful structure (col_count <= 1)."""
+        markdown = table.get("markdown", "")
+        cells = table.get("cells", [])
+        if not markdown and not cells:
+            return True
+        col_count = 0
+        if cells:
+            col_count = max(
+                (len(row) for row in cells if isinstance(row, (list, tuple))),
+                default=0,
             )
-            node.table_count = count
-        for child in node.children:
-            self._annotate_tree_with_table_counts(child, tables)
+        elif markdown:
+            lines = [l for l in markdown.strip().split("\n") if l.strip().startswith("|")]
+            col_count = (lines[0].count("|") - 1) if lines else 0
+        return col_count <= 1
+
+    def _spawn_table_children(
+        self,
+        node: "TreeNode",
+        matched_tables: List[Dict[str, Any]],
+        content: str,
+        counter: List[int],
+    ) -> None:
+        """Create TreeNode children for each matched table under a leaf node.
+
+        Also inserts a text-content sibling preserving the original leaf content.
+        """
+        from sirchmunk.learnings.tree_indexer import TreeNode
+
+        child_level = node.level + 1
+
+        # Preserve original text content as first child
+        text_child_id = f"T{counter[0]:06d}"
+        counter[0] += 1
+        node.children.append(
+            TreeNode(
+                node_id=text_child_id,
+                title=node.title,
+                summary=node.summary[:300] if node.summary else "",
+                char_range=node.char_range,
+                level=child_level,
+                page_range=node.page_range,
+                children=[],
+                table_count=0,
+                content_type="text",
+            )
+        )
+
+        # Create one child per table
+        for table in matched_tables:
+            tid = f"T{counter[0]:06d}"
+            counter[0] += 1
+
+            markdown = table.get("markdown", "")
+            title = self._extract_table_title(table)
+            page_number = table.get("page_number")
+
+            # Attempt to locate table markdown in content
+            char_range = node.char_range
+            if markdown and content:
+                pos = content.find(markdown[:120])
+                if pos >= 0:
+                    char_range = (pos, pos + len(markdown))
+
+            page_range = (
+                (page_number, page_number) if page_number is not None
+                else node.page_range
+            )
+
+            node.children.append(
+                TreeNode(
+                    node_id=tid,
+                    title=title,
+                    summary=markdown[:300] if markdown else "",
+                    char_range=char_range,
+                    level=child_level,
+                    page_range=page_range,
+                    children=[],
+                    table_count=0,
+                    content_type="table",
+                )
+            )
+
+    @staticmethod
+    def _extract_table_title(table: Dict[str, Any]) -> str:
+        """Extract a concise title from table markdown header row.
+
+        Parses the first meaningful line of the markdown table (skipping
+        separator rows like ``|---|---|``), strips ``|`` delimiters, and
+        returns the first 80 characters as the title.
+        """
+        markdown = table.get("markdown", "")
+        if not markdown:
+            pn = table.get("page_number", "?")
+            return f"Table (p.{pn})"
+
+        for line in markdown.strip().split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Skip separator rows (e.g. |---|---| or +---+---+)
+            content_chars = stripped.replace("|", "").replace("-", "").replace(":", "").replace("+", "").strip()
+            if not content_chars:
+                continue
+            # Extract cell contents
+            title = " | ".join(
+                seg.strip() for seg in stripped.split("|") if seg.strip()
+            )
+            return title[:80] if title else f"Table (p.{table.get('page_number', '?')})"
+
+        pn = table.get("page_number", "?")
+        return f"Table (p.{pn})"
 
     @staticmethod
     def _count_tree_nodes(tree: Optional[DocumentTree]) -> int:

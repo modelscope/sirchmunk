@@ -3818,17 +3818,21 @@ class AgenticSearch(BaseSearch):
         parts: List[str] = []
         total_chars = 0
         for leaf in leaves[: self._TREE_SAMPLE_MAX_SECTIONS]:
-            start, end = leaf.char_range
-            if self._is_valid_char_range(start, end, len(full_text)) and full_text:
-                segment = full_text[start:end]
-            elif leaf.summary:
-                _loguru_logger.debug(
-                    f"[TreeNav] char_range degraded for '{leaf.title}' "
-                    f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), using summary"
-                )
+            # Table nodes: prefer summary (contains table markdown)
+            if getattr(leaf, 'content_type', 'text') == 'table' and leaf.summary:
                 segment = leaf.summary
             else:
-                continue
+                start, end = leaf.char_range
+                if self._is_valid_char_range(start, end, len(full_text)) and full_text:
+                    segment = full_text[start:end]
+                elif leaf.summary:
+                    _loguru_logger.debug(
+                        f"[TreeNav] char_range degraded for '{leaf.title}' "
+                        f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), using summary"
+                    )
+                    segment = leaf.summary
+                else:
+                    continue
             segment = segment[: self._TREE_SAMPLE_SECTION_MAX_CHARS]
             if not segment.strip():
                 continue
@@ -3836,7 +3840,8 @@ class AgenticSearch(BaseSearch):
             if leaf.page_range:
                 ps, pe = leaf.page_range
                 page_info = f" (pp.{ps}-{pe})" if ps != pe else f" (p.{ps})"
-            header = f"[{fname} → {leaf.title}{page_info}]"
+            type_tag = " [TABLE]" if getattr(leaf, 'content_type', 'text') == 'table' else ""
+            header = f"[{fname} → {leaf.title}{page_info}{type_tag}]"
             chunk = f"{header}\n{segment}"
             if total_chars + len(chunk) > max_chars:
                 remaining = max_chars - total_chars
@@ -4006,23 +4011,28 @@ class AgenticSearch(BaseSearch):
             full_text = ""
 
         for leaf in leaves:
-            start, end = leaf.char_range
-            if self._is_valid_char_range(start, end, len(full_text)) and full_text:
-                segment = full_text[start:end]
-            elif leaf.summary:
-                _loguru_logger.debug(
-                    f"[TreeNav] char_range degraded for '{leaf.title}' "
-                    f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), using summary"
-                )
+            # Table nodes: prefer summary (contains table markdown)
+            if getattr(leaf, 'content_type', 'text') == 'table' and leaf.summary:
                 segment = leaf.summary
             else:
-                continue
+                start, end = leaf.char_range
+                if self._is_valid_char_range(start, end, len(full_text)) and full_text:
+                    segment = full_text[start:end]
+                elif leaf.summary:
+                    _loguru_logger.debug(
+                        f"[TreeNav] char_range degraded for '{leaf.title}' "
+                        f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), using summary"
+                    )
+                    segment = leaf.summary
+                else:
+                    continue
             if segment.strip():
                 page_info = ""
                 if leaf.page_range:
                     ps, pe = leaf.page_range
                     page_info = f" (pp.{ps}-{pe})" if ps != pe else f" (p.{ps})"
-                header = f"[{fname} → {leaf.title}{page_info}]"
+                type_tag = " [TABLE]" if getattr(leaf, 'content_type', 'text') == 'table' else ""
+                header = f"[{fname} → {leaf.title}{page_info}{type_tag}]"
                 parts.append(f"{header}\n{segment[:3000]}")
 
         if not parts:
