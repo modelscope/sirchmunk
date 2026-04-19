@@ -303,6 +303,17 @@ class DocumentExtractor:
             from kreuzberg import LanguageDetectionConfig
             lang_config = LanguageDetectionConfig(enabled=True)
 
+        # --- Layout detection for table extraction ---
+        layout_config = None
+        if profile.extract_tables:
+            try:
+                from kreuzberg import LayoutDetectionConfig
+                layout_config = LayoutDetectionConfig()
+            except ImportError:
+                # kreuzberg <= 4.2.x extracts tables by default;
+                # filtering is handled in _convert_result().
+                pass
+
         # --- Assemble ExtractionConfig ---
         kwargs: dict[str, Any] = {
             "output_format": output_format,
@@ -319,6 +330,8 @@ class DocumentExtractor:
             kwargs["language_detection"] = lang_config
         if profile.max_concurrent is not None:
             kwargs["max_concurrent_extractions"] = profile.max_concurrent
+        if layout_config is not None:
+            kwargs["layout"] = layout_config
 
         return ExtractionConfig(**kwargs)
 

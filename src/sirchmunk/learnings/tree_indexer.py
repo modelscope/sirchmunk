@@ -65,6 +65,7 @@ class TreeNode:
     level: int = 0
     page_range: Optional[Tuple[int, int]] = None
     children: List["TreeNode"] = field(default_factory=list)
+    table_count: int = 0  # Number of tables associated with this node's page range
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -75,6 +76,7 @@ class TreeNode:
             "level": self.level,
             "page_range": list(self.page_range) if self.page_range else None,
             "children": [c.to_dict() for c in self.children],
+            "table_count": self.table_count,
         }
 
     @classmethod
@@ -89,6 +91,7 @@ class TreeNode:
             level=data.get("level", 0),
             page_range=tuple(pr) if pr else None,
             children=children,
+            table_count=data.get("table_count", 0),
         )
 
     @property
@@ -600,7 +603,9 @@ class DocumentTreeIndexer:
             return nodes
 
         listing = "\n".join(
-            f"[{i}] {n.title}{self._format_page_range(n.page_range)}: {n.summary[:150]}"
+            f"[{i}] {n.title}{self._format_page_range(n.page_range)}"
+            f"{' [' + str(n.table_count) + ' tables]' if n.table_count > 0 else ''}"
+            f": {n.summary[:150]}"
             for i, n in enumerate(nodes)
         )
         prompt = (

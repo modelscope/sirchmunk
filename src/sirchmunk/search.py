@@ -2671,6 +2671,18 @@ class AgenticSearch(BaseSearch):
                                 except Exception:
                                     pass
 
+                    # 0.5 Table digest priority (pre-compiled PDF table evidence)
+                    if ev is None and artifacts and artifacts.manifest_map:
+                        _me = artifacts.manifest_map.get(fp)
+                        if _me and getattr(_me, 'has_table_digest', False):
+                            _all_tables = self._load_table_digest(
+                                self.work_path, _me.file_hash,
+                            )
+                            if _all_tables:
+                                _table_ev = self._format_table_evidence(_all_tables)
+                                if _table_ev:
+                                    ev = f"[{fn} - Table Evidence]\n{_table_ev}"
+
                     # 1. Tree-guided sampling FIRST for tree-indexed files
                     if (
                         artifacts
@@ -3810,7 +3822,7 @@ class AgenticSearch(BaseSearch):
             if self._is_valid_char_range(start, end, len(full_text)) and full_text:
                 segment = full_text[start:end]
             elif leaf.summary:
-                logger.debug(
+                _loguru_logger.debug(
                     f"[TreeNav] char_range degraded for '{leaf.title}' "
                     f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), using summary"
                 )
@@ -3884,6 +3896,81 @@ class AgenticSearch(BaseSearch):
         span_ratio = (end - start) / text_len
         return span_ratio < self._CHAR_RANGE_MAX_SPAN_RATIO
 
+    @staticmethod
+    def _load_table_digest(
+        work_path: Path, file_hash: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Load pre-compiled table digest for a file.
+
+        Returns the list of table entries from the digest JSON, or None
+        if no digest exists or loading fails.
+        """
+        digest_path = (
+            work_path / ".cache" / "compile" / "table_digests" / f"{file_hash}.json"
+        )
+        if not digest_path.exists():
+            return None
+        try:
+            data = json.loads(digest_path.read_text(encoding="utf-8"))
+            return data.get("tables", [])
+        except Exception:
+            return None
+
+    @staticmethod
+    def _filter_tables_by_page_range(
+        tables: List[Dict[str, Any]],
+        page_start: int,
+        page_end: int,
+    ) -> List[Dict[str, Any]]:
+        """Filter tables whose page_number falls within the given range (inclusive)."""
+        return [
+            t for t in tables
+            if t.get("page_number") is not None
+            and page_start <= t["page_number"] <= page_end
+        ]
+
+    @staticmethod
+    def _format_table_evidence(
+        tables: List[Dict[str, Any]],
+        max_chars: int = 3000,
+    ) -> str:
+        """Format table digest entries as LLM-friendly evidence text.
+
+        Strategy:
+        - Small tables (<1000 chars): preserve full Markdown
+        - Large tables: truncate to max_chars with "(truncated)" note
+        - Each table prefixed with "[Table from page N]"
+
+        Returns concatenated formatted table evidence string.
+        """
+        if not tables:
+            return ""
+
+        parts: List[str] = []
+        remaining = max_chars
+
+        for table in tables:
+            if remaining <= 0:
+                break
+
+            page = table.get("page_number", "?")
+            markdown = table.get("markdown", "")
+
+            if not markdown:
+                continue
+
+            header = f"[Table from page {page}]"
+
+            if len(markdown) <= remaining:
+                parts.append(f"{header}\n{markdown}")
+                remaining -= len(markdown) + len(header) + 2
+            else:
+                truncated = markdown[:remaining]
+                parts.append(f"{header}\n{truncated}\n(truncated)")
+                remaining = 0
+
+        return "\n\n".join(parts)
+
     async def _navigate_tree_for_evidence(
         self, file_path: str, query: str, *, max_results: int = 3,
     ) -> Optional[str]:
@@ -3923,7 +4010,7 @@ class AgenticSearch(BaseSearch):
             if self._is_valid_char_range(start, end, len(full_text)) and full_text:
                 segment = full_text[start:end]
             elif leaf.summary:
-                logger.debug(
+                _loguru_logger.debug(
                     f"[TreeNav] char_range degraded for '{leaf.title}' "
                     f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), using summary"
                 )
@@ -3940,6 +4027,37 @@ class AgenticSearch(BaseSearch):
 
         if not parts:
             return None
+
+        # Supplement with table evidence if available
+        try:
+            from sirchmunk.utils.file_utils import get_fast_hash
+            _file_hash = get_fast_hash(file_path)
+            if _file_hash:
+                _all_tables = self._load_table_digest(
+                    self.work_path, _file_hash,
+                )
+                if _all_tables and leaves:
+                    _seen_pages: set = set()
+                    for leaf in leaves:
+                        if leaf.page_range:
+                            ps, pe = leaf.page_range
+                            page_key = (ps, pe)
+                            if page_key in _seen_pages:
+                                continue
+                            _seen_pages.add(page_key)
+                            leaf_tables = self._filter_tables_by_page_range(
+                                _all_tables, ps, pe,
+                            )
+                            if leaf_tables:
+                                table_text = self._format_table_evidence(
+                                    leaf_tables, max_chars=2000,
+                                )
+                                if table_text:
+                                    parts.append(
+                                        f"[Tables pp.{ps}-{pe}]\n{table_text}"
+                                    )
+        except Exception:
+            pass
 
         evidence = "\n\n".join(parts)
         await self._logger.info(

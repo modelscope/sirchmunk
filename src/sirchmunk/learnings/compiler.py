@@ -76,6 +76,8 @@ class FileManifestEntry:
     has_explicit_toc: bool = False  # Whether a native TOC was extracted from the file
     tree_node_count: int = 0  # Number of nodes in the tree index (quality metric)
     has_xlsx_digest: bool = False  # Whether a pre-compiled Excel evidence digest exists
+    has_table_digest: bool = False  # Whether PDF tables were extracted and stored
+    table_count: int = 0  # Number of tables in this file
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -88,6 +90,8 @@ class FileManifestEntry:
             "has_explicit_toc": self.has_explicit_toc,
             "tree_node_count": self.tree_node_count,
             "has_xlsx_digest": self.has_xlsx_digest,
+            "has_table_digest": self.has_table_digest,
+            "table_count": self.table_count,
         }
 
     @classmethod
@@ -102,6 +106,8 @@ class FileManifestEntry:
             has_explicit_toc=data.get("has_explicit_toc", False),
             tree_node_count=data.get("tree_node_count", 0),
             has_xlsx_digest=data.get("has_xlsx_digest", False),
+            has_table_digest=data.get("has_table_digest", False),
+            table_count=data.get("table_count", 0),
         )
 
 
@@ -167,6 +173,8 @@ class FileCompileResult:
     has_explicit_toc: bool = False  # Whether TOC was extracted from native structure
     tree_node_count: int = 0  # Number of nodes in the tree index
     has_xlsx_digest: bool = False  # Whether a pre-compiled Excel evidence digest exists
+    has_table_digest: bool = False  # Whether a pre-compiled table digest exists
+    table_count: int = 0  # Number of tables extracted
 
 
 @dataclass
@@ -402,6 +410,8 @@ class KnowledgeCompiler:
                     has_explicit_toc=result.has_explicit_toc,
                     tree_node_count=result.tree_node_count,
                     has_xlsx_digest=result.has_xlsx_digest,
+                    has_table_digest=result.has_table_digest,
+                    table_count=result.table_count,
                 )
 
         # Phase 3: aggregate results into knowledge network
@@ -608,6 +618,29 @@ class KnowledgeCompiler:
                         result.has_xlsx_digest = True
                 except Exception:
                     pass
+
+            # Persist table digest for documents with extracted tables
+            if extraction.tables:
+                try:
+                    table_digest = self._build_table_digest(extraction.tables)
+                    if table_digest:
+                        digest_dir = self._compile_dir / "table_digests"
+                        digest_dir.mkdir(parents=True, exist_ok=True)
+                        file_hash = get_fast_hash(entry.path) or ""
+                        if file_hash:
+                            digest_path = digest_dir / f"{file_hash}.json"
+                            digest_path.write_text(
+                                json.dumps(table_digest, ensure_ascii=False),
+                                encoding="utf-8",
+                            )
+                            result.has_table_digest = True
+                            result.table_count = len(extraction.tables)
+                except Exception:
+                    pass
+
+            # Annotate tree nodes with table counts for navigation hints
+            if result.tree and result.tree.root and extraction.tables:
+                self._annotate_tree_with_table_counts(result.tree.root, extraction.tables)
 
         except Exception as exc:
             result.error = str(exc)
@@ -1129,6 +1162,77 @@ class KnowledgeCompiler:
         cluster.related_clusters.append(
             WeakSemanticEdge(target_cluster_id=target_id, weight=weight, source=source)
         )
+
+    def _build_table_digest(
+        self, tables: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Build a structured table digest from extraction output.
+
+        Returns a versioned JSON-serializable dict containing all tables
+        with their page numbers, markdown representation, and cell data.
+        Tables are indexed for page-range-based retrieval at search time.
+        """
+        if not tables:
+            return None
+
+        digest_tables = []
+        for idx, table in enumerate(tables):
+            markdown = table.get("markdown", "")
+            cells = table.get("cells", [])
+            if not markdown and not cells:
+                continue
+
+            # Compute row/col counts from cells (kreuzberg returns List[List[str]])
+            row_count = 0
+            col_count = 0
+            if cells:
+                row_count = len(cells)
+                col_count = max((len(row) for row in cells if isinstance(row, (list, tuple))), default=0)
+            elif markdown:
+                # Estimate from markdown lines
+                lines = [l for l in markdown.strip().split("\n") if l.strip().startswith("|")]
+                row_count = max(0, len(lines) - 1)  # exclude separator
+                col_count = lines[0].count("|") - 1 if lines else 0
+
+            digest_tables.append({
+                "index": idx,
+                "page_number": table.get("page_number"),
+                "markdown": markdown,
+                "row_count": row_count,
+                "col_count": col_count,
+                "cells": cells,
+            })
+
+        if not digest_tables:
+            return None
+
+        return {
+            "version": 1,
+            "table_count": len(digest_tables),
+            "tables": digest_tables,
+        }
+
+    def _annotate_tree_with_table_counts(
+        self,
+        node: "TreeNode",
+        tables: List[Dict[str, Any]],
+    ) -> None:
+        """Annotate tree nodes with table count based on page_range overlap.
+
+        For each node with a valid page_range, counts how many extracted
+        tables fall within that range and sets node.table_count accordingly.
+        """
+        if node is None:
+            return
+        if node.page_range:
+            ps, pe = node.page_range
+            count = sum(
+                1 for t in tables
+                if t.get("page_number") is not None and ps <= t["page_number"] <= pe
+            )
+            node.table_count = count
+        for child in node.children:
+            self._annotate_tree_with_table_counts(child, tables)
 
     @staticmethod
     def _count_tree_nodes(tree: Optional[DocumentTree]) -> int:
