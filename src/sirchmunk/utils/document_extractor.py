@@ -143,9 +143,16 @@ class DocumentExtractor:
         extract_tables=True,
         extract_metadata=True,
         pdf_extract_metadata=True,
-        force_ocr=True,
+        force_ocr=False,
     )
-    """Rich extraction with tables, metadata, and OCR fallback."""
+    """Rich extraction with tables, metadata, and layout-based table detection.
+
+    ``force_ocr`` is disabled because:
+    - Most documents (e.g. 10-K, 10-Q PDFs) already contain a native text layer.
+    - kreuzberg automatically falls back to OCR for scanned / image-only pages.
+    - Forcing OCR triggers Tesseract ObjectCache leak warnings in concurrent use
+      and significantly slows down compilation with no quality benefit.
+    """
 
     # Public API -----------------------------------------------------------
 
@@ -174,7 +181,21 @@ class DocumentExtractor:
 
         try:
             result = await extract_file(file_path=file_path, config=config)
-            return DocumentExtractor._convert_result(result, profile)
+            output = DocumentExtractor._convert_result(result, profile)
+            # Fallback: kreuzberg 4.9.1 returns page_count=0 when force_ocr=True;
+            # use pypdf to get the real page count when missing.
+            if output.page_count is None:
+                fallback = DocumentExtractor._fallback_page_count(file_path)
+                if fallback is not None:
+                    output = ExtractionOutput(
+                        content=output.content,
+                        mime_type=output.mime_type,
+                        metadata=output.metadata,
+                        tables=output.tables,
+                        detected_languages=output.detected_languages,
+                        page_count=fallback,
+                    )
+            return output
         except Exception as exc:
             logger.error(
                 "Document extraction failed for {}: {}",
@@ -232,14 +253,53 @@ class DocumentExtractor:
 
         try:
             results = await batch_extract_files(paths=list(file_paths), config=config)
-            return [
+            outputs = [
                 DocumentExtractor._convert_result(r, profile) for r in results
             ]
+            # Apply page_count fallback for each output
+            fixed: List[ExtractionOutput] = []
+            for output, fp in zip(outputs, file_paths):
+                if output.page_count is None:
+                    fallback = DocumentExtractor._fallback_page_count(fp)
+                    if fallback is not None:
+                        output = ExtractionOutput(
+                            content=output.content,
+                            mime_type=output.mime_type,
+                            metadata=output.metadata,
+                            tables=output.tables,
+                            detected_languages=output.detected_languages,
+                            page_count=fallback,
+                        )
+                fixed.append(output)
+            return fixed
         except Exception:
             logger.error("Batch extraction failed for {} files", len(file_paths))
             raise
 
     # Internal helpers -----------------------------------------------------
+
+    @staticmethod
+    def _fallback_page_count(
+        file_path: Union[str, Path],
+    ) -> Optional[int]:
+        """Get page count via pypdf when kreuzberg fails to report it.
+
+        kreuzberg >= 4.9.1 returns ``get_page_count() == 0`` when
+        ``force_ocr=True`` is set.  This fallback uses pypdf (already a
+        transitive dependency) for a lightweight page-count-only read.
+
+        Returns:
+            Page count, or None for non-PDF files or on error.
+        """
+        if Path(file_path).suffix.lower() != ".pdf":
+            return None
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(str(file_path))
+            count = len(reader.pages)
+            return count if count > 0 else None
+        except Exception:
+            return None
 
     @staticmethod
     def _build_config(profile: ExtractionProfile):
@@ -308,9 +368,11 @@ class DocumentExtractor:
         if profile.extract_tables:
             try:
                 from kreuzberg import LayoutDetectionConfig
+                # kreuzberg >= 4.5.0: model-based table detection (RT-DETR v2)
+                # Default: table_model="tatr", apply_heuristics=True
                 layout_config = LayoutDetectionConfig()
             except ImportError:
-                # kreuzberg <= 4.2.x extracts tables by default;
+                # kreuzberg < 4.5.0: tables extracted via heuristics only;
                 # filtering is handled in _convert_result().
                 pass
 

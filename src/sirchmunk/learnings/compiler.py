@@ -1194,6 +1194,10 @@ class KnowledgeCompiler:
                 row_count = max(0, len(lines) - 1)  # exclude separator
                 col_count = lines[0].count("|") - 1 if lines else 0
 
+            # Skip pseudo-tables: single-column or insufficient structure
+            if col_count <= 1:
+                continue
+
             digest_tables.append({
                 "index": idx,
                 "page_number": table.get("page_number"),
