@@ -559,6 +559,7 @@ class KnowledgeCompiler:
                 from sirchmunk.learnings.toc_extractor import TOCExtractor
                 toc_entries = await TOCExtractor.extract(
                     entry.path, content,
+                    total_pages=extraction.page_count,
                 )
                 if toc_entries:
                     await self._log.info(
@@ -568,7 +569,9 @@ class KnowledgeCompiler:
 
             if use_tree:
                 result.tree = await self._tree_indexer.build_tree(
-                    entry.path, content, toc_entries=toc_entries,
+                    entry.path, content,
+                    toc_entries=toc_entries,
+                    total_pages=extraction.page_count,
                 )
 
             # Record TOC / tree metrics on the result for manifest persistence

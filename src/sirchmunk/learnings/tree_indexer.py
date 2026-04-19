@@ -32,6 +32,12 @@ _TREE_ADAPTIVE_DEPTH_THRESHOLDS: tuple = (
 # Summary snippet length extracted from section content (chars)
 _TOC_NODE_SUMMARY_MAX_CHARS = 300
 
+# Marker substring length for fuzzy fallback matching in _resolve_positions
+_MARKER_SUBSTRING_LEN = 32
+
+# Maximum span ratio: filter out overly large spans (>80% of document)
+_MAX_SPAN_RATIO = 0.8
+
 # Adaptive preview window for LLM structure analysis
 _TREE_PREVIEW_MIN = 12_000    # Minimum preview window (chars)
 _TREE_PREVIEW_MAX = 50_000    # Maximum preview window (~12K tokens)
@@ -201,7 +207,9 @@ class DocumentTreeIndexer:
 
         # TOC-accelerated path: skip recursive LLM analysis
         if toc_entries:
-            root = await self._build_tree_from_toc(toc_entries, content)
+            root = await self._build_tree_from_toc(
+                toc_entries, content, total_pages=total_pages,
+            )
             if root is not None:
                 tree = DocumentTree(
                     file_path=file_path,
@@ -300,6 +308,8 @@ class DocumentTreeIndexer:
         self,
         toc_entries: List[Any],
         content: str,
+        *,
+        total_pages: Optional[int] = None,
     ) -> Optional[TreeNode]:
         """Build tree directly from extracted TOC entries, avoiding recursive LLM.
 
@@ -309,25 +319,29 @@ class DocumentTreeIndexer:
         Args:
             toc_entries: List of TOCEntry from toc_extractor.
             content: Full extracted text of the document.
+            total_pages: Total page count for page_range calculation.
 
         Returns:
             Root TreeNode, or None if no children could be created.
         """
         seen_ids: set = set()
         children = self._toc_entries_to_nodes(
-            toc_entries, content, len(content), seen_ids, fallback_level=1,
+            toc_entries, content, len(content), seen_ids,
+            fallback_level=1, total_pages=total_pages,
         )
 
         if not children:
             return None
 
         root_summary = await self._synthesize_root_summary(children)
+        root_page_range = (1, total_pages) if total_pages and total_pages > 0 else None
         return TreeNode(
             node_id=self._unique_node_id(0, seen_ids),
             title="Document",
             summary=root_summary,
             char_range=(0, len(content)),
             level=0,
+            page_range=root_page_range,
             children=children,
         )
 
@@ -338,15 +352,25 @@ class DocumentTreeIndexer:
         parent_end: int,
         seen_ids: set,
         fallback_level: int,
+        total_pages: Optional[int] = None,
     ) -> List["TreeNode"]:
         """Recursively convert TOCEntry trees into TreeNode trees.
 
         Handles arbitrary nesting depth and guards against invalid
-        char_start / char_end values.
+        char_start / char_end values.  Computes ``page_range`` using a
+        look-ahead algorithm when ``page_start`` is available on entries.
+
+        Args:
+            entries: List of TOCEntry objects (may have children).
+            content: Full extracted text.
+            parent_end: End offset inherited from the parent node.
+            seen_ids: Set for unique node-id generation.
+            fallback_level: Default level when entry.level is 0.
+            total_pages: Total page count for page_range look-ahead.
         """
         nodes: List[TreeNode] = []
         content_len = len(content)
-        for entry in entries:
+        for i, entry in enumerate(entries):
             start = max(0, min(entry.char_start, content_len))
             end = entry.char_end if entry.char_end and entry.char_end > start else parent_end
             end = min(end, content_len)
@@ -355,11 +379,23 @@ class DocumentTreeIndexer:
             nid = DocumentTreeIndexer._unique_node_id(start, seen_ids)
             level = entry.level if entry.level > 0 else fallback_level
 
+            # page_range: look-ahead algorithm
+            page_range = None
+            if hasattr(entry, 'page_start') and entry.page_start is not None:
+                # Find next sibling with page_start to determine page_end
+                page_end = total_pages or entry.page_start
+                for j in range(i + 1, len(entries)):
+                    if hasattr(entries[j], 'page_start') and entries[j].page_start is not None:
+                        page_end = entries[j].page_start
+                        break
+                page_range = (entry.page_start, max(entry.page_start, page_end))
+
             child_nodes: List[TreeNode] = []
             if entry.children:
                 child_nodes = DocumentTreeIndexer._toc_entries_to_nodes(
                     entry.children, content, end, seen_ids,
                     fallback_level=level + 1,
+                    total_pages=total_pages,
                 )
 
             node = TreeNode(
@@ -368,6 +404,7 @@ class DocumentTreeIndexer:
                 summary=section_text.strip(),
                 char_range=(start, end),
                 level=level,
+                page_range=page_range,
                 children=child_nodes,
             )
             nodes.append(node)
@@ -495,40 +532,65 @@ class DocumentTreeIndexer:
     def _resolve_positions(
         items: List[Dict[str, Any]], full_text: str,
     ) -> List[Dict[str, Any]]:
-        """Resolve section start/end character offsets from marker text."""
-        resolved: List[Dict[str, Any]] = []
-        prev_end = 0
+        """Resolve section start/end character offsets from marker text.
+
+        Two-pass algorithm:
+          Pass 1 — determine all start positions with tiered fallback:
+                   exact match from prev_end -> substring match -> full-text fallback.
+          Pass 2 — set end[i] = start[i+1]; last end = text_len.
+
+        Filters out invalid spans and overly large spans (> ``_MAX_SPAN_RATIO``
+        of the document) to prevent accumulated positioning errors.
+        """
         text_lower = full_text.lower()
+        text_len = len(full_text)
+        resolved: List[Dict[str, Any]] = []
+
+        # Pass 1: determine all start positions
+        prev_end = 0
         for item in items:
             title = item.get("title", "")
-            summary = item.get("summary", "")
             marker = item.get("start_marker", title)
 
-            pos = text_lower.find(marker.lower(), prev_end) if marker else -1
+            pos = -1
+            if marker:
+                marker_lower = marker.lower()
+                # Level 1: exact match from prev_end
+                pos = text_lower.find(marker_lower, prev_end)
+                # Level 2: substring match (first N chars) from prev_end
+                if pos < 0 and len(marker_lower) > _MARKER_SUBSTRING_LEN:
+                    pos = text_lower.find(
+                        marker_lower[:_MARKER_SUBSTRING_LEN], prev_end,
+                    )
+                # Level 3: full text fallback from start
+                if pos < 0:
+                    pos = text_lower.find(marker_lower, 0)
+
             start = pos if pos >= 0 else prev_end
-
-            end_marker = item.get("end_marker", "")
-            if end_marker:
-                epos = text_lower.find(end_marker.lower(), start + 1)
-                end = epos if epos > start else min(start + 50000, len(full_text))
-            else:
-                end = min(start + 50000, len(full_text))
-
             resolved.append({
                 "title": title,
-                "summary": summary,
+                "summary": item.get("summary", ""),
                 "start": start,
-                "end": end,
+                "end": text_len,  # placeholder
             })
-            prev_end = end
+            prev_end = (
+                start + max(1, len(marker))
+                if pos >= 0
+                else prev_end
+            )
 
-        # Fix gaps: each section ends where the next begins
+        # Pass 2: set end[i] = start[i+1], last end = text_len
         for i in range(len(resolved) - 1):
             resolved[i]["end"] = resolved[i + 1]["start"]
         if resolved:
-            resolved[-1]["end"] = len(full_text)
+            resolved[-1]["end"] = text_len
 
-        return [s for s in resolved if s["end"] > s["start"]]
+        # Filter out invalid spans and overly large spans
+        return [
+            s for s in resolved
+            if s["end"] > s["start"]
+            and (s["end"] - s["start"]) / max(text_len, 1) < _MAX_SPAN_RATIO
+        ]
 
     async def _select_children(
         self, nodes: List[TreeNode], query: str,
@@ -538,7 +600,7 @@ class DocumentTreeIndexer:
             return nodes
 
         listing = "\n".join(
-            f"[{i}] {n.title}: {n.summary[:150]}"
+            f"[{i}] {n.title}{self._format_page_range(n.page_range)}: {n.summary[:150]}"
             for i, n in enumerate(nodes)
         )
         prompt = (
@@ -603,6 +665,16 @@ class DocumentTreeIndexer:
         if not node.children:
             return node.level
         return max(DocumentTreeIndexer._max_node_depth(c) for c in node.children)
+
+    @staticmethod
+    def _format_page_range(
+        page_range: "Optional[Tuple[int, int]]",
+    ) -> str:
+        """Format a page_range tuple into a human-readable string for prompts."""
+        if not page_range:
+            return ""
+        ps, pe = page_range
+        return f" [pages {ps}-{pe}]" if ps != pe else f" [page {ps}]"
 
     @staticmethod
     def should_build_tree(file_path: str, content_length: int) -> bool:

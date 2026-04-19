@@ -683,6 +683,46 @@ class TOCExtractor:
     # Minimum entries to consider a TOC extraction successful
     _MIN_ENTRIES_THRESHOLD: ClassVar[int] = 3
 
+    @staticmethod
+    def _build_hierarchy(flat_entries: List["TOCEntry"]) -> List["TOCEntry"]:
+        """Convert flat TocEntry list to nested tree using level field.
+
+        Uses stack-based algorithm, O(n). When encountering a deeper level
+        entry, push it as a child of the current stack top; when same or
+        shallower, pop back to the corresponding level.
+
+        Args:
+            flat_entries: Flat list of TOCEntry objects with ``level`` set.
+
+        Returns:
+            List of top-level TOCEntry objects with ``children`` populated.
+        """
+        if not flat_entries:
+            return []
+
+        roots: List[TOCEntry] = []
+        # Stack holds (level, entry) pairs representing the current path
+        stack: List[TOCEntry] = []
+
+        for entry in flat_entries:
+            # Reset children to avoid stale data from prior processing
+            entry.children = []
+
+            # Pop stack until we find the parent (shallower level)
+            while stack and stack[-1].level >= entry.level:
+                stack.pop()
+
+            if stack:
+                # Attach as child of the current stack top
+                stack[-1].children.append(entry)
+            else:
+                # No parent — this is a root-level entry
+                roots.append(entry)
+
+            stack.append(entry)
+
+        return roots
+
     @classmethod
     async def extract(
         cls,
@@ -690,6 +730,7 @@ class TOCExtractor:
         content: str,
         *,
         llm_caller: Any | None = None,
+        total_pages: Optional[int] = None,
     ) -> Optional[List[TOCEntry]]:
         """Extract TOC using layered fallback strategy.
 
@@ -701,6 +742,8 @@ class TOCExtractor:
             file_path: Absolute path to the source file.
             content: Extracted text content of the file.
             llm_caller: Optional LLM caller for Layer 4.
+            total_pages: Total page count of the source document, if known.
+                         Used to estimate ``page_start`` for Layer 3/4 entries.
 
         Returns:
             List of TOCEntry with resolved char positions, or None if
@@ -709,11 +752,16 @@ class TOCExtractor:
         ext = Path(file_path).suffix.lower()
 
         result: Optional[TocResult] = None
+        # Track whether the result came from pypdf (Layer 1) which
+        # already produces a properly nested tree with children.
+        is_pypdf = False
 
         if ext == ".pdf":
             result = await cls._extract_pdf_layered(
                 file_path, content, llm_caller,
             )
+            if result is not None:
+                is_pypdf = result.source == "pypdf"
         elif ext in (".md", ".markdown"):
             heading_result = HeadingTocExtractor.extract(content)
             if cls._is_sufficient(heading_result):
@@ -728,7 +776,30 @@ class TOCExtractor:
         if result is None or not cls._is_sufficient(result):
             return None
 
+        # Merge total_pages from TocResult if not explicitly provided
+        if total_pages is None and result.page_count:
+            total_pages = result.page_count
+
         entries = result.entries
+
+        # Post-processing for non-pypdf layers: rebuild hierarchy from
+        # flat level-annotated entries (Layer 2/3/4 and format extractors
+        # produce flat lists; pypdf already builds a nested tree).
+        if not is_pypdf:
+            entries = cls._build_hierarchy(entries)
+
+        # Estimate page_start for Layer 3/4 entries that lack it
+        if total_pages and content:
+            flat_all: List[TOCEntry] = []
+            cls._flatten_entries(entries, flat_all)
+            content_len = len(content)
+            for entry in flat_all:
+                if entry.page_start is None and entry.char_start is not None:
+                    entry.page_start = min(
+                        total_pages,
+                        max(1, round(entry.char_start / content_len * total_pages) + 1),
+                    )
+
         total = cls._count_entries(entries)
         if total < cls._MIN_ENTRIES_THRESHOLD:
             return None

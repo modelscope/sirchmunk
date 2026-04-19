@@ -86,6 +86,10 @@ _NO_RESULTS_MESSAGE = "No results found."
 # Soft-similarity threshold for gradient cluster reuse (P2)
 _SOFT_SIM_THRESHOLD = 0.65
 
+# Pure tree search mode for ablation experiments.
+# When enabled, search relies solely on tree index navigation, skipping rga keyword search.
+_PURE_TREE_SEARCH: bool = os.getenv("SIRCHMUNK_PURE_TREE_SEARCH", "false").lower() == "true"
+
 # Common English stop-words filtered out during keyword coverage computation.
 _STOP_WORDS: frozenset = frozenset({
     "the", "is", "a", "an", "of", "in", "for", "to", "and", "or",
@@ -1631,36 +1635,44 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         # Phase 2: Parallel retrieval — keyword search + dir_scan rank
         # ==============================================================
-        await self._logger.info("[Phase 2] Parallel retrieval: rga keyword search + dir_scan LLM rank")
-        context.increment_loop()
+        keyword_files: List[str] = []
+        dir_scan_files: List[str] = []
 
-        phase2_tasks = []
+        if _PURE_TREE_SEARCH:
+            # Pure tree search mode: skip rga and dir_scan, rely solely on tree hits
+            await self._logger.info("[Phase 2:PureTree] Skipping rga keyword search and dir_scan")
+            context.increment_loop()
+        else:
+            await self._logger.info("[Phase 2] Parallel retrieval: rga keyword search + dir_scan LLM rank")
+            context.increment_loop()
 
-        if initial_keywords:
-            phase2_tasks.append(
-                self._retrieve_by_keywords(
-                    initial_keywords, paths,
-                    max_depth=max_depth, include=include, exclude=exclude,
+            phase2_tasks = []
+
+            if initial_keywords:
+                phase2_tasks.append(
+                    self._retrieve_by_keywords(
+                        initial_keywords, paths,
+                        max_depth=max_depth, include=include, exclude=exclude,
+                    )
                 )
-            )
-        else:
-            phase2_tasks.append(self._async_noop([]))
+            else:
+                phase2_tasks.append(self._async_noop([]))
 
-        if scan_result is not None and enable_dir_scan:
-            phase2_tasks.append(
-                self._rank_dir_scan_candidates(query, scan_result)
-            )
-        else:
-            phase2_tasks.append(self._async_noop([]))
+            if scan_result is not None and enable_dir_scan:
+                phase2_tasks.append(
+                    self._rank_dir_scan_candidates(query, scan_result)
+                )
+            else:
+                phase2_tasks.append(self._async_noop([]))
 
-        phase2_results = await asyncio.gather(*phase2_tasks, return_exceptions=True)
+            phase2_results = await asyncio.gather(*phase2_tasks, return_exceptions=True)
 
-        keyword_files = phase2_results[0] if not isinstance(phase2_results[0], Exception) else []
-        dir_scan_files = phase2_results[1] if not isinstance(phase2_results[1], Exception) else []
+            keyword_files = phase2_results[0] if not isinstance(phase2_results[0], Exception) else []
+            dir_scan_files = phase2_results[1] if not isinstance(phase2_results[1], Exception) else []
 
-        for i, label in enumerate(["keyword_search", "dir_scan_rank"]):
-            if isinstance(phase2_results[i], Exception):
-                await self._logger.warning(f"[Phase 2] {label} failed: {phase2_results[i]}")
+            for i, label in enumerate(["keyword_search", "dir_scan_rank"]):
+                if isinstance(phase2_results[i], Exception):
+                    await self._logger.warning(f"[Phase 2] {label} failed: {phase2_results[i]}")
 
         await self._logger.info(
             f"[Phase 2] Results: keyword_files={len(keyword_files)}, "
@@ -1698,12 +1710,30 @@ class AgenticSearch(BaseSearch):
         extra_knowledge_files = knowledge_probe.file_paths
         if soft_hit:
             extra_knowledge_files = soft_hit.file_paths + extra_knowledge_files
-        merged_files = self._merge_file_paths(
-            keyword_files=list(tree_hits) + catalog_deep_hits + compile_hints.file_paths + summary_index_hits + keyword_files,
-            dir_scan_files=dir_scan_files,
-            knowledge_hits=extra_knowledge_files,
-        )
-        await self._logger.info(f"[Phase 3] Merged {len(merged_files)} unique candidate files")
+
+        if _PURE_TREE_SEARCH:
+            # Pure tree search: only use tree hits (+ soft-hit fallback if no tree hits)
+            pure_tree_files = list(tree_hits)
+            if not pure_tree_files and soft_hit:
+                pure_tree_files = soft_hit.file_paths
+                await self._logger.info(
+                    f"[Phase 3:PureTree] No tree hits, using {len(pure_tree_files)} soft-hit files"
+                )
+            merged_files = self._merge_file_paths(
+                keyword_files=pure_tree_files,
+                dir_scan_files=[],
+                knowledge_hits=[],
+            )
+            await self._logger.info(
+                f"[Phase 3:PureTree] Merged {len(merged_files)} tree-only candidate files"
+            )
+        else:
+            merged_files = self._merge_file_paths(
+                keyword_files=list(tree_hits) + catalog_deep_hits + compile_hints.file_paths + summary_index_hits + keyword_files,
+                dir_scan_files=dir_scan_files,
+                knowledge_hits=extra_knowledge_files,
+            )
+            await self._logger.info(f"[Phase 3] Merged {len(merged_files)} unique candidate files")
 
         cluster: Optional[KnowledgeCluster] = None
         if merged_files:
@@ -2181,6 +2211,8 @@ class AgenticSearch(BaseSearch):
     """Maximum files returned by tree index probing in DEEP mode."""
     _TREE_ROOT_HINT_TRUNCATE = 150
     """Max chars of tree root summary in Step 1 structure hints."""
+    _CHAR_RANGE_MAX_SPAN_RATIO: float = 0.8
+    """char_range spanning more than this ratio of the document is treated as invalid."""
 
     # --- Self-correction expanded sampling ---
     _SELF_CORRECT_EXPANDED_NAV_RESULTS: int = 6
@@ -2484,58 +2516,88 @@ class AgenticSearch(BaseSearch):
         evidence = ""
         file_path: Optional[str] = None  # set when best_files found
 
-        # High-confidence catalog routing: skip rga, use catalog directly
-        if catalog_routed_files and catalog_confidence == "high":
-            used_level = "catalog_route"
-            await self._logger.info(
-                f"[FAST:Step2] High-confidence catalog routing → "
-                f"{[Path(p).name for p in catalog_routed_files[:top_k_files]]}"
-            )
-            best_files = [
-                {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
-                for p in catalog_routed_files[:top_k_files]
-            ]
-
-        if not best_files and primary:
-            best_files = await self._fast_find_best_file(
-                primary, top_k=top_k_files, keyword_idfs=keyword_idfs,
-                query=query, artifacts=artifacts,
-                **rga_kwargs,
-            )
-
-        if not best_files and fallback:
-            used_level = "fallback"
-            await self._logger.info(
-                "[FAST:Step2] Primary miss, trying fine-grained fallback"
-            )
-            best_files = await self._fast_find_best_file(
-                fallback, top_k=top_k_files, keyword_idfs=keyword_idfs,
-                query=query, artifacts=artifacts,
-                **rga_kwargs,
-            )
-
-        # --- Fallback: compile-hint files when rga misses (catalog + P2 + P4) ---
-        if not best_files and compile_hint_files:
-            used_level = "compile_hint"
-            await self._logger.info(
-                f"[FAST:Step2] rga miss — using {len(compile_hint_files)} compile-hint files"
-            )
-            best_files = [
-                {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
-                for p in compile_hint_files[:top_k_files]
-            ]
-
-        # --- Fallback: use dir_scan only when rga misses and dir scan is enabled ---
-        if not best_files and enable_dir_scan:
-            scan_result = await self._probe_dir_scan(paths, enable=True, max_files=300)
-            if scan_result is not None:
-                await self._logger.info("[FAST:Step2] rga miss — falling back to dir_scan ranking")
-                ranked_paths = await self._rank_dir_scan_candidates(
-                    query, scan_result, top_k=10, include_medium=True,
+        # --- Pure tree search mode: skip rga, use tree probe results directly ---
+        if _PURE_TREE_SEARCH:
+            if _tree_probed_files:
+                used_level = "pure_tree"
+                best_files = [
+                    {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
+                    for p in _tree_probed_files[:top_k_files]
+                ]
+                await self._logger.info(
+                    f"[FAST:PureTree] Using {len(best_files)} tree-probed files: "
+                    f"{[Path(p).name for p in _tree_probed_files[:top_k_files]]}"
                 )
-                if ranked_paths:
-                    used_level = "dir_scan"
-                    best_files = [{"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0} for p in ranked_paths[:top_k_files]]
+            elif compile_hint_files:
+                # Tree probe returned nothing but compile hints have tree files
+                used_level = "pure_tree_hint"
+                best_files = [
+                    {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
+                    for p in compile_hint_files[:top_k_files]
+                ]
+                await self._logger.info(
+                    f"[FAST:PureTree] No tree probes, falling back to "
+                    f"{len(best_files)} compile-hint files"
+                )
+            else:
+                await self._logger.warning(
+                    "[FAST:PureTree] No tree probes available, returning empty"
+                )
+                return _NO_RESULTS_MESSAGE, None, context
+        else:
+            # --- Original rga-based retrieval logic ---
+            # High-confidence catalog routing: skip rga, use catalog directly
+            if catalog_routed_files and catalog_confidence == "high":
+                used_level = "catalog_route"
+                await self._logger.info(
+                    f"[FAST:Step2] High-confidence catalog routing → "
+                    f"{[Path(p).name for p in catalog_routed_files[:top_k_files]]}"
+                )
+                best_files = [
+                    {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
+                    for p in catalog_routed_files[:top_k_files]
+                ]
+
+            if not best_files and primary:
+                best_files = await self._fast_find_best_file(
+                    primary, top_k=top_k_files, keyword_idfs=keyword_idfs,
+                    query=query, artifacts=artifacts,
+                    **rga_kwargs,
+                )
+
+            if not best_files and fallback:
+                used_level = "fallback"
+                await self._logger.info(
+                    "[FAST:Step2] Primary miss, trying fine-grained fallback"
+                )
+                best_files = await self._fast_find_best_file(
+                    fallback, top_k=top_k_files, keyword_idfs=keyword_idfs,
+                    query=query, artifacts=artifacts,
+                    **rga_kwargs,
+                )
+
+            # --- Fallback: compile-hint files when rga misses (catalog + P2 + P4) ---
+            if not best_files and compile_hint_files:
+                used_level = "compile_hint"
+                await self._logger.info(
+                    f"[FAST:Step2] rga miss — using {len(compile_hint_files)} compile-hint files"
+                )
+                best_files = [
+                    {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
+                    for p in compile_hint_files[:top_k_files]
+                ]
+
+            # --- Fallback: use dir_scan only when rga misses and dir scan is enabled ---
+            if not best_files and enable_dir_scan:
+                scan_result = await self._probe_dir_scan(paths, enable=True, max_files=300)
+                if scan_result is not None:
+                    await self._logger.info("[FAST:Step2] rga miss — falling back to dir_scan ranking")
+                    ranked_paths = await self._rank_dir_scan_candidates(
+                        query, scan_result, top_k=10, include_medium=True,
+                    )
+                    if ranked_paths:
+                        used_level = "dir_scan"
+                        best_files = [{"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0} for p in ranked_paths[:top_k_files]]
 
         if not best_files:
             if llm_fallback:
@@ -3745,14 +3807,24 @@ class AgenticSearch(BaseSearch):
         total_chars = 0
         for leaf in leaves[: self._TREE_SAMPLE_MAX_SECTIONS]:
             start, end = leaf.char_range
-            if full_text and end > start:
+            if self._is_valid_char_range(start, end, len(full_text)) and full_text:
                 segment = full_text[start:end]
+            elif leaf.summary:
+                logger.debug(
+                    f"[TreeNav] char_range degraded for '{leaf.title}' "
+                    f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), using summary"
+                )
+                segment = leaf.summary
             else:
-                segment = leaf.summary or ""
+                continue
             segment = segment[: self._TREE_SAMPLE_SECTION_MAX_CHARS]
             if not segment.strip():
                 continue
-            header = f"[{fname} \u2192 {leaf.title}]"
+            page_info = ""
+            if leaf.page_range:
+                ps, pe = leaf.page_range
+                page_info = f" (pp.{ps}-{pe})" if ps != pe else f" (p.{ps})"
+            header = f"[{fname} → {leaf.title}{page_info}]"
             chunk = f"{header}\n{segment}"
             if total_chars + len(chunk) > max_chars:
                 remaining = max_chars - total_chars
@@ -3798,6 +3870,20 @@ class AgenticSearch(BaseSearch):
         )
         return evidence
 
+    def _is_valid_char_range(
+        self, start: int, end: int, text_len: int,
+    ) -> bool:
+        """Check whether a char_range is valid for slicing.
+
+        A range is invalid when it covers more than
+        ``_CHAR_RANGE_MAX_SPAN_RATIO`` of the document (likely a
+        whole-document fallback) or when *end <= start*.
+        """
+        if start < 0 or end <= start or text_len <= 0:
+            return False
+        span_ratio = (end - start) / text_len
+        return span_ratio < self._CHAR_RANGE_MAX_SPAN_RATIO
+
     async def _navigate_tree_for_evidence(
         self, file_path: str, query: str, *, max_results: int = 3,
     ) -> Optional[str]:
@@ -3834,12 +3920,22 @@ class AgenticSearch(BaseSearch):
 
         for leaf in leaves:
             start, end = leaf.char_range
-            if full_text and end > start:
+            if self._is_valid_char_range(start, end, len(full_text)) and full_text:
                 segment = full_text[start:end]
+            elif leaf.summary:
+                logger.debug(
+                    f"[TreeNav] char_range degraded for '{leaf.title}' "
+                    f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), using summary"
+                )
+                segment = leaf.summary
             else:
-                segment = leaf.summary or ""
+                continue
             if segment.strip():
-                header = f"[{fname} → {leaf.title}]"
+                page_info = ""
+                if leaf.page_range:
+                    ps, pe = leaf.page_range
+                    page_info = f" (pp.{ps}-{pe})" if ps != pe else f" (p.{ps})"
+                header = f"[{fname} → {leaf.title}{page_info}]"
                 parts.append(f"{header}\n{segment[:3000]}")
 
         if not parts:
