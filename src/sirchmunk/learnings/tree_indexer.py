@@ -217,7 +217,10 @@ class DocumentTreeIndexer:
                 toc_entries, content, total_pages=total_pages,
             )
             if root is not None:
-                await self._deepen_large_leaves(root, content, max_depth=effective_depth)
+                # NOTE: _deepen_large_leaves disabled - char_range anchoring via LLM start_text
+                # is unreliable, causing overlapping ranges and search failures.
+                # TODO: Re-enable when robust char_range calculation is implemented.
+                # await self._deepen_large_leaves(root, content, max_depth=effective_depth)
                 await self._enrich_node_summaries(root, content)
                 tree = DocumentTree(
                     file_path=file_path,
@@ -238,7 +241,10 @@ class DocumentTreeIndexer:
         if root is None:
             return None
 
-        await self._deepen_large_leaves(root, content, max_depth=effective_depth)
+        # NOTE: _deepen_large_leaves disabled - char_range anchoring via LLM start_text
+        # is unreliable, causing overlapping ranges and search failures.
+        # TODO: Re-enable when robust char_range calculation is implemented.
+        # await self._deepen_large_leaves(root, content, max_depth=effective_depth)
         await self._enrich_node_summaries(root, content)
 
         tree = DocumentTree(

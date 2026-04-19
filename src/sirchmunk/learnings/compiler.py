@@ -1265,14 +1265,16 @@ class KnowledgeCompiler:
 
         node.table_count = len(matched_tables)
 
-        # Create table child nodes only for leaf nodes with matched tables
-        if not node.children and matched_tables:
-            try:
-                self._spawn_table_children(
-                    node, matched_tables, content, _counter,
-                )
-            except Exception:
-                pass  # Never break compile for table node creation
+        # NOTE: _spawn_table_children disabled - converting leaf to non-leaf breaks
+        # search navigation which expects leaves for char_range extraction.
+        # TODO: Re-enable when search can properly handle mixed text+table children.
+        # if not node.children and matched_tables:
+        #     try:
+        #         self._spawn_table_children(
+        #             node, matched_tables, content, _counter,
+        #         )
+        #     except Exception:
+        #         pass
 
     @staticmethod
     def _is_pseudo_table(table: Dict[str, Any]) -> bool:
