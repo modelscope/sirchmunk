@@ -8,7 +8,9 @@ Monte Carlo sampling.
 """
 
 import json
+import math
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -153,6 +155,13 @@ class DocumentTree:
 class DocumentTreeIndexer:
     """Build and cache PageIndex-style hierarchical tree indices for documents."""
 
+    # Maximum child nodes before switching to paginated LLM selection.
+    # Balance: lower = more LLM calls, higher = more tokens per call.
+    _PAGE_SIZE_THRESHOLD: int = 15
+
+    # Number of nodes per group in paginated selection.
+    _GROUP_PAGE_SIZE: int = 15
+
     def __init__(
         self,
         llm: OpenAIChat,
@@ -272,8 +281,23 @@ class DocumentTreeIndexer:
         query: str,
         *,
         max_results: int = 3,
+        max_depth: int = 4,
     ) -> List[TreeNode]:
-        """LLM-driven branch selection using _select_children()."""
+        """Adaptive-depth LLM-driven tree navigation.
+
+        Iteratively descends the tree using _select_children() at each level,
+        collecting leaf nodes until *max_results* are found or *max_depth* is
+        reached.
+
+        Args:
+            tree: DocumentTree with a root node.
+            query: Search query for relevance selection.
+            max_results: Maximum number of leaf nodes to return.
+            max_depth: Maximum descent depth (default 4).
+
+        Returns:
+            List of the most relevant leaf TreeNodes.
+        """
         if tree.root is None:
             return []
 
@@ -281,18 +305,41 @@ class DocumentTreeIndexer:
         if not candidates:
             return [tree.root]
 
-        selected = await self._select_children(candidates, query)
-        if not selected:
-            return []
-
         result_leaves: List[TreeNode] = []
-        for node in selected:
-            if node.leaf:
-                result_leaves.append(node)
-            else:
-                deeper = await self._select_children(node.children, query)
-                for d in (deeper or node.children[:1]):
-                    result_leaves.extend(d.all_leaves()[:max_results])
+        visited: set = set()  # prevent cycles
+        frontier = candidates
+        selected: List[TreeNode] = []
+
+        depth = 0
+        while depth < max_depth and frontier:
+            selected = await self._select_children(
+                frontier, query, max_selections=max_results,
+            )
+            if not selected:
+                break
+
+            next_frontier: List[TreeNode] = []
+            for node in selected:
+                node_id = id(node)
+                if node_id in visited:
+                    continue
+                visited.add(node_id)
+
+                if node.leaf or not node.children:
+                    result_leaves.append(node)
+                else:
+                    next_frontier.extend(node.children)
+
+            if len(result_leaves) >= max_results:
+                break
+
+            frontier = next_frontier
+            depth += 1
+
+        # Fallback: if no leaves found, expand last selected nodes
+        if not result_leaves and selected:
+            for node in selected:
+                result_leaves.extend(node.all_leaves()[:max_results])
 
         # Deduplicate and cap
         seen_ids: set = set()
@@ -341,6 +388,9 @@ class DocumentTreeIndexer:
         Returns:
             Root TreeNode, or None if no children could be created.
         """
+        # Infer hierarchy when TOC entries are flat (all same level)
+        toc_entries = self._infer_hierarchy(toc_entries)
+
         seen_ids: set = set()
         children = self._toc_entries_to_nodes(
             toc_entries, content, len(content), seen_ids,
@@ -610,11 +660,20 @@ class DocumentTreeIndexer:
         ]
 
     async def _select_children(
-        self, nodes: List[TreeNode], query: str,
+        self, nodes: List[TreeNode], query: str, *, max_selections: int = 3,
     ) -> List[TreeNode]:
-        """LLM-driven branch selection: pick the most relevant children."""
+        """LLM-driven branch selection: pick the most relevant children.
+
+        Dispatches to paginated selection when *nodes* exceeds
+        ``_PAGE_SIZE_THRESHOLD`` to avoid overwhelming the LLM.
+        """
         if len(nodes) <= 2:
             return nodes
+
+        if len(nodes) > self._PAGE_SIZE_THRESHOLD:
+            return await self._select_children_paginated(
+                nodes, query, max_selections=max_selections,
+            )
 
         listing = "\n".join(
             f"[{i}] {n.title}{self._format_page_range(n.page_range)}"
@@ -634,10 +693,120 @@ class DocumentTreeIndexer:
             m = re.search(r"\[[\d\s,]+\]", raw)
             if m:
                 indices = json.loads(m.group())
-                return [nodes[i] for i in indices if 0 <= i < len(nodes)]
+                selected = [nodes[i] for i in indices if 0 <= i < len(nodes)]
+                return selected if selected else nodes[:max_selections]
         except (json.JSONDecodeError, IndexError, TypeError):
             pass
-        return nodes[:2]
+        return nodes[:max_selections]
+
+    async def _select_children_paginated(
+        self,
+        nodes: List[TreeNode],
+        query: str,
+        *,
+        page_size: int = 15,
+        max_selections: int = 3,
+    ) -> List[TreeNode]:
+        """Two-phase paginated selection for large node sets.
+
+        Phase 1: partition *nodes* into sequential groups of *page_size*,
+                 present group summaries to LLM, and select 1-2 groups.
+        Phase 2: run fine-grained selection within each chosen group.
+
+        Falls back to the first *max_selections* nodes on any LLM failure.
+        """
+        page_size = max(page_size, self._GROUP_PAGE_SIZE)
+
+        # --- Phase 0: build groups ---
+        groups: List[List[TreeNode]] = []
+        for start in range(0, len(nodes), page_size):
+            groups.append(nodes[start:start + page_size])
+
+        if len(groups) <= 1:
+            # Only one group — skip directly to fine-grained selection
+            return await self._select_from_group(nodes, query, max_selections)
+
+        # --- Phase 1: group-level selection ---
+        group_listing = "\n".join(
+            f"[{i}] {g[0].title} ... {g[-1].title} ({len(g)} sections)"
+            for i, g in enumerate(groups)
+        )
+        group_prompt = (
+            f"Given the query: \"{query}\"\n\n"
+            f"The document has {len(nodes)} sections organized into "
+            f"{len(groups)} groups.\n"
+            f"Select the 1-2 most relevant groups (by index number):\n"
+            f"{group_listing}\n\n"
+            f"Return ONLY a JSON array of group index numbers, e.g. [0, 2]"
+        )
+
+        selected_groups: List[List[TreeNode]] = []
+        try:
+            resp = await self._llm.achat(
+                [{"role": "user", "content": group_prompt}],
+            )
+            raw = resp.content.strip()
+            m = re.search(r"\[[\d\s,]+\]", raw)
+            if m:
+                g_indices = json.loads(m.group())
+                selected_groups = [
+                    groups[i] for i in g_indices if 0 <= i < len(groups)
+                ]
+        except (json.JSONDecodeError, IndexError, TypeError):
+            pass
+
+        if not selected_groups:
+            # Fallback: take the first group
+            selected_groups = [groups[0]]
+
+        # --- Phase 2: fine-grained selection within chosen groups ---
+        results: List[TreeNode] = []
+        for group in selected_groups:
+            picked = await self._select_from_group(group, query, max_selections)
+            results.extend(picked)
+
+        # Deduplicate by node_id and cap
+        seen: set = set()
+        unique: List[TreeNode] = []
+        for n in results:
+            if n.node_id not in seen:
+                seen.add(n.node_id)
+                unique.append(n)
+        return unique[:max_selections] if unique else nodes[:max_selections]
+
+    async def _select_from_group(
+        self,
+        group: List[TreeNode],
+        query: str,
+        max_selections: int,
+    ) -> List[TreeNode]:
+        """Select the most relevant nodes within a single group via LLM."""
+        if len(group) <= 2:
+            return group
+
+        listing = "\n".join(
+            f"[{i}] {n.title}{self._format_page_range(n.page_range)}"
+            f"{' [' + str(n.table_count) + ' tables]' if n.table_count > 0 else ''}"
+            f": {n.summary[:150]}"
+            for i, n in enumerate(group)
+        )
+        prompt = (
+            f"Given the query: \"{query}\"\n\n"
+            f"Select the 1-2 most relevant sections (by index number):\n{listing}\n\n"
+            f"Return ONLY a JSON array of index numbers, e.g. [0, 2]"
+        )
+        try:
+            resp = await self._llm.achat([{"role": "user", "content": prompt}])
+            raw = resp.content.strip()
+            m = re.search(r"\[[\d\s,]+\]", raw)
+            if m:
+                indices = json.loads(m.group())
+                selected = [group[i] for i in indices if 0 <= i < len(group)]
+                if selected:
+                    return selected[:max_selections]
+        except (json.JSONDecodeError, IndexError, TypeError):
+            pass
+        return group[:max_selections]
 
     # ------------------------------------------------------------------ #
     #  Cache I/O                                                          #
@@ -924,3 +1093,282 @@ class DocumentTreeIndexer:
         """Determine whether a file is eligible for tree indexing."""
         ext = Path(file_path).suffix.lower()
         return ext in _TREE_EXTENSIONS and content_length >= _TREE_MIN_CHARS
+
+    # ------------------------------------------------------------------ #
+    #  Hierarchy inference for flat TOC entries                            #
+    # ------------------------------------------------------------------ #
+
+    # Minimum number of TOC entries to trigger hierarchy inference.
+    # Documents with fewer entries are typically already well-structured.
+    _FLAT_ENTRY_THRESHOLD = 20
+
+    # If this fraction of entries share the same level, consider it "flat"
+    # and apply hierarchy inference. Real hierarchies typically have
+    # varied level distribution.
+    _FLAT_LEVEL_RATIO = 0.9
+
+    # Number of entries per virtual group when using uniform grouping fallback.
+    _GROUP_SIZE = 15
+
+    @staticmethod
+    def _infer_hierarchy(entries: List[Any]) -> List[Any]:
+        """When all entries share the same level, infer hierarchy from title patterns.
+
+        Applies three strategies in priority order:
+          A. Keyword groups — detect repeated structural prefixes (generic)
+          B. Generic numbering patterns (1., 1.1, I., A., etc.)
+          C. Uniform grouping fallback (virtual parent nodes)
+
+        Only activates when >90% of entries share the same level and
+        the total count exceeds ``_FLAT_ENTRY_THRESHOLD``.
+
+        Args:
+            entries: List of TOCEntry (may be nested).
+
+        Returns:
+            Possibly restructured list of TOCEntry with updated levels
+            and rebuilt hierarchy.
+        """
+        if not entries:
+            return entries or []
+
+        try:
+            from sirchmunk.learnings.toc_extractor import TOCExtractor
+            flat: List[Any] = []
+            TOCExtractor._flatten_entries(entries, flat)
+        except Exception:
+            return entries  # Cannot flatten; return original entries
+
+        if not flat:
+            return entries
+
+        if len(flat) <= DocumentTreeIndexer._FLAT_ENTRY_THRESHOLD:
+            return entries
+
+        # Validate level field: skip entries with invalid levels
+        valid_flat = [e for e in flat if hasattr(e, 'level') and isinstance(e.level, (int, float))]
+        if not valid_flat:
+            return entries
+
+        # Check if >90% share the same level
+        level_counts = Counter(e.level for e in valid_flat)
+        dominant_level, dominant_count = level_counts.most_common(1)[0]
+        if dominant_count / len(flat) <= DocumentTreeIndexer._FLAT_LEVEL_RATIO:
+            return entries  # Already has meaningful hierarchy
+
+        # Try strategies in priority order
+        modified = DocumentTreeIndexer._strategy_keyword_groups(flat, dominant_level)
+        if modified is None:
+            modified = DocumentTreeIndexer._strategy_numbering(flat, dominant_level)
+        if modified is None:
+            modified = DocumentTreeIndexer._strategy_uniform_grouping(
+                flat, dominant_level,
+            )
+        if modified is None:
+            return entries
+
+        # Rebuild hierarchy from the re-leveled flat list
+        return TOCExtractor._build_hierarchy(modified)
+
+    # -- Strategy A: keyword groups (generic structural prefix detection) #
+
+    # Pattern: title starts with a capitalized word optionally followed by
+    # a Roman numeral or Arabic number (e.g. "PART IV", "Item 1A",
+    # "Section 3", "Chapter 12", "Article II").
+    _RE_STRUCTURAL_PREFIX = re.compile(
+        r'^([A-Z][A-Za-z]*(?:\s+[IVXLCDM\d]+[A-Za-z]?)?)\b',
+    )
+
+    @staticmethod
+    def _extract_structural_prefix(title: str) -> Optional[str]:
+        """Extract a structural prefix from a title.
+
+        Matches leading capitalized words optionally followed by a number
+        or Roman numeral (e.g. "PART IV", "Item 1A", "Section 3").
+        Returns the normalized (uppercased) prefix, or None.
+        """
+        if not title or not title.strip():
+            return None
+        m = DocumentTreeIndexer._RE_STRUCTURAL_PREFIX.match(title.strip())
+        if m:
+            prefix = m.group(1).strip()
+            # Prefix must not be too long (avoid capturing entire title)
+            if len(prefix) <= 20:
+                return prefix.upper()
+        return None
+
+    @staticmethod
+    def _strategy_keyword_groups(
+        flat: List[Any],
+        dominant_level: int,
+    ) -> Optional[List[Any]]:
+        """Strategy A — detect repeated structural prefixes and infer levels.
+
+        Works for any document with repetitive heading patterns (SEC filings,
+        legal contracts, technical specs, etc.).  Automatically discovers
+        prefix groups and assigns hierarchical levels based on frequency:
+        lower-frequency prefixes become higher-level parents.
+
+        Returns re-leveled flat list, or None if coverage is insufficient.
+        """
+        # 1. Extract prefix for each entry
+        prefix_map: Dict[str, List[int]] = {}  # prefix -> [entry indices]
+        for i, e in enumerate(flat):
+            prefix = DocumentTreeIndexer._extract_structural_prefix(e.title)
+            if prefix:
+                prefix_map.setdefault(prefix, []).append(i)
+
+        # 2. Keep only prefixes appearing >= 2 times
+        repeated_prefixes = {k: v for k, v in prefix_map.items() if len(v) >= 2}
+        if not repeated_prefixes:
+            return None
+
+        # 3. Check coverage: at least 30% of entries must be covered
+        covered = sum(len(indices) for indices in repeated_prefixes.values())
+        if covered < len(flat) * 0.3:
+            return None
+
+        # 4. Sort prefixes by frequency (ascending) then by first appearance
+        #    Low frequency = higher level (parent), high frequency = lower level
+        sorted_prefixes = sorted(
+            repeated_prefixes.items(),
+            key=lambda x: (len(x[1]), min(x[1])),
+        )
+
+        # 5. Assign level per prefix group
+        prefix_to_level: Dict[str, int] = {}
+        for level_idx, (prefix, _) in enumerate(sorted_prefixes):
+            prefix_to_level[prefix] = level_idx + 1
+
+        # 6. Determine the "other" level for entries without a known prefix
+        max_level = max(prefix_to_level.values()) + 1
+
+        # 7. Apply levels
+        for i, e in enumerate(flat):
+            prefix = DocumentTreeIndexer._extract_structural_prefix(e.title)
+            if prefix and prefix in prefix_to_level:
+                e.level = prefix_to_level[prefix]
+            else:
+                e.level = max_level
+            e.children = []
+
+        return flat
+
+    # -- Strategy B: generic numbering --------------------------------- #
+
+    # Three-level numbering: 1.1.1, (a), (i), (1)
+    _RE_NUM_LEVEL3 = re.compile(
+        r"^\s*(?:\d+\.\d+\.\d+|\([a-z]\)|\([ivx]+\)|\(\d+\))\s",
+        re.IGNORECASE,
+    )
+    # Two-level numbering: 1.1, A., B., a., b.
+    _RE_NUM_LEVEL2 = re.compile(
+        r"^\s*(?:\d+\.\d+(?!\.)\b|[A-Z]\.\s|[a-z]\.\s)",
+    )
+    # Top-level numbering: 1., 2., I., II.
+    _RE_NUM_LEVEL1 = re.compile(
+        r"^\s*(?:\d+\.\s|[IVXLC]+\.\s)",
+    )
+
+    @staticmethod
+    def _strategy_numbering(
+        flat: List[Any],
+        dominant_level: int,
+    ) -> Optional[List[Any]]:
+        """Strategy B — detect generic numbering patterns.
+
+        Returns re-leveled flat list, or None if fewer than 30% of
+        entries match any numbering pattern.
+        """
+        matched = 0
+        assignments: List[Optional[int]] = []
+
+        for e in flat:
+            title = e.title
+            if DocumentTreeIndexer._RE_NUM_LEVEL3.match(title):
+                assignments.append(3)
+                matched += 1
+            elif DocumentTreeIndexer._RE_NUM_LEVEL2.match(title):
+                assignments.append(2)
+                matched += 1
+            elif DocumentTreeIndexer._RE_NUM_LEVEL1.match(title):
+                assignments.append(1)
+                matched += 1
+            else:
+                assignments.append(None)
+
+        if matched < len(flat) * 0.3:
+            return None
+
+        # Apply assignments; entries without a pattern get the level of
+        # the previous entry + 1 (capped at 3)
+        prev_level = 1
+        for i, e in enumerate(flat):
+            if assignments[i] is not None:
+                e.level = assignments[i]
+            else:
+                e.level = min(prev_level + 1, 3)
+            prev_level = e.level
+            e.children = []
+        return flat
+
+    # -- Strategy C: uniform grouping fallback ------------------------- #
+
+    @staticmethod
+    def _strategy_uniform_grouping(
+        flat: List[Any],
+        dominant_level: int,
+    ) -> Optional[List[Any]]:
+        """Strategy C — group entries into fixed-size buckets with virtual parents.
+
+        Creates synthetic parent TOCEntry nodes whose char_start/char_end
+        and page_start/page_end are derived from the first and last child
+        in each group.
+
+        Returns the re-leveled flat list including virtual parents, or None
+        on error.
+        """
+        from sirchmunk.learnings.toc_extractor import TOCEntry
+
+        group_size = DocumentTreeIndexer._GROUP_SIZE
+        num_groups = math.ceil(len(flat) / group_size)
+        if num_groups <= 1:
+            return None  # Grouping would not improve anything
+
+        parent_level = max(1, dominant_level - 1) if dominant_level > 1 else 1
+        child_level = parent_level + 1
+
+        result: List[Any] = []
+        for g in range(num_groups):
+            start_idx = g * group_size
+            end_idx = min((g + 1) * group_size, len(flat))
+            group = flat[start_idx:end_idx]
+
+            first = group[0]
+            last = group[-1]
+
+            # Derive positions from children
+            char_start = first.char_start
+            char_end = last.char_end if last.char_end else None
+            page_start = first.page_start
+            page_end = last.page_start  # Best available estimate
+
+            virtual_parent = TOCEntry(
+                title=f"{first.title} \u2013 {last.title}",
+                level=parent_level,
+                char_start=char_start,
+                char_end=char_end,
+                page_start=page_start,
+                page_end=page_end,
+                children=[],
+                source="inferred",
+            )
+            result.append(virtual_parent)
+
+            # Set child level
+            for e in group:
+                e.level = child_level
+                e.children = []
+            result.extend(group)
+
+        return result

@@ -12,6 +12,7 @@ import json
 import math
 import os
 import random
+import re
 import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -50,6 +51,17 @@ _SUMMARY_PREVIEW_CHARS = 16_000
 # Multi-section sampling for large documents without a tree index
 _SUMMARY_SAMPLE_SECTIONS = 3          # Number of sections to sample for large docs
 _SUMMARY_SAMPLE_SECTION_CHARS = 5_000  # Chars per sampled section
+
+# Targeted table extraction: max chars per table region
+_TARGETED_TABLE_MAX_CHARS = 5000
+
+# Targeted table extraction: only process nodes spanning <= N pages
+_TABLE_PAGE_SPAN_LIMIT = 5
+
+# Numeric density threshold – fraction of numeric/symbol chars ($, %, digits,
+# parenthesised numbers) relative to total non-whitespace chars.  Pages below
+# this threshold are skipped during targeted extraction.
+_TABLE_NUMERIC_DENSITY_THRESHOLD = 0.15
 
 # Excel table-level adaptive sampling constants
 _XLSX_TOTAL_ROW_BUDGET = 100       # Total sampled rows budget across all sheets
@@ -644,6 +656,51 @@ class KnowledgeCompiler:
                     result.tree.root, extraction.tables,
                     content=content, total_pages=extraction.page_count,
                 )
+
+            # Phase 2.5: Targeted table extraction via generic structural signals
+            if result.tree and result.tree.root and ext == ".pdf":
+                targeted_tables = await self._targeted_table_extraction(
+                    entry.path, result.tree,
+                )
+                if targeted_tables:
+                    # Load existing table digest (if any) and merge
+                    digest_dir = self._compile_dir / "table_digests"
+                    file_hash = get_fast_hash(entry.path) or ""
+                    existing_digest: list[dict] = []
+                    if file_hash and result.has_table_digest:
+                        digest_path = digest_dir / f"{file_hash}.json"
+                        if digest_path.exists():
+                            try:
+                                raw = json.loads(
+                                    digest_path.read_text(encoding="utf-8")
+                                )
+                                existing_digest = raw.get("tables", [])
+                            except Exception:
+                                pass
+                    merged = self._merge_table_digests(
+                        existing_digest, targeted_tables,
+                    )
+                    if merged and file_hash:
+                        digest_dir.mkdir(parents=True, exist_ok=True)
+                        digest_path = digest_dir / f"{file_hash}.json"
+                        digest_path.write_text(
+                            json.dumps(
+                                {
+                                    "version": 1,
+                                    "table_count": len(merged),
+                                    "tables": merged,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            encoding="utf-8",
+                        )
+                        result.has_table_digest = True
+                        result.table_count = len(merged)
+                        await self._log.info(
+                            f"[Compile] Targeted table extraction added "
+                            f"{len(targeted_tables)} tables for "
+                            f"{Path(entry.path).name}"
+                        )
 
         except Exception as exc:
             result.error = str(exc)
@@ -1408,6 +1465,239 @@ class KnowledgeCompiler:
             return 1 + sum(_count(c) for c in node.children)
 
         return _count(tree.root)
+
+    # ------------------------------------------------------------------ #
+    #  Targeted table extraction                                          #
+    # ------------------------------------------------------------------ #
+
+    async def _targeted_table_extraction(
+        self, file_path: str, tree: DocumentTree,
+    ) -> list[dict]:
+        """Extract tables from tree nodes likely containing tabular data.
+
+        Uses generic structural signals (metadata, page span, numeric
+        density) instead of domain-specific title keywords.  For each
+        candidate with a valid ``page_range``, extracts per-page text
+        via :meth:`DocumentExtractor.extract_page_range` and applies
+        heuristic table-region detection.  Pages whose numeric density
+        falls below ``_TABLE_NUMERIC_DENSITY_THRESHOLD`` are skipped.
+
+        Returns:
+            List of table dicts compatible with the table-digest format::
+
+                {"page": int, "content": str, "source": str}
+        """
+        if tree is None or tree.root is None:
+            return []
+
+        candidates = self._find_table_candidate_nodes(tree.root)
+        if not candidates:
+            return []
+
+        await self._log.info(
+            f"[Compile] Targeted extraction: {len(candidates)} candidate "
+            f"nodes in {Path(file_path).name}"
+        )
+
+        results: list[dict] = []
+        seen_pages: set[int] = set()
+
+        for node in candidates:
+            if node.page_range is None:
+                continue
+            start_page, end_page = node.page_range
+            # Skip pages already processed by another candidate
+            page_nums = [p for p in range(start_page, end_page + 1)
+                         if p not in seen_pages]
+            if not page_nums:
+                continue
+
+            try:
+                pages = DocumentExtractor.extract_page_range(
+                    file_path, start_page, end_page,
+                )
+            except Exception as exc:
+                await self._log.warning(
+                    f"[Compile] Targeted extraction page read failed "
+                    f"({start_page}-{end_page}): {exc}"
+                )
+                continue
+
+            for pc in pages:
+                if pc.page_number in seen_pages:
+                    continue
+                seen_pages.add(pc.page_number)
+                # Numeric density gate – skip pages unlikely to contain tables
+                if not self._page_has_table_density(pc.content):
+                    continue
+                regions = self._identify_table_regions(pc.content)
+                for region in regions:
+                    truncated = region[:_TARGETED_TABLE_MAX_CHARS]
+                    results.append({
+                        "page": pc.page_number,
+                        "content": truncated,
+                        "source": f"targeted:{node.title[:80]}",
+                    })
+
+        return results
+
+    def _find_table_candidate_nodes(
+        self, root: "TreeNode",
+    ) -> list["TreeNode"]:
+        """Collect leaf nodes that likely contain tables.
+
+        Uses generic, domain-agnostic structural signals (any match
+        suffices):
+
+        - ``node.content_type == "table"`` – already tagged during compile.
+        - ``node.table_count > 0`` – known to contain tables.
+        - Has a valid ``page_range`` with span ≤ ``_TABLE_PAGE_SPAN_LIMIT``.
+        """
+        candidates: list = []
+
+        def _walk(node: "TreeNode") -> None:
+            if node.leaf:
+                # Signal 1: content_type marked as table
+                if getattr(node, "content_type", None) == "table":
+                    candidates.append(node)
+                    return
+                # Signal 2: known to contain tables
+                if getattr(node, "table_count", 0) > 0:
+                    candidates.append(node)
+                    return
+                # Signal 3: moderate page span (tables rarely span many pages)
+                page_range = getattr(node, "page_range", None)
+                if page_range and len(page_range) == 2:
+                    span = page_range[1] - page_range[0] + 1
+                    if 1 <= span <= _TABLE_PAGE_SPAN_LIMIT:
+                        candidates.append(node)
+            else:
+                for child in node.children:
+                    _walk(child)
+
+        _walk(root)
+        return candidates
+
+    @staticmethod
+    def _page_has_table_density(page_text: str) -> bool:
+        """Return True if *page_text* has numeric density above the threshold.
+
+        Counts digits and common table symbols (``$``, ``%``, ``(``, ``)``)
+        relative to total non-whitespace characters.
+        """
+        if not page_text:
+            return False
+        non_ws = sum(1 for ch in page_text if not ch.isspace())
+        if non_ws == 0:
+            return False
+        numeric_chars = sum(
+            1 for ch in page_text
+            if ch.isdigit() or ch in "$%(),.+-"
+        )
+        return (numeric_chars / non_ws) >= _TABLE_NUMERIC_DENSITY_THRESHOLD
+
+    @staticmethod
+    def _identify_table_regions(page_text: str) -> list[str]:
+        """Identify contiguous table-like regions in *page_text*.
+
+        Heuristic rules:
+        - Lines containing multiple numeric tokens (dollar amounts, %,
+          parenthesised negatives) are considered *numeric rows*.
+        - A run of >= 3 consecutive numeric rows forms a table region.
+        - Leading/trailing whitespace rows are trimmed.
+
+        Returns:
+            List of extracted region strings (may be empty).
+        """
+        if not page_text:
+            return []
+
+        # Pattern: line has at least 2 numeric-looking tokens
+        _NUM_TOKEN = re.compile(
+            r"(?:"
+            r"[\$€£¥]\s*[\d,.]+|"
+            r"\([\d,.]+\)|"
+            r"[\d,.]+%|"
+            r"[\d]+\.[\d]+(?:[eE][+-]?\d+)?|"
+            r"[\d,]{2,}"
+            r")"
+        )
+        _MIN_NUMS_PER_LINE = 2
+        _MIN_CONSECUTIVE = 3
+
+        lines = page_text.split("\n")
+        is_numeric = [
+            len(_NUM_TOKEN.findall(line)) >= _MIN_NUMS_PER_LINE
+            for line in lines
+        ]
+
+        regions: list[str] = []
+        run_start: int | None = None
+
+        for i, flag in enumerate(is_numeric):
+            if flag:
+                if run_start is None:
+                    run_start = i
+            else:
+                if run_start is not None:
+                    run_len = i - run_start
+                    if run_len >= _MIN_CONSECUTIVE:
+                        # Include one context line above/below
+                        start = max(0, run_start - 1)
+                        end = min(len(lines), i + 1)
+                        regions.append(
+                            "\n".join(lines[start:end]).strip()
+                        )
+                    run_start = None
+
+        # Flush trailing run
+        if run_start is not None:
+            run_len = len(lines) - run_start
+            if run_len >= _MIN_CONSECUTIVE:
+                start = max(0, run_start - 1)
+                regions.append(
+                    "\n".join(lines[start:]).strip()
+                )
+
+        return regions
+
+    @staticmethod
+    def _get_table_page(entry: dict) -> int | None:
+        """统一获取表格条目的页码，兼容 page_number 和 page 两种字段名。"""
+        p = entry.get("page_number") or entry.get("page")
+        return int(p) if p is not None else None
+
+    @classmethod
+    def _merge_table_digests(
+        cls, existing: list[dict], new_tables: list[dict],
+    ) -> list[dict]:
+        """Merge *new_tables* into *existing* digest, deduplicating by page.
+
+        If an existing entry and a new entry share the same page number,
+        the new entry is skipped (existing kreuzberg-detected table takes
+        precedence because it has richer structure like cells/markdown).
+
+        Returns:
+            Merged list suitable for storage in the table-digest JSON.
+        """
+        existing_pages = {cls._get_table_page(e) for e in existing}
+        existing_pages.discard(None)
+
+        merged = list(existing)
+        for tbl in new_tables:
+            page = cls._get_table_page(tbl)
+            if page is not None and page in existing_pages:
+                continue
+            # Normalise to digest table format for consistency
+            merged.append({
+                "page_number": page,
+                "markdown": tbl.get("content", ""),
+                "row_count": None,
+                "col_count": None,
+                "cells": [],
+                "source": tbl.get("source", "targeted"),
+            })
+        return merged
 
     # ------------------------------------------------------------------ #
     #  Summary index for embedding + BM25 fallback                        #

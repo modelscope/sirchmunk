@@ -111,6 +111,25 @@ class ExtractionOutput:
 
 
 # ---------------------------------------------------------------------------
+# Page-level extraction output
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PageContent:
+    """Single page extraction result.
+
+    Returned by :meth:`DocumentExtractor.extract_pages` to represent the
+    text content of one PDF page.
+    """
+
+    page_number: int
+    """1-indexed page number."""
+
+    content: str
+    """Extracted text content (may be empty string)."""
+
+
+# ---------------------------------------------------------------------------
 # Document extractor facade
 # ---------------------------------------------------------------------------
 
@@ -275,6 +294,78 @@ class DocumentExtractor:
         except Exception:
             logger.error("Batch extraction failed for {} files", len(file_paths))
             raise
+
+    # Page-level extraction -------------------------------------------------
+
+    @staticmethod
+    def extract_pages(
+        file_path: Union[str, Path],
+        pages: list[int],
+    ) -> list[PageContent]:
+        """Extract text content from specific PDF pages.
+
+        Uses pypdf to read individual pages by 1-indexed page number.
+        Invalid page numbers (< 1 or > total pages) are silently skipped.
+
+        Args:
+            file_path: Path to a PDF file.
+            pages:     List of 1-indexed page numbers to extract.
+
+        Returns:
+            List of :class:`PageContent` for each valid requested page,
+            in the order given by *pages*.
+
+        Raises:
+            FileNotFoundError: If *file_path* does not exist.
+            Exception: On PDF parsing failure (logged before re-raise).
+        """
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"PDF file not found: {path}")
+
+        try:
+            from pypdf import PdfReader
+
+            reader = PdfReader(str(path))
+            total = len(reader.pages)
+            valid_pages = [p for p in pages if 1 <= p <= total]
+            return [
+                PageContent(
+                    page_number=p,
+                    content=reader.pages[p - 1].extract_text() or "",
+                )
+                for p in valid_pages
+            ]
+        except FileNotFoundError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Page-level extraction failed for {}: {}",
+                file_path,
+                exc,
+            )
+            raise
+
+    @staticmethod
+    def extract_page_range(
+        file_path: Union[str, Path],
+        start_page: int,
+        end_page: int,
+    ) -> list[PageContent]:
+        """Extract text content from a contiguous range of PDF pages.
+
+        Convenience wrapper around :meth:`extract_pages`.
+
+        Args:
+            file_path:  Path to a PDF file.
+            start_page: First page (1-indexed, inclusive).
+            end_page:   Last page (1-indexed, inclusive).
+
+        Returns:
+            List of :class:`PageContent` for the requested range.
+        """
+        pages = list(range(start_page, end_page + 1))
+        return DocumentExtractor.extract_pages(file_path, pages)
 
     # Internal helpers -----------------------------------------------------
 

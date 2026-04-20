@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 from sirchmunk.base import BaseSearch
 from sirchmunk.learnings.knowledge_base import KnowledgeBase
+from sirchmunk.utils.document_extractor import DocumentExtractor
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import (
     KEYWORD_QUERY_PLACEHOLDER,
@@ -3808,42 +3809,100 @@ class AgenticSearch(BaseSearch):
         if not leaves:
             return None
 
-        # --- Read full text once for char_range slicing ---
-        try:
-            from sirchmunk.utils.file_utils import fast_extract
-            extraction = await fast_extract(file_path=file_path)
-            full_text = extraction.content or ""
-        except Exception:
-            full_text = ""
+        # --- Classify leaves by extraction method ---
+        trimmed = leaves[: self._TREE_SAMPLE_MAX_SECTIONS]
+        page_leaves, char_leaves, table_and_summary = self._classify_leaves(trimmed)
 
-        # --- Extract tree sections ---
-        parts: List[str] = []
-        total_chars = 0
-        for leaf in leaves[: self._TREE_SAMPLE_MAX_SECTIONS]:
-            # Table nodes: prefer summary (contains table markdown)
-            if getattr(leaf, 'content_type', 'text') == 'table' and leaf.summary:
-                segment = leaf.summary
+        # Collect (leaf, segment) pairs preserving original leaf order
+        leaf_segments: List[tuple] = []  # (leaf, segment_text)
+
+        # -- Phase A: table / summary-only leaves --
+        for leaf in table_and_summary:
+            leaf_segments.append((leaf, leaf.summary))
+
+        # -- Phase B: batch page-level extraction (single IO) --
+        page_segment_map: dict = {}  # id(leaf) -> segment
+        if page_leaves:
+            all_pages: set = set()
+            for _leaf, (sp, ep) in page_leaves:
+                all_pages.update(range(sp, ep + 1))
+            try:
+                page_contents = DocumentExtractor.extract_pages(
+                    file_path, sorted(all_pages),
+                )
+                page_map = {pc.page_number: pc.content for pc in page_contents}
+
+                for leaf, (sp, ep) in page_leaves:
+                    seg_parts = []
+                    for p in range(sp, ep + 1):
+                        text = page_map.get(p, "")
+                        if text.strip():
+                            seg_parts.append(text)
+                    if seg_parts:
+                        page_segment_map[id(leaf)] = "\n".join(seg_parts)
+                    elif getattr(leaf, 'summary', None):
+                        page_segment_map[id(leaf)] = leaf.summary
+            except (FileNotFoundError, PermissionError):
+                raise  # 文件系统错误应传播
+            except Exception as e:
+                _loguru_logger.warning(
+                    f"[TreeSample] Page extraction failed for {fname}: {e}, "
+                    f"falling back to char_range for {len(page_leaves)} leaves"
+                )
+                # Demote page_leaves → char_leaves
+                for leaf, _ in page_leaves:
+                    if hasattr(leaf, 'char_range') and leaf.char_range:
+                        char_leaves.append(leaf)
+                    elif getattr(leaf, 'summary', None):
+                        leaf_segments.append((leaf, leaf.summary))
+                page_leaves_ok = False
             else:
+                page_leaves_ok = True
+
+            if page_leaves_ok:
+                for leaf, _ in page_leaves:
+                    seg = page_segment_map.get(id(leaf))
+                    if seg:
+                        leaf_segments.append((leaf, seg))
+        # If page extraction failed, demoted leaves are now in char_leaves
+
+        # -- Phase C: char_range fallback (lazy full-text extraction) --
+        if char_leaves:
+            try:
+                from sirchmunk.utils.file_utils import fast_extract
+                extraction = await fast_extract(file_path=file_path)
+                full_text = extraction.content or ""
+            except Exception:
+                full_text = ""
+
+            for leaf in char_leaves:
                 start, end = leaf.char_range
                 if self._is_valid_char_range(start, end, len(full_text)) and full_text:
                     segment = full_text[start:end]
-                elif leaf.summary:
+                    if segment.strip():
+                        leaf_segments.append((leaf, segment))
+                    elif getattr(leaf, 'summary', None):
+                        leaf_segments.append((leaf, leaf.summary))
+                elif getattr(leaf, 'summary', None):
                     _loguru_logger.debug(
-                        f"[TreeNav] char_range degraded for '{leaf.title}' "
+                        f"[TreeSample] char_range degraded for '{leaf.title}' "
                         f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), using summary"
                     )
-                    segment = leaf.summary
-                else:
-                    continue
+                    leaf_segments.append((leaf, leaf.summary))
+
+        # --- Build parts with budget control ---
+        parts: List[str] = []
+        total_chars = 0
+        for leaf, segment in leaf_segments:
             segment = segment[: self._TREE_SAMPLE_SECTION_MAX_CHARS]
             if not segment.strip():
                 continue
             page_info = ""
-            if leaf.page_range:
+            if getattr(leaf, 'page_range', None):
                 ps, pe = leaf.page_range
                 page_info = f" (pp.{ps}-{pe})" if ps != pe else f" (p.{ps})"
             type_tag = " [TABLE]" if getattr(leaf, 'content_type', 'text') == 'table' else ""
-            header = f"[{fname} → {leaf.title}{page_info}{type_tag}]"
+            header = f"[{fname} \u2192 {leaf.title}{page_info}{type_tag}]"
             chunk = f"{header}\n{segment}"
             if total_chars + len(chunk) > max_chars:
                 remaining = max_chars - total_chars
@@ -3888,6 +3947,36 @@ class AgenticSearch(BaseSearch):
             f"(pre_nav={'yes' if pre_navigated_leaves else 'no'})"
         )
         return evidence
+
+    @staticmethod
+    def _classify_leaves(leaves: list) -> Tuple[List[tuple], List, List]:
+        """将叶节点按提取策略分类。
+
+        Returns:
+            (page_leaves, char_leaves, summary_leaves) 三元组:
+            - page_leaves: list of (leaf, page_range) tuples — 有有效 page_range 的
+            - char_leaves: list of leaf — 需要 char_range fallback 的
+            - summary_leaves: list of leaf — 只有 summary 可用的
+        """
+        page_leaves: List[tuple] = []
+        char_leaves: List = []
+        summary_leaves: List = []
+
+        for leaf in leaves:
+            # 表格类型节点优先使用 summary（结构化摘要）
+            if getattr(leaf, 'content_type', 'text') == 'table' and getattr(leaf, 'summary', None):
+                summary_leaves.append(leaf)
+                continue
+
+            page_range = getattr(leaf, 'page_range', None)
+            if page_range and len(page_range) == 2 and page_range[0] is not None and page_range[0] > 0:
+                page_leaves.append((leaf, page_range))
+            elif hasattr(leaf, 'char_range') and leaf.char_range:
+                char_leaves.append(leaf)
+            elif getattr(leaf, 'summary', None):
+                summary_leaves.append(leaf)
+
+        return page_leaves, char_leaves, summary_leaves
 
     def _is_valid_char_range(
         self, start: int, end: int, text_len: int,
@@ -3978,6 +4067,23 @@ class AgenticSearch(BaseSearch):
 
         return "\n\n".join(parts)
 
+    @staticmethod
+    def _append_evidence_part(
+        parts: List[str], fname: str, leaf, segment: str,
+        *, max_chars: int = 3000,
+    ) -> None:
+        """Format and append one leaf's evidence to *parts* (in-place)."""
+        text = segment[:max_chars]
+        if not text.strip():
+            return
+        page_info = ""
+        if getattr(leaf, 'page_range', None):
+            ps, pe = leaf.page_range
+            page_info = f" (pp.{ps}-{pe})" if ps != pe else f" (p.{ps})"
+        type_tag = " [TABLE]" if getattr(leaf, 'content_type', 'text') == 'table' else ""
+        header = f"[{fname} \u2192 {leaf.title}{page_info}{type_tag}]"
+        parts.append(f"{header}\n{text}")
+
     async def _navigate_tree_for_evidence(
         self, file_path: str, query: str, *, max_results: int = 3,
     ) -> Optional[str]:
@@ -3986,6 +4092,11 @@ class AgenticSearch(BaseSearch):
         Uses 1 LLM call to drill into the compiled tree index for
         *file_path*, returning concatenated leaf content as evidence.
         Returns None when no tree cache is available.
+
+        Extraction priority (highest first):
+          1. page_range  – page-level extraction via DocumentExtractor
+          2. char_range   – full-text extraction + slice (fallback)
+          3. leaf.summary – last resort
         """
         indexer = self._get_tree_indexer()
         if indexer is None:
@@ -4003,39 +4114,86 @@ class AgenticSearch(BaseSearch):
             return None
 
         fname = Path(file_path).name
-        # Read leaf content from the original document via char_range
         parts: List[str] = []
-        try:
-            from sirchmunk.utils.file_utils import fast_extract
-            extraction = await fast_extract(file_path=file_path)
-            full_text = extraction.content or ""
-        except Exception:
-            full_text = ""
 
-        for leaf in leaves:
-            # Table nodes: prefer summary (contains table markdown)
-            if getattr(leaf, 'content_type', 'text') == 'table' and leaf.summary:
-                segment = leaf.summary
-            else:
+        # ── Phase 1: classify leaves by available extraction method ──
+        page_leaves, char_leaves, summary_only = self._classify_leaves(leaves)
+
+        for leaf in summary_only:
+            self._append_evidence_part(
+                parts, fname, leaf, leaf.summary,
+            )
+
+        # ── Phase 2: batch page-level extraction (single IO) ──
+        if page_leaves:
+            all_pages: set = set()
+            for _leaf, (sp, ep) in page_leaves:
+                all_pages.update(range(sp, ep + 1))
+            try:
+                page_contents = DocumentExtractor.extract_pages(
+                    file_path, sorted(all_pages),
+                )
+                page_map = {pc.page_number: pc.content for pc in page_contents}
+
+                for leaf, (sp, ep) in page_leaves:
+                    segment_parts = []
+                    for p in range(sp, ep + 1):
+                        text = page_map.get(p, "")
+                        if text.strip():
+                            segment_parts.append(text)
+                    if segment_parts:
+                        self._append_evidence_part(
+                            parts, fname, leaf, "\n".join(segment_parts),
+                        )
+                    elif getattr(leaf, 'summary', None):
+                        self._append_evidence_part(
+                            parts, fname, leaf, leaf.summary,
+                        )
+            except (FileNotFoundError, PermissionError):
+                raise  # 文件系统错误应传播
+            except Exception as e:
+                _loguru_logger.warning(
+                    f"[TreeNav] Page extraction failed for {fname}: {e}, "
+                    f"falling back to char_range for {len(page_leaves)} leaves"
+                )
+                # Demote page_leaves → char_leaves for char_range fallback
+                for leaf, _ in page_leaves:
+                    if hasattr(leaf, 'char_range') and leaf.char_range:
+                        char_leaves.append(leaf)
+                    elif getattr(leaf, 'summary', None):
+                        self._append_evidence_part(
+                            parts, fname, leaf, leaf.summary,
+                        )
+
+        # ── Phase 3: char_range fallback (lazy full-text extraction) ──
+        if char_leaves:
+            try:
+                from sirchmunk.utils.file_utils import fast_extract
+                extraction = await fast_extract(file_path=file_path)
+                full_text = extraction.content or ""
+            except Exception:
+                full_text = ""
+
+            for leaf in char_leaves:
                 start, end = leaf.char_range
                 if self._is_valid_char_range(start, end, len(full_text)) and full_text:
                     segment = full_text[start:end]
-                elif leaf.summary:
+                    if segment.strip():
+                        self._append_evidence_part(
+                            parts, fname, leaf, segment,
+                        )
+                    elif getattr(leaf, 'summary', None):
+                        self._append_evidence_part(
+                            parts, fname, leaf, leaf.summary,
+                        )
+                elif getattr(leaf, 'summary', None):
                     _loguru_logger.debug(
                         f"[TreeNav] char_range degraded for '{leaf.title}' "
                         f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), using summary"
                     )
-                    segment = leaf.summary
-                else:
-                    continue
-            if segment.strip():
-                page_info = ""
-                if leaf.page_range:
-                    ps, pe = leaf.page_range
-                    page_info = f" (pp.{ps}-{pe})" if ps != pe else f" (p.{ps})"
-                type_tag = " [TABLE]" if getattr(leaf, 'content_type', 'text') == 'table' else ""
-                header = f"[{fname} → {leaf.title}{page_info}{type_tag}]"
-                parts.append(f"{header}\n{segment[:3000]}")
+                    self._append_evidence_part(
+                        parts, fname, leaf, leaf.summary,
+                    )
 
         if not parts:
             return None
