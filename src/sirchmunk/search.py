@@ -1453,6 +1453,8 @@ class AgenticSearch(BaseSearch):
                 return ctx
             return msg
 
+        await self._logger.info(f"[SearchConfig] PURE_TREE_SEARCH={'enabled' if _PURE_TREE_SEARCH else 'disabled'}")
+
         # ---- Chat intent short-circuit (rule-based, no LLM cost) ----
         if mode != "FILENAME_ONLY" and self._is_chat_query(query):
             answer, cluster, ctx = await self._respond_chat(query, chat_history=chat_history)

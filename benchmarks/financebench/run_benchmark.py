@@ -27,6 +27,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List
 
+from dotenv import load_dotenv
+
 from config import FinanceBenchConfig
 from data_loader import FinanceBenchLoader
 from evaluate import compute_metrics
@@ -157,6 +159,9 @@ def main() -> None:
         help="Override FB_LIMIT — number of questions to evaluate",
     )
     args = parser.parse_args()
+
+    # Load .env into os.environ so SIRCHMUNK_* variables are visible globally
+    load_dotenv(args.env, override=True)
 
     # 1. Load config
     cfg = FinanceBenchConfig.from_env(args.env)

@@ -221,7 +221,9 @@ class DocumentTreeIndexer:
                 # is unreliable, causing overlapping ranges and search failures.
                 # TODO: Re-enable when robust char_range calculation is implemented.
                 # await self._deepen_large_leaves(root, content, max_depth=effective_depth)
-                await self._enrich_node_summaries(root, content)
+                # NOTE: _enrich_node_summaries disabled temporarily to isolate its impact.
+                # The summaries may inadvertently bias _select_children() navigation.
+                # await self._enrich_node_summaries(root, content)
                 tree = DocumentTree(
                     file_path=file_path,
                     file_hash=file_hash,
@@ -245,7 +247,9 @@ class DocumentTreeIndexer:
         # is unreliable, causing overlapping ranges and search failures.
         # TODO: Re-enable when robust char_range calculation is implemented.
         # await self._deepen_large_leaves(root, content, max_depth=effective_depth)
-        await self._enrich_node_summaries(root, content)
+        # NOTE: _enrich_node_summaries disabled temporarily to isolate its impact.
+        # The summaries may inadvertently bias _select_children() navigation.
+        # await self._enrich_node_summaries(root, content)
 
         tree = DocumentTree(
             file_path=file_path,
@@ -268,48 +272,32 @@ class DocumentTreeIndexer:
         query: str,
         *,
         max_results: int = 3,
-        max_nav_depth: int = 4,
     ) -> List[TreeNode]:
-        """Reasoning-based tree navigation: LLM selects the most relevant branches.
-
-        Iteratively descends through the tree until leaf nodes are reached or
-        *max_nav_depth* selection rounds are exhausted.
-
-        Returns up to *max_results* leaf nodes with their char_range for
-        precise evidence extraction.
-        """
+        """LLM-driven branch selection using _select_children()."""
         if tree.root is None:
             return []
 
-        current = tree.root.children if tree.root.children else [tree.root]
-        if not current:
+        candidates = tree.root.children if tree.root.children else [tree.root]
+        if not candidates:
             return [tree.root]
 
-        selected: List[TreeNode] = current
-        for _ in range(max_nav_depth):
-            selected = await self._select_children(current, query)
-            if not selected:
-                break
-            # All leaves — stop descending
-            if all(n.leaf for n in selected):
-                break
-            # Expand non-leaf children, keep leaves as-is
-            next_level: List[TreeNode] = []
-            for n in selected:
-                if n.leaf:
-                    next_level.append(n)
-                else:
-                    next_level.extend(n.children)
-            if not next_level:
-                break
-            current = next_level
-        else:
-            selected = current
+        selected = await self._select_children(candidates, query)
+        if not selected:
+            return []
+
+        result_leaves: List[TreeNode] = []
+        for node in selected:
+            if node.leaf:
+                result_leaves.append(node)
+            else:
+                deeper = await self._select_children(node.children, query)
+                for d in (deeper or node.children[:1]):
+                    result_leaves.extend(d.all_leaves()[:max_results])
 
         # Deduplicate and cap
         seen_ids: set = set()
         unique: List[TreeNode] = []
-        for n in (selected or current):
+        for n in result_leaves:
             if n.node_id not in seen_ids:
                 seen_ids.add(n.node_id)
                 unique.append(n)
@@ -630,17 +618,13 @@ class DocumentTreeIndexer:
 
         listing = "\n".join(
             f"[{i}] {n.title}{self._format_page_range(n.page_range)}"
-            f" [{n.content_type.upper()}]"
             f"{' [' + str(n.table_count) + ' tables]' if n.table_count > 0 else ''}"
-            f": {n.summary[:200]}"
+            f": {n.summary[:150]}"
             for i, n in enumerate(nodes)
         )
+
         prompt = (
             f"Given the query: \"{query}\"\n\n"
-            "Guidelines:\n"
-            "- For numerical/financial data queries, prefer TABLE nodes and consolidated statements\n"
-            "- Prefer company-wide/consolidated data over segment-level unless query specifies a segment\n"
-            "- When multiple tables exist, select the one most directly answering the query\n\n"
             f"Select the 1-2 most relevant sections (by index number):\n{listing}\n\n"
             f"Return ONLY a JSON array of index numbers, e.g. [0, 2]"
         )
