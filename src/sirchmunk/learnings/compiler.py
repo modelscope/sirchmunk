@@ -8,6 +8,7 @@ knowledge clusters for downstream search acceleration.
 """
 
 import asyncio
+import bisect
 import json
 import math
 import os
@@ -65,6 +66,23 @@ _TABLE_NUMERIC_DENSITY_THRESHOLD = 0.15
 
 # Selective force-OCR: max pages to re-extract with forced OCR per document
 _FORCE_OCR_MAX_PAGES = 30
+
+# Shared numeric-token regex for table detection heuristics.
+# Matches: $1,234  (1,234)  12.5%  3.14e-5  1,000
+_NUM_TOKEN_RE = re.compile(
+    r"(?:"
+    r"[\$€£¥]\s*[\d,.]+|"
+    r"\([\d,.]+\)|"
+    r"[\d,.]+%|"
+    r"[\d]+\.[\d]+(?:[eE][+-]?\d+)?|"
+    r"[\d,]{2,}"
+    r")"
+)
+
+# A single line with >= this many numeric tokens is treated as a dense
+# table row (or multiple rows concatenated), enabling detection even when
+# pypdf flattens the entire page to one or two lines.
+_DENSE_LINE_MIN_TOKENS = 15
 
 # Excel table-level adaptive sampling constants
 _XLSX_TOTAL_ROW_BUDGET = 100       # Total sampled rows budget across all sheets
@@ -692,10 +710,16 @@ class KnowledgeCompiler:
             # Phase 2.6: Content-based full-page table scan (tree-independent)
             if ext == ".pdf" and extraction.page_count:
                 covered_pages = self._get_covered_table_pages(entry.path)
+                tree_root = (
+                    result.tree.root
+                    if result.tree and result.tree.root else None
+                )
                 content_tables = await self._content_based_table_scan(
                     entry.path,
                     extraction.page_count,
                     covered_pages,
+                    enhanced_content=content,
+                    tree_root=tree_root,
                 )
                 await self._supplement_table_digest(
                     entry.path, content_tables, result,
@@ -1595,10 +1619,15 @@ class KnowledgeCompiler:
 
     @staticmethod
     def _page_has_table_density(page_text: str) -> bool:
-        """Return True if *page_text* has numeric density above the threshold.
+        """Return True if *page_text* likely contains tabular numeric data.
 
-        Counts digits and common table symbols (``$``, ``%``, ``(``, ``)``)
-        relative to total non-whitespace characters.
+        Two independent signals (either suffices):
+
+        1. **Character-level density** — fraction of digit/symbol chars
+           relative to total non-whitespace exceeds the threshold.
+        2. **Token-dense line** — any single line contains
+           ``_DENSE_LINE_MIN_TOKENS`` or more numeric tokens, which
+           catches pages where pypdf flattens all content into ≤ 2 lines.
         """
         if not page_text:
             return False
@@ -1609,17 +1638,26 @@ class KnowledgeCompiler:
             1 for ch in page_text
             if ch.isdigit() or ch in "$%(),.+-"
         )
-        return (numeric_chars / non_ws) >= _TABLE_NUMERIC_DENSITY_THRESHOLD
+        if (numeric_chars / non_ws) >= _TABLE_NUMERIC_DENSITY_THRESHOLD:
+            return True
+        return any(
+            len(_NUM_TOKEN_RE.findall(line)) >= _DENSE_LINE_MIN_TOKENS
+            for line in page_text.split("\n")
+        )
 
     @staticmethod
     def _identify_table_regions(page_text: str) -> list[str]:
         """Identify contiguous table-like regions in *page_text*.
 
-        Heuristic rules:
-        - Lines containing multiple numeric tokens (dollar amounts, %,
-          parenthesised negatives) are considered *numeric rows*.
-        - A run of >= 3 consecutive numeric rows forms a table region.
-        - Leading/trailing whitespace rows are trimmed.
+        Two complementary strategies:
+
+        1. **Consecutive-line detection** — a run of ≥ 3 lines each
+           containing ≥ 2 numeric tokens forms a table region.  Works
+           well when pypdf preserves per-row line breaks.
+        2. **Dense-line detection** — a *single* line with ≥
+           ``_DENSE_LINE_MIN_TOKENS`` numeric tokens is treated as a
+           table region.  This handles PDFs where pypdf collapses
+           the entire page into one or two very long lines.
 
         Returns:
             List of extracted region strings (may be empty).
@@ -1627,52 +1665,44 @@ class KnowledgeCompiler:
         if not page_text:
             return []
 
-        # Pattern: line has at least 2 numeric-looking tokens
-        _NUM_TOKEN = re.compile(
-            r"(?:"
-            r"[\$€£¥]\s*[\d,.]+|"
-            r"\([\d,.]+\)|"
-            r"[\d,.]+%|"
-            r"[\d]+\.[\d]+(?:[eE][+-]?\d+)?|"
-            r"[\d,]{2,}"
-            r")"
-        )
         _MIN_NUMS_PER_LINE = 2
         _MIN_CONSECUTIVE = 3
 
         lines = page_text.split("\n")
-        is_numeric = [
-            len(_NUM_TOKEN.findall(line)) >= _MIN_NUMS_PER_LINE
-            for line in lines
+        token_counts = [
+            len(_NUM_TOKEN_RE.findall(line)) for line in lines
         ]
 
         regions: list[str] = []
-        run_start: int | None = None
+        captured_lines: set[int] = set()
 
-        for i, flag in enumerate(is_numeric):
-            if flag:
+        # --- Strategy 1: consecutive-line runs ---
+        run_start: int | None = None
+        for i, cnt in enumerate(token_counts):
+            if cnt >= _MIN_NUMS_PER_LINE:
                 if run_start is None:
                     run_start = i
             else:
                 if run_start is not None:
-                    run_len = i - run_start
-                    if run_len >= _MIN_CONSECUTIVE:
-                        # Include one context line above/below
+                    if i - run_start >= _MIN_CONSECUTIVE:
                         start = max(0, run_start - 1)
                         end = min(len(lines), i + 1)
                         regions.append(
                             "\n".join(lines[start:end]).strip()
                         )
+                        captured_lines.update(range(start, end))
                     run_start = None
+        if run_start is not None and len(lines) - run_start >= _MIN_CONSECUTIVE:
+            start = max(0, run_start - 1)
+            regions.append("\n".join(lines[start:]).strip())
+            captured_lines.update(range(start, len(lines)))
 
-        # Flush trailing run
-        if run_start is not None:
-            run_len = len(lines) - run_start
-            if run_len >= _MIN_CONSECUTIVE:
-                start = max(0, run_start - 1)
-                regions.append(
-                    "\n".join(lines[start:]).strip()
-                )
+        # --- Strategy 2: dense-line detection ---
+        for i, cnt in enumerate(token_counts):
+            if cnt >= _DENSE_LINE_MIN_TOKENS and i not in captured_lines:
+                start = max(0, i - 1)
+                end = min(len(lines), i + 2)
+                regions.append("\n".join(lines[start:end]).strip())
 
         return regions
 
@@ -1795,30 +1825,54 @@ class KnowledgeCompiler:
         self,
         file_path: str,
         total_pages: Optional[int],
-        kreuzberg_table_pages: Set[int],
+        covered_pages: Set[int],
+        *,
+        enhanced_content: Optional[str] = None,
+        tree_root: Optional[Any] = None,
     ) -> list[dict]:
-        """Scan *all* PDF pages for table-like regions via numeric density.
+        """Scan PDF pages for table-like regions via numeric density.
 
-        Unlike :meth:`_targeted_table_extraction` this method does **not**
-        depend on tree node metadata (``page_range``, ``table_count``).
-        It reads every page through pypdf and applies the same density +
-        region-detection heuristics, skipping pages that already have a
-        kreuzberg-detected table.
+        Uses a two-tier strategy:
+
+        1. **pypdf page scan** — reads every page individually.  Works well
+           when pypdf preserves per-row line breaks.
+        2. **ENHANCED content fallback** — if pypdf yields poor line
+           structure (> 50 % of pages have ≤ 3 lines), falls back to
+           scanning the kreuzberg ENHANCED markdown content, which often
+           has better formatting.  Page numbers are recovered via the
+           tree's ``char_range → page_range`` mapping.
 
         Args:
-            file_path:              Path to the PDF file.
-            total_pages:            Total page count (from extraction metadata).
-            kreuzberg_table_pages:  Page numbers already covered by kreuzberg
-                                    layout-detected tables.
+            file_path:          Path to the PDF file.
+            total_pages:        Total page count.
+            covered_pages:      Page numbers already in the table digest.
+            enhanced_content:   Cached kreuzberg ENHANCED text (optional).
+            tree_root:          Tree root node for char → page mapping (optional).
 
         Returns:
-            List of table dicts compatible with the digest format::
-
-                {"page": int, "content": str, "source": "content_scan"}
+            List of table dicts compatible with the digest format.
         """
         if not total_pages or total_pages <= 0:
             return []
 
+        results = await self._pypdf_page_scan(
+            file_path, total_pages, covered_pages,
+        )
+
+        if results or not enhanced_content or not tree_root:
+            return results
+
+        return self._enhanced_content_scan(
+            enhanced_content, total_pages, covered_pages, tree_root,
+        )
+
+    async def _pypdf_page_scan(
+        self,
+        file_path: str,
+        total_pages: int,
+        covered_pages: Set[int],
+    ) -> list[dict]:
+        """Primary scan: per-page pypdf extraction with density heuristics."""
         all_page_nums = list(range(1, total_pages + 1))
         try:
             pages = DocumentExtractor.extract_pages(file_path, all_page_nums)
@@ -1830,19 +1884,109 @@ class KnowledgeCompiler:
             return []
 
         results: list[dict] = []
+        poor_line_count = 0
         for pc in pages:
-            if pc.page_number in kreuzberg_table_pages:
+            if len(pc.content.split("\n")) <= 3:
+                poor_line_count += 1
+            if pc.page_number in covered_pages:
                 continue
             if not self._page_has_table_density(pc.content):
                 continue
-            regions = self._identify_table_regions(pc.content)
-            for region in regions:
+            for region in self._identify_table_regions(pc.content):
                 results.append({
                     "page": pc.page_number,
                     "content": region[:_TARGETED_TABLE_MAX_CHARS],
                     "source": "content_scan",
                 })
+
+        if results:
+            return results
+
+        # Signal that pypdf line quality is poor — caller should try fallback
+        if poor_line_count > total_pages * 0.5:
+            return []
+
         return results
+
+    @staticmethod
+    def _enhanced_content_scan(
+        enhanced_content: str,
+        total_pages: int,
+        covered_pages: Set[int],
+        tree_root: Any,
+    ) -> list[dict]:
+        """Fallback scan: use ENHANCED (kreuzberg markdown) content.
+
+        Scans the full ENHANCED text line-by-line for dense-token lines,
+        then maps each detected region back to a page number using the
+        tree's ``char_range → page_range`` mapping.
+        """
+        char_page_map = KnowledgeCompiler._build_char_to_page_map(
+            tree_root, total_pages,
+        )
+        if not char_page_map:
+            return []
+
+        breakpoints = [cp[0] for cp in char_page_map]
+
+        results: list[dict] = []
+        offset = 0
+        for line in enhanced_content.split("\n"):
+            token_count = len(_NUM_TOKEN_RE.findall(line))
+            if token_count >= _DENSE_LINE_MIN_TOKENS:
+                idx = bisect.bisect_right(breakpoints, offset) - 1
+                page = char_page_map[max(0, idx)][1] if idx >= 0 else 1
+                if page not in covered_pages:
+                    results.append({
+                        "page": page,
+                        "content": line[:_TARGETED_TABLE_MAX_CHARS],
+                        "source": "content_scan:enhanced",
+                    })
+                    covered_pages.add(page)
+            offset += len(line) + 1  # +1 for '\n'
+
+        return results
+
+    @staticmethod
+    def _build_char_to_page_map(
+        tree_root: Any,
+        total_pages: int,
+    ) -> list[tuple[int, int]]:
+        """Build a sorted (char_start, page_number) list from tree leaves.
+
+        Enables efficient binary-search lookup from any character offset
+        in the ENHANCED content to the corresponding page number.
+        """
+        entries: list[tuple[int, int]] = []
+
+        def _collect(node: Any) -> None:
+            children = getattr(node, "children", None) or []
+            if isinstance(node, dict):
+                children = node.get("children", [])
+            pr = (
+                getattr(node, "page_range", None)
+                if not isinstance(node, dict)
+                else node.get("page_range")
+            )
+            cr = (
+                getattr(node, "char_range", None)
+                if not isinstance(node, dict)
+                else node.get("char_range")
+            )
+            if not children and cr and pr:
+                page = pr[0] if isinstance(pr, (list, tuple)) else pr
+                char_start = cr[0] if isinstance(cr, (list, tuple)) else cr
+                if page and char_start is not None:
+                    entries.append((int(char_start), int(page)))
+            for ch in children:
+                _collect(ch)
+
+        _collect(tree_root)
+
+        if not entries:
+            return [(0, 1)]
+        entries.sort()
+        return entries
 
     def _find_force_ocr_candidates(
         self,
