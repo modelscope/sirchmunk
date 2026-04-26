@@ -233,7 +233,9 @@ class DocumentTreeIndexer:
                 # await self._deepen_large_leaves(root, content, max_depth=effective_depth)
                 # Node summary enrichment: controlled by SIRCHMUNK_SKIP_NODE_SUMMARIES env var.
                 # Set to "true" to skip during debugging / performance testing.
-                if os.getenv("SIRCHMUNK_SKIP_NODE_SUMMARIES", "").lower() not in ("true", "1", "yes"):
+                _skip_summaries = os.getenv("SIRCHMUNK_SKIP_NODE_SUMMARIES", "").lower() in ("true", "1", "yes")
+                print(f"SEARCH_WIKI_DEBUG [T1] enrich_node_summaries (TOC path): skip={_skip_summaries}, env={os.getenv('SIRCHMUNK_SKIP_NODE_SUMMARIES', '')}", flush=True)
+                if not _skip_summaries:
                     await self._enrich_node_summaries(root, content)
                 tree = DocumentTree(
                     file_path=file_path,
@@ -260,7 +262,9 @@ class DocumentTreeIndexer:
         # await self._deepen_large_leaves(root, content, max_depth=effective_depth)
         # Node summary enrichment: controlled by SIRCHMUNK_SKIP_NODE_SUMMARIES env var.
         # Set to "true" to skip during debugging / performance testing.
-        if os.getenv("SIRCHMUNK_SKIP_NODE_SUMMARIES", "").lower() not in ("true", "1", "yes"):
+        _skip_summaries = os.getenv("SIRCHMUNK_SKIP_NODE_SUMMARIES", "").lower() in ("true", "1", "yes")
+        print(f"SEARCH_WIKI_DEBUG [T1] enrich_node_summaries (recursive path): skip={_skip_summaries}, env={os.getenv('SIRCHMUNK_SKIP_NODE_SUMMARIES', '')}", flush=True)
+        if not _skip_summaries:
             await self._enrich_node_summaries(root, content)
 
         tree = DocumentTree(
@@ -304,6 +308,8 @@ class DocumentTreeIndexer:
         if tree.root is None:
             return []
 
+        print(f"SEARCH_WIKI_DEBUG [T2] navigate: query={query[:80]}, total_nodes={self._count_nodes(tree.root)}", flush=True)
+
         candidates = tree.root.children if tree.root.children else [tree.root]
         if not candidates:
             return [tree.root]
@@ -318,6 +324,7 @@ class DocumentTreeIndexer:
             selected = await self._select_children(
                 frontier, query, max_selections=max_results,
             )
+            print(f"SEARCH_WIKI_DEBUG [T3] navigate layer: depth={depth}, selected={len(selected)}, names={[n.title[:30] for n in selected][:5]}", flush=True)
             if not selected:
                 break
 
@@ -351,7 +358,10 @@ class DocumentTreeIndexer:
             if n.node_id not in seen_ids:
                 seen_ids.add(n.node_id)
                 unique.append(n)
-        return unique[:max_results]
+        leaves = unique[:max_results]
+        _page_valid = sum(1 for l in leaves if getattr(l, 'page_range', None) and len(l.page_range) == 2 and l.page_range[0])
+        print(f"SEARCH_WIKI_DEBUG [T4] navigate result: leaves={len(leaves)}, page_range_valid={_page_valid}", flush=True)
+        return leaves
 
     def load_tree(self, file_path: str) -> Optional[DocumentTree]:
         """Load a cached tree index for the given file (sync)."""
@@ -821,6 +831,7 @@ class DocumentTreeIndexer:
     def _save_cache(self, file_hash: str, tree: DocumentTree) -> None:
         path = self._cache_path(file_hash)
         path.write_text(tree.to_json(), encoding="utf-8")
+        print(f"SEARCH_WIKI_DEBUG [C5] tree_json_saved: path={path}", flush=True)
 
     def _load_cache(self, file_hash: str) -> Optional[DocumentTree]:
         path = self._cache_path(file_hash)

@@ -2527,6 +2527,8 @@ class AgenticSearch(BaseSearch):
                     {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
                     for p in _tree_probed_files[:top_k_files]
                 ]
+                print(f"SEARCH_WIKI_DEBUG [D7] _tree_probed_files={_tree_probed_files}", flush=True)
+                print(f"SEARCH_WIKI_DEBUG [D8] best_files={[bf['path'] for bf in best_files]}", flush=True)
                 await self._logger.info(
                     f"[FAST:PureTree] Using {len(best_files)} tree-probed files: "
                     f"{[Path(p).name for p in _tree_probed_files[:top_k_files]]}"
@@ -2651,6 +2653,11 @@ class AgenticSearch(BaseSearch):
             tree_nav_done: Set[str] = set()
             tree_nav_target = best_files[0]["path"]
 
+            print(f"SEARCH_WIKI_DEBUG [D9] tree_nav_target={tree_nav_target}", flush=True)
+            print(f"SEARCH_WIKI_DEBUG [D10] tree_nav_match={tree_nav_target in (artifacts.tree_available_paths if artifacts else set())}", flush=True)
+            if artifacts and tree_nav_target not in artifacts.tree_available_paths:
+                print(f"SEARCH_WIKI_DEBUG [D11] MISMATCH! tree_available_paths={artifacts.tree_available_paths}", flush=True)
+
             if artifacts and tree_nav_target in artifacts.tree_available_paths:
                 tree_task = self._navigate_tree_for_evidence(tree_nav_target, query)
                 tree_nav_done.add(tree_nav_target)
@@ -2668,6 +2675,8 @@ class AgenticSearch(BaseSearch):
                     fn = Path(fp).name
                     ext = Path(fp).suffix.lower()
                     ev = None
+
+                    print(f"SEARCH_WIKI_DEBUG [D12] _rga_evidence: fp={fp}", flush=True)
 
                     # 0. Excel digest priority (pre-compiled evidence)
                     if artifacts and artifacts.manifest_map:
@@ -2708,12 +2717,16 @@ class AgenticSearch(BaseSearch):
                             except Exception:
                                 pass
 
+                        print(f"SEARCH_WIKI_DEBUG [D13] table_digest: manifest_lookup={'found' if artifacts.manifest_map and artifacts.manifest_map.get(fp) else 'miss'}, has_table_digest={getattr(artifacts.manifest_map.get(fp), 'has_table_digest', False) if artifacts.manifest_map else 'N/A'}, hash_fallback={'tried' if not _all_tables else 'skipped'}, tables_count={len(_all_tables) if _all_tables else 0}", flush=True)
+
                         if _all_tables:
                             _table_ev = self._format_table_evidence(_all_tables)
                             if _table_ev:
                                 ev = f"[{fn} - Table Evidence]\n{_table_ev}"
 
                     # 1. Tree-guided sampling FIRST for tree-indexed files
+                    _tree_cond = artifacts and fp in artifacts.tree_available_paths and fp not in tree_nav_done
+                    print(f"SEARCH_WIKI_DEBUG [D14] tree_sample: cond={_tree_cond}, in_tree_paths={fp in (artifacts.tree_available_paths if artifacts else set())}, in_nav_done={fp in tree_nav_done}", flush=True)
                     if (
                         artifacts
                         and fp in artifacts.tree_available_paths
@@ -2755,6 +2768,14 @@ class AgenticSearch(BaseSearch):
                         parts.append(ev[:remaining])
                         chars += len(parts[-1])
                         context.mark_file_read(fp)
+
+                    _ev_source = "none"
+                    if ev:
+                        if "Table Evidence" in ev: _ev_source = "table_digest"
+                        elif "Pre-compiled" in ev: _ev_source = "excel_digest"
+                        elif "TreeSample" in str(ev)[:50] or "TreeNav" in str(ev)[:50]: _ev_source = "tree"
+                        else: _ev_source = "rga_or_other"
+                    print(f"SEARCH_WIKI_DEBUG [D15] ev_source={_ev_source}, ev_len={len(ev) if ev else 0}", flush=True)
                 return "\n\n---\n\n".join(parts)
 
             # Launch tree navigation for the primary file alongside rga
@@ -2769,6 +2790,10 @@ class AgenticSearch(BaseSearch):
             if rga_ev:
                 evidence_parts_final.append(rga_ev)
             evidence = "\n\n---\n\n".join(evidence_parts_final)
+
+            print(f"SEARCH_WIKI_DEBUG [D16] tree_ev: {'yes' if tree_ev else 'no'}, len={len(tree_ev) if tree_ev else 0}", flush=True)
+            print(f"SEARCH_WIKI_DEBUG [D17] rga_ev: {'yes' if rga_ev else 'no'}, len={len(rga_ev) if rga_ev else 0}", flush=True)
+            print(f"SEARCH_WIKI_DEBUG [D18] final_evidence_len={len(evidence)}", flush=True)
 
             if not evidence or len(evidence.strip()) < 20:
                 if llm_fallback:
@@ -3549,6 +3574,9 @@ class AgenticSearch(BaseSearch):
             except Exception:
                 pass
 
+        print(f"SEARCH_WIKI_DEBUG [D1] manifest_map: {len(manifest_map)} entries, keys={list(manifest_map.keys())[:3]}", flush=True)
+        print(f"SEARCH_WIKI_DEBUG [D2] tree_available_paths: {tree_paths}", flush=True)
+        print(f"SEARCH_WIKI_DEBUG [D3] manifest_fallback_executed: {manifest_map and not tree_paths}", flush=True)
         return CompileArtifacts(
             catalog=catalog,
             catalog_map=catalog_map,
@@ -3804,6 +3832,8 @@ class AgenticSearch(BaseSearch):
         if max_chars <= 0:
             max_chars = self._FAST_MAX_EVIDENCE_CHARS
 
+        print(f"SEARCH_WIKI_DEBUG [S1] _tree_guided_sample: file_path={file_path}", flush=True)
+
         # --- Guard: tree availability ---
         if artifacts is not None:
             if file_path not in artifacts.tree_available_paths:
@@ -3839,6 +3869,7 @@ class AgenticSearch(BaseSearch):
         # --- Classify leaves by extraction method ---
         trimmed = leaves[: self._TREE_SAMPLE_MAX_SECTIONS]
         page_leaves, char_leaves, table_and_summary = self._classify_leaves(trimmed)
+        print(f"SEARCH_WIKI_DEBUG [S2] classify_leaves: page={len(page_leaves)}, char={len(char_leaves)}, table_summary={len(table_and_summary)}", flush=True)
 
         # Collect (leaf, segment) pairs preserving original leaf order
         leaf_segments: List[tuple] = []  # (leaf, segment_text)
@@ -3968,6 +3999,7 @@ class AgenticSearch(BaseSearch):
             return None
 
         evidence = "\n\n".join(parts)
+        print(f"SEARCH_WIKI_DEBUG [S3] _tree_guided_sample result: len={len(evidence) if evidence else 0}", flush=True)
         await self._logger.info(
             f"[TreeSample] {fname}: "
             f"{len(parts)} sections, {total_chars} chars "
@@ -4126,6 +4158,7 @@ class AgenticSearch(BaseSearch):
           3. leaf.summary – last resort
         """
         indexer = self._get_tree_indexer()
+        print(f"SEARCH_WIKI_DEBUG [N1] _navigate_tree_for_evidence: file_path={file_path}", flush=True)
         if indexer is None:
             return None
         tree = indexer.load_tree(file_path)
@@ -4137,6 +4170,8 @@ class AgenticSearch(BaseSearch):
         except Exception:
             return None
 
+        print(f"SEARCH_WIKI_DEBUG [N2] navigate_result: {len(leaves) if leaves else 0} leaves", flush=True)
+
         if not leaves:
             return None
 
@@ -4145,6 +4180,7 @@ class AgenticSearch(BaseSearch):
 
         # ── Phase 1: classify leaves by available extraction method ──
         page_leaves, char_leaves, summary_only = self._classify_leaves(leaves)
+        print(f"SEARCH_WIKI_DEBUG [N3] classify_leaves: page={len(page_leaves)}, char={len(char_leaves)}, summary={len(summary_only)}", flush=True)
 
         for leaf in summary_only:
             self._append_evidence_part(
@@ -4191,6 +4227,9 @@ class AgenticSearch(BaseSearch):
                         self._append_evidence_part(
                             parts, fname, leaf, leaf.summary,
                         )
+                print(f"SEARCH_WIKI_DEBUG [N4] page_extraction: page_leaves_ok=False", flush=True)
+            else:
+                print(f"SEARCH_WIKI_DEBUG [N4] page_extraction: page_leaves_ok=True", flush=True)
 
         # ── Phase 3: char_range fallback (lazy full-text extraction) ──
         if char_leaves:
@@ -4256,7 +4295,10 @@ class AgenticSearch(BaseSearch):
         except Exception:
             pass
 
+        print(f"SEARCH_WIKI_DEBUG [N5] table_supplement: tables_loaded={len(_all_tables) if '_all_tables' in dir() and _all_tables else 0}", flush=True)
+
         evidence = "\n\n".join(parts)
+        print(f"SEARCH_WIKI_DEBUG [N6] _navigate_tree_for_evidence result: len={len(evidence) if evidence else 0}", flush=True)
         await self._logger.info(
             f"[FAST:TreeNav] Extracted {len(parts)} sections, "
             f"{len(evidence)} chars from {fname}"
@@ -4931,16 +4973,19 @@ class AgenticSearch(BaseSearch):
         Returns file paths of selected documents, or empty list when trees
         are unavailable or cover too few files to justify an LLM call.
         """
+        print(f"SEARCH_WIKI_DEBUG [D4] _probe_tree_for_fast: tree_available_paths={len(artifacts.tree_available_paths) if artifacts else 0}", flush=True)
         if not artifacts or not artifacts.tree_available_paths:
             return []
 
         try:
             trees = self._load_cached_trees()
+            print(f"SEARCH_WIKI_DEBUG [D5] loaded_trees: {len(trees)} trees, paths={[t.file_path for t in trees][:3]}", flush=True)
             if not trees:
                 return []
             result = await self._llm_select_from_trees(
                 query, trees, max_select=self._FAST_TREE_PROBE_MAX_FILES,
             )
+            print(f"SEARCH_WIKI_DEBUG [D6] llm_select_result: {result}", flush=True)
             if result:
                 await self._logger.info(
                     f"[FAST:TreeProbe] Selected {len(result)} files "

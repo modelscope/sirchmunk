@@ -35,23 +35,60 @@ from evaluate import compute_metrics
 from runner import run_batch
 
 # ---------------------------------------------------------------------------
+# Tee stdout to log file
+# ---------------------------------------------------------------------------
+
+
+class _TeeWriter:
+    """Duplicate stdout to both terminal and a log file."""
+
+    def __init__(self, log_path: str) -> None:
+        self._terminal = sys.stdout
+        self._log = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
+
+    def write(self, msg: str) -> int:
+        self._terminal.write(msg)
+        self._log.write(msg)
+        return len(msg)
+
+    def flush(self) -> None:
+        self._terminal.flush()
+        self._log.flush()
+
+    def close(self) -> None:
+        self._log.close()
+
+    # Let logging / other code check the stream capabilities
+    @property
+    def encoding(self) -> str:
+        return getattr(self._terminal, "encoding", "utf-8")
+
+    def isatty(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        return self._terminal.fileno()
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
 
-def setup_logging(output_dir: str) -> str:
+def setup_logging(output_dir: str, ts: str | None = None) -> tuple[str, str]:
     """Configure logging to file + console.
 
     Creates a timestamped log file under ``logs/`` (relative to *output_dir*'s
     parent, i.e. the benchmark root directory).
 
     Returns:
-        Absolute path to the log file.
+        Tuple of (absolute path to the log file, timestamp string).
     """
     log_dir = Path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if ts is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = log_dir / f"benchmark_{ts}.log"
 
     root_logger = logging.getLogger("financebench")
@@ -77,7 +114,7 @@ def setup_logging(output_dir: str) -> str:
     root_logger.addHandler(fh)
     root_logger.addHandler(ch)
 
-    return str(log_path.resolve())
+    return str(log_path.resolve()), ts
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +206,16 @@ def main() -> None:
         cfg.limit = args.limit
 
     # 2. Setup logging
-    log_path = setup_logging(cfg.output_dir)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path, ts = setup_logging(cfg.output_dir, ts=ts)
     logger = logging.getLogger("financebench")
+
+    # 2b. Tee stdout → debug log so SEARCH_WIKI_DEBUG prints are captured
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    debug_log_path = log_dir / f"benchmark_{ts}_debug.log"
+    tee = _TeeWriter(str(debug_log_path))
+    sys.stdout = tee
 
     # Print config source info
     work_env = Path(cfg.work_path) / ".env"
@@ -250,7 +295,25 @@ def main() -> None:
 
     # 10. Print summary
     _print_summary(results, metrics, total_time, results_path, metrics_path, log_path)
+    print(f"  Debug log: {debug_log_path.resolve()}")
+
+    # 11. Restore stdout
+    sys.stdout = tee._terminal
+    tee.close()
+
+
+def _main_safe() -> None:
+    """Wrapper that guarantees stdout is restored even on exceptions."""
+    try:
+        main()
+    except (KeyboardInterrupt, Exception):
+        # Restore stdout if tee was installed
+        if hasattr(sys.stdout, "_terminal"):
+            terminal = sys.stdout._terminal
+            sys.stdout.close()
+            sys.stdout = terminal
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    _main_safe()

@@ -425,6 +425,8 @@ class KnowledgeCompiler:
                     has_table_digest=result.has_table_digest,
                     table_count=result.table_count,
                 )
+                _mentry = manifest.files[result.path]
+                print(f"SEARCH_WIKI_DEBUG [C4] manifest_entry: has_tree={_mentry.has_tree}, has_table_digest={_mentry.has_table_digest}, file_hash={_mentry.file_hash}", flush=True)
 
         # Phase 3: aggregate results into knowledge network
         await self._log.info("[Compile] Phase 3: Knowledge aggregation")
@@ -559,6 +561,7 @@ class KnowledgeCompiler:
         the pipeline skips tree building and summarises via a direct LLM call.
         """
         result = FileCompileResult(path=entry.path)
+        print(f"SEARCH_WIKI_DEBUG [C1] _compile_single_file: file_path={entry.path}, file_hash={entry.file_hash}", flush=True)
         try:
             await self._log.info(f"[Compile] Processing: {Path(entry.path).name}")
 
@@ -599,6 +602,7 @@ class KnowledgeCompiler:
             # Record TOC / tree metrics on the result for manifest persistence
             result.has_explicit_toc = toc_entries is not None and len(toc_entries) > 0
             result.tree_node_count = self._count_tree_nodes(result.tree)
+            print(f"SEARCH_WIKI_DEBUG [C2] tree_build: success={result.tree is not None}, nodes={result.tree_node_count}, tree.file_path={result.tree.file_path if result.tree else 'N/A'}", flush=True)
 
             # Enrich content with structural metadata for non-text types
             ext = Path(entry.path).suffix.lower()
@@ -649,6 +653,8 @@ class KnowledgeCompiler:
                             result.table_count = len(extraction.tables)
                 except Exception:
                     pass
+
+            print(f"SEARCH_WIKI_DEBUG [C3] table_digest: generated={result.has_table_digest}, count={result.table_count}", flush=True)
 
             # Integrate tables into tree: annotate counts + create table child nodes
             if result.tree and result.tree.root and extraction.tables:
