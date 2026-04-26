@@ -9,6 +9,7 @@ Monte Carlo sampling.
 
 import json
 import math
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -230,9 +231,10 @@ class DocumentTreeIndexer:
                 # is unreliable, causing overlapping ranges and search failures.
                 # TODO: Re-enable when robust char_range calculation is implemented.
                 # await self._deepen_large_leaves(root, content, max_depth=effective_depth)
-                # NOTE: _enrich_node_summaries disabled temporarily to isolate its impact.
-                # The summaries may inadvertently bias _select_children() navigation.
-                # await self._enrich_node_summaries(root, content)
+                # Node summary enrichment: controlled by SIRCHMUNK_SKIP_NODE_SUMMARIES env var.
+                # Set to "true" to skip during debugging / performance testing.
+                if os.getenv("SIRCHMUNK_SKIP_NODE_SUMMARIES", "").lower() not in ("true", "1", "yes"):
+                    await self._enrich_node_summaries(root, content)
                 tree = DocumentTree(
                     file_path=file_path,
                     file_hash=file_hash,
@@ -256,9 +258,10 @@ class DocumentTreeIndexer:
         # is unreliable, causing overlapping ranges and search failures.
         # TODO: Re-enable when robust char_range calculation is implemented.
         # await self._deepen_large_leaves(root, content, max_depth=effective_depth)
-        # NOTE: _enrich_node_summaries disabled temporarily to isolate its impact.
-        # The summaries may inadvertently bias _select_children() navigation.
-        # await self._enrich_node_summaries(root, content)
+        # Node summary enrichment: controlled by SIRCHMUNK_SKIP_NODE_SUMMARIES env var.
+        # Set to "true" to skip during debugging / performance testing.
+        if os.getenv("SIRCHMUNK_SKIP_NODE_SUMMARIES", "").lower() not in ("true", "1", "yes"):
+            await self._enrich_node_summaries(root, content)
 
         tree = DocumentTree(
             file_path=file_path,

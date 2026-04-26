@@ -2543,10 +2543,21 @@ class AgenticSearch(BaseSearch):
                     f"{len(best_files)} compile-hint files"
                 )
             else:
-                await self._logger.warning(
-                    "[FAST:PureTree] No tree probes available, returning empty"
+                # Graceful degradation: fall back to keyword search when no tree is available
+                await self._logger.info(
+                    "[FAST:PureTree] No tree probes available, falling back to keyword search"
                 )
-                return _NO_RESULTS_MESSAGE, None, context
+                best_files = await self._fast_find_best_file(
+                    primary, top_k=top_k_files, keyword_idfs=keyword_idfs,
+                    query=query, artifacts=artifacts, **rga_kwargs,
+                )
+                if not best_files and fallback:
+                    best_files = await self._fast_find_best_file(
+                        fallback, top_k=top_k_files, keyword_idfs=keyword_idfs,
+                        query=query, artifacts=artifacts, **rga_kwargs,
+                    )
+                if not best_files:
+                    return _NO_RESULTS_MESSAGE, None, context
         else:
             # --- Original rga-based retrieval logic ---
             # High-confidence catalog routing: skip rga, use catalog directly
@@ -2675,16 +2686,32 @@ class AgenticSearch(BaseSearch):
                                     pass
 
                     # 0.5 Table digest priority (pre-compiled PDF table evidence)
-                    if ev is None and artifacts and artifacts.manifest_map:
-                        _me = artifacts.manifest_map.get(fp)
-                        if _me and getattr(_me, 'has_table_digest', False):
-                            _all_tables = self._load_table_digest(
-                                self.work_path, _me.file_hash,
-                            )
-                            if _all_tables:
-                                _table_ev = self._format_table_evidence(_all_tables)
-                                if _table_ev:
-                                    ev = f"[{fn} - Table Evidence]\n{_table_ev}"
+                    _all_tables = None
+                    if ev is None and artifacts:
+                        # Primary: manifest-based lookup
+                        if artifacts.manifest_map:
+                            _me = artifacts.manifest_map.get(fp)
+                            if _me and getattr(_me, 'has_table_digest', False):
+                                _all_tables = self._load_table_digest(
+                                    self.work_path, _me.file_hash,
+                                )
+
+                        # Fallback: direct hash-based lookup when manifest misses
+                        if not _all_tables:
+                            try:
+                                from sirchmunk.utils.file_utils import get_fast_hash
+                                _file_hash = get_fast_hash(fp)
+                                if _file_hash:
+                                    _all_tables = self._load_table_digest(
+                                        self.work_path, _file_hash,
+                                    )
+                            except Exception:
+                                pass
+
+                        if _all_tables:
+                            _table_ev = self._format_table_evidence(_all_tables)
+                            if _table_ev:
+                                ev = f"[{fn} - Table Evidence]\n{_table_ev}"
 
                     # 1. Tree-guided sampling FIRST for tree-indexed files
                     if (
@@ -3492,8 +3519,8 @@ class AgenticSearch(BaseSearch):
             # Prefer manifest-based detection (fast, O(1) per file)
             if manifest_map:
                 tree_paths = {fp for fp, entry in manifest_map.items() if entry.has_tree}
-            # Fallback: scan tree cache directory (legacy path)
-            elif indexer is not None:
+            # Always try directory fallback if manifest-based detection found nothing
+            if not tree_paths and indexer is not None:
                 tree_cache = self.work_path / ".cache" / "compile" / "trees"
                 if tree_cache.exists():
                     try:
@@ -4904,7 +4931,7 @@ class AgenticSearch(BaseSearch):
         Returns file paths of selected documents, or empty list when trees
         are unavailable or cover too few files to justify an LLM call.
         """
-        if not artifacts or len(artifacts.tree_available_paths) <= 2:
+        if not artifacts or not artifacts.tree_available_paths:
             return []
 
         try:
