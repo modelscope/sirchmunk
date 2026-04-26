@@ -63,6 +63,9 @@ _TABLE_PAGE_SPAN_LIMIT = 5
 # this threshold are skipped during targeted extraction.
 _TABLE_NUMERIC_DENSITY_THRESHOLD = 0.15
 
+# Selective force-OCR: max pages to re-extract with forced OCR per document
+_FORCE_OCR_MAX_PAGES = 30
+
 # Excel table-level adaptive sampling constants
 _XLSX_TOTAL_ROW_BUDGET = 100       # Total sampled rows budget across all sheets
 _XLSX_MIN_ROWS_PER_SHEET = 3       # Minimum sampled rows per sheet
@@ -676,50 +679,43 @@ class KnowledgeCompiler:
                     content=content, total_pages=extraction.page_count,
                 )
 
-            # Phase 2.5: Targeted table extraction via generic structural signals
+            # Phase 2.5: Targeted table extraction via tree-node structural signals
             if result.tree and result.tree.root and ext == ".pdf":
                 targeted_tables = await self._targeted_table_extraction(
                     entry.path, result.tree,
                 )
-                if targeted_tables:
-                    # Load existing table digest (if any) and merge
-                    digest_dir = self._compile_dir / "table_digests"
-                    file_hash = get_fast_hash(entry.path) or ""
-                    existing_digest: list[dict] = []
-                    if file_hash and result.has_table_digest:
-                        digest_path = digest_dir / f"{file_hash}.json"
-                        if digest_path.exists():
-                            try:
-                                raw = json.loads(
-                                    digest_path.read_text(encoding="utf-8")
-                                )
-                                existing_digest = raw.get("tables", [])
-                            except Exception:
-                                pass
-                    merged = self._merge_table_digests(
-                        existing_digest, targeted_tables,
+                await self._supplement_table_digest(
+                    entry.path, targeted_tables, result,
+                    source_label="Targeted extraction",
+                )
+
+            # Phase 2.6: Content-based full-page table scan (tree-independent)
+            if ext == ".pdf" and extraction.page_count:
+                covered_pages = self._get_covered_table_pages(entry.path)
+                content_tables = await self._content_based_table_scan(
+                    entry.path,
+                    extraction.page_count,
+                    covered_pages,
+                )
+                await self._supplement_table_digest(
+                    entry.path, content_tables, result,
+                    source_label="Content-based scan",
+                )
+
+            # Phase 2.7: Selective force-OCR for high-density gap pages
+            if ext == ".pdf" and extraction.page_count:
+                covered_after_scan = self._get_covered_table_pages(entry.path)
+                gap_pages = self._find_force_ocr_candidates(
+                    entry.path, extraction.page_count, covered_after_scan,
+                )
+                if gap_pages:
+                    ocr_tables = await self._selective_force_ocr_tables(
+                        entry.path, gap_pages,
                     )
-                    if merged and file_hash:
-                        digest_dir.mkdir(parents=True, exist_ok=True)
-                        digest_path = digest_dir / f"{file_hash}.json"
-                        digest_path.write_text(
-                            json.dumps(
-                                {
-                                    "version": 1,
-                                    "table_count": len(merged),
-                                    "tables": merged,
-                                },
-                                ensure_ascii=False,
-                            ),
-                            encoding="utf-8",
-                        )
-                        result.has_table_digest = True
-                        result.table_count = len(merged)
-                        await self._log.info(
-                            f"[Compile] Targeted table extraction added "
-                            f"{len(targeted_tables)} tables for "
-                            f"{Path(entry.path).name}"
-                        )
+                    await self._supplement_table_digest(
+                        entry.path, ocr_tables, result,
+                        source_label="Selective force-OCR",
+                    )
 
         except Exception as exc:
             result.error = str(exc)
@@ -1707,16 +1703,225 @@ class KnowledgeCompiler:
             page = cls._get_table_page(tbl)
             if page is not None and page in existing_pages:
                 continue
-            # Normalise to digest table format for consistency
             merged.append({
                 "page_number": page,
-                "markdown": tbl.get("content", ""),
-                "row_count": None,
-                "col_count": None,
-                "cells": [],
-                "source": tbl.get("source", "targeted"),
+                "markdown": tbl.get("markdown", "") or tbl.get("content", ""),
+                "row_count": tbl.get("row_count"),
+                "col_count": tbl.get("col_count"),
+                "cells": tbl.get("cells", []),
+                "source": tbl.get("source", "supplementary"),
             })
         return merged
+
+    async def _supplement_table_digest(
+        self,
+        file_path: str,
+        new_tables: list[dict],
+        result: "FileCompileResult",
+        *,
+        source_label: str,
+    ) -> None:
+        """Merge supplementary tables into the persisted table digest.
+
+        Loads the existing digest (if any), merges *new_tables* with
+        page-level deduplication, and writes the updated digest back.
+        Updates *result* metadata in place.
+        """
+        if not new_tables:
+            return
+
+        file_hash = get_fast_hash(file_path) or ""
+        if not file_hash:
+            return
+
+        digest_dir = self._compile_dir / "table_digests"
+        digest_path = digest_dir / f"{file_hash}.json"
+
+        existing: list[dict] = []
+        if result.has_table_digest and digest_path.exists():
+            try:
+                raw = json.loads(digest_path.read_text(encoding="utf-8"))
+                existing = raw.get("tables", [])
+            except Exception:
+                pass
+
+        merged = self._merge_table_digests(existing, new_tables)
+        if not merged:
+            return
+
+        digest_dir.mkdir(parents=True, exist_ok=True)
+        digest_path.write_text(
+            json.dumps(
+                {"version": 1, "table_count": len(merged), "tables": merged},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        result.has_table_digest = True
+        result.table_count = len(merged)
+        await self._log.info(
+            f"[Compile] {source_label}: +{len(new_tables)} tables for "
+            f"{Path(file_path).name} (total={len(merged)})"
+        )
+
+    def _get_covered_table_pages(self, file_path: str) -> Set[int]:
+        """Return the set of page numbers already present in the table digest."""
+        file_hash = get_fast_hash(file_path) or ""
+        if not file_hash:
+            return set()
+
+        digest_path = (
+            self._compile_dir / "table_digests" / f"{file_hash}.json"
+        )
+        if not digest_path.exists():
+            return set()
+
+        try:
+            raw = json.loads(digest_path.read_text(encoding="utf-8"))
+            pages: Set[int] = set()
+            for t in raw.get("tables", []):
+                p = self._get_table_page(t)
+                if p is not None:
+                    pages.add(p)
+            return pages
+        except Exception:
+            return set()
+
+    # ------------------------------------------------------------------ #
+    #  Tree-independent content-based table scanning (P1)                  #
+    # ------------------------------------------------------------------ #
+
+    async def _content_based_table_scan(
+        self,
+        file_path: str,
+        total_pages: Optional[int],
+        kreuzberg_table_pages: Set[int],
+    ) -> list[dict]:
+        """Scan *all* PDF pages for table-like regions via numeric density.
+
+        Unlike :meth:`_targeted_table_extraction` this method does **not**
+        depend on tree node metadata (``page_range``, ``table_count``).
+        It reads every page through pypdf and applies the same density +
+        region-detection heuristics, skipping pages that already have a
+        kreuzberg-detected table.
+
+        Args:
+            file_path:              Path to the PDF file.
+            total_pages:            Total page count (from extraction metadata).
+            kreuzberg_table_pages:  Page numbers already covered by kreuzberg
+                                    layout-detected tables.
+
+        Returns:
+            List of table dicts compatible with the digest format::
+
+                {"page": int, "content": str, "source": "content_scan"}
+        """
+        if not total_pages or total_pages <= 0:
+            return []
+
+        all_page_nums = list(range(1, total_pages + 1))
+        try:
+            pages = DocumentExtractor.extract_pages(file_path, all_page_nums)
+        except Exception as exc:
+            await self._log.warning(
+                f"[Compile] Content-based scan: page read failed for "
+                f"{Path(file_path).name}: {exc}"
+            )
+            return []
+
+        results: list[dict] = []
+        for pc in pages:
+            if pc.page_number in kreuzberg_table_pages:
+                continue
+            if not self._page_has_table_density(pc.content):
+                continue
+            regions = self._identify_table_regions(pc.content)
+            for region in regions:
+                results.append({
+                    "page": pc.page_number,
+                    "content": region[:_TARGETED_TABLE_MAX_CHARS],
+                    "source": "content_scan",
+                })
+        return results
+
+    def _find_force_ocr_candidates(
+        self,
+        file_path: str,
+        total_pages: Optional[int],
+        covered_pages: Set[int],
+    ) -> List[int]:
+        """Identify pages worth re-extracting with forced OCR.
+
+        Returns 0-indexed page numbers for pages that have high numeric
+        density (suggesting tabular content) but are NOT already covered
+        by any table in the digest.  The result is capped at
+        :data:`_FORCE_OCR_MAX_PAGES`.
+        """
+        if not total_pages or total_pages <= 0:
+            return []
+
+        all_page_nums = list(range(1, total_pages + 1))
+        try:
+            pages = DocumentExtractor.extract_pages(file_path, all_page_nums)
+        except Exception:
+            return []
+
+        candidates: List[int] = []
+        for pc in pages:
+            if pc.page_number in covered_pages:
+                continue
+            if self._page_has_table_density(pc.content):
+                candidates.append(pc.page_number - 1)  # 0-indexed for kreuzberg
+
+        return sorted(candidates)[:_FORCE_OCR_MAX_PAGES]
+
+    # ------------------------------------------------------------------ #
+    #  Selective force-OCR re-extraction (P2)                              #
+    # ------------------------------------------------------------------ #
+
+    async def _selective_force_ocr_tables(
+        self,
+        file_path: str,
+        gap_pages: List[int],
+    ) -> list[dict[str, Any]]:
+        """Re-extract specific pages with forced OCR + layout detection.
+
+        For pages where the native text layer was not recognized as tables
+        by kreuzberg's RT-DETR model, re-rendering as images may yield
+        better layout detection results.  Uses ``force_ocr_pages`` so only
+        the targeted pages are OCR'd (no full-document penalty).
+
+        Args:
+            file_path:  Path to the PDF.
+            gap_pages:  0-indexed page numbers to force OCR on.  Capped at
+                        :data:`_FORCE_OCR_MAX_PAGES` to bound compile time.
+
+        Returns:
+            List of kreuzberg-format table dicts (with ``markdown``,
+            ``cells``, ``page_number``).
+        """
+        from sirchmunk.utils.document_extractor import ExtractionProfile
+
+        if not gap_pages:
+            return []
+
+        capped = sorted(gap_pages)[:_FORCE_OCR_MAX_PAGES]
+
+        profile = ExtractionProfile(
+            output_format="markdown",
+            extract_tables=True,
+            force_ocr_pages=tuple(capped),
+        )
+        try:
+            extraction = await DocumentExtractor.extract(file_path, profile)
+        except Exception as exc:
+            await self._log.warning(
+                f"[Compile] Selective force-OCR failed for "
+                f"{Path(file_path).name}: {exc}"
+            )
+            return []
+
+        return extraction.tables
 
     # ------------------------------------------------------------------ #
     #  Summary index for embedding + BM25 fallback                        #

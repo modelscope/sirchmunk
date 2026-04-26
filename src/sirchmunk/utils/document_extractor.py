@@ -72,6 +72,14 @@ class ExtractionProfile:
     when set, OCR is always applied regardless of text layer presence.
     """
 
+    force_ocr_pages: Optional[tuple[int, ...]] = None
+    """Force OCR on specific pages only (0-indexed).
+
+    Maps to kreuzberg's ``ExtractionConfig.force_ocr_pages``.
+    Mutually exclusive with :attr:`force_ocr` — when both are set,
+    ``force_ocr`` takes precedence.
+    """
+
     pdf_password: Optional[str] = None
     """Password for encrypted PDFs."""
 
@@ -459,12 +467,12 @@ class DocumentExtractor:
         if profile.extract_tables:
             try:
                 from kreuzberg import LayoutDetectionConfig
-                # kreuzberg >= 4.5.0: model-based table detection (RT-DETR v2)
-                # Default: table_model="tatr", apply_heuristics=True
-                layout_config = LayoutDetectionConfig()
+                layout_config = LayoutDetectionConfig(
+                    confidence_threshold=0.3,
+                    apply_heuristics=True,
+                    table_model="slanet_auto",
+                )
             except ImportError:
-                # kreuzberg < 4.5.0: tables extracted via heuristics only;
-                # filtering is handled in _convert_result().
                 pass
 
         # --- Assemble ExtractionConfig ---
@@ -475,6 +483,8 @@ class DocumentExtractor:
             kwargs["ocr"] = ocr_config
         if profile.force_ocr:
             kwargs["force_ocr"] = True
+        elif profile.force_ocr_pages:
+            kwargs["force_ocr_pages"] = list(profile.force_ocr_pages)
         if page_config is not None:
             kwargs["pages"] = page_config
         if pdf_config is not None:
