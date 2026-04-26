@@ -292,21 +292,21 @@ class DocumentTreeIndexer:
         *,
         max_results: int = 3,
         max_depth: int = 4,
-        min_depth: int = 2,
+        min_depth: int = 1,
     ) -> List[TreeNode]:
         """Adaptive-depth LLM-driven tree navigation.
 
         Iteratively descends the tree using _select_children() at each level,
         collecting leaf nodes until *max_results* are found or *max_depth* is
         reached.  Enforces *min_depth* descent before allowing early
-        termination to avoid shallow results.
+        termination to avoid overly shallow results.
 
         Args:
             tree: DocumentTree with a root node.
             query: Search query for relevance selection.
             max_results: Maximum number of leaf nodes to return.
             max_depth: Maximum descent depth (default 4).
-            min_depth: Minimum depth before early termination (default 2).
+            min_depth: Minimum depth before early termination (default 1).
 
         Returns:
             List of the most relevant leaf TreeNodes.
@@ -319,6 +319,16 @@ class DocumentTreeIndexer:
         candidates = tree.root.children if tree.root.children else [tree.root]
         if not candidates:
             return [tree.root]
+
+        # Skip single-child container chains (e.g. SEC boilerplate wrappers
+        # like "UNITED STATES SECURITIES AND EXCHANGE COMMISSION" → "FORM 10-K")
+        # to avoid wasting navigation depth on structural-only nodes.
+        while (
+            len(candidates) == 1
+            and candidates[0].children
+            and not candidates[0].leaf
+        ):
+            candidates = candidates[0].children
 
         # Adaptive min-depth: clamp to tree's actual depth
         tree_max_depth = self._max_node_depth(tree.root)
@@ -359,17 +369,10 @@ class DocumentTreeIndexer:
                     continue
                 visited.add(node_id)
 
-                # Fix A.2: leaf determination with depth constraint
-                if node.leaf or not node.children:
-                    if depth >= effective_min_depth:
-                        result_leaves.append(node)
-                    elif node.children:
-                        next_frontier.extend(node.children)
-                    else:
-                        # True leaf (no children), cannot descend further
-                        result_leaves.append(node)
-                else:
+                if node.children:
                     next_frontier.extend(node.children)
+                else:
+                    result_leaves.append(node)
 
             # Fix A.3: early termination requires depth >= effective_min_depth
             if len(result_leaves) >= max_results and depth >= effective_min_depth:
@@ -788,68 +791,58 @@ class DocumentTreeIndexer:
         *,
         min_remaining: int = 3,
     ) -> List["TreeNode"]:
-        """Filter out low-value fragment nodes using structural signals.
+        """Remove only structurally empty or exact-duplicate nodes.
 
-        Applies three generic heuristics (no domain-specific keywords):
-          1. Short-page leaf: page_range spans <= 2 pages AND no children AND
-             summary length < 100 chars.
-          2. Tiny fragment: title < 10 chars AND no children AND
-             char_range span < 200 chars.
-          3. Duplicate page_range: among nodes sharing the same page_range,
-             keep only the one with the largest char_range span.
+        Intentionally conservative: the LLM selection step receives rich
+        structural descriptors (page span, table count, subsection count)
+        and is trusted to judge relevance.  This filter removes only
+        definitive noise that would waste LLM context:
 
-        Safety valve: returns original *nodes* if fewer than *min_remaining*
-        survive filtering.
+          1. Empty placeholders — no title, no children, zero char span,
+             and no summary.
+          2. Exact duplicates — identical (title, page_range) pairs; among
+             duplicates the node with the richest structure is kept.
+
+        Safety: returns original *nodes* when fewer than *min_remaining*
+        would survive.
         """
         if len(nodes) <= min_remaining:
             return nodes
 
-        # Pass 1: identify fragment nodes
         keep: List[bool] = [True] * len(nodes)
 
+        def _char_span(n: "TreeNode") -> int:
+            cr = getattr(n, "char_range", (0, 0))
+            return (cr[1] - cr[0]) if cr and len(cr) == 2 else 0
+
+        # Pass 1: remove structurally empty placeholder nodes
         for i, n in enumerate(nodes):
-            pr = getattr(n, 'page_range', None)
-            has_children = bool(n.children)
-            summary_len = len(n.summary) if n.summary else 0
-            title_len = len(n.title.strip()) if n.title else 0
-            cr = getattr(n, 'char_range', (0, 0))
-            span = (cr[1] - cr[0]) if cr and len(cr) == 2 else 0
-
-            # Heuristic 1: short-page leaf
-            if (
-                pr and len(pr) == 2
-                and pr[0] is not None and pr[1] is not None
-                and (pr[1] - pr[0]) <= 1
-                and not has_children
-                and summary_len < 100
-            ):
+            title = (n.title or "").strip()
+            if not title and not n.children and _char_span(n) == 0 and not n.summary:
                 keep[i] = False
-                continue
 
-            # Heuristic 2: tiny fragment
-            if title_len < 10 and not has_children and span < 200:
-                keep[i] = False
-                continue
-
-        # Pass 2: deduplicate by page_range
-        page_range_groups: dict = {}  # page_range -> list of (index, span)
+        # Pass 2: deduplicate exact (title, page_range) pairs —
+        # keep the node with more structural richness.
+        seen: dict = {}  # (title, page_range_key) → index
         for i, n in enumerate(nodes):
             if not keep[i]:
                 continue
-            pr = getattr(n, 'page_range', None)
-            if pr and len(pr) == 2:
-                key = (pr[0], pr[1])
-                cr = getattr(n, 'char_range', (0, 0))
-                span = (cr[1] - cr[0]) if cr and len(cr) == 2 else 0
-                page_range_groups.setdefault(key, []).append((i, span))
-
-        for key, group in page_range_groups.items():
-            if len(group) > 1:
-                # Keep only the node with largest char_range span
-                best_idx = max(group, key=lambda x: x[1])[0]
-                for idx, _ in group:
-                    if idx != best_idx:
-                        keep[idx] = False
+            title = (n.title or "").strip()
+            pr = getattr(n, "page_range", None)
+            pr_key = (pr[0], pr[1]) if pr and len(pr) == 2 else None
+            dup_key = (title, pr_key)
+            if dup_key in seen:
+                prev_i = seen[dup_key]
+                prev = nodes[prev_i]
+                richness = (len(n.children), getattr(n, "table_count", 0), _char_span(n))
+                prev_richness = (len(prev.children), getattr(prev, "table_count", 0), _char_span(prev))
+                if richness > prev_richness:
+                    keep[prev_i] = False
+                    seen[dup_key] = i
+                else:
+                    keep[i] = False
+            else:
+                seen[dup_key] = i
 
         filtered = [n for i, n in enumerate(nodes) if keep[i]]
         return filtered if len(filtered) >= min_remaining else nodes
@@ -908,9 +901,9 @@ class DocumentTreeIndexer:
             f"Select the {sel_hint} most relevant sections (by index number):\n"
             f"{listing}\n\n"
             f"Selection criteria:\n"
-            f"- Prioritize sections containing tables and data\n"
-            f"- Prefer sections with many subsections over small leaf fragments\n"
-            f"- Avoid sections covering only 1-2 pages with no subsections\n"
+            f"- Prioritize sections most likely to answer the query\n"
+            f"- Sections with tables, data, or subsections are often high-value\n"
+            f"- Short sections containing relevant data should not be dismissed\n"
             f"- When uncertain, prefer larger sections that can be narrowed later\n\n"
             f"Return ONLY a JSON array of index numbers, e.g. [0, 2]"
         )
@@ -920,8 +913,9 @@ class DocumentTreeIndexer:
     ) -> List[TreeNode]:
         """LLM-driven branch selection: pick the most relevant children.
 
-        Pre-filters low-value fragments, then dispatches to paginated
-        selection when *nodes* exceeds ``_PAGE_SIZE_THRESHOLD``.
+        Removes only definitive noise (empty / duplicate nodes), then
+        dispatches to paginated selection when *nodes* exceeds
+        ``_PAGE_SIZE_THRESHOLD``.  Relevance judgment is delegated to the LLM.
         """
         if len(nodes) <= 2:
             return nodes

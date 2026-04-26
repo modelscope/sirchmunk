@@ -934,20 +934,21 @@ class AgenticSearch(BaseSearch):
 
     @staticmethod
     def _parse_summary_response(llm_response: str) -> Tuple[str, bool, bool]:
-        """
-        Parse LLM response to extract summary and quality decisions.
+        """Parse LLM response to extract summary, precise answer, and quality decisions.
 
-        Args:
-            llm_response: Raw LLM response containing SUMMARY, SHOULD_ANSWER and SHOULD_SAVE tags
+        When a ``<PRECISE_ANSWER>`` tag is present, its content is prepended to
+        the summary so downstream consumers (evaluation judges, UIs) see the
+        direct answer prominently without needing separate tag awareness.
 
         Returns:
             Tuple of (summary_text, should_save_flag, should_answer_flag)
         """
         summary_fields = extract_fields(
             content=llm_response,
-            tags=["SUMMARY", "SHOULD_ANSWER", "SHOULD_SAVE"],
+            tags=["PRECISE_ANSWER", "SUMMARY", "SHOULD_ANSWER", "SHOULD_SAVE"],
         )
 
+        precise = str(summary_fields.get("precise_answer") or "").strip()
         summary = str(summary_fields.get("summary") or "").strip()
         should_answer_str = str(summary_fields.get("should_answer") or "false").strip().lower()
         should_save_str = str(summary_fields.get("should_save") or "false").strip().lower()
@@ -955,8 +956,11 @@ class AgenticSearch(BaseSearch):
         should_answer = should_answer_str in ["true", "yes", "1"]
         should_save = should_save_str in ["true", "yes", "1"]
 
-        # If extraction failed, use entire response as summary and default to conservative:
-        # not answerable and not saveable.
+        if precise and summary:
+            summary = f"**Answer: {precise}**\n\n{summary}"
+        elif precise:
+            summary = precise
+
         if not summary:
             summary = llm_response.strip()
             should_answer = False
@@ -2198,7 +2202,7 @@ class AgenticSearch(BaseSearch):
     """Maximum files returned by catalog keyword-overlap probe in DEEP mode."""
 
     # --- Tree-guided sampling constants ---
-    _TREE_SAMPLE_MAX_SECTIONS = 3
+    _TREE_SAMPLE_MAX_SECTIONS = 5
     """Max tree sections to include per file in tree-guided sampling."""
     _TREE_SAMPLE_SECTION_MAX_CHARS = 3000
     """Max chars per tree section."""
@@ -2218,10 +2222,10 @@ class AgenticSearch(BaseSearch):
     """char_range spanning more than this ratio of the document is treated as invalid."""
 
     # --- Self-correction expanded sampling ---
-    _SELF_CORRECT_EXPANDED_NAV_RESULTS: int = 6
-    """Expanded tree navigation leaf count for same-file re-sampling (default nav uses 3)."""
-    _SELF_CORRECT_EXPANDED_SECTIONS: int = 5
-    """Expanded tree sample sections for same-file re-sampling (default uses 3)."""
+    _SELF_CORRECT_EXPANDED_NAV_RESULTS: int = 10
+    """Expanded tree navigation leaf count for same-file re-sampling (default nav uses 5)."""
+    _SELF_CORRECT_EXPANDED_SECTIONS: int = 8
+    """Expanded tree sample sections for same-file re-sampling (default uses 5)."""
 
     # --- Evidence acceptance thresholds ---
     _EVIDENCE_MIN_ACCEPT_LENGTH: int = 800
@@ -2720,7 +2724,9 @@ class AgenticSearch(BaseSearch):
                         print(f"SEARCH_WIKI_DEBUG [D13] table_digest: manifest_lookup={'found' if artifacts.manifest_map and artifacts.manifest_map.get(fp) else 'miss'}, has_table_digest={getattr(artifacts.manifest_map.get(fp), 'has_table_digest', False) if artifacts.manifest_map else 'N/A'}, hash_fallback={'tried' if not _all_tables else 'skipped'}, tables_count={len(_all_tables) if _all_tables else 0}", flush=True)
 
                         if _all_tables:
-                            _table_ev = self._format_table_evidence(_all_tables)
+                            _table_ev = self._format_table_evidence(
+                                _all_tables, query=query,
+                            )
                             if _table_ev:
                                 ev = f"[{fn} - Table Evidence]\n{_table_ev}"
 
@@ -4009,20 +4015,26 @@ class AgenticSearch(BaseSearch):
 
     @staticmethod
     def _classify_leaves(leaves: list) -> Tuple[List[tuple], List, List]:
-        """将叶节点按提取策略分类。
+        """Classify leaf nodes by preferred extraction strategy.
+
+        For non-table leaves, **char_range** (kreuzberg markdown) is preferred
+        over page_range (pypdf raw text) because compile-time extraction
+        preserves table layout and column structure far better than pypdf's
+        ``extract_text()``.  page_range remains available on each leaf for
+        table-supplement filtering even when the leaf is routed to char_leaves.
 
         Returns:
-            (page_leaves, char_leaves, summary_leaves) 三元组:
-            - page_leaves: list of (leaf, page_range) tuples — 有有效 page_range 的
-            - char_leaves: list of leaf — 需要 char_range fallback 的
-            - summary_leaves: list of leaf — 只有 summary 可用的
+            (page_leaves, char_leaves, summary_leaves) triple:
+            - page_leaves: list of (leaf, page_range) — page-level extraction
+            - char_leaves: list of leaf — kreuzberg char_range extraction
+            - summary_leaves: list of leaf — only summary available
         """
         page_leaves: List[tuple] = []
         char_leaves: List = []
         summary_leaves: List = []
 
         for leaf in leaves:
-            # 表格类型节点：优先 page-level 提取获取完整原始内容
+            # Table nodes: prefer page-level extraction for raw original content
             if getattr(leaf, 'content_type', 'text') == 'table':
                 page_range = getattr(leaf, 'page_range', None)
                 if (
@@ -4038,11 +4050,21 @@ class AgenticSearch(BaseSearch):
                     char_leaves.append(leaf)
                 continue
 
+            # Non-table leaves: prefer char_range (kreuzberg markdown) over
+            # page_range (pypdf raw text) for higher-fidelity table rendering.
+            has_char = hasattr(leaf, 'char_range') and leaf.char_range
             page_range = getattr(leaf, 'page_range', None)
-            if page_range and len(page_range) == 2 and page_range[0] is not None and page_range[0] > 0:
-                page_leaves.append((leaf, page_range))
-            elif hasattr(leaf, 'char_range') and leaf.char_range:
+            has_page = (
+                page_range
+                and len(page_range) == 2
+                and page_range[0] is not None
+                and page_range[0] > 0
+            )
+
+            if has_char:
                 char_leaves.append(leaf)
+            elif has_page:
+                page_leaves.append((leaf, page_range))
             elif getattr(leaf, 'summary', None):
                 summary_leaves.append(leaf)
 
@@ -4096,26 +4118,61 @@ class AgenticSearch(BaseSearch):
         ]
 
     @staticmethod
+    def _score_table_relevance(
+        markdown: str, query_tokens: frozenset,
+    ) -> float:
+        """Score a table's relevance to the query via token overlap.
+
+        Returns a value in [0, 1] representing the fraction of *query_tokens*
+        found in the table's markdown text (case-insensitive).
+        """
+        if not markdown or not query_tokens:
+            return 0.0
+        md_lower = markdown.lower()
+        hits = sum(1 for tok in query_tokens if tok in md_lower)
+        return hits / len(query_tokens)
+
+    @staticmethod
     def _format_table_evidence(
         tables: List[Dict[str, Any]],
-        max_chars: int = 3000,
+        max_chars: int = 6000,
+        query: str = "",
     ) -> str:
         """Format table digest entries as LLM-friendly evidence text.
 
+        When *query* is provided, tables are **sorted by relevance** to the
+        query before budget truncation, ensuring critical tables are included
+        even when they appear late in page order.
+
         Strategy:
-        - Small tables (<1000 chars): preserve full Markdown
-        - Large tables: truncate to max_chars with "(truncated)" note
+        - Query-relevant tables are prioritised via keyword overlap scoring
         - Each table prefixed with "[Table from page N]"
+        - Large tables truncated with "(truncated)" note
 
         Returns concatenated formatted table evidence string.
         """
         if not tables:
             return ""
 
+        ordered = tables
+        if query:
+            query_tokens = frozenset(
+                tok for tok in query.lower().split() if len(tok) > 2
+            )
+            if query_tokens:
+                scored = [
+                    (AgenticSearch._score_table_relevance(
+                        t.get("markdown", ""), query_tokens,
+                    ), idx, t)
+                    for idx, t in enumerate(tables)
+                ]
+                scored.sort(key=lambda x: (-x[0], x[1]))
+                ordered = [t for _, _, t in scored]
+
         parts: List[str] = []
         remaining = max_chars
 
-        for table in tables:
+        for table in ordered:
             if remaining <= 0:
                 break
 
@@ -4155,7 +4212,7 @@ class AgenticSearch(BaseSearch):
         parts.append(f"{header}\n{text}")
 
     async def _navigate_tree_for_evidence(
-        self, file_path: str, query: str, *, max_results: int = 3,
+        self, file_path: str, query: str, *, max_results: int = 5,
     ) -> Optional[str]:
         """LLM-driven tree navigation: select relevant sections and read leaf content.
 
@@ -4297,7 +4354,8 @@ class AgenticSearch(BaseSearch):
                             )
                             if leaf_tables:
                                 table_text = self._format_table_evidence(
-                                    leaf_tables, max_chars=2000,
+                                    leaf_tables, max_chars=4000,
+                                    query=query,
                                 )
                                 if table_text:
                                     parts.append(

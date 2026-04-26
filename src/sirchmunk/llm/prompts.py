@@ -422,6 +422,7 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 1. **Language Continuity**: The output must be in the SAME language as the User Input.
 2. **Format**: Use Markdown (headings, bullet points, and bold text) for high readability.
 3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
+4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
 
 ### Input Data
 - **User Input**: {user_input}
@@ -442,8 +443,11 @@ Evaluate based on:
 - If evidence is insufficient or irrelevant, both SHOULD_ANSWER and SHOULD_SAVE MUST be "false".
 
 ### Output Format
+<PRECISE_ANSWER>
+[If the query asks for a specific value, ratio, number, or factual answer, state ONLY the direct answer here (e.g. "0.83", "$1,832 million", "Yes", "Increased from 0.67 to 0.69"). If the query is open-ended, write a one-sentence conclusion.]
+</PRECISE_ANSWER>
 <SUMMARY>
-[Generate the Markdown Briefing here]
+[Generate the Markdown Briefing here with detailed analysis and supporting evidence]
 </SUMMARY>
 <SHOULD_ANSWER>true/false</SHOULD_ANSWER>
 <SHOULD_SAVE>true/false</SHOULD_SAVE>
@@ -458,6 +462,7 @@ Leverage the document context below for better understanding of the source mater
 1. **Language Continuity**: The output must be in the SAME language as the User Input.
 2. **Format**: Use Markdown (headings, bullet points, and bold text) for high readability.
 3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
+4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
 
 ### Document Context
 {document_context}
@@ -481,8 +486,11 @@ Evaluate based on:
 - If evidence is insufficient or irrelevant, both SHOULD_ANSWER and SHOULD_SAVE MUST be "false".
 
 ### Output Format
+<PRECISE_ANSWER>
+[If the query asks for a specific value, ratio, number, or factual answer, state ONLY the direct answer here (e.g. "0.83", "$1,832 million", "Yes", "Increased from 0.67 to 0.69"). If the query is open-ended, write a one-sentence conclusion.]
+</PRECISE_ANSWER>
 <SUMMARY>
-[Generate the Markdown Briefing here]
+[Generate the Markdown Briefing here with detailed analysis and supporting evidence]
 </SUMMARY>
 <SHOULD_ANSWER>true/false</SHOULD_ANSWER>
 <SHOULD_SAVE>true/false</SHOULD_SAVE>
