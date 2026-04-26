@@ -635,6 +635,19 @@ class KnowledgeCompiler:
                 except Exception:
                     pass
 
+            # Cache compile-time ENHANCED content so search can slice
+            # char_range from the same text the tree was built from.
+            try:
+                file_hash_content = get_fast_hash(entry.path) or ""
+                if file_hash_content and content:
+                    content_dir = self._compile_dir / "content"
+                    content_dir.mkdir(parents=True, exist_ok=True)
+                    (content_dir / f"{file_hash_content}.txt").write_text(
+                        content, encoding="utf-8",
+                    )
+            except Exception:
+                pass
+
             # Persist table digest for documents with extracted tables
             if extraction.tables:
                 try:

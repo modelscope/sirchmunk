@@ -3930,14 +3930,16 @@ class AgenticSearch(BaseSearch):
                         leaf_segments.append((leaf, seg))
         # If page extraction failed, demoted leaves are now in char_leaves
 
-        # -- Phase C: char_range fallback (lazy full-text extraction) --
+        # -- Phase C: char_range extraction (compile-consistent content) --
         if char_leaves:
-            try:
-                from sirchmunk.utils.file_utils import fast_extract
-                extraction = await fast_extract(file_path=file_path)
-                full_text = extraction.content or ""
-            except Exception:
-                full_text = ""
+            full_text = self._load_compile_content(self.work_path, file_path)
+            if not full_text:
+                try:
+                    from sirchmunk.utils.file_utils import fast_extract
+                    extraction = await fast_extract(file_path=file_path)
+                    full_text = extraction.content or ""
+                except Exception:
+                    full_text = ""
 
             for leaf in char_leaves:
                 start, end = leaf.char_range
@@ -4085,6 +4087,31 @@ class AgenticSearch(BaseSearch):
         return span_ratio < self._CHAR_RANGE_MAX_SPAN_RATIO
 
     @staticmethod
+    def _load_compile_content(
+        work_path: Path, file_path: str,
+    ) -> Optional[str]:
+        """Load the ENHANCED content cached at compile time.
+
+        Compile stores the kreuzberg ENHANCED-profile content alongside the
+        tree index so that search-time ``char_range`` slicing operates on
+        the *same* text the ranges were computed from.  Returns ``None``
+        when the cache file is missing (e.g. pre-cache compile run).
+        """
+        try:
+            from sirchmunk.utils.file_utils import get_fast_hash
+            file_hash = get_fast_hash(file_path)
+            if not file_hash:
+                return None
+            cache_path = (
+                work_path / ".cache" / "compile" / "content" / f"{file_hash}.txt"
+            )
+            if cache_path.exists():
+                return cache_path.read_text(encoding="utf-8")
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
     def _load_table_digest(
         work_path: Path, file_hash: str,
     ) -> Optional[List[Dict[str, Any]]]:
@@ -4221,8 +4248,8 @@ class AgenticSearch(BaseSearch):
         Returns None when no tree cache is available.
 
         Extraction priority (highest first):
-          1. page_range  – page-level extraction via DocumentExtractor
-          2. char_range   – full-text extraction + slice (fallback)
+          1. char_range   – compile-time ENHANCED content slice (preserves tables)
+          2. page_range   – page-level extraction via DocumentExtractor (fallback)
           3. leaf.summary – last resort
         """
         indexer = self._get_tree_indexer()
@@ -4299,14 +4326,22 @@ class AgenticSearch(BaseSearch):
             else:
                 print(f"SEARCH_WIKI_DEBUG [N4] page_extraction: page_leaves_ok=True", flush=True)
 
-        # ── Phase 3: char_range fallback (lazy full-text extraction) ──
+        # ── Phase 3: char_range extraction (compile-consistent content) ──
         if char_leaves:
-            try:
-                from sirchmunk.utils.file_utils import fast_extract
-                extraction = await fast_extract(file_path=file_path)
-                full_text = extraction.content or ""
-            except Exception:
-                full_text = ""
+            # Prefer compile-time ENHANCED content (matches char_range offsets
+            # exactly).  Fall back to fast_extract only when cache is absent.
+            full_text = self._load_compile_content(self.work_path, file_path)
+            if not full_text:
+                try:
+                    from sirchmunk.utils.file_utils import fast_extract
+                    extraction = await fast_extract(file_path=file_path)
+                    full_text = extraction.content or ""
+                except Exception:
+                    full_text = ""
+
+            # Leaves whose char_range is invalid but have a valid page_range
+            # are demoted to page extraction instead of discarding to summary.
+            page_fallback_leaves: List[tuple] = []
 
             for leaf in char_leaves:
                 start, end = leaf.char_range
@@ -4320,14 +4355,57 @@ class AgenticSearch(BaseSearch):
                         self._append_evidence_part(
                             parts, fname, leaf, leaf.summary,
                         )
-                elif getattr(leaf, 'summary', None):
-                    _loguru_logger.debug(
-                        f"[TreeNav] char_range degraded for '{leaf.title}' "
-                        f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), using summary"
+                else:
+                    # char_range covers too much of the document (or text is
+                    # empty).  Try page_range extraction before falling back
+                    # to summary.
+                    pr = getattr(leaf, 'page_range', None)
+                    if (
+                        pr
+                        and len(pr) == 2
+                        and pr[0] is not None
+                        and pr[0] > 0
+                    ):
+                        page_fallback_leaves.append((leaf, pr))
+                    elif getattr(leaf, 'summary', None):
+                        _loguru_logger.debug(
+                            f"[TreeNav] char_range degraded for '{leaf.title}' "
+                            f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), "
+                            f"using summary"
+                        )
+                        self._append_evidence_part(
+                            parts, fname, leaf, leaf.summary,
+                        )
+
+            # Batch page extraction for demoted leaves (same pattern as Phase 2)
+            if page_fallback_leaves:
+                all_fb_pages: set = set()
+                for _lf, (sp, ep) in page_fallback_leaves:
+                    all_fb_pages.update(range(sp, ep + 1))
+                try:
+                    fb_contents = DocumentExtractor.extract_pages(
+                        file_path, sorted(all_fb_pages),
                     )
-                    self._append_evidence_part(
-                        parts, fname, leaf, leaf.summary,
-                    )
+                    fb_map = {pc.page_number: pc.content for pc in fb_contents}
+                    for lf, (sp, ep) in page_fallback_leaves:
+                        seg_parts = [
+                            fb_map[p] for p in range(sp, ep + 1)
+                            if fb_map.get(p, "").strip()
+                        ]
+                        if seg_parts:
+                            self._append_evidence_part(
+                                parts, fname, lf, "\n".join(seg_parts),
+                            )
+                        elif getattr(lf, 'summary', None):
+                            self._append_evidence_part(
+                                parts, fname, lf, lf.summary,
+                            )
+                except Exception:
+                    for lf, _ in page_fallback_leaves:
+                        if getattr(lf, 'summary', None):
+                            self._append_evidence_part(
+                                parts, fname, lf, lf.summary,
+                            )
 
         if not parts:
             return None
