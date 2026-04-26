@@ -163,6 +163,9 @@ class DocumentTreeIndexer:
     # Number of nodes per group in paginated selection.
     _GROUP_PAGE_SIZE: int = 15
 
+    # Minimum navigation depth before allowing early termination.
+    _NAV_MIN_DEPTH: int = 2
+
     def __init__(
         self,
         llm: OpenAIChat,
@@ -289,18 +292,21 @@ class DocumentTreeIndexer:
         *,
         max_results: int = 3,
         max_depth: int = 4,
+        min_depth: int = 2,
     ) -> List[TreeNode]:
         """Adaptive-depth LLM-driven tree navigation.
 
         Iteratively descends the tree using _select_children() at each level,
         collecting leaf nodes until *max_results* are found or *max_depth* is
-        reached.
+        reached.  Enforces *min_depth* descent before allowing early
+        termination to avoid shallow results.
 
         Args:
             tree: DocumentTree with a root node.
             query: Search query for relevance selection.
             max_results: Maximum number of leaf nodes to return.
             max_depth: Maximum descent depth (default 4).
+            min_depth: Minimum depth before early termination (default 2).
 
         Returns:
             List of the most relevant leaf TreeNodes.
@@ -314,6 +320,10 @@ class DocumentTreeIndexer:
         if not candidates:
             return [tree.root]
 
+        # Adaptive min-depth: clamp to tree's actual depth
+        tree_max_depth = self._max_node_depth(tree.root)
+        effective_min_depth = min(min_depth, max(tree_max_depth - 1, 1))
+
         result_leaves: List[TreeNode] = []
         visited: set = set()  # prevent cycles
         frontier = candidates
@@ -325,7 +335,21 @@ class DocumentTreeIndexer:
                 frontier, query, max_selections=max_results,
             )
             print(f"SEARCH_WIKI_DEBUG [T3] navigate layer: depth={depth}, selected={len(selected)}, names={[n.title[:30] for n in selected][:5]}", flush=True)
+
             if not selected:
+                # Fix A.1: when depth < effective_min_depth, expand all frontier children
+                if depth < effective_min_depth:
+                    next_frontier: List[TreeNode] = []
+                    for node in frontier:
+                        if node.children:
+                            next_frontier.extend(node.children)
+                        else:
+                            result_leaves.append(node)
+                    if not next_frontier:
+                        break
+                    frontier = next_frontier
+                    depth += 1
+                    continue
                 break
 
             next_frontier: List[TreeNode] = []
@@ -335,14 +359,25 @@ class DocumentTreeIndexer:
                     continue
                 visited.add(node_id)
 
+                # Fix A.2: leaf determination with depth constraint
                 if node.leaf or not node.children:
-                    result_leaves.append(node)
+                    if depth >= effective_min_depth:
+                        result_leaves.append(node)
+                    elif node.children:
+                        next_frontier.extend(node.children)
+                    else:
+                        # True leaf (no children), cannot descend further
+                        result_leaves.append(node)
                 else:
                     next_frontier.extend(node.children)
 
-            if len(result_leaves) >= max_results:
+            # Fix A.3: early termination requires depth >= effective_min_depth
+            if len(result_leaves) >= max_results and depth >= effective_min_depth:
                 break
 
+            # Fix A.4: check for empty next_frontier
+            if not next_frontier:
+                break
             frontier = next_frontier
             depth += 1
 
@@ -404,6 +439,9 @@ class DocumentTreeIndexer:
         # Infer hierarchy when TOC entries are flat (all same level)
         toc_entries = self._infer_hierarchy(toc_entries)
 
+        # Merge consecutive fragment entries into virtual parents
+        toc_entries = self._merge_fragment_entries(toc_entries)
+
         seen_ids: set = set()
         children = self._toc_entries_to_nodes(
             toc_entries, content, len(content), seen_ids,
@@ -424,6 +462,78 @@ class DocumentTreeIndexer:
             page_range=root_page_range,
             children=children,
         )
+
+    @staticmethod
+    def _merge_fragment_entries(entries: List[Any]) -> List[Any]:
+        """Merge consecutive fragment TOC entries into virtual parent nodes.
+
+        Detects runs of >=3 consecutive entries that have tiny char_range
+        spans (<500) and no children, then collapses them into a single
+        virtual 'Preamble' entry.  Uses only structural signals (char spans,
+        children counts) — no domain-specific keywords.
+
+        Safety valve: returns original *entries* if result has < 2 entries.
+        """
+        if len(entries) <= 5:
+            return entries
+
+        # Phase 1: Detect fragment runs
+        def _is_fragment(e: Any) -> bool:
+            span = 0
+            if hasattr(e, 'char_start') and hasattr(e, 'char_end'):
+                if e.char_end and e.char_start is not None:
+                    span = e.char_end - e.char_start
+            has_children = bool(getattr(e, 'children', None))
+            return span < 500 and not has_children
+
+        # Find runs of consecutive fragments
+        runs: List[List[int]] = []  # list of [start_idx, end_idx] inclusive
+        i = 0
+        while i < len(entries):
+            if _is_fragment(entries[i]):
+                run_start = i
+                while i < len(entries) and _is_fragment(entries[i]):
+                    i += 1
+                if (i - run_start) >= 3:  # Only merge runs of 3+
+                    runs.append([run_start, i - 1])
+            else:
+                i += 1
+
+        if not runs:
+            return entries
+
+        # Phase 2: Merge each run into a virtual parent
+        from copy import deepcopy
+
+        result: List[Any] = []
+        prev_end = -1
+        for run_start, run_end in runs:
+            # Add non-fragment entries before this run
+            for j in range(prev_end + 1, run_start):
+                result.append(entries[j])
+
+            # Create virtual parent from the run
+            first_entry = entries[run_start]
+            last_entry = entries[run_end]
+
+            merged = deepcopy(first_entry)
+            merged.title = f"Preamble ({run_end - run_start + 1} sections)"
+            if hasattr(last_entry, 'char_end') and last_entry.char_end:
+                merged.char_end = last_entry.char_end
+            # Set children to the original entries
+            merged.children = list(entries[run_start:run_end + 1])
+            result.append(merged)
+            prev_end = run_end
+
+        # Add remaining entries after last run
+        for j in range(prev_end + 1, len(entries)):
+            result.append(entries[j])
+
+        # Safety valve
+        if len(result) < 2:
+            return entries
+
+        return result
 
     @staticmethod
     def _toc_entries_to_nodes(
@@ -672,14 +782,152 @@ class DocumentTreeIndexer:
             and (s["end"] - s["start"]) / max(text_len, 1) < _MAX_SPAN_RATIO
         ]
 
+    @staticmethod
+    def _filter_low_value_nodes(
+        nodes: List["TreeNode"],
+        *,
+        min_remaining: int = 3,
+    ) -> List["TreeNode"]:
+        """Filter out low-value fragment nodes using structural signals.
+
+        Applies three generic heuristics (no domain-specific keywords):
+          1. Short-page leaf: page_range spans <= 2 pages AND no children AND
+             summary length < 100 chars.
+          2. Tiny fragment: title < 10 chars AND no children AND
+             char_range span < 200 chars.
+          3. Duplicate page_range: among nodes sharing the same page_range,
+             keep only the one with the largest char_range span.
+
+        Safety valve: returns original *nodes* if fewer than *min_remaining*
+        survive filtering.
+        """
+        if len(nodes) <= min_remaining:
+            return nodes
+
+        # Pass 1: identify fragment nodes
+        keep: List[bool] = [True] * len(nodes)
+
+        for i, n in enumerate(nodes):
+            pr = getattr(n, 'page_range', None)
+            has_children = bool(n.children)
+            summary_len = len(n.summary) if n.summary else 0
+            title_len = len(n.title.strip()) if n.title else 0
+            cr = getattr(n, 'char_range', (0, 0))
+            span = (cr[1] - cr[0]) if cr and len(cr) == 2 else 0
+
+            # Heuristic 1: short-page leaf
+            if (
+                pr and len(pr) == 2
+                and pr[0] is not None and pr[1] is not None
+                and (pr[1] - pr[0]) <= 1
+                and not has_children
+                and summary_len < 100
+            ):
+                keep[i] = False
+                continue
+
+            # Heuristic 2: tiny fragment
+            if title_len < 10 and not has_children and span < 200:
+                keep[i] = False
+                continue
+
+        # Pass 2: deduplicate by page_range
+        page_range_groups: dict = {}  # page_range -> list of (index, span)
+        for i, n in enumerate(nodes):
+            if not keep[i]:
+                continue
+            pr = getattr(n, 'page_range', None)
+            if pr and len(pr) == 2:
+                key = (pr[0], pr[1])
+                cr = getattr(n, 'char_range', (0, 0))
+                span = (cr[1] - cr[0]) if cr and len(cr) == 2 else 0
+                page_range_groups.setdefault(key, []).append((i, span))
+
+        for key, group in page_range_groups.items():
+            if len(group) > 1:
+                # Keep only the node with largest char_range span
+                best_idx = max(group, key=lambda x: x[1])[0]
+                for idx, _ in group:
+                    if idx != best_idx:
+                        keep[idx] = False
+
+        filtered = [n for i, n in enumerate(nodes) if keep[i]]
+        return filtered if len(filtered) >= min_remaining else nodes
+
+    @staticmethod
+    def _build_node_descriptor(node: "TreeNode", index: int) -> str:
+        """Build a rich descriptor string for a single tree node.
+
+        Includes structural signals: page span, table count, subsection
+        count, and depth information to help LLM make informed selections.
+        """
+        parts = [f"[{index}] {node.title}"]
+
+        # Page range with span
+        pr = getattr(node, 'page_range', None)
+        if pr and len(pr) == 2 and pr[0] is not None:
+            span_pages = pr[1] - pr[0] + 1 if pr[1] else 1
+            parts.append(f"[pages {pr[0]}-{pr[1]}, {span_pages}p]")
+
+        # Table count
+        if node.table_count > 0:
+            parts.append(f"[{node.table_count} tables]")
+
+        # Subsections
+        child_count = len(node.children)
+        if child_count > 0:
+            parts.append(f"[{child_count} subsections]")
+
+        # Summary
+        summary = (node.summary or "")[:200]
+        if summary:
+            parts.append(f": {summary}")
+
+        return " ".join(parts)
+
+    @staticmethod
+    def _build_selection_prompt(
+        nodes: List["TreeNode"],
+        query: str,
+        max_selections: int,
+    ) -> str:
+        """Build unified LLM prompt for branch selection.
+
+        Uses structural signals to guide LLM toward high-value sections:
+        tables, subsection depth, page span.  No domain-specific keywords.
+        """
+        listing = "\n".join(
+            DocumentTreeIndexer._build_node_descriptor(n, i)
+            for i, n in enumerate(nodes)
+        )
+
+        sel_hint = f"1-{min(max_selections, len(nodes))}"
+
+        return (
+            f"Given the query: \"{query}\"\n\n"
+            f"Select the {sel_hint} most relevant sections (by index number):\n"
+            f"{listing}\n\n"
+            f"Selection criteria:\n"
+            f"- Prioritize sections containing tables and data\n"
+            f"- Prefer sections with many subsections over small leaf fragments\n"
+            f"- Avoid sections covering only 1-2 pages with no subsections\n"
+            f"- When uncertain, prefer larger sections that can be narrowed later\n\n"
+            f"Return ONLY a JSON array of index numbers, e.g. [0, 2]"
+        )
+
     async def _select_children(
         self, nodes: List[TreeNode], query: str, *, max_selections: int = 3,
     ) -> List[TreeNode]:
         """LLM-driven branch selection: pick the most relevant children.
 
-        Dispatches to paginated selection when *nodes* exceeds
-        ``_PAGE_SIZE_THRESHOLD`` to avoid overwhelming the LLM.
+        Pre-filters low-value fragments, then dispatches to paginated
+        selection when *nodes* exceeds ``_PAGE_SIZE_THRESHOLD``.
         """
+        if len(nodes) <= 2:
+            return nodes
+
+        # Pre-filter low-value fragment nodes
+        nodes = self._filter_low_value_nodes(nodes)
         if len(nodes) <= 2:
             return nodes
 
@@ -688,18 +936,7 @@ class DocumentTreeIndexer:
                 nodes, query, max_selections=max_selections,
             )
 
-        listing = "\n".join(
-            f"[{i}] {n.title}{self._format_page_range(n.page_range)}"
-            f"{' [' + str(n.table_count) + ' tables]' if n.table_count > 0 else ''}"
-            f": {n.summary[:150]}"
-            for i, n in enumerate(nodes)
-        )
-
-        prompt = (
-            f"Given the query: \"{query}\"\n\n"
-            f"Select the 1-2 most relevant sections (by index number):\n{listing}\n\n"
-            f"Return ONLY a JSON array of index numbers, e.g. [0, 2]"
-        )
+        prompt = self._build_selection_prompt(nodes, query, max_selections)
         resp = await self._llm.achat([{"role": "user", "content": prompt}])
         try:
             raw = resp.content.strip()
@@ -797,17 +1034,7 @@ class DocumentTreeIndexer:
         if len(group) <= 2:
             return group
 
-        listing = "\n".join(
-            f"[{i}] {n.title}{self._format_page_range(n.page_range)}"
-            f"{' [' + str(n.table_count) + ' tables]' if n.table_count > 0 else ''}"
-            f": {n.summary[:150]}"
-            for i, n in enumerate(group)
-        )
-        prompt = (
-            f"Given the query: \"{query}\"\n\n"
-            f"Select the 1-2 most relevant sections (by index number):\n{listing}\n\n"
-            f"Return ONLY a JSON array of index numbers, e.g. [0, 2]"
-        )
+        prompt = self._build_selection_prompt(group, query, max_selections)
         try:
             resp = await self._llm.achat([{"role": "user", "content": prompt}])
             raw = resp.content.strip()

@@ -4022,9 +4022,20 @@ class AgenticSearch(BaseSearch):
         summary_leaves: List = []
 
         for leaf in leaves:
-            # 表格类型节点优先使用 summary（结构化摘要）
-            if getattr(leaf, 'content_type', 'text') == 'table' and getattr(leaf, 'summary', None):
-                summary_leaves.append(leaf)
+            # 表格类型节点：优先 page-level 提取获取完整原始内容
+            if getattr(leaf, 'content_type', 'text') == 'table':
+                page_range = getattr(leaf, 'page_range', None)
+                if (
+                    page_range
+                    and len(page_range) == 2
+                    and page_range[0] is not None
+                    and page_range[0] > 0
+                ):
+                    page_leaves.append((leaf, page_range))
+                elif getattr(leaf, 'summary', None):
+                    summary_leaves.append(leaf)
+                else:
+                    char_leaves.append(leaf)
                 continue
 
             page_range = getattr(leaf, 'page_range', None)
