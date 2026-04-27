@@ -107,6 +107,12 @@ class KnowledgeStorage:
         variable-length ``FLOAT[]`` from Parquet's list encoding, breaking
         ``list_cosine_similarity`` which requires matching fixed-size types.
 
+        Handles schema evolution gracefully with adaptive column mapping:
+        - Forward compatible: old parquet (more cols) → new table (fewer cols),
+          extra columns in parquet are silently ignored.
+        - Backward compatible: new parquet (fewer cols) → old table (more cols),
+          missing columns are filled with defaults.
+
         Also records the file's modification time so that
         ``_check_and_reload()`` can detect external changes later.
         """
@@ -117,11 +123,63 @@ class KnowledgeStorage:
                 self.db.drop_table(self.table_name, if_exists=True)
                 # Create table with explicit schema (preserves FLOAT[384])
                 self._create_table()
-                # Insert data from parquet — DuckDB casts to the declared types
-                self.db.execute(
-                    f"INSERT INTO {self.table_name} "
-                    f"SELECT * FROM read_parquet('{self.parquet_file}')"
-                )
+
+                # Adaptive column mapping: detect parquet & table columns
+                parquet_cols = self._get_parquet_columns(self.parquet_file)
+                table_cols = self._get_table_columns()
+
+                if not parquet_cols or not table_cols:
+                    logger.warning(
+                        "Could not detect columns for adaptive mapping, "
+                        "skipping parquet load"
+                    )
+                else:
+                    parquet_col_set = set(parquet_cols)
+                    table_col_set = set(table_cols)
+                    # Compute common columns (preserve table column order)
+                    common_cols = [c for c in table_cols if c in parquet_col_set]
+
+                    if not common_cols:
+                        logger.warning(
+                            "No common columns between parquet and table, "
+                            "skipping parquet load"
+                        )
+                    else:
+                        # Log column mismatches as warnings
+                        ignored_cols = parquet_col_set - table_col_set
+                        missing_cols = table_col_set - parquet_col_set
+                        if ignored_cols:
+                            logger.warning(
+                                "Parquet has extra columns (ignored): %s",
+                                ignored_cols,
+                            )
+                        if missing_cols:
+                            logger.warning(
+                                "Table has extra columns (filled with defaults): %s",
+                                missing_cols,
+                            )
+
+                        # Build INSERT with explicit column lists
+                        # For common cols: select directly from parquet
+                        # For missing cols (in table but not in parquet): use defaults
+                        insert_cols = list(table_cols)  # all table columns
+                        select_parts = []
+                        for col_name in table_cols:
+                            if col_name in parquet_col_set:
+                                select_parts.append(col_name)
+                            elif col_name == "merge_count":
+                                select_parts.append("0 AS merge_count")
+                            else:
+                                select_parts.append(f"NULL AS {col_name}")
+
+                        cols_str = ", ".join(insert_cols)
+                        select_clause = ", ".join(select_parts)
+                        self.db.execute(
+                            f"INSERT INTO {self.table_name} ({cols_str}) "
+                            f"SELECT {select_clause} "
+                            f"FROM read_parquet('{self.parquet_file}')"
+                        )
+
                 count = self.db.get_table_count(self.table_name)
                 # Record mtime for stale-detection
                 self._parquet_loaded_mtime = pq.stat().st_mtime
@@ -132,11 +190,62 @@ class KnowledgeStorage:
                 self._parquet_loaded_mtime = 0.0
                 logger.info("Created new knowledge clusters table")
         except Exception as e:
-            logger.error(f"Failed to load from parquet: {e}")
-            # Try to recreate table
-            self.db.drop_table(self.table_name, if_exists=True)
-            self._create_table()
+            logger.warning(f"Failed to load from parquet (non-blocking): {e}")
+            # Try to recreate table so retrieval can still work
+            try:
+                self.db.drop_table(self.table_name, if_exists=True)
+                self._create_table()
+            except Exception as recreate_err:
+                logger.warning(f"Failed to recreate table after load failure: {recreate_err}")
             self._parquet_loaded_mtime = 0.0
+
+    def _get_schema_columns(self) -> List[str]:
+        """Return the ordered list of column names in the canonical schema."""
+        return [
+            "id", "name", "description", "content", "scripts", "resources",
+            "evidences", "patterns", "constraints", "confidence",
+            "abstraction_level", "landmark_potential", "hotness", "lifecycle",
+            "create_time", "last_modified", "version", "related_clusters",
+            "search_results", "queries", "merge_count",
+            "embedding_vector", "embedding_model", "embedding_timestamp",
+            "embedding_text_hash",
+        ]
+
+    def _get_parquet_columns(self, parquet_path: str) -> List[str]:
+        """Get column names from a parquet file's schema.
+
+        Uses DuckDB's ``parquet_schema()`` function.  The returned metadata
+        rows use a ``name`` field (not ``column_name``).
+
+        Returns:
+            Ordered list of column names, or empty list on failure.
+        """
+        try:
+            rows = self.db.fetch_all(
+                f"SELECT name FROM parquet_schema('{parquet_path}') "
+                f"WHERE name != 'duckdb_schema'"
+            )
+            return [row[0] for row in rows]
+        except Exception as e:
+            logger.warning(f"Failed to read parquet schema: {e}")
+            return []
+
+    def _get_table_columns(self) -> List[str]:
+        """Get column names from the current DuckDB table.
+
+        Returns:
+            Ordered list of column names, or empty list on failure.
+        """
+        try:
+            rows = self.db.fetch_all(
+                "SELECT column_name FROM information_schema.columns "
+                f"WHERE table_name = '{self.table_name}' "
+                "ORDER BY ordinal_position"
+            )
+            return [row[0] for row in rows]
+        except Exception as e:
+            logger.warning(f"Failed to read table columns: {e}")
+            return []
 
     def _check_and_reload(self):
         """Check if the parquet file was modified externally and reload if so.
@@ -190,6 +299,7 @@ class KnowledgeStorage:
             "related_clusters": "VARCHAR",  # JSON array
             "search_results": "VARCHAR",  # JSON array
             "queries": "VARCHAR",  # JSON array of historical queries
+            "merge_count": "INTEGER",  # compile merge counter
             "embedding_vector": "FLOAT[384]",  # 384-dim embedding vector
             "embedding_model": "VARCHAR",  # Model identifier
             "embedding_timestamp": "TIMESTAMP",  # Embedding computation time
@@ -338,21 +448,22 @@ class KnowledgeStorage:
             "related_clusters": json.dumps([rc.to_dict() for rc in cluster.related_clusters]),
             "search_results": json.dumps(cluster.search_results) if cluster.search_results else None,
             "queries": json.dumps(cluster.queries) if cluster.queries else None,
+            "merge_count": cluster.merge_count or 0,
         }
 
     def _row_to_cluster(self, row: tuple) -> KnowledgeCluster:
         """
         Convert database row to KnowledgeCluster.
 
-        Expected row structure (24 columns):
+        Expected row structure (25 columns):
         id, name, description, content, scripts, resources, evidences, patterns,
         constraints, confidence, abstraction_level, landmark_potential, hotness,
         lifecycle, create_time, last_modified, version, related_clusters, search_results, queries,
-        embedding_vector, embedding_model, embedding_timestamp, embedding_text_hash
+        merge_count, embedding_vector, embedding_model, embedding_timestamp, embedding_text_hash
         """
-        if len(row) != 24:
+        if len(row) != 25:
             raise ValueError(
-                f"Expected 24 columns in knowledge_clusters row, got {len(row)}. "
+                f"Expected 25 columns in knowledge_clusters row, got {len(row)}. "
                 f"Please ensure the table schema is up to date."
             )
 
@@ -361,6 +472,7 @@ class KnowledgeStorage:
             id, name, description, content, scripts, resources, evidences, patterns,
             constraints, confidence, abstraction_level, landmark_potential, hotness,
             lifecycle, create_time, last_modified, version, related_clusters, search_results, queries,
+            merge_count,
             _embedding_vector, _embedding_model, _embedding_timestamp, _embedding_text_hash
         ) = row
 
@@ -400,7 +512,9 @@ class KnowledgeStorage:
                     is_found=ev_dict["is_found"],
                     snippets=ev_dict["snippets"],
                     extracted_at=extracted_at_parsed or datetime.now(),
-                    conflict_group=ev_dict.get("conflict_group")
+                    conflict_group=ev_dict.get("conflict_group"),
+                    tree_path=ev_dict.get("tree_path"),
+                    page_range=ev_dict.get("page_range"),
                 ))
 
         # Parse constraints
@@ -463,6 +577,7 @@ class KnowledgeStorage:
             related_clusters=related_clusters_parsed,
             search_results=search_results_parsed,
             queries=queries_parsed,
+            merge_count=merge_count or 0,
         )
 
     # ------------------------------------------------------------------ #

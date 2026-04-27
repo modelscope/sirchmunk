@@ -189,7 +189,7 @@ Evaluate based on:
 2. Is the content meaningful and not just error messages or "no information found"?
 3. Are there sufficient evidences and context to answer the user's query?
 
-- <SHOULD_ANSWER>: output "true" only if the evidence is sufficient to answer the query.
+- <SHOULD_ANSWER>: output "true" if the evidence contains relevant information that can help answer the query, even if it requires reasoning, computation, or interpretation. Only output "false" if the evidence is clearly irrelevant or contains no useful information for the query.
 - <SHOULD_SAVE>: output "true" only if the evidence is sufficient AND the result is worth caching.
 - If evidence is insufficient or irrelevant, both SHOULD_ANSWER and SHOULD_SAVE MUST be "false".
 
@@ -389,6 +389,31 @@ Example: query "总结这几篇文档"
 """
 
 
+FAST_QUERY_ANALYSIS_WITH_CATALOG = """Classify the user query, extract search terms, AND select the most relevant document(s) from the compiled index.
+
+### User Query
+{user_input}
+
+### Compiled Document Index
+{document_listing}
+
+### Output
+Return JSON only, no extra text:
+{{"type": "search", "primary": ["compound phrase"], "fallback": ["term1", "term2"], "idf": {{"compound phrase": 8.0, "term1": 2.5}}, "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "...", "selected_docs": [0, 2], "doc_confidence": "high"}}
+
+Rules:
+- **type**: "search" if the query requires retrieving information from files or documents; "chat" if it is a greeting, small talk, or conversational message — set primary/fallback to empty arrays, put a brief reply in "response". "summary" if the user wants to summarize entire documents.
+- **primary**: 1 compound phrase (2-3 words) most likely to appear **verbatim** in the target document.
+- **fallback**: 1-3 single-word atomic terms. Tried only if primary misses.
+- **primary_alt / fallback_alt**: Cross-lingual equivalents (Chinese↔English). Only the most critical 1-2 terms.
+- **file_hints**: filename fragments or glob patterns ONLY if clearly implied; empty array otherwise.
+- **intent**: one sentence describing the query intent.
+- **idf**: IDF weight (1.0-10.0) for EVERY keyword. Higher for rare terms.
+- **selected_docs**: Index numbers (from the Compiled Document Index above) of the 1-3 most relevant documents for this query. Consider BOTH the filename and the summary. Choose documents whose content is most likely to answer the query.
+- **doc_confidence**: "high" if you are very confident the selected documents contain the answer; "medium" if likely but uncertain; "low" if guessing.
+"""
+
+
 ROI_RESULT_SUMMARY = """
 ### Task
 Analyze the provided {text_content} and generate a concise summary in the form of a Markdown Briefing.
@@ -397,6 +422,7 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 1. **Language Continuity**: The output must be in the SAME language as the User Input.
 2. **Format**: Use Markdown (headings, bullet points, and bold text) for high readability.
 3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
+4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
 
 ### Input Data
 - **User Input**: {user_input}
@@ -412,14 +438,165 @@ Evaluate based on:
 2. Is the content meaningful and not just error messages or "no information found"?
 3. Are there sufficient evidences and context to answer the user's query?
 
-- <SHOULD_ANSWER>: output "true" only if the evidence is sufficient to answer the query.
+- <SHOULD_ANSWER>: output "true" if the evidence contains relevant information that can help answer the query, even if it requires reasoning, computation, or interpretation. Only output "false" if the evidence is clearly irrelevant or contains no useful information for the query.
 - <SHOULD_SAVE>: output "true" only if the evidence is sufficient AND the result is worth caching.
 - If evidence is insufficient or irrelevant, both SHOULD_ANSWER and SHOULD_SAVE MUST be "false".
 
 ### Output Format
+<PRECISE_ANSWER>
+[If the query asks for a specific value, ratio, number, or factual answer, state ONLY the direct answer here (e.g. "0.83", "$1,832 million", "Yes", "Increased from 0.67 to 0.69"). If the query is open-ended, write a one-sentence conclusion.]
+</PRECISE_ANSWER>
 <SUMMARY>
-[Generate the Markdown Briefing here]
+[Generate the Markdown Briefing here with detailed analysis and supporting evidence]
 </SUMMARY>
 <SHOULD_ANSWER>true/false</SHOULD_ANSWER>
 <SHOULD_SAVE>true/false</SHOULD_SAVE>
 """
+
+ROI_RESULT_SUMMARY_WITH_CONTEXT = """
+### Task
+Analyze the provided evidence and generate a concise summary in the form of a Markdown Briefing.
+Leverage the document context below for better understanding of the source material's structure and purpose.
+
+### Constraints
+1. **Language Continuity**: The output must be in the SAME language as the User Input.
+2. **Format**: Use Markdown (headings, bullet points, and bold text) for high readability.
+3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
+4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
+
+### Document Context
+{document_context}
+
+### Input Data
+- **User Input**: {user_input}
+- **Search Result Text**: {text_content}
+
+### Quality Evaluation
+After generating the summary, make TWO decisions:
+1) whether the query can be answered from the provided evidence;
+2) whether this result is worth caching.
+
+Evaluate based on:
+1. Does the search result contain substantial, relevant information for the user input?
+2. Is the content meaningful and not just error messages or "no information found"?
+3. Are there sufficient evidences and context to answer the user's query?
+
+- <SHOULD_ANSWER>: output "true" if the evidence contains relevant information that can help answer the query, even if it requires reasoning, computation, or interpretation. Only output "false" if the evidence is clearly irrelevant or contains no useful information for the query.
+- <SHOULD_SAVE>: output "true" only if the evidence is sufficient AND the result is worth caching.
+- If evidence is insufficient or irrelevant, both SHOULD_ANSWER and SHOULD_SAVE MUST be "false".
+
+### Output Format
+<PRECISE_ANSWER>
+[If the query asks for a specific value, ratio, number, or factual answer, state ONLY the direct answer here (e.g. "0.83", "$1,832 million", "Yes", "Increased from 0.67 to 0.69"). If the query is open-ended, write a one-sentence conclusion.]
+</PRECISE_ANSWER>
+<SUMMARY>
+[Generate the Markdown Briefing here with detailed analysis and supporting evidence]
+</SUMMARY>
+<SHOULD_ANSWER>true/false</SHOULD_ANSWER>
+<SHOULD_SAVE>true/false</SHOULD_SAVE>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Compile prompts
+# ---------------------------------------------------------------------------
+
+COMPILE_TREE_STRUCTURE = """Analyze the following document and identify its natural hierarchical structure (chapters, sections, subsections).
+
+### Document Content (may be truncated)
+{document_content}
+
+### Output Requirements
+Return a JSON array of top-level sections. Each section object must have:
+- "title": Section heading or descriptive title
+- "summary": 1-2 sentence summary of the section content
+- "start_marker": A short text string (5-15 words) that appears verbatim at the start of this section in the document
+- "end_marker": A short text string that appears at the start of the NEXT section (empty for the last section)
+
+Maximum {max_sections} sections. Identify only the most significant structural boundaries.
+
+### Output Format
+Return ONLY a JSON array, no extra text:
+[
+  {{"title": "...", "summary": "...", "start_marker": "...", "end_marker": "..."}},
+  ...
+]
+"""
+
+
+COMPILE_SYNTHESIZE_SUMMARY = """Synthesize a comprehensive document summary from the following section summaries.
+
+### Section Summaries
+{sections}
+
+### Output
+Provide a unified, coherent summary in 3-8 sentences that captures the document's overall topic, key arguments, and conclusions. Do not simply list the sections — weave them into a natural narrative.
+Write in the same language as the section summaries."""
+
+
+COMPILE_DOC_SUMMARY = """Summarize the following document concisely, capturing the key topics, arguments, conclusions, and important details.
+
+### File: {file_name}
+
+### Document Content (may be truncated)
+{document_content}
+
+### Output
+Provide a comprehensive summary in 3-8 sentences. Focus on:
+1. What is this document about (main topic/purpose)
+2. Key findings, arguments, or conclusions
+3. Important details, data points, or methodologies
+
+Write the summary in the same language as the document content."""
+
+
+COMPILE_TOPIC_EXTRACTION = """Extract the 3-5 most important topics, concepts, or entities from the following summary.
+
+### Summary
+{summary}
+
+### Output
+Return ONLY a JSON array of topic strings, no extra text:
+["topic1", "topic2", "topic3"]
+
+Rules:
+- Each topic should be 1-4 words
+- Prefer specific, domain-relevant terms over generic ones
+- Use the same language as the summary"""
+
+
+COMPILE_CLASSIFY_HEADINGS = """Classify each bold text line as either a **section heading** or **non-heading**.
+
+A line is a *section heading* if it serves as the title of a major structural division of the document (chapter, section, subsection, exhibit, schedule, financial statement, note, etc.).
+A line is *non-heading* if it is emphasis text, a label, a caption, a total/subtotal row, or any inline bold phrase that does not introduce a new document section.
+
+For each heading, also assign a Markdown heading level (2–4):
+- Level 2: top-level sections (e.g. financial statements, major chapters)
+- Level 3: sub-sections (e.g. notes to financial statements, sub-chapters)
+- Level 4: sub-sub-sections
+
+Return ONLY a JSON array of objects for the lines that ARE headings.
+Each object: {{"idx": <0-based index>, "level": <2|3|4>}}
+If none are headings, return an empty array: []
+
+Bold lines:
+{candidates}"""
+
+
+COMPILE_MERGE_KNOWLEDGE = """You are merging new information into an existing knowledge cluster.
+
+### Existing Knowledge
+{existing_content}
+
+### New Information
+{new_summary}
+
+### Task
+Produce an updated, unified summary that:
+1. Preserves all important information from the existing knowledge
+2. Integrates the new information, avoiding redundancy
+3. Highlights any contradictions or complementary perspectives
+4. Maintains a coherent, well-structured narrative
+
+### Output
+Return ONLY the merged summary text (no extra tags or metadata). Keep the same language as the inputs."""
