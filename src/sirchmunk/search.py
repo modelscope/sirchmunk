@@ -4144,19 +4144,52 @@ class AgenticSearch(BaseSearch):
             and page_start <= t["page_number"] <= page_end
         ]
 
+    _TABLE_RELEVANCE_MIN_PREFIX = 5
+
     @staticmethod
     def _score_table_relevance(
         markdown: str, query_tokens: frozenset,
     ) -> float:
         """Score a table's relevance to the query via token overlap.
 
-        Returns a value in [0, 1] representing the fraction of *query_tokens*
-        found in the table's markdown text (case-insensitive).
+        Uses two matching strategies per token:
+
+        1. **Exact substring** — fast check whether the token appears
+           anywhere in the table text (original behaviour).
+        2. **Prefix match** — handles morphological variation such as
+           plural/singular (*inventory* ↔ *inventories*) by comparing
+           word prefixes of at least ``_TABLE_RELEVANCE_MIN_PREFIX``
+           characters.  Only attempted when the exact match misses.
+
+        Returns a value in [0, 1] representing the fraction of
+        *query_tokens* matched.
         """
         if not markdown or not query_tokens:
             return 0.0
+
+        min_pfx = AgenticSearch._TABLE_RELEVANCE_MIN_PREFIX
         md_lower = markdown.lower()
-        hits = sum(1 for tok in query_tokens if tok in md_lower)
+        md_words = None  # lazily built on first prefix-match attempt
+
+        hits = 0
+        for tok in query_tokens:
+            if tok in md_lower:
+                hits += 1
+                continue
+            # Prefix-match fallback
+            pfx_len = min(len(tok), min_pfx)
+            if pfx_len < 4:
+                continue
+            if md_words is None:
+                md_words = frozenset(md_lower.split())
+            prefix = tok[:pfx_len]
+            if any(
+                w[:pfx_len] == prefix
+                for w in md_words
+                if len(w) >= pfx_len
+            ):
+                hits += 1
+
         return hits / len(query_tokens)
 
     @staticmethod

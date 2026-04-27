@@ -84,6 +84,28 @@ _NUM_TOKEN_RE = re.compile(
 # pypdf flattens the entire page to one or two lines.
 _DENSE_LINE_MIN_TOKENS = 15
 
+# ---------------------------------------------------------------------------
+# Heading normalisation: candidate extraction patterns
+# ---------------------------------------------------------------------------
+# kreuzberg sometimes renders section titles as ``**bold text**`` or bare
+# short standalone lines instead of ``## heading``.  The tree indexer can
+# only split on markdown headings, so these "invisible" titles get absorbed
+# into parent nodes.
+#
+# We extract *candidates* via lightweight regexes and let the LLM classify
+# which ones are genuine section headings (language/domain-agnostic).
+
+_BOLD_LINE_RE = re.compile(
+    r"^\*\*((?:(?!\*\*).)+)\*\*\s*$",
+    re.MULTILINE,
+)
+
+_STANDALONE_LINE_RE = re.compile(
+    r"(?:^|\n\n)([^\n]{5,100})\n\n",
+)
+
+_HEADING_CANDIDATE_CAP = 40
+
 # Excel table-level adaptive sampling constants
 _XLSX_TOTAL_ROW_BUDGET = 100       # Total sampled rows budget across all sheets
 _XLSX_MIN_ROWS_PER_SHEET = 3       # Minimum sampled rows per sheet
@@ -590,6 +612,7 @@ class KnowledgeCompiler:
                 entry.path, DocumentExtractor.ENHANCED,
             )
             content = extraction.content
+            content = await self._normalize_bold_headings(content)
             if not content or len(content.strip()) < 100:
                 result.error = "Insufficient text content"
                 return result
@@ -740,6 +763,12 @@ class KnowledgeCompiler:
                         entry.path, ocr_tables, result,
                         source_label="Selective force-OCR",
                     )
+
+            # Phase 2.8: Enrich targeted-extraction tables with ENHANCED content
+            if ext == ".pdf" and result.has_table_digest:
+                self._enrich_table_digest_content(
+                    entry.path, content, tree_root=None,
+                )
 
         except Exception as exc:
             result.error = str(exc)
@@ -1617,6 +1646,177 @@ class KnowledgeCompiler:
         _walk(root)
         return candidates
 
+    # ------------------------------------------------------------------ #
+    #  LLM-based heading normalisation                                     #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _extract_heading_candidates(
+        content: str,
+    ) -> list[tuple[re.Match, str, str]]:
+        """Extract candidate lines that *might* be section headings.
+
+        Returns a list of ``(match, title_text, source_tag)`` triples
+        where *source_tag* is ``"bold"`` or ``"standalone"``.
+
+        Bold lines (``**Title**``) are always candidates.  Short
+        standalone lines (surrounded by blank lines, 10-100 chars) are
+        included only when they pass structural heuristics that filter
+        out data rows, sentences, and existing headings.
+        """
+        occupied: list[tuple[int, int]] = []
+        candidates: list[tuple[re.Match, str, str]] = []
+
+        def _overlaps(start: int, end: int) -> bool:
+            return any(s < end and start < e for s, e in occupied)
+
+        for m in _BOLD_LINE_RE.finditer(content):
+            title = m.group(1).strip()
+            if title and not _overlaps(m.start(), m.end()):
+                occupied.append((m.start(), m.end()))
+                candidates.append((m, title, "bold"))
+
+        for m in _STANDALONE_LINE_RE.finditer(content):
+            text = m.group(1).strip()
+            if len(text) < 10:
+                continue
+            text_offset = m.start() + m.group(0).index(m.group(1))
+            if _overlaps(text_offset, text_offset + len(m.group(1))):
+                continue
+            if text.startswith(("#", "**")):
+                continue
+            if _NUM_TOKEN_RE.search(text):
+                continue
+            if text.endswith((".", "。", "!", "?", "！", "？")):
+                continue
+            if len(text.split()) > 12:
+                continue
+            occupied.append((text_offset, text_offset + len(m.group(1))))
+            candidates.append((m, text, "standalone"))
+
+        candidates.sort(key=lambda t: t[0].start())
+        return candidates[:_HEADING_CANDIDATE_CAP]
+
+    async def _normalize_bold_headings(self, content: str) -> str:
+        """Detect and promote bold/standalone section titles to headings.
+
+        Three-phase pipeline:
+          1. **Extract** candidate lines via regex (deterministic).
+          2. **Classify** candidates with a single LLM call — the LLM
+             returns which indices are section headings and their level.
+          3. **Replace** confirmed headings deterministically.
+
+        Short-circuits when no candidates are found (zero LLM calls).
+        On any LLM / parse failure, returns the original content unchanged
+        (graceful degradation — equivalent to no-op).
+
+        The transformation is idempotent: existing ``#`` headings never
+        enter the candidate set.
+        """
+        if not content:
+            return content
+
+        candidates = self._extract_heading_candidates(content)
+        if not candidates:
+            return content
+
+        listing = "\n".join(
+            f"{i}: \"{title}\"" for i, (_, title, _tag) in enumerate(candidates)
+        )
+
+        from sirchmunk.llm.prompts import COMPILE_CLASSIFY_HEADINGS
+        prompt = COMPILE_CLASSIFY_HEADINGS.format(candidates=listing)
+
+        try:
+            resp = await self._llm.achat(
+                [{"role": "user", "content": prompt}],
+            )
+            raw = resp.content.strip()
+            headings = self._parse_heading_classifications(raw, len(candidates))
+        except Exception:
+            return content
+
+        if not headings:
+            return content
+
+        return self._apply_heading_promotions(content, candidates, headings)
+
+    @staticmethod
+    def _parse_heading_classifications(
+        raw: str,
+        num_candidates: int,
+    ) -> list[tuple[int, int]]:
+        """Parse LLM JSON response into a list of ``(idx, level)`` pairs.
+
+        Robustly handles markdown code fences, trailing commas, and
+        out-of-range indices.  Returns an empty list on any parse failure.
+        """
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            lines = [ln for ln in lines if not ln.strip().startswith("```")]
+            cleaned = "\n".join(lines).strip()
+
+        try:
+            items = json.loads(cleaned)
+        except json.JSONDecodeError:
+            m = re.search(r"\[.*\]", cleaned, re.DOTALL)
+            if not m:
+                return []
+            try:
+                items = json.loads(m.group())
+            except json.JSONDecodeError:
+                return []
+
+        if not isinstance(items, list):
+            return []
+
+        result: list[tuple[int, int]] = []
+        for item in items:
+            if isinstance(item, dict):
+                idx = item.get("idx")
+                level = item.get("level", 2)
+            elif isinstance(item, int):
+                idx, level = item, 2
+            else:
+                continue
+            if not isinstance(idx, int) or not (0 <= idx < num_candidates):
+                continue
+            level = max(2, min(4, int(level)))
+            result.append((idx, level))
+        return result
+
+    @staticmethod
+    def _apply_heading_promotions(
+        content: str,
+        candidates: list[tuple[re.Match, str, str]],
+        headings: list[tuple[int, int]],
+    ) -> str:
+        """Apply heading promotions to *content* in reverse-offset order.
+
+        Processes replacements from end-to-start so that earlier offsets
+        remain valid after each substitution.
+        """
+        heading_map: dict[int, int] = dict(headings)
+
+        replacements: list[tuple[int, int, str]] = []
+        for idx, (match, title, tag) in enumerate(candidates):
+            if idx not in heading_map:
+                continue
+            level = heading_map[idx]
+            prefix = "#" * level
+            if tag == "bold":
+                replacements.append((match.start(), match.end(), f"{prefix} {title}"))
+            else:
+                text_start = match.start() + match.group(0).index(match.group(1))
+                text_end = text_start + len(match.group(1))
+                replacements.append((text_start, text_end, f"{prefix} {title}"))
+
+        replacements.sort(key=lambda r: r[0], reverse=True)
+        for start, end, replacement in replacements:
+            content = content[:start] + replacement + content[end:]
+        return content
+
     @staticmethod
     def _page_has_table_density(page_text: str) -> bool:
         """Return True if *page_text* likely contains tabular numeric data.
@@ -1818,7 +2018,184 @@ class KnowledgeCompiler:
             return set()
 
     # ------------------------------------------------------------------ #
-    #  Tree-independent content-based table scanning (P1)                  #
+    #  P1: Enrich table digest with ENHANCED content                       #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _build_page_char_map(
+        tree_root: Any,
+        max_page_span: int = _TABLE_PAGE_SPAN_LIMIT,
+    ) -> Dict[int, Tuple[int, int]]:
+        """Map page numbers to ``(start_char, end_char)`` in ENHANCED content.
+
+        Aggregates ``char_range`` bounds from leaf nodes whose
+        ``page_range`` intersects a given page.  To avoid inflated
+        ranges from wide-spanning nodes (e.g. a cover-page node
+        spanning pages 1–85), only nodes with a page span ≤
+        *max_page_span* are used when available; wider nodes serve
+        as a fallback.
+        """
+        # (char_start, char_end, page_span) per page
+        entries: Dict[int, List[Tuple[int, int, int]]] = {}
+
+        def _walk(node: Any) -> None:
+            children = getattr(node, "children", None) or []
+            if isinstance(node, dict):
+                children = node.get("children", [])
+            if not children:
+                pr = (
+                    getattr(node, "page_range", None)
+                    if not isinstance(node, dict)
+                    else node.get("page_range")
+                )
+                cr = (
+                    getattr(node, "char_range", None)
+                    if not isinstance(node, dict)
+                    else node.get("char_range")
+                )
+                if (
+                    pr
+                    and cr
+                    and len(pr) >= 2
+                    and len(cr) >= 2
+                ):
+                    span = int(pr[1]) - int(pr[0]) + 1
+                    for p in range(int(pr[0]), int(pr[1]) + 1):
+                        entries.setdefault(p, []).append(
+                            (int(cr[0]), int(cr[1]), span)
+                        )
+            for ch in children:
+                _walk(ch)
+
+        _walk(tree_root)
+
+        result: Dict[int, Tuple[int, int]] = {}
+        for page, elist in entries.items():
+            narrow = [e for e in elist if e[2] <= max_page_span]
+            chosen = narrow if narrow else elist
+            result[page] = (
+                min(e[0] for e in chosen),
+                max(e[1] for e in chosen),
+            )
+        return result
+
+    @staticmethod
+    def _find_enhanced_region(
+        enhanced_content: str,
+        pypdf_text: str,
+        budget: int = _TARGETED_TABLE_MAX_CHARS,
+    ) -> Optional[str]:
+        """Locate the ENHANCED content region matching *pypdf_text*.
+
+        Uses progressively shorter text anchors extracted from the
+        pypdf content to find the corresponding position in the
+        ENHANCED (kreuzberg markdown) text.  Whitespace is normalised
+        in the anchor to handle formatting differences (pypdf line
+        breaks vs kreuzberg markdown spacing).  This avoids reliance
+        on page-number alignment, which may differ between the two
+        extractors.
+
+        Returns the ENHANCED slice (up to *budget* chars) or ``None``.
+        """
+        text = pypdf_text.strip()
+        for prefix in ("Table of Contents\n", "Table of Contents "):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+        text = text.strip()
+
+        for anchor_len in (80, 50, 30):
+            raw = text[:anchor_len].strip()
+            if len(raw) < 15:
+                continue
+            anchor = " ".join(raw.split())
+            pos = enhanced_content.find(anchor)
+            if pos < 0:
+                continue
+            start = max(
+                0,
+                enhanced_content.rfind("\n", max(0, pos - 300), pos) + 1,
+            )
+            end = min(len(enhanced_content), start + budget)
+            return enhanced_content[start:end].strip()
+
+        return None
+
+    def _enrich_table_digest_content(
+        self,
+        file_path: str,
+        enhanced_content: str,
+        tree_root: Optional[Any],
+    ) -> None:
+        """Replace pypdf-sourced table text with ENHANCED content slices.
+
+        Targeted extraction tables use pypdf, which often produces dense
+        single-line text (the "2-line page" problem).  This method
+        locates each table's content in the ENHANCED (kreuzberg markdown)
+        text via anchor matching and replaces the ``markdown`` field when
+        the ENHANCED version has substantially better structure.
+
+        Only tables whose ``source`` indicates pypdf origin are
+        candidates; kreuzberg-detected tables already have high-quality
+        markdown and are left untouched.
+        """
+        if not enhanced_content:
+            return
+
+        file_hash = get_fast_hash(file_path) or ""
+        if not file_hash:
+            return
+
+        digest_path = (
+            self._compile_dir / "table_digests" / f"{file_hash}.json"
+        )
+        if not digest_path.exists():
+            return
+
+        try:
+            raw = json.loads(digest_path.read_text(encoding="utf-8"))
+            tables = raw.get("tables", [])
+        except Exception:
+            return
+
+        if not tables:
+            return
+
+        modified = False
+        for table in tables:
+            source = table.get("source", "")
+            if not (
+                source.startswith("targeted:")
+                or source == "content_scan"
+            ):
+                continue
+
+            current = table.get("markdown", "")
+            if not current:
+                continue
+
+            enhanced_region = self._find_enhanced_region(
+                enhanced_content, current,
+            )
+            if not enhanced_region:
+                continue
+
+            current_lines = len(current.strip().split("\n"))
+            enhanced_lines = len(enhanced_region.split("\n"))
+
+            if enhanced_lines > max(current_lines, 3):
+                table["markdown"] = enhanced_region[
+                    :_TARGETED_TABLE_MAX_CHARS
+                ]
+                modified = True
+
+        if modified:
+            digest_path.write_text(
+                json.dumps(raw, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Tree-independent content-based table scanning                       #
     # ------------------------------------------------------------------ #
 
     async def _content_based_table_scan(

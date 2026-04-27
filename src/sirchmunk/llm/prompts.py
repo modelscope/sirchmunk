@@ -565,6 +565,24 @@ Rules:
 - Use the same language as the summary"""
 
 
+COMPILE_CLASSIFY_HEADINGS = """Classify each bold text line as either a **section heading** or **non-heading**.
+
+A line is a *section heading* if it serves as the title of a major structural division of the document (chapter, section, subsection, exhibit, schedule, financial statement, note, etc.).
+A line is *non-heading* if it is emphasis text, a label, a caption, a total/subtotal row, or any inline bold phrase that does not introduce a new document section.
+
+For each heading, also assign a Markdown heading level (2–4):
+- Level 2: top-level sections (e.g. financial statements, major chapters)
+- Level 3: sub-sections (e.g. notes to financial statements, sub-chapters)
+- Level 4: sub-sub-sections
+
+Return ONLY a JSON array of objects for the lines that ARE headings.
+Each object: {{"idx": <0-based index>, "level": <2|3|4>}}
+If none are headings, return an empty array: []
+
+Bold lines:
+{candidates}"""
+
+
 COMPILE_MERGE_KNOWLEDGE = """You are merging new information into an existing knowledge cluster.
 
 ### Existing Knowledge
