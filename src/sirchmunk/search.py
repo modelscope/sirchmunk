@@ -932,13 +932,23 @@ class AgenticSearch(BaseSearch):
             await self._logger.error(f"Traceback: {traceback.format_exc()}")
             return []
 
-    @staticmethod
-    def _parse_summary_response(llm_response: str) -> Tuple[str, bool, bool]:
+    _SELF_CORRECTION_PATTERN = re.compile(
+        r'(?:correction|re-?verif|wait,?\s|let me re|actually|self-correction|recalcul)',
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _parse_summary_response(cls, llm_response: str) -> Tuple[str, bool, bool]:
         """Parse LLM response to extract summary, precise answer, and quality decisions.
 
         When a ``<PRECISE_ANSWER>`` tag is present, its content is prepended to
         the summary so downstream consumers (evaluation judges, UIs) see the
         direct answer prominently without needing separate tag awareness.
+
+        The method also detects self-correction patterns in the summary text:
+        when the LLM revised its calculation mid-stream, the last numeric
+        conclusion is used if PRECISE_ANSWER is absent or matches the
+        pre-correction value.
 
         Returns:
             Tuple of (summary_text, should_save_flag, should_answer_flag)
@@ -2226,6 +2236,17 @@ class AgenticSearch(BaseSearch):
     """Evidence below this length triggers a retry with expanded results."""
     _NAV_RETRY_EXPANDED_RESULTS: int = 8
     """Expanded max_results for retry navigation pass."""
+
+    _CHAR_RANGE_MIN_SPAN: int = 200
+    """Minimum char_range span to trust as substantive content.
+
+    Nodes whose char_range covers fewer characters than this threshold
+    (e.g. a TOC entry that only records the section title) are demoted
+    to page-level extraction when a valid page_range is available.
+    """
+
+    _NAV_COMPLEMENT_MIN_COMPONENTS: int = 2
+    """Minimum query decomposition components to trigger complementary navigation."""
 
     # --- Table evidence budgets (Plan 5) ---
     _TABLE_EVIDENCE_DEFAULT_CHARS: int = 10_000
@@ -4029,8 +4050,8 @@ class AgenticSearch(BaseSearch):
         )
         return evidence
 
-    @staticmethod
-    def _classify_leaves(leaves: list) -> Tuple[List[tuple], List, List]:
+    @classmethod
+    def _classify_leaves(cls, leaves: list) -> Tuple[List[tuple], List, List]:
         """Classify leaf nodes by preferred extraction strategy.
 
         For non-table leaves, **char_range** (kreuzberg markdown) is preferred
@@ -4038,6 +4059,11 @@ class AgenticSearch(BaseSearch):
         preserves table layout and column structure far better than pypdf's
         ``extract_text()``.  page_range remains available on each leaf for
         table-supplement filtering even when the leaf is routed to char_leaves.
+
+        Thin char_range nodes (span < ``_CHAR_RANGE_MIN_SPAN``) are demoted
+        to page-level extraction when a valid page_range exists, as they
+        typically represent TOC entries whose char offsets only cover the
+        section title rather than the actual content.
 
         Returns:
             (page_leaves, char_leaves, summary_leaves) triple:
@@ -4048,6 +4074,7 @@ class AgenticSearch(BaseSearch):
         page_leaves: List[tuple] = []
         char_leaves: List = []
         summary_leaves: List = []
+        min_span = cls._CHAR_RANGE_MIN_SPAN
 
         for leaf in leaves:
             # Table nodes: prefer page-level extraction for raw original content
@@ -4078,7 +4105,12 @@ class AgenticSearch(BaseSearch):
             )
 
             if has_char:
-                char_leaves.append(leaf)
+                start, end = leaf.char_range
+                span = end - start if end > start else 0
+                if span < min_span and has_page:
+                    page_leaves.append((leaf, page_range))
+                else:
+                    char_leaves.append(leaf)
             elif has_page:
                 page_leaves.append((leaf, page_range))
             elif getattr(leaf, 'summary', None):
@@ -4112,6 +4144,64 @@ class AgenticSearch(BaseSearch):
             return False
         stripped = evidence.strip()
         return len(stripped) >= min_chars
+
+    _MULTI_COMPONENT_PATTERNS: Tuple[Tuple[str, ...], ...] = (
+        ("balance sheet", "income statement"),
+        ("balance sheet", "cash flow"),
+        ("income statement", "cash flow"),
+        ("accounts payable", "cost of"),
+        ("accounts payable", "inventory"),
+        ("current assets", "current liabilities"),
+        ("revenue", "net income", "earnings"),
+        ("operating income", "depreciation"),
+    )
+
+    @staticmethod
+    def _decompose_query_components(query: str) -> List[str]:
+        """Extract distinct data-source components from a multi-part query.
+
+        Scans for known multi-component patterns (e.g. a ratio needing data
+        from both Balance Sheet and Income Statement) and returns a list of
+        component phrases that the evidence should cover.
+        """
+        q = query.lower()
+        components: List[str] = []
+        for group in AgenticSearch._MULTI_COMPONENT_PATTERNS:
+            hits = [phrase for phrase in group if phrase in q]
+            if len(hits) >= 2:
+                components.extend(hits)
+        if not components:
+            financial_keywords = [
+                "balance sheet", "income statement", "cash flow",
+                "accounts payable", "accounts receivable", "inventory",
+                "current liabilities", "current assets", "total assets",
+                "revenue", "cost of", "cogs", "depreciation", "amortization",
+                "operating income", "net income", "earnings",
+            ]
+            for kw in financial_keywords:
+                if kw in q:
+                    components.append(kw)
+        seen: set = set()
+        return [c for c in components if not (c in seen or seen.add(c))]
+
+    @staticmethod
+    def _check_leaf_coverage(
+        leaves: list, components: List[str],
+    ) -> Tuple[List[str], List[str]]:
+        """Check which query components are covered by the navigated leaves.
+
+        Returns:
+            (covered, missing) — lists of component phrases.
+        """
+        if not leaves or not components:
+            return [], list(components)
+        leaf_text = " ".join(
+            (getattr(l, 'title', '') or '') + " " + (getattr(l, 'summary', '') or '')
+            for l in leaves
+        ).lower()
+        covered = [c for c in components if c in leaf_text]
+        missing = [c for c in components if c not in leaf_text]
+        return covered, missing
 
     @staticmethod
     def _load_compile_content(
@@ -4466,6 +4556,58 @@ class AgenticSearch(BaseSearch):
                             self._append_evidence_part(
                                 parts, fname, lf, lf.summary,
                             )
+
+        # ── Phase 4: Complementary navigation for multi-component queries ──
+        # When a query requires data from multiple document sections (e.g.
+        # Balance Sheet + Income Statement for a ratio), the initial navigate
+        # may only reach one component.  Detect missing components and run a
+        # focused second navigate pass with a refined query.
+        _query_components = self._decompose_query_components(query)
+        if len(_query_components) >= self._NAV_COMPLEMENT_MIN_COMPONENTS:
+            _covered, _missing = self._check_leaf_coverage(leaves, _query_components)
+            if _missing:
+                _complement_query = f"{query} — focus on: {', '.join(_missing)}"
+                try:
+                    _existing_ids = {id(l) for l in leaves}
+                    comp_leaves = await indexer.navigate(
+                        tree, _complement_query, max_results=max_results,
+                    )
+                    comp_new = [l for l in (comp_leaves or []) if id(l) not in _existing_ids]
+                    if comp_new:
+                        c_page, c_char, c_summary = self._classify_leaves(comp_new)
+                        for cl in c_summary:
+                            self._append_evidence_part(parts, fname, cl, cl.summary)
+                        if c_page:
+                            c_all_pages: set = set()
+                            for _cl, (csp, cep) in c_page:
+                                c_all_pages.update(range(csp, cep + 1))
+                            try:
+                                c_contents = DocumentExtractor.extract_pages(
+                                    file_path, sorted(c_all_pages),
+                                )
+                                c_map = {pc.page_number: pc.content for pc in c_contents}
+                                for cl, (csp, cep) in c_page:
+                                    c_seg = [c_map[p] for p in range(csp, cep + 1) if c_map.get(p, "").strip()]
+                                    if c_seg:
+                                        self._append_evidence_part(parts, fname, cl, "\n".join(c_seg))
+                            except Exception:
+                                pass
+                        if c_char:
+                            c_text = self._load_compile_content(self.work_path, file_path) or ""
+                            for cl in c_char:
+                                s, e = cl.char_range
+                                if self._is_valid_char_range(s, e, len(c_text)) and c_text:
+                                    seg = c_text[s:e]
+                                    if seg.strip():
+                                        self._append_evidence_part(parts, fname, cl, seg)
+                        leaves = list(leaves) + comp_new
+                        print(
+                            f"SEARCH_WIKI_DEBUG [N3.2] complement_nav: "
+                            f"missing={_missing}, new_leaves={len(comp_new)}",
+                            flush=True,
+                        )
+                except Exception:
+                    pass
 
         # ── Plan 3: Retry with expanded results if evidence is insufficient ──
         # Triggers on: (a) zero evidence parts, OR (b) evidence too thin.

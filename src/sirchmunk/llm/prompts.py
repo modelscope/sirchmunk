@@ -423,6 +423,7 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 2. **Format**: Use Markdown (headings, bullet points, and bold text) for high readability.
 3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
 4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
+5. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
 
 ### Input Data
 - **User Input**: {user_input}
@@ -443,12 +444,12 @@ Evaluate based on:
 - If evidence is insufficient or irrelevant, both SHOULD_ANSWER and SHOULD_SAVE MUST be "false".
 
 ### Output Format
-<PRECISE_ANSWER>
-[If the query asks for a specific value, ratio, number, or factual answer, state ONLY the direct answer here (e.g. "0.83", "$1,832 million", "Yes", "Increased from 0.67 to 0.69"). If the query is open-ended, write a one-sentence conclusion.]
-</PRECISE_ANSWER>
 <SUMMARY>
-[Generate the Markdown Briefing here with detailed analysis and supporting evidence]
+[Generate the Markdown Briefing here with detailed analysis, supporting evidence, and full calculation steps. Complete all reasoning BEFORE the PRECISE_ANSWER tag.]
 </SUMMARY>
+<PRECISE_ANSWER>
+[State ONLY the final verified answer here (e.g. "0.83", "$1,832 million", "Yes", "Increased from 0.67 to 0.69"). For calculations, this MUST reflect the result from your completed computation above. If the query is open-ended, write a one-sentence conclusion.]
+</PRECISE_ANSWER>
 <SHOULD_ANSWER>true/false</SHOULD_ANSWER>
 <SHOULD_SAVE>true/false</SHOULD_SAVE>
 """
@@ -463,6 +464,7 @@ Leverage the document context below for better understanding of the source mater
 2. **Format**: Use Markdown (headings, bullet points, and bold text) for high readability.
 3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
 4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
+5. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
 
 ### Document Context
 {document_context}
@@ -486,12 +488,12 @@ Evaluate based on:
 - If evidence is insufficient or irrelevant, both SHOULD_ANSWER and SHOULD_SAVE MUST be "false".
 
 ### Output Format
-<PRECISE_ANSWER>
-[If the query asks for a specific value, ratio, number, or factual answer, state ONLY the direct answer here (e.g. "0.83", "$1,832 million", "Yes", "Increased from 0.67 to 0.69"). If the query is open-ended, write a one-sentence conclusion.]
-</PRECISE_ANSWER>
 <SUMMARY>
-[Generate the Markdown Briefing here with detailed analysis and supporting evidence]
+[Generate the Markdown Briefing here with detailed analysis, supporting evidence, and full calculation steps. Complete all reasoning BEFORE the PRECISE_ANSWER tag.]
 </SUMMARY>
+<PRECISE_ANSWER>
+[State ONLY the final verified answer here (e.g. "0.83", "$1,832 million", "Yes", "Increased from 0.67 to 0.69"). For calculations, this MUST reflect the result from your completed computation above. If the query is open-ended, write a one-sentence conclusion.]
+</PRECISE_ANSWER>
 <SHOULD_ANSWER>true/false</SHOULD_ANSWER>
 <SHOULD_SAVE>true/false</SHOULD_SAVE>
 """
