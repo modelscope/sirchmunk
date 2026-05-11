@@ -71,6 +71,10 @@ _FORCE_OCR_MAX_PAGES = 30
 # to survive interrupted compiles without excessive I/O overhead.
 _MANIFEST_FLUSH_INTERVAL = 10
 
+# Page-level extraction: max pages to load into memory per batch.
+# Prevents loading all 200-400 pages of a large PDF at once.
+_PAGE_SCAN_BATCH_SIZE = 50
+
 # Shared numeric-token regex for table detection heuristics.
 # Matches: $1,234  (1,234)  12.5%  3.14e-5  1,000
 _NUM_TOKEN_RE = re.compile(
@@ -375,6 +379,29 @@ class KnowledgeCompiler:
         self._manifest_path = self._compile_dir / "manifest.json"
 
     # ------------------------------------------------------------------ #
+    #  Resource management                                                #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _configure_thread_limits() -> None:
+        """Cap PyTorch / OpenMP / MKL thread count to avoid runaway CPU and memory.
+
+        Only sets defaults when the user has not already configured them via
+        environment variables, so explicit overrides are always respected.
+        The cap is half the available CPU cores, clamped to [1, 4].
+        """
+        cpu_count = os.cpu_count() or 4
+        cap = str(max(1, min(cpu_count // 2, 4)))
+        for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+            if var not in os.environ:
+                os.environ[var] = cap
+        try:
+            import torch
+            torch.set_num_threads(int(cap))
+        except ImportError:
+            pass
+
+    # ------------------------------------------------------------------ #
     #  Public API                                                         #
     # ------------------------------------------------------------------ #
 
@@ -398,6 +425,9 @@ class KnowledgeCompiler:
             concurrency: Max parallel file compilations.
         """
         import time
+
+        self._configure_thread_limits()
+
         t0 = time.monotonic()
         report = CompileReport()
 
@@ -441,9 +471,11 @@ class KnowledgeCompiler:
             f"(concurrency={concurrency})"
         )
 
-        # Phase 2: compile files with bounded concurrency
+        # Phase 2 + 3 (fused): compile files, aggregate inline, release heavy objects
+        # Fusing Phase 3 into the completion loop avoids retaining all
+        # DocumentTree / EvidenceUnit objects until the end of the pipeline.
         semaphore = asyncio.Semaphore(concurrency)
-        results: List[FileCompileResult] = []
+        _xref_pairs: List[Tuple[str, List[str]]] = []  # lightweight (path, cluster_ids) for Phase 4
         _files_since_flush = 0
 
         async def _bounded(entry: FileEntry) -> FileCompileResult:
@@ -453,7 +485,6 @@ class KnowledgeCompiler:
         tasks = [_bounded(f) for f in to_compile]
         for coro in asyncio.as_completed(tasks):
             result = await coro
-            results.append(result)
             if result.error:
                 report.errors.append(f"{result.path}: {result.error}")
             else:
@@ -475,6 +506,16 @@ class KnowledgeCompiler:
                 _mentry = manifest.files[result.path]
                 print(f"SEARCH_WIKI_DEBUG [C4] manifest_entry: has_tree={_mentry.has_tree}, has_table_digest={_mentry.has_table_digest}, file_hash={_mentry.file_hash}", flush=True)
 
+            # Phase 3 inline: aggregate while the result is still alive
+            if not result.error and result.summary:
+                created, merged = await self._aggregate_to_knowledge_network(result)
+                report.clusters_created += created
+                report.clusters_merged += merged
+
+            # Retain only lightweight cross-ref data, then drop the heavy result
+            _xref_pairs.append((result.path, list(result.cluster_ids)))
+            del result
+
             # Incremental manifest flush to survive interrupted compiles
             _files_since_flush += 1
             if _files_since_flush >= _MANIFEST_FLUSH_INTERVAL:
@@ -482,22 +523,15 @@ class KnowledgeCompiler:
                 self._save_manifest(manifest)
                 _files_since_flush = 0
 
-        # Phase 2 checkpoint: persist manifest before knowledge aggregation
+        # Phase 2 checkpoint: persist manifest before cross-references
         manifest.last_compile_at = datetime.now(timezone.utc).isoformat()
         self._save_manifest(manifest)
 
-        # Phase 3: aggregate results into knowledge network
-        await self._log.info("[Compile] Phase 3: Knowledge aggregation")
-        for r in results:
-            if r.error or not r.summary:
-                continue
-            created, merged = await self._aggregate_to_knowledge_network(r)
-            report.clusters_created += created
-            report.clusters_merged += merged
-
-        # Phase 4: cross-references
+        # Phase 4: cross-references (uses only lightweight path+cluster_ids pairs)
         await self._log.info("[Compile] Phase 4: Building cross-references")
-        report.cross_refs_built = await self._build_cross_references(results)
+        report.cross_refs_built = await self._build_cross_references_from_pairs(
+            _xref_pairs, manifest,
+        )
 
         # Phase 5: persist final manifest + derived indices
         # Catalog and summary index are rebuilt from the manifest, so even
@@ -1265,25 +1299,23 @@ class KnowledgeCompiler:
     #  Cross-references                                                   #
     # ------------------------------------------------------------------ #
 
-    async def _build_cross_references(
-        self, results: List[FileCompileResult],
+    async def _build_cross_references_from_pairs(
+        self,
+        pairs: List[Tuple[str, List[str]]],
+        manifest: CompileManifest,
     ) -> int:
         """Build co-occurrence edges between clusters that share source files.
 
-        Two clusters are co-occurring when the same source file contributed
-        evidence to both (e.g., different sections compiled into different
-        clusters).  Includes historical data from the manifest.
+        Accepts lightweight ``(path, cluster_ids)`` pairs instead of full
+        ``FileCompileResult`` objects to avoid retaining heavy compile results.
+        Includes historical data from the manifest.
         """
-        # Build a complete map: cluster_id -> set of source file paths
         cluster_to_files: Dict[str, Set[str]] = {}
 
-        # From current compile results
-        for r in results:
-            for cid in r.cluster_ids:
-                cluster_to_files.setdefault(cid, set()).add(r.path)
+        for path, cluster_ids in pairs:
+            for cid in cluster_ids:
+                cluster_to_files.setdefault(cid, set()).add(path)
 
-        # From manifest (historical data)
-        manifest = self._load_manifest()
         for fp, entry in manifest.files.items():
             for cid in entry.cluster_ids:
                 cluster_to_files.setdefault(cid, set()).add(fp)
@@ -2288,37 +2320,44 @@ class KnowledgeCompiler:
         total_pages: int,
         covered_pages: Set[int],
     ) -> list[dict]:
-        """Primary scan: per-page pypdf extraction with density heuristics."""
-        all_page_nums = list(range(1, total_pages + 1))
-        try:
-            pages = DocumentExtractor.extract_pages(file_path, all_page_nums)
-        except Exception as exc:
-            await self._log.warning(
-                f"[Compile] Content-based scan: page read failed for "
-                f"{Path(file_path).name}: {exc}"
-            )
-            return []
+        """Primary scan: per-page pypdf extraction with density heuristics.
 
+        Pages are loaded in batches of ``_PAGE_SCAN_BATCH_SIZE`` to bound
+        peak memory when processing large PDFs (200-400+ pages).
+        """
         results: list[dict] = []
         poor_line_count = 0
-        for pc in pages:
-            if len(pc.content.split("\n")) <= 3:
-                poor_line_count += 1
-            if pc.page_number in covered_pages:
-                continue
-            if not self._page_has_table_density(pc.content):
-                continue
-            for region in self._identify_table_regions(pc.content):
-                results.append({
-                    "page": pc.page_number,
-                    "content": region[:_TARGETED_TABLE_MAX_CHARS],
-                    "source": "content_scan",
-                })
+
+        for batch_start in range(1, total_pages + 1, _PAGE_SCAN_BATCH_SIZE):
+            batch_end = min(batch_start + _PAGE_SCAN_BATCH_SIZE, total_pages + 1)
+            batch_pages = list(range(batch_start, batch_end))
+            try:
+                pages = DocumentExtractor.extract_pages(file_path, batch_pages)
+            except Exception as exc:
+                await self._log.warning(
+                    f"[Compile] Content-based scan: page read failed for "
+                    f"{Path(file_path).name}: {exc}"
+                )
+                return []
+
+            for pc in pages:
+                if len(pc.content.split("\n")) <= 3:
+                    poor_line_count += 1
+                if pc.page_number in covered_pages:
+                    continue
+                if not self._page_has_table_density(pc.content):
+                    continue
+                for region in self._identify_table_regions(pc.content):
+                    results.append({
+                        "page": pc.page_number,
+                        "content": region[:_TARGETED_TABLE_MAX_CHARS],
+                        "source": "content_scan",
+                    })
+            del pages
 
         if results:
             return results
 
-        # Signal that pypdf line quality is poor — caller should try fallback
         if poor_line_count > total_pages * 0.5:
             return []
 
@@ -2498,7 +2537,8 @@ class KnowledgeCompiler:
         The index is saved to .cache/compile/summary_index.json and consumed
         by search.py as a last-resort fallback when rga keyword search fails.
 
-        Skips gracefully if dependencies (EmbeddingUtil/TokenizerUtil) are unavailable.
+        Reuses ``self._embedding`` when available to avoid loading a duplicate
+        model into memory.  Falls back to a fresh instance otherwise.
         """
         try:
             from sirchmunk.utils.tokenizer_util import TokenizerUtil
@@ -2518,7 +2558,6 @@ class KnowledgeCompiler:
             if not entries:
                 return
 
-            # Tokenize summaries + compute TF (always available)
             tokenizer = TokenizerUtil()
             for idx, entry in enumerate(entries):
                 tokens = tokenizer.segment(entry.summary)
@@ -2527,12 +2566,14 @@ class KnowledgeCompiler:
                 for t in tokens:
                     entry.token_freqs[t] = entry.token_freqs.get(t, 0) + 1
 
-            # Compute embeddings (optional — requires EmbeddingUtil)
+            # Reuse the compiler's embedding client to avoid duplicate model load
             try:
-                from sirchmunk.utils.embedding_util import EmbeddingUtil
-                embedding_util = EmbeddingUtil()
-                embedding_util.start_loading()
-                # Wait up to 60 seconds for model load
+                embedding_util = self._embedding
+                if embedding_util is None:
+                    from sirchmunk.utils.embedding_util import EmbeddingUtil
+                    embedding_util = EmbeddingUtil()
+                    embedding_util.start_loading()
+
                 await embedding_util._ensure_model_async(timeout=60)
 
                 if embedding_util.is_ready():
