@@ -2324,6 +2324,16 @@ class AgenticSearch(BaseSearch):
     """Max chars for per-page-range table supplement in tree nav."""
     _TABLE_EVIDENCE_STANDALONE_CHARS: int = 20_000
     """Max chars for standalone table digest fallback when tree nav evidence is thin."""
+    _TABLE_CROSS_SECTION_CHARS: int = 6_000
+    """Max chars for cross-section table supplement drawn from pages outside
+    the navigated leaf ranges.  Ensures data-dense tables in distant
+    document sections (e.g. financial statements when leaves are in
+    management discussion) are included."""
+    _TABLE_EVIDENCE_NAV_OVERLAP_CHARS: int = 8_000
+    """Reduced table evidence budget for files that are already receiving
+    parallel tree navigation.  Since tree_ev will provide targeted evidence,
+    the RGA path uses a smaller budget to supply incremental tables,
+    leaving room for more diverse evidence."""
 
     # --- Self-correction expanded sampling ---
     _SELF_CORRECT_EXPANDED_NAV_RESULTS: int = 10
@@ -2851,9 +2861,14 @@ class AgenticSearch(BaseSearch):
                         print(f"SEARCH_WIKI_DEBUG [D13] table_digest: manifest_lookup={'found' if artifacts.manifest_map and artifacts.manifest_map.get(fp) else 'miss'}, has_table_digest={getattr(artifacts.manifest_map.get(fp), 'has_table_digest', False) if artifacts.manifest_map else 'N/A'}, hash_fallback={'tried' if not _all_tables else 'skipped'}, tables_count={len(_all_tables) if _all_tables else 0}", flush=True)
 
                         if _all_tables:
+                            _td_budget = (
+                                self._TABLE_EVIDENCE_NAV_OVERLAP_CHARS
+                                if fp in tree_nav_done
+                                else self._TABLE_EVIDENCE_DEFAULT_CHARS
+                            )
                             _table_ev = self._format_table_evidence(
                                 _all_tables,
-                                max_chars=self._TABLE_EVIDENCE_DEFAULT_CHARS,
+                                max_chars=_td_budget,
                                 query=query,
                             )
                             if _table_ev:
@@ -4412,6 +4427,16 @@ class AgenticSearch(BaseSearch):
         ]
 
     _TABLE_RELEVANCE_MIN_PREFIX = 5
+    _TABLE_STRUCTURE_BONUS: float = 0.25
+    """Bonus score for tables exhibiting structured data characteristics
+    (high row count, numeric density).  Applied additively to the keyword
+    relevance score so that data-rich tables are preferred when keyword
+    scores tie."""
+    _TABLE_STRUCTURE_MIN_ROWS: int = 5
+    """Minimum ``|``-delimited rows for a table to qualify for the
+    structure bonus."""
+    _TABLE_STRUCTURE_MIN_NUMERIC_RATIO: float = 0.15
+    """Minimum ratio of numeric tokens to total tokens for the bonus."""
 
     @staticmethod
     def _score_table_relevance(
@@ -4458,6 +4483,39 @@ class AgenticSearch(BaseSearch):
                 hits += 1
 
         return hits / len(query_tokens)
+
+    @staticmethod
+    def _score_table_structure(markdown: str) -> float:
+        """Score a table's structural richness (row count + numeric density).
+
+        Data-dense tables (financial statements, balance sheets) score
+        higher than narrative paragraphs that happen to contain a small
+        embedded table.  The score is in [0, 1] and is added as a bonus
+        to the keyword relevance score during table ranking.
+        """
+        if not markdown:
+            return 0.0
+
+        rows = markdown.count("\n")
+        if rows < AgenticSearch._TABLE_STRUCTURE_MIN_ROWS:
+            return 0.0
+
+        tokens = markdown.split()
+        if not tokens:
+            return 0.0
+
+        numeric_count = sum(
+            1 for t in tokens
+            if any(c.isdigit() for c in t)
+        )
+        numeric_ratio = numeric_count / len(tokens)
+
+        if numeric_ratio < AgenticSearch._TABLE_STRUCTURE_MIN_NUMERIC_RATIO:
+            return 0.0
+
+        row_score = min(rows / 30.0, 1.0)
+        num_score = min(numeric_ratio / 0.4, 1.0)
+        return (row_score * 0.5 + num_score * 0.5)
 
     @staticmethod
     def _deduplicate_table_sections(
@@ -4521,10 +4579,18 @@ class AgenticSearch(BaseSearch):
                 tok for tok in query.lower().split() if len(tok) >= 2
             )
             if query_tokens:
+                struct_bonus = AgenticSearch._TABLE_STRUCTURE_BONUS
                 scored = [
-                    (AgenticSearch._score_table_relevance(
-                        t.get("markdown", ""), query_tokens,
-                    ), idx, t)
+                    (
+                        AgenticSearch._score_table_relevance(
+                            t.get("markdown", ""), query_tokens,
+                        )
+                        + struct_bonus * AgenticSearch._score_table_structure(
+                            t.get("markdown", ""),
+                        ),
+                        idx,
+                        t,
+                    )
                     for idx, t in enumerate(tables)
                 ]
                 scored.sort(key=lambda x: (-x[0], x[1]))
@@ -4896,6 +4962,43 @@ class AgenticSearch(BaseSearch):
                                     )
         except Exception:
             pass
+
+        # ── Phase 5.5: Cross-section table supplement ──
+        # The leaf-scoped supplement (above) only includes tables from
+        # pages matching selected leaves.  When leaves cluster in one
+        # region (e.g. management discussion), data-dense tables from
+        # other sections (e.g. financial statements) are missed.
+        # Fix: include top-ranked tables from UNCOVERED pages.
+        if _all_tables and leaves:
+            _leaf_page_set: Set[int] = set()
+            for _lf in leaves:
+                _pr = getattr(_lf, "page_range", None)
+                if _pr and len(_pr) == 2 and _pr[0] is not None:
+                    _leaf_page_set.update(range(
+                        max(1, _pr[0] - self._NAV_PAGE_MARGIN),
+                        _pr[1] + self._NAV_PAGE_MARGIN + 1,
+                    ))
+            _cross_tables = [
+                t for t in _all_tables
+                if t.get("page_number") is not None
+                and t["page_number"] not in _leaf_page_set
+            ]
+            if _cross_tables:
+                _cross_ev = self._format_table_evidence(
+                    _cross_tables,
+                    max_chars=self._TABLE_CROSS_SECTION_CHARS,
+                    query=query,
+                )
+                if _cross_ev:
+                    parts.append(
+                        f"[{fname} - Cross-section Tables]\n{_cross_ev}"
+                    )
+                    print(
+                        f"SEARCH_WIKI_DEBUG [N5.3] cross_section_tables: "
+                        f"uncovered_tables={len(_cross_tables)}, "
+                        f"ev_len={len(_cross_ev)}",
+                        flush=True,
+                    )
 
         # Plan 3: If evidence is still too thin, add full table digest as standalone
         evidence = "\n\n".join(parts)
