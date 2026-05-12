@@ -87,6 +87,54 @@ _NO_RESULTS_MESSAGE = "No results found."
 # Soft-similarity threshold for gradient cluster reuse (P2)
 _SOFT_SIM_THRESHOLD = 0.65
 
+
+class _PathScope:
+    """Immutable search-path scope for filtering compile artifacts.
+
+    Resolves the provided search paths into absolute file paths and
+    directory prefixes, then offers ``contains()`` to test whether a
+    given artifact path falls within this scope.
+
+    When the scope is empty (no paths provided), ``contains()`` always
+    returns True — i.e. *no filtering* is applied.
+    """
+
+    __slots__ = ("_files", "_dirs", "_empty")
+
+    def __init__(self, search_paths: Optional[List[str]] = None) -> None:
+        files: Set[str] = set()
+        dirs: List[str] = []
+        if search_paths:
+            for p in search_paths:
+                resolved = str(Path(p).expanduser().resolve())
+                if Path(resolved).is_file():
+                    files.add(resolved)
+                elif Path(resolved).is_dir():
+                    dirs.append(
+                        resolved if resolved.endswith(os.sep)
+                        else resolved + os.sep
+                    )
+                else:
+                    files.add(resolved)
+        self._files = frozenset(files)
+        self._dirs = tuple(dirs)
+        self._empty = not files and not dirs
+
+    def contains(self, file_path: str) -> bool:
+        """Return True when *file_path* falls within the search scope."""
+        if self._empty:
+            return True
+        if not file_path:
+            return False
+        resolved = str(Path(file_path).expanduser().resolve())
+        if resolved in self._files:
+            return True
+        return any(resolved.startswith(d) for d in self._dirs)
+
+    @property
+    def is_empty(self) -> bool:
+        return self._empty
+
 # Pure tree search mode for ablation experiments.
 # When enabled, search relies solely on tree index navigation, skipping rga keyword search.
 _PURE_TREE_SEARCH: bool = os.getenv("SIRCHMUNK_PURE_TREE_SEARCH", "false").lower() == "true"
@@ -1556,7 +1604,8 @@ class AgenticSearch(BaseSearch):
         _llm_usage_start = len(self.llm_usages)
 
         # --- Adaptive compile artifact detection (shared with FAST) ---
-        artifacts = self._detect_compile_artifacts()
+        _scope = _PathScope(paths)
+        artifacts = self._detect_compile_artifacts(paths)
 
         # ==============================================================
         # Phase 0a: Direct document analysis (intent-gated short-circuit)
@@ -1591,8 +1640,8 @@ class AgenticSearch(BaseSearch):
             self._probe_knowledge_cache(query),
             self._load_spec_context(paths, stale_hours=spec_stale_hours),
             self._probe_tree_index(query),
-            self._probe_compile_hints([query]),  # query-level hints; keyword-level runs post-Phase 1
-            self._probe_summary_index(query, artifacts),    # GAP 2: zero-LLM BM25
+            self._probe_compile_hints([query], scope=_scope),  # query-level hints; keyword-level runs post-Phase 1
+            self._probe_summary_index(query, artifacts, scope=_scope),    # GAP 2: zero-LLM BM25
             self._probe_catalog_for_deep(query, artifacts),  # GAP 4: zero-LLM keyword overlap
             return_exceptions=True,
         )
@@ -2322,7 +2371,8 @@ class AgenticSearch(BaseSearch):
         self._tree_nav_cache = _TreeNavCache()
 
         # --- Adaptive compile artifact detection (one-shot, zero LLM) ---
-        artifacts = self._detect_compile_artifacts()
+        _scope = _PathScope(paths)
+        artifacts = self._detect_compile_artifacts(paths)
         if artifacts.catalog or artifacts.tree_available_paths:
             await self._logger.info(
                 f"[FAST:Artifacts] catalog={'yes' if artifacts.catalog else 'no'} "
@@ -2375,7 +2425,7 @@ class AgenticSearch(BaseSearch):
             messages=[{"role": "user", "content": prompt}],
             stream=False,
         )
-        _compile_hints_task = self._probe_compile_hints([query])
+        _compile_hints_task = self._probe_compile_hints([query], scope=_scope)
         _tree_probe_task = self._probe_tree_for_fast(query, artifacts)
 
         _parallel_results = await asyncio.gather(
@@ -2494,7 +2544,7 @@ class AgenticSearch(BaseSearch):
                     keyword_idfs.setdefault(p, 0.6)
 
         # P4: compile hints — pre-fetched (query-level) + keyword-level supplement
-        _kw_compile_hints = await self._probe_compile_hints(primary + fallback)
+        _kw_compile_hints = await self._probe_compile_hints(primary + fallback, scope=_scope)
         compile_hints = self._merge_compile_hints(_early_compile_hints, _kw_compile_hints)
         for kw in compile_hints.extra_keywords:
             if kw not in all_kw_set:
@@ -2515,7 +2565,7 @@ class AgenticSearch(BaseSearch):
                 seen_hint_paths.add(fp)
                 compile_hint_files.append(fp)
         # Summary index BM25 files: proactive zero-LLM discovery (GAP 2)
-        _summary_hint_files = await self._probe_summary_index(query, artifacts)
+        _summary_hint_files = await self._probe_summary_index(query, artifacts, scope=_scope)
         for fp in _summary_hint_files:
             if fp not in seen_hint_paths:
                 seen_hint_paths.add(fp)
@@ -3551,7 +3601,10 @@ class AgenticSearch(BaseSearch):
             pass
         return None
 
-    def _detect_compile_artifacts(self) -> CompileArtifacts:
+    def _detect_compile_artifacts(
+        self,
+        search_paths: Optional[List[str]] = None,
+    ) -> CompileArtifacts:
         """One-shot probe of all compile artifacts for adaptive FAST activation.
 
         Reads the document catalog and scans the tree cache directory to
@@ -3559,12 +3612,19 @@ class AgenticSearch(BaseSearch):
         start of ``_search_fast()``; the result is passed to downstream
         helpers so they can enable enhanced logic only when artifacts exist.
 
+        When *search_paths* is provided, all returned artifacts are filtered
+        to only include entries whose file paths fall within the search scope.
+        This ensures downstream consumers (catalog routing, tree probing,
+        summary index) never see documents outside the requested scope.
+
         Cost: one JSON read (catalog) + one directory listing (tree cache).
         Tree path results are cached in ``_tree_paths_cache`` so subsequent
         calls within the same instance avoid re-parsing every JSON file.
         Returns a ``CompileArtifacts`` with ``None``/empty fields when
         compile has not been run.
         """
+        scope = _PathScope(search_paths)
+
         catalog = self._load_document_catalog()
         catalog_map: Dict[str, Dict[str, str]] = {}
         if catalog:
@@ -3622,6 +3682,14 @@ class AgenticSearch(BaseSearch):
                 summary_index = CompileSummaryIndex.load(summary_index_path)
             except Exception:
                 pass
+
+        # --- Apply search-path scope filtering ---
+        if not scope.is_empty:
+            if catalog:
+                catalog = [e for e in catalog if scope.contains(e.get("path", ""))]
+            catalog_map = {p: e for p, e in catalog_map.items() if scope.contains(p)}
+            tree_paths = {p for p in tree_paths if scope.contains(p)}
+            manifest_map = {p: e for p, e in manifest_map.items() if scope.contains(p)}
 
         print(f"SEARCH_WIKI_DEBUG [D1] manifest_map: {len(manifest_map)} entries, keys={list(manifest_map.keys())[:3]}", flush=True)
         print(f"SEARCH_WIKI_DEBUG [D2] tree_available_paths: {tree_paths}", flush=True)
@@ -5126,8 +5194,16 @@ class AgenticSearch(BaseSearch):
         if not tokens:
             return trees
 
-        year_tokens = {t for t in tokens if re.fullmatch(r"(?:19|20)\d{2}", t)}
-        entity_tokens = {t for t in tokens if len(t) >= 3 and t not in year_tokens}
+        # Extract years: bare "2018" and compound prefixed forms "fy2018", "cy2023"
+        year_tokens: Set[str] = set()
+        for t in tokens:
+            if re.fullmatch(r"(?:19|20)\d{2}", t):
+                year_tokens.add(t)
+            else:
+                m = re.search(r"((?:19|20)\d{2})", t)
+                if m:
+                    year_tokens.add(m.group(1))
+        entity_tokens = {t for t in tokens if len(t) >= 2 and t not in year_tokens}
 
         scored: List[Tuple[float, int]] = []
         for idx, tree in enumerate(trees):
@@ -5238,12 +5314,20 @@ class AgenticSearch(BaseSearch):
         except Exception:
             return []
 
-    async def _probe_compile_hints(self, keywords: List[str]) -> CompileHints:
+    async def _probe_compile_hints(
+        self,
+        keywords: List[str],
+        *,
+        scope: Optional["_PathScope"] = None,
+    ) -> CompileHints:
         """Zero-LLM enrichment from compile manifest and tree cache.
 
         Scans the compile manifest for clusters whose patterns overlap with
         the query keywords, and scans cached tree root summaries for keyword
         matches.  No LLM calls — only local JSON reads and in-memory DB lookups.
+
+        When *scope* is provided, only file paths falling within the scope
+        are included in the returned hints.
         """
         empty = CompileHints([], [])
         if not keywords:
@@ -5254,6 +5338,11 @@ class AgenticSearch(BaseSearch):
         extra_keywords: List[str] = []
         seen_paths: set = set()
         seen_kw: set = set(kw_lower)
+
+        def _accept(fp: str) -> bool:
+            return bool(fp) and fp not in seen_paths and Path(fp).exists() and (
+                scope is None or scope.contains(fp)
+            )
 
         # --- Cluster pattern matching via manifest ---
         manifest_path = self.work_path / ".cache" / "compile" / "manifest.json"
@@ -5280,7 +5369,7 @@ class AgenticSearch(BaseSearch):
                     if kw_lower & set(cluster_patterns):
                         for ev in getattr(c, "evidences", []):
                             fp = str(getattr(ev, "file_or_url", ""))
-                            if fp and fp not in seen_paths and Path(fp).exists():
+                            if _accept(fp):
                                 seen_paths.add(fp)
                                 file_paths.append(fp)
                         for p in cluster_patterns:
@@ -5307,7 +5396,7 @@ class AgenticSearch(BaseSearch):
                     summary_lower = (tree.root.summary or "").lower()
                     if any(kw in summary_lower for kw in kw_lower):
                         fp = tree.file_path
-                        if fp not in seen_paths and Path(fp).exists():
+                        if _accept(fp):
                             seen_paths.add(fp)
                             file_paths.append(fp)
             except Exception:
@@ -5339,6 +5428,8 @@ class AgenticSearch(BaseSearch):
         self,
         query: str,
         artifacts: Optional["CompileArtifacts"] = None,
+        *,
+        scope: Optional["_PathScope"] = None,
     ) -> List[str]:
         """Zero-LLM file discovery via compile-time summary index (BM25 only).
 
@@ -5346,9 +5437,13 @@ class AgenticSearch(BaseSearch):
         summaries are lexically similar to the query.  No LLM or embedding
         calls — pure local computation.
 
+        When *scope* is provided, results are post-filtered to only include
+        file paths within the search scope.
+
         Args:
             query: User query string.
             artifacts: Compile artifacts (uses summary_index field).
+            scope: Optional path scope for filtering results.
 
         Returns:
             File paths of top-k matching documents, or empty list.
@@ -5374,6 +5469,7 @@ class AgenticSearch(BaseSearch):
             file_paths = [
                 fp for fp, score in results
                 if score > 0.0 and Path(fp).exists()
+                and (scope is None or scope.contains(fp))
             ]
 
             if file_paths:
@@ -5459,6 +5555,10 @@ class AgenticSearch(BaseSearch):
 
         try:
             trees = self._load_cached_trees()
+            # Scope-filter: only keep trees whose files are in artifacts
+            if artifacts and artifacts.tree_available_paths:
+                scoped = artifacts.tree_available_paths
+                trees = [t for t in trees if t.file_path in scoped]
             print(f"SEARCH_WIKI_DEBUG [D5] loaded_trees: {len(trees)} trees, paths={[t.file_path for t in trees][:3]}", flush=True)
             if not trees:
                 return []
