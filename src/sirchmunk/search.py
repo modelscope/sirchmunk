@@ -2225,7 +2225,7 @@ class AgenticSearch(BaseSearch):
         ".css", ".bash", ".java", ".c", ".cpp", ".h", ".go", ".rs",
     }
     _FAST_CONTEXT_WINDOW = 30  # ± lines around each grep hit
-    _FAST_MAX_EVIDENCE_CHARS = 20_000  # Plan 5: expanded from 15K to accommodate richer table evidence
+    _FAST_MAX_EVIDENCE_CHARS = 40_000
     _FAST_SMALL_FILE_THRESHOLD = 100_000  # 100K chars - read full file instead of grep sampling
 
     # --- Wiki-enhanced ranking constants ---
@@ -2261,7 +2261,7 @@ class AgenticSearch(BaseSearch):
     """Maximum files returned by catalog keyword-overlap probe in DEEP mode."""
 
     # --- Tree-guided sampling constants ---
-    _TREE_SAMPLE_MAX_SECTIONS = 5
+    _TREE_SAMPLE_MAX_SECTIONS = 8
     """Max tree sections to include per file in tree-guided sampling."""
     _TREE_SAMPLE_SECTION_MAX_CHARS = 3000
     """Max chars per tree section."""
@@ -2280,6 +2280,10 @@ class AgenticSearch(BaseSearch):
     _CHAR_RANGE_MAX_SPAN_RATIO: float = 0.8
     """char_range spanning more than this ratio of the document is treated as invalid."""
 
+    # --- Tree probe / RGA fusion ---
+    _TREE_PROBE_RANKING_BOOST: float = 3.0
+    """Score boost (0-10 scale) for files selected by LLM tree probing."""
+
     # --- Hierarchical file selection for large tree pools ---
     _TREE_PREFILTER_THRESHOLD: int = 15
     """Tree pool size above which rule-based pre-filtering is applied."""
@@ -2288,10 +2292,12 @@ class AgenticSearch(BaseSearch):
     _TREE_PREFILTER_MIN_SCORE: float = 0.5
     """Minimum relevance score for a tree to survive pre-filtering."""
 
-    # --- Tree navigation retry (Plan 3) ---
+    # --- Tree navigation ---
+    _TREE_NAV_MAX_RESULTS: int = 8
+    """Primary max_results for LLM-driven tree navigation."""
     _NAV_RETRY_MIN_EVIDENCE_CHARS: int = 200
     """Evidence below this length triggers a retry with expanded results."""
-    _NAV_RETRY_EXPANDED_RESULTS: int = 8
+    _NAV_RETRY_EXPANDED_RESULTS: int = 12
     """Expanded max_results for retry navigation pass."""
 
     _CHAR_RANGE_MIN_SPAN: int = 200
@@ -2305,12 +2311,12 @@ class AgenticSearch(BaseSearch):
     _NAV_COMPLEMENT_MIN_COMPONENTS: int = 2
     """Minimum query decomposition components to trigger complementary navigation."""
 
-    # --- Table evidence budgets (Plan 5) ---
-    _TABLE_EVIDENCE_DEFAULT_CHARS: int = 10_000
-    """Default max_chars for _format_table_evidence (was 6000)."""
+    # --- Table evidence budgets ---
+    _TABLE_EVIDENCE_DEFAULT_CHARS: int = 20_000
+    """Default max_chars for _format_table_evidence."""
     _TABLE_EVIDENCE_PER_RANGE_CHARS: int = 8_000
-    """Max chars for per-page-range table supplement in tree nav (was 4000)."""
-    _TABLE_EVIDENCE_STANDALONE_CHARS: int = 12_000
+    """Max chars for per-page-range table supplement in tree nav."""
+    _TABLE_EVIDENCE_STANDALONE_CHARS: int = 20_000
     """Max chars for standalone table digest fallback when tree nav evidence is thin."""
 
     # --- Self-correction expanded sampling ---
@@ -2445,6 +2451,7 @@ class AgenticSearch(BaseSearch):
         if isinstance(_tree_probed_files, Exception):
             await self._logger.warning(f"[FAST:Step1] Tree probe failed: {_tree_probed_files}")
             _tree_probed_files = []
+        _tree_probed_set: frozenset[str] = frozenset(_tree_probed_files)
 
         self.llm_usages.append(resp.usage)
         if resp.usage and isinstance(resp.usage, dict):
@@ -2671,10 +2678,26 @@ class AgenticSearch(BaseSearch):
                     for p in catalog_routed_files[:top_k_files]
                 ]
 
+            # Narrow-scope RGA: search within tree-probed files first
+            if not best_files and _tree_probed_set and primary:
+                best_files = await self._fast_find_best_file(
+                    primary, paths=list(_tree_probed_set),
+                    top_k=top_k_files, keyword_idfs=keyword_idfs,
+                    query=query, artifacts=artifacts,
+                )
+                if best_files:
+                    used_level = "tree_rga"
+                    await self._logger.info(
+                        f"[FAST:Step2] Narrow-scope tree+rga hit → "
+                        f"{[Path(f['path']).name for f in best_files]}"
+                    )
+
+            # Full-scope RGA with tree probe boost
             if not best_files and primary:
                 best_files = await self._fast_find_best_file(
                     primary, top_k=top_k_files, keyword_idfs=keyword_idfs,
                     query=query, artifacts=artifacts,
+                    tree_probed_paths=_tree_probed_set or None,
                     **rga_kwargs,
                 )
 
@@ -2686,6 +2709,7 @@ class AgenticSearch(BaseSearch):
                 best_files = await self._fast_find_best_file(
                     fallback, top_k=top_k_files, keyword_idfs=keyword_idfs,
                     query=query, artifacts=artifacts,
+                    tree_probed_paths=_tree_probed_set or None,
                     **rga_kwargs,
                 )
 
@@ -2756,7 +2780,11 @@ class AgenticSearch(BaseSearch):
                 print(f"SEARCH_WIKI_DEBUG [D11] MISMATCH! tree_available_paths={artifacts.tree_available_paths}", flush=True)
 
             if artifacts and tree_nav_target in artifacts.tree_available_paths:
-                tree_task = self._navigate_tree_for_evidence(tree_nav_target, query)
+                tree_task = self._navigate_tree_for_evidence(
+                    tree_nav_target, query,
+                    max_results=self._TREE_NAV_MAX_RESULTS,
+                    match_objects=best_files[0].get("matches"),
+                )
                 tree_nav_done.add(tree_nav_target)
             else:
                 tree_task = self._async_noop(None)
@@ -2818,12 +2846,15 @@ class AgenticSearch(BaseSearch):
 
                         if _all_tables:
                             _table_ev = self._format_table_evidence(
-                                _all_tables, query=query,
+                                _all_tables,
+                                max_chars=self._TABLE_EVIDENCE_DEFAULT_CHARS,
+                                query=query,
                             )
                             if _table_ev:
                                 ev = f"[{fn} - Table Evidence]\n{_table_ev}"
 
-                    # 1. Tree-guided sampling FIRST for tree-indexed files
+                    # 1. Tree-guided sampling for tree-indexed files
+                    # (skipped when a parallel tree_task already covers this file)
                     _tree_cond = artifacts and fp in artifacts.tree_available_paths and fp not in tree_nav_done
                     print(f"SEARCH_WIKI_DEBUG [D14] tree_sample: cond={_tree_cond}, in_tree_paths={fp in (artifacts.tree_available_paths if artifacts else set())}, in_nav_done={fp in tree_nav_done}", flush=True)
                     if (
@@ -2839,7 +2870,10 @@ class AgenticSearch(BaseSearch):
                                 artifacts=artifacts,
                             )
                             if tree_ev_inner:
-                                ev = tree_ev_inner
+                                if ev:
+                                    ev = ev + "\n\n" + tree_ev_inner
+                                else:
+                                    ev = tree_ev_inner
                                 await self._logger.info(
                                     f"[FAST:Step3] Tree-guided sample for {fn} "
                                     f"({len(tree_ev_inner)} chars)"
@@ -2883,6 +2917,8 @@ class AgenticSearch(BaseSearch):
             rga_ev, tree_ev = await asyncio.gather(rga_task, tree_task)
 
             # Merge: tree evidence first (highest quality), then rga
+            if tree_ev and rga_ev:
+                rga_ev = self._deduplicate_table_sections(tree_ev, rga_ev)
             evidence_parts_final: List[str] = []
             if tree_ev:
                 evidence_parts_final.append(tree_ev)
@@ -3257,10 +3293,15 @@ class AgenticSearch(BaseSearch):
         keyword_idfs: Optional[Dict[str, float]] = None,
         query: str = "",
         artifacts: Optional["CompileArtifacts"] = None,
+        tree_probed_paths: Optional[Set[str]] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Search per keyword via rga and return the top-k best-matching files
         ranked by IDF-weighted log-TF scoring, optionally enhanced with
         wiki-derived relevance from compile artifacts.
+
+        When *tree_probed_paths* is provided, files that were selected by
+        LLM-driven tree probing receive a ranking boost, ensuring the tree
+        probe's high-quality signal influences the final file ordering.
 
         Args:
             keywords: Search keywords from FAST Step 1.
@@ -3272,6 +3313,7 @@ class AgenticSearch(BaseSearch):
             keyword_idfs: Pre-computed IDF values for keywords.
             query: Original user query (used for wiki relevance scoring).
             artifacts: Compile artifacts for adaptive wiki-enhanced ranking.
+            tree_probed_paths: File paths selected by tree probing (receive boost).
 
         Returns:
             List of merged file dicts (path, matches, lines, total_matches, weighted_score) or None.
@@ -3426,6 +3468,11 @@ class AgenticSearch(BaseSearch):
                     self._WIKI_BLEND_ALPHA * tf_idf_norm
                     + (1 - self._WIKI_BLEND_ALPHA) * wiki_score
                 )
+
+        if tree_probed_paths:
+            for f in merged:
+                if f["path"] in tree_probed_paths:
+                    f["weighted_score"] += self._TREE_PROBE_RANKING_BOOST
 
         merged.sort(key=lambda f: f["weighted_score"], reverse=True)
         pruned = self._prune_by_score(merged, top_k=top_k)
@@ -4386,9 +4433,43 @@ class AgenticSearch(BaseSearch):
         return hits / len(query_tokens)
 
     @staticmethod
+    def _deduplicate_table_sections(
+        primary_ev: str, secondary_ev: str,
+    ) -> str:
+        """Remove table sections from *secondary_ev* whose pages already
+        appear in *primary_ev*.
+
+        Matching is based on ``[Table from page N]`` and ``[Tables pp.X-Y]``
+        headers.  Non-table content in *secondary_ev* is preserved intact.
+        """
+        if not primary_ev or not secondary_ev:
+            return secondary_ev
+
+        covered: Set[int] = {
+            int(m.group(1))
+            for m in re.finditer(r"\[Table from page (\d+)\]", primary_ev)
+        }
+        for m in re.finditer(r"\[Tables pp\.(\d+)-(\d+)\]", primary_ev):
+            covered.update(range(int(m.group(1)), int(m.group(2)) + 1))
+
+        if not covered:
+            return secondary_ev
+
+        blocks = secondary_ev.split("\n\n")
+        kept: List[str] = []
+        for block in blocks:
+            page_m = re.search(r"\[Table from page (\d+)\]", block)
+            if page_m and int(page_m.group(1)) in covered:
+                continue
+            kept.append(block)
+
+        result = "\n\n".join(kept)
+        return result if result.strip() else ""
+
+    @staticmethod
     def _format_table_evidence(
         tables: List[Dict[str, Any]],
-        max_chars: int = 10_000,
+        max_chars: int = 20_000,
         query: str = "",
     ) -> str:
         """Format table digest entries as LLM-friendly evidence text.
@@ -4410,7 +4491,7 @@ class AgenticSearch(BaseSearch):
         ordered = tables
         if query:
             query_tokens = frozenset(
-                tok for tok in query.lower().split() if len(tok) > 2
+                tok for tok in query.lower().split() if len(tok) >= 2
             )
             if query_tokens:
                 scored = [
@@ -4465,13 +4546,22 @@ class AgenticSearch(BaseSearch):
         parts.append(f"{header}\n{text}")
 
     async def _navigate_tree_for_evidence(
-        self, file_path: str, query: str, *, max_results: int = 5,
+        self,
+        file_path: str,
+        query: str,
+        *,
+        max_results: int = 8,
+        match_objects: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[str]:
         """LLM-driven tree navigation: select relevant sections and read leaf content.
 
         Uses 1 LLM call to drill into the compiled tree index for
         *file_path*, returning concatenated leaf content as evidence.
         Returns None when no tree cache is available.
+
+        When *match_objects* (RGA hit dicts) are provided, keyword-level
+        context windows are appended as supplementary evidence after tree
+        navigation, fusing structural and keyword signals.
 
         Extraction priority (highest first):
           1. char_range   – compile-time ENHANCED content slice (preserves tables)
@@ -4795,6 +4885,38 @@ class AgenticSearch(BaseSearch):
                 print(f"SEARCH_WIKI_DEBUG [N5.1] standalone_table_fallback: len={len(standalone_table_ev)}", flush=True)
 
         print(f"SEARCH_WIKI_DEBUG [N5] table_supplement: tables_loaded={len(_all_tables) if _all_tables else 0}", flush=True)
+
+        # --- RGA keyword supplement: fuse keyword hits into tree evidence ---
+        if match_objects:
+            _ev_len = sum(len(p) for p in parts)
+            _rga_budget = max(0, self._FAST_MAX_EVIDENCE_CHARS - _ev_len)
+            if _rga_budget > 200:
+                hit_lines: List[int] = [
+                    m.get("data", {}).get("line_number")
+                    for m in match_objects
+                    if isinstance(m.get("data", {}).get("line_number"), int)
+                ]
+                ext = Path(file_path).suffix.lower()
+                rga_ctx: Optional[str] = None
+                if ext in self._FAST_TEXT_EXTENSIONS and hit_lines:
+                    rga_ctx = self._read_context_windows(
+                        file_path, hit_lines,
+                        window=self._FAST_CONTEXT_WINDOW,
+                        max_chars=_rga_budget,
+                    )
+                else:
+                    snippet_parts: List[str] = []
+                    snippet_total = 0
+                    for m in match_objects:
+                        text = m.get("data", {}).get("lines", {}).get("text", "").rstrip()
+                        if text and snippet_total + len(text) < _rga_budget:
+                            snippet_parts.append(text)
+                            snippet_total += len(text)
+                    if snippet_parts:
+                        rga_ctx = "\n".join(snippet_parts)
+                if rga_ctx:
+                    parts.append(f"[{fname} \u2192 keyword hits]\n{rga_ctx}")
+                    evidence = "\n\n".join(parts)
 
         print(f"SEARCH_WIKI_DEBUG [N6] _navigate_tree_for_evidence result: len={len(evidence) if evidence else 0}", flush=True)
         await self._logger.info(
