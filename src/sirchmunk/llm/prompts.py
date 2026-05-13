@@ -426,7 +426,6 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 5. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
 6. **Rounding**: Match the precision implied by the query. When the question asks for a value in specific units (e.g. "in USD millions"), round the final result to match the expected granularity. For percentages, use at most one decimal place unless the query explicitly asks for more. For dollar amounts, round to the nearest whole number in the stated unit. Example: if the raw calculation yields $8.738 billion and the expected unit is "USD billions", report $8.7 billion or $8.74 billion, not $8.738 billion.
 7. **Best-effort answering**: Always attempt to answer based on available evidence. When the query requests a specific metric, ratio, or calculation, compute it from whatever relevant data is available — even if the data is partial. Do not refuse to calculate a metric solely because you believe it is unconventional or less applicable for a given entity type. Only mark SHOULD_ANSWER as "false" when the evidence is entirely unrelated to the query.
-8. **Binary/judgment questions**: For questions expecting a Yes/No or directional answer, briefly list evidence supporting each side before stating your conclusion. Base your answer on the quantitative evidence rather than subjective assessments.
 
 ### Input Data
 - **User Input**: {user_input}
@@ -470,7 +469,6 @@ Leverage the document context below for better understanding of the source mater
 5. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
 6. **Rounding**: Match the precision implied by the query. When the question asks for a value in specific units (e.g. "in USD millions"), round the final result to match the expected granularity. For percentages, use at most one decimal place unless the query explicitly asks for more. For dollar amounts, round to the nearest whole number in the stated unit. Example: if the raw calculation yields $8.738 billion and the expected unit is "USD billions", report $8.7 billion or $8.74 billion, not $8.738 billion.
 7. **Best-effort answering**: Always attempt to answer based on available evidence. When the query requests a specific metric, ratio, or calculation, compute it from whatever relevant data is available — even if the data is partial. Do not refuse to calculate a metric solely because you believe it is unconventional or less applicable for a given entity type. Only mark SHOULD_ANSWER as "false" when the evidence is entirely unrelated to the query.
-8. **Binary/judgment questions**: For questions expecting a Yes/No or directional answer, briefly list evidence supporting each side before stating your conclusion. Base your answer on the quantitative evidence rather than subjective assessments.
 
 ### Document Context
 {document_context}
@@ -502,6 +500,87 @@ Evaluate based on:
 </PRECISE_ANSWER>
 <SHOULD_ANSWER>true/false</SHOULD_ANSWER>
 <SHOULD_SAVE>true/false</SHOULD_SAVE>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Deep Structured Reasoning prompts
+# ---------------------------------------------------------------------------
+
+DEEP_SECTION_SELECT = """Given the user query and a document section map, select the sections most likely to contain the answer.
+
+### User Query
+{query}
+
+### Document Section Map
+{section_map}
+
+### Instructions
+1. Identify which sections contain data needed to answer the query.
+2. For questions requiring computation (ratios, growth rates, comparisons), select ALL sections containing the required input data.
+3. Prefer sections containing structured data (tables, financial statements) over narrative sections.
+4. Select 1-5 sections. Fewer is better if you are confident.
+
+### Output
+Return ONLY a JSON array of section indices (0-based) from the map above:
+[0, 3, 5]
+"""
+
+
+DEEP_STRUCTURED_EXTRACT = """Extract all data relevant to the query from the provided document content.
+
+### User Query
+{query}
+
+### Document Content
+{evidence}
+
+### Instructions
+1. Extract every data point, number, or fact that could help answer the query.
+2. Preserve exact values, units, and context (e.g. fiscal year, line item name).
+3. For tables, extract the specific rows and columns relevant to the query.
+4. Note the source location (section title or page) for each extracted item.
+5. If the query requires a calculation, identify and extract ALL input values needed.
+
+### Output Format
+<EXTRACTED_DATA>
+- [source]: [data point name] = [value] [unit]
+- [source]: [data point name] = [value] [unit]
+...
+</EXTRACTED_DATA>
+<DATA_COMPLETENESS>complete|partial|insufficient</DATA_COMPLETENESS>
+<MISSING_DATA>
+[List any data items needed to answer the query that were NOT found. Empty if complete.]
+</MISSING_DATA>
+"""
+
+
+DEEP_COT_REASONING = """Answer the query using ONLY the extracted data below. Show complete reasoning.
+
+### User Query
+{query}
+
+### Extracted Data
+{structured_data}
+
+### Instructions
+1. State which data points you will use and why.
+2. Show ALL calculation steps explicitly (one operation per line).
+3. After computing the result, verify it:
+   a. Check units and order of magnitude.
+   b. Cross-check with any alternative data if available.
+   c. Ensure the result directly answers what was asked.
+4. Match the precision and units implied by the query.
+
+### Output Format
+<REASONING>
+[Step-by-step reasoning with explicit calculations]
+</REASONING>
+<VERIFICATION>
+[Sanity checks and cross-validation]
+</VERIFICATION>
+<ANSWER>[Your final answer here]</ANSWER>
+<CONFIDENCE>high|medium|low</CONFIDENCE>
 """
 
 

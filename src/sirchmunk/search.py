@@ -27,6 +27,9 @@ from sirchmunk.llm.prompts import (
     DOC_SUMMARY,
     DOC_CHUNK_SUMMARY,
     DOC_MERGE_SUMMARIES,
+    DEEP_SECTION_SELECT,
+    DEEP_STRUCTURED_EXTRACT,
+    DEEP_COT_REASONING,
 )
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.schema.knowledge import (
@@ -1833,111 +1836,234 @@ class AgenticSearch(BaseSearch):
                 cluster.content = f"{cluster.content}\n\n{graph_ctx}"
 
         # ==============================================================
-        # Phase 4: Generate answer — cluster summary or ReAct refinement
+        # Phase 3.6: Adaptive depth — fast triage for simple queries
+        # When pre-nav evidence is sufficient, attempt FAST-style synthesis.
+        # The LLM decides via SHOULD_ANSWER + PRECISE_ANSWER whether the
+        # evidence is adequate — no hardcoded heuristic.  If the LLM
+        # returns a precise answer with acceptance, we skip the heavier
+        # structured reasoning pipeline.
         # ==============================================================
-        context.increment_loop()
-        answer: str = ""
-        should_save: bool = True
+        _fast_triage_answer: Optional[str] = None
+        _fast_triage_accepted = False
 
-        # Inject catalog context for wiki-enhanced answer (GAP 4)
-        if artifacts and artifacts.catalog_map and cluster and cluster.content:
-            _catalog_ctx_parts = []
-            for fp in (cluster.search_results or merged_files)[:3]:
-                ctx = self._build_answer_context(fp, artifacts)
-                if ctx:
-                    _catalog_ctx_parts.append(ctx)
-            if _catalog_ctx_parts:
-                _catalog_context = "\n".join(_catalog_ctx_parts)
-                if isinstance(cluster.content, list):
-                    cluster.content = "\n".join(cluster.content)
-                cluster.content = f"{cluster.content}\n\n[Document Context]\n{_catalog_context}"
-                await self._logger.info(
-                    f"[Phase 4] Injected catalog context for {len(_catalog_ctx_parts)} documents"
+        if _pre_nav_evidence:
+            _pre_nav_total = sum(len(v) for v in _pre_nav_evidence.values())
+            await self._logger.info(
+                f"[Phase 3.6] Fast triage: {_pre_nav_total} chars of pre-nav evidence"
+            )
+            _triage_evidence = "\n\n---\n\n".join(
+                f"[{Path(fp).name}]\n{ev}"
+                for fp, ev in _pre_nav_evidence.items()
+            )
+
+            doc_context = None
+            if artifacts and artifacts.catalog_map:
+                _ctx_parts = [
+                    self._build_answer_context(fp, artifacts)
+                    for fp in list(_pre_nav_evidence)[:2]
+                ]
+                _ctx_parts = [c for c in _ctx_parts if c]
+                if _ctx_parts:
+                    doc_context = "\n".join(_ctx_parts)
+
+            if doc_context:
+                from sirchmunk.llm.prompts import ROI_RESULT_SUMMARY_WITH_CONTEXT
+                _triage_prompt = ROI_RESULT_SUMMARY_WITH_CONTEXT.format(
+                    user_input=query,
+                    text_content=_triage_evidence,
+                    document_context=doc_context,
+                )
+            else:
+                _triage_prompt = ROI_RESULT_SUMMARY.format(
+                    user_input=query,
+                    text_content=_triage_evidence,
                 )
 
-        if cluster and cluster.content:
-            await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
-            answer, should_save, should_answer = await self._summarise_cluster(query, cluster)
+            _triage_resp = await self.llm.achat(
+                messages=[{"role": "user", "content": _triage_prompt}],
+                stream=True,
+            )
+            self.llm_usages.append(_triage_resp.usage)
+            context.increment_loop()
 
-            # --- Multi-factor evidence acceptance ---
-            cluster_evidence = str(cluster.content) if cluster and cluster.content else ""
-            accepted, accept_reason = self._evaluate_evidence_acceptance(
-                query, cluster_evidence, should_answer,
+            _triage_raw = _triage_resp.content or ""
+            _fast_triage_answer, _ft_save, _ft_should = (
+                self._parse_summary_response(_triage_raw)
             )
-            await self._logger.info(
-                f"[Phase 4] Evidence acceptance: {accepted} ({accept_reason})"
+            _fast_triage_accepted, _ft_reason = (
+                self._evaluate_evidence_acceptance(
+                    query, _triage_evidence, _ft_should,
+                )
             )
 
-            if not accepted:
-                if llm_fallback:
-                    await self._logger.info(
-                        "[Phase 4] Summary gate rejected evidence, llm_fallback=True → LLM fallback"
-                    )
-                    answer, should_save = await self._summarise_cluster_fallback(query)
-                else:
-                    await self._logger.warning(
-                        "[Phase 4] Summary gate rejected evidence and llm_fallback=False "
-                        "→ returning no results"
-                    )
-                    return _NO_RESULTS_MESSAGE, None, context
-            if not cluster.search_results:
-                cluster.search_results = list(merged_files)
-        elif llm_fallback:
-            await self._logger.info(
-                "[Phase 4] Evidence insufficient, llm_fallback=True \u2192 LLM summary"
+            # Require a PRECISE_ANSWER for true triage acceptance — if the
+            # LLM could not produce one, the query likely needs deeper
+            # reasoning even if evidence was nominally accepted.
+            _has_precise = bool(
+                re.search(
+                    r"<PRECISE_ANSWER>(.+?)</PRECISE_ANSWER>",
+                    _triage_raw, re.DOTALL,
+                )
             )
-            answer, should_save = await self._summarise_cluster_fallback(query)
+            if _fast_triage_accepted and not _has_precise:
+                _fast_triage_accepted = False
+                _ft_reason = "no_precise_answer"
+
+            await self._logger.info(
+                f"[Phase 3.6] Fast triage: accepted={_fast_triage_accepted} "
+                f"({_ft_reason})"
+            )
+
+        if _fast_triage_accepted and _fast_triage_answer:
+            answer = _fast_triage_answer
+            should_save = True
+            if not cluster:
+                cluster = self._make_answer_cluster(
+                    query, answer, "DT",
+                    file_paths=list(_pre_nav_evidence),
+                )
+            elif not cluster.content:
+                cluster.content = answer
+            await self._logger.info(
+                "[Phase 3.6] Fast triage accepted → skipping structured reasoning"
+            )
         else:
-            await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
-            # P5: enrich ReAct context with graph knowledge
-            react_spec = f"{spec_context}\n\n{graph_ctx}" if graph_ctx else spec_context
-            react_answer, context = await self._react_refinement(
-                query=query, paths=paths,
-                initial_keywords=initial_keywords, spec_context=react_spec,
-                enable_dir_scan=enable_dir_scan,
-                max_loops=max_loops, max_token_budget=max_token_budget,
-                max_depth=max_depth, include=include, exclude=exclude,
-            )
+            # ==============================================================
+            # Phase 4: Deep Structured Reasoning or cluster-based fallback
+            # ==============================================================
+            context.increment_loop()
+            answer = ""
+            should_save = True
 
-            if not cluster:
-                cluster = await self._build_cluster_from_context(
-                    query=query, answer=react_answer, context=context,
-                    query_keywords=query_keywords, top_k_files=top_k_files,
+            # Determine tree-indexed files for structured reasoning.
+            # tree_hits come from Phase 1 probe and are always tree-indexed;
+            # also check artifacts when available for broader coverage.
+            _sr_files: List[str] = []
+            if tree_hits:
+                _sr_files = list(tree_hits[: self._DEEP_STRUCTURED_MAX_FILES])
+            elif artifacts and artifacts.tree_available_paths:
+                _sr_files = list(artifacts.tree_available_paths)[
+                    : self._DEEP_STRUCTURED_MAX_FILES
+                ]
+
+            if _sr_files:
+                await self._logger.info(
+                    f"[Phase 4] Launching structured reasoning for "
+                    f"{len(_sr_files)} tree-indexed files"
                 )
-            elif react_answer and not cluster.content:
-                cluster.content = react_answer
-
-            if not cluster:
-                await self._logger.warning(
-                    "[Phase 4] ReAct found no buildable evidence and llm_fallback=False "
-                    "→ returning no results"
+                sr_answer, sr_cluster = await self._deep_structured_reasoning(
+                    query, _sr_files, artifacts, context,
                 )
-                return _NO_RESULTS_MESSAGE, None, context
 
-            # Final DEEP decision is always made in the summary call.
-            answer, should_save, should_answer = await self._summarise_cluster(query, cluster)
-
-            # --- Multi-factor evidence acceptance ---
-            final_cluster_evidence = str(cluster.content) if cluster and cluster.content else ""
-            final_accepted, final_reason = self._evaluate_evidence_acceptance(
-                query, final_cluster_evidence, should_answer,
-            )
-            await self._logger.info(
-                f"[Phase 4] Final evidence acceptance: {final_accepted} ({final_reason})"
-            )
-
-            if not final_accepted:
-                if llm_fallback:
+                if sr_answer:
+                    answer, should_save, should_answer = self._parse_summary_response(
+                        sr_answer
+                    )
+                    accepted, accept_reason = self._evaluate_evidence_acceptance(
+                        query,
+                        sr_answer,
+                        should_answer,
+                    )
                     await self._logger.info(
-                        "[Phase 4] Final summary gate rejected evidence, llm_fallback=True → LLM fallback"
+                        f"[Phase 4] Structured reasoning acceptance: "
+                        f"{accepted} ({accept_reason})"
                     )
-                    answer, should_save = await self._summarise_cluster_fallback(query)
+                    if accepted:
+                        cluster = sr_cluster or cluster
+                    else:
+                        answer = ""  # Fall through to cluster/ReAct path
+
+            # Fallback: original cluster summary or ReAct
+            if not answer:
+                # Inject catalog context for wiki-enhanced answer
+                if artifacts and artifacts.catalog_map and cluster and cluster.content:
+                    _catalog_ctx_parts = []
+                    for fp in (cluster.search_results or merged_files)[:3]:
+                        ctx = self._build_answer_context(fp, artifacts)
+                        if ctx:
+                            _catalog_ctx_parts.append(ctx)
+                    if _catalog_ctx_parts:
+                        _catalog_context = "\n".join(_catalog_ctx_parts)
+                        if isinstance(cluster.content, list):
+                            cluster.content = "\n".join(cluster.content)
+                        cluster.content = (
+                            f"{cluster.content}\n\n"
+                            f"[Document Context]\n{_catalog_context}"
+                        )
+
+                if cluster and cluster.content:
+                    await self._logger.info(
+                        "[Phase 4:Fallback] Generating summary from cluster"
+                    )
+                    answer, should_save, should_answer = (
+                        await self._summarise_cluster(query, cluster)
+                    )
+                    cluster_evidence = (
+                        str(cluster.content) if cluster.content else ""
+                    )
+                    accepted, accept_reason = (
+                        self._evaluate_evidence_acceptance(
+                            query, cluster_evidence, should_answer,
+                        )
+                    )
+                    if not accepted:
+                        if llm_fallback:
+                            answer, should_save = (
+                                await self._summarise_cluster_fallback(query)
+                            )
+                        else:
+                            return _NO_RESULTS_MESSAGE, None, context
+                    if not cluster.search_results:
+                        cluster.search_results = list(merged_files)
+                elif llm_fallback:
+                    answer, should_save = (
+                        await self._summarise_cluster_fallback(query)
+                    )
                 else:
-                    await self._logger.warning(
-                        "[Phase 4] Final summary gate rejected evidence and llm_fallback=False "
-                        "→ returning no results"
+                    await self._logger.info(
+                        "[Phase 4:Fallback] Launching ReAct refinement"
                     )
-                    return _NO_RESULTS_MESSAGE, None, context
+                    react_spec = (
+                        f"{spec_context}\n\n{graph_ctx}"
+                        if graph_ctx else spec_context
+                    )
+                    react_answer, context = await self._react_refinement(
+                        query=query, paths=paths,
+                        initial_keywords=initial_keywords,
+                        spec_context=react_spec,
+                        enable_dir_scan=enable_dir_scan,
+                        max_loops=max_loops,
+                        max_token_budget=max_token_budget,
+                        max_depth=max_depth,
+                        include=include, exclude=exclude,
+                    )
+                    if not cluster:
+                        cluster = await self._build_cluster_from_context(
+                            query=query, answer=react_answer,
+                            context=context,
+                            query_keywords=query_keywords,
+                            top_k_files=top_k_files,
+                        )
+                    elif react_answer and not cluster.content:
+                        cluster.content = react_answer
+                    if not cluster:
+                        return _NO_RESULTS_MESSAGE, None, context
+                    answer, should_save, should_answer = (
+                        await self._summarise_cluster(query, cluster)
+                    )
+                    final_evidence = (
+                        str(cluster.content) if cluster.content else ""
+                    )
+                    final_accepted, _ = self._evaluate_evidence_acceptance(
+                        query, final_evidence, should_answer,
+                    )
+                    if not final_accepted:
+                        if llm_fallback:
+                            answer, should_save = (
+                                await self._summarise_cluster_fallback(query)
+                            )
+                        else:
+                            return _NO_RESULTS_MESSAGE, None, context
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -2334,12 +2460,27 @@ class AgenticSearch(BaseSearch):
     parallel tree navigation.  Since tree_ev will provide targeted evidence,
     the RGA path uses a smaller budget to supply incremental tables,
     leaving room for more diverse evidence."""
+    _DEEP_CROSS_SECTION_MIN_EVIDENCE: int = 8_000
+    """Cross-section table supplement is skipped when existing tree-nav
+    evidence already exceeds this threshold (chars), preventing overload."""
 
     # --- Self-correction expanded sampling ---
     _SELF_CORRECT_EXPANDED_NAV_RESULTS: int = 10
     """Expanded tree navigation leaf count for same-file re-sampling (default nav uses 5)."""
     _SELF_CORRECT_EXPANDED_SECTIONS: int = 8
     """Expanded tree sample sections for same-file re-sampling (default uses 5)."""
+
+    # --- Deep Structured Reasoning ---
+    _DEEP_SECTION_MAP_MAX_DEPTH: int = 2
+    """Maximum tree depth for section map construction (top-N layers)."""
+    _DEEP_MAX_EXTRACT_PAGES: int = 12
+    """Maximum pages to extract per file in targeted page extraction."""
+    _DEEP_STRUCTURED_MAX_CHARS: int = 30_000
+    """Maximum character budget for structured evidence per file."""
+    _DEEP_MAX_RECOVERY_ROUNDS: int = 2
+    """Maximum rounds of missing-data recovery before final answer."""
+    _DEEP_STRUCTURED_MAX_FILES: int = 3
+    """Maximum files to process through structured reasoning pipeline."""
 
     # --- Evidence acceptance thresholds ---
     _EVIDENCE_MIN_ACCEPT_LENGTH: int = 800
@@ -4963,13 +5104,11 @@ class AgenticSearch(BaseSearch):
         except Exception:
             pass
 
-        # ── Phase 5.5: Cross-section table supplement ──
-        # The leaf-scoped supplement (above) only includes tables from
-        # pages matching selected leaves.  When leaves cluster in one
-        # region (e.g. management discussion), data-dense tables from
-        # other sections (e.g. financial statements) are missed.
-        # Fix: include top-ranked tables from UNCOVERED pages.
-        if _all_tables and leaves:
+        # ── Phase 5.5: Cross-section table supplement (conditional) ──
+        # Only supplements when existing evidence is below threshold
+        # to prevent evidence overload for queries already well-served.
+        _current_ev_len = sum(len(p) for p in parts)
+        if _all_tables and leaves and _current_ev_len < self._DEEP_CROSS_SECTION_MIN_EVIDENCE:
             _leaf_page_set: Set[int] = set()
             for _lf in leaves:
                 _pr = getattr(_lf, "page_range", None)
@@ -6179,6 +6318,439 @@ class AgenticSearch(BaseSearch):
             )
         answer, _, _ = self._parse_summary_response(answer_resp.content or "")
         return answer, False  # Never save fallback answers
+
+    # ------------------------------------------------------------------
+    # Deep Structured Reasoning pipeline
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_section_map(
+        root: Any,
+        max_depth: int = 2,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Build a lightweight section map from the top layers of a tree index.
+
+        Args:
+            root: A ``TreeNode`` root from a ``DocumentTree``.
+
+        Returns a human-readable map string (with numbered indices so the LLM
+        can reference specific sections) and a parallel list of section
+        metadata dicts for programmatic use.
+        """
+        sections: List[Dict[str, Any]] = []
+
+        def _walk(node: Any, depth: int) -> None:
+            if depth > max_depth:
+                return
+            pr = node.page_range
+            idx = len(sections)
+            sections.append({
+                "idx": idx,
+                "title": node.title,
+                "page_range": list(pr) if pr else None,
+                "char_range": list(node.char_range) if getattr(node, "char_range", None) else None,
+                "depth": depth,
+                "node_id": node.node_id,
+                "summary": (node.summary or "")[:120],
+            })
+            for child in node.children:
+                _walk(child, depth + 1)
+
+        children = root.children if root.children else [root]
+        while len(children) == 1 and children[0].children and not children[0].leaf:
+            children = children[0].children
+
+        for child in children:
+            _walk(child, 0)
+
+        map_lines: List[str] = []
+        for sec in sections:
+            indent = "  " * sec["depth"]
+            pr = sec.get("page_range")
+            page_str = f"(p{pr[0]}-{pr[1]})" if pr and pr[0] else ""
+            map_lines.append(f"[{sec['idx']}] {indent}{sec['title']} {page_str}")
+
+        return "\n".join(map_lines), sections
+
+    async def _select_evidence_sections(
+        self,
+        query: str,
+        section_map: str,
+        sections_meta: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """LLM-driven selection of relevant sections from a section map.
+
+        Returns the metadata dicts for the selected sections.
+        """
+        prompt = DEEP_SECTION_SELECT.format(
+            query=query,
+            section_map=section_map,
+        )
+        resp = await self.llm.achat(
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+        self.llm_usages.append(resp.usage)
+
+        raw = (resp.content or "").strip()
+        # Parse JSON array of indices
+        try:
+            match = re.search(r"\[[\s\d,]*\]", raw)
+            if match:
+                indices = json.loads(match.group(0))
+                return [
+                    sections_meta[i]
+                    for i in indices
+                    if isinstance(i, int) and 0 <= i < len(sections_meta)
+                ]
+        except (json.JSONDecodeError, IndexError):
+            pass
+
+        # Fallback: return sections that have page_range data
+        return [s for s in sections_meta if s.get("page_range")][:3]
+
+    async def _extract_targeted_pages(
+        self,
+        file_path: str,
+        selected_sections: List[Dict[str, Any]],
+        query: str,
+    ) -> str:
+        """Extract content for LLM-selected sections.
+
+        Two extraction strategies (tried in order):
+          1. **Page-based** — ``DocumentExtractor.extract_pages`` for PDFs.
+          2. **Char-range** — direct text slice from compile cache or
+             fast_extract for any file type.
+
+        Table digests are appended when available.  Caps output at
+        ``_DEEP_STRUCTURED_MAX_CHARS``.
+        """
+        parts: List[str] = []
+
+        # Strategy 1: page-based extraction (PDF)
+        pages_needed: Set[int] = set()
+        for sec in selected_sections:
+            pr = sec.get("page_range")
+            if pr and len(pr) == 2 and pr[0]:
+                pages_needed.update(range(
+                    max(1, pr[0] - self._NAV_PAGE_MARGIN),
+                    pr[1] + self._NAV_PAGE_MARGIN + 1,
+                ))
+
+        if pages_needed:
+            sorted_pages = sorted(pages_needed)[: self._DEEP_MAX_EXTRACT_PAGES]
+            try:
+                page_contents = DocumentExtractor.extract_pages(
+                    file_path, sorted_pages,
+                )
+                for pc in page_contents:
+                    if pc.content and pc.content.strip():
+                        parts.append(f"[Page {pc.page_number}]\n{pc.content}")
+            except Exception as e:
+                await self._logger.warning(
+                    f"[DeepStructured] Page extraction failed for "
+                    f"{Path(file_path).name}: {e}"
+                )
+
+        # Strategy 2: char_range fallback (non-PDF or when pages failed)
+        if not parts:
+            full_text = self._load_compile_content(self.work_path, file_path)
+            if not full_text:
+                try:
+                    from sirchmunk.utils.file_utils import fast_extract
+                    extraction = await fast_extract(file_path=file_path)
+                    full_text = extraction.content or ""
+                except Exception:
+                    full_text = ""
+            if full_text:
+                for sec in selected_sections:
+                    cr = sec.get("char_range")
+                    if cr and len(cr) == 2 and cr[0] is not None:
+                        start, end = cr
+                        if 0 <= start < end <= len(full_text):
+                            segment = full_text[start:end]
+                            if segment.strip():
+                                parts.append(
+                                    f"[{sec.get('title', 'Section')}]\n{segment}"
+                                )
+
+        # Append relevant table digests when available
+        if pages_needed:
+            try:
+                from sirchmunk.utils.file_utils import get_fast_hash
+                fhash = get_fast_hash(file_path)
+                if fhash:
+                    tables = self._load_table_digest(self.work_path, fhash)
+                    if tables:
+                        page_tables = [
+                            t for t in tables
+                            if t.get("page_number") in pages_needed
+                        ]
+                        if page_tables:
+                            table_ev = self._format_table_evidence(
+                                page_tables,
+                                max_chars=self._TABLE_EVIDENCE_DEFAULT_CHARS,
+                                query=query,
+                            )
+                            if table_ev:
+                                parts.append(f"[Table Evidence]\n{table_ev}")
+            except Exception:
+                pass
+
+        evidence = "\n\n".join(parts)
+        return evidence[: self._DEEP_STRUCTURED_MAX_CHARS]
+
+    async def _extract_structured_data(
+        self,
+        query: str,
+        raw_evidence: str,
+    ) -> Tuple[str, str, List[str]]:
+        """LLM extraction of structured data from raw page evidence.
+
+        Returns (structured_data, completeness, missing_items).
+        """
+        prompt = DEEP_STRUCTURED_EXTRACT.format(
+            query=query,
+            evidence=raw_evidence,
+        )
+        resp = await self.llm.achat(
+            messages=[{"role": "user", "content": prompt}],
+            stream=True,
+        )
+        self.llm_usages.append(resp.usage)
+        content = resp.content or ""
+
+        # Parse structured output
+        data_match = re.search(
+            r"<EXTRACTED_DATA>(.*?)</EXTRACTED_DATA>", content, re.DOTALL,
+        )
+        structured = data_match.group(1).strip() if data_match else content
+
+        comp_match = re.search(
+            r"<DATA_COMPLETENESS>\s*(complete|partial|insufficient)\s*</DATA_COMPLETENESS>",
+            content, re.IGNORECASE,
+        )
+        completeness = comp_match.group(1).lower() if comp_match else "partial"
+
+        missing_match = re.search(
+            r"<MISSING_DATA>(.*?)</MISSING_DATA>", content, re.DOTALL,
+        )
+        missing_items: List[str] = []
+        if missing_match:
+            raw_missing = missing_match.group(1).strip()
+            if raw_missing and raw_missing.lower() not in ("", "none", "n/a", "empty"):
+                missing_items = [
+                    line.strip().lstrip("- ")
+                    for line in raw_missing.split("\n")
+                    if line.strip() and line.strip() != "-"
+                ]
+
+        return structured, completeness, missing_items
+
+    async def _reason_with_verification(
+        self,
+        query: str,
+        structured_data: str,
+    ) -> Tuple[str, str, str]:
+        """CoT reasoning with self-verification.
+
+        Returns (answer, confidence, full_reasoning).
+        """
+        prompt = DEEP_COT_REASONING.format(
+            query=query,
+            structured_data=structured_data,
+        )
+        resp = await self.llm.achat(
+            messages=[{"role": "user", "content": prompt}],
+            stream=True,
+        )
+        self.llm_usages.append(resp.usage)
+        content = resp.content or ""
+
+        answer_match = re.search(
+            r"<ANSWER>(.*?)</ANSWER>", content, re.DOTALL,
+        )
+        answer = answer_match.group(1).strip() if answer_match else ""
+
+        conf_match = re.search(
+            r"<CONFIDENCE>\s*(high|medium|low)\s*</CONFIDENCE>",
+            content, re.IGNORECASE,
+        )
+        confidence = conf_match.group(1).lower() if conf_match else "low"
+
+        return answer, confidence, content
+
+    async def _deep_structured_reasoning(
+        self,
+        query: str,
+        tree_files: List[str],
+        artifacts: Any,
+        context: "SearchContext",
+    ) -> Tuple[str, Optional["KnowledgeCluster"]]:
+        """Orchestrate the full Deep Structured Reasoning pipeline.
+
+        Phases:
+          1. Section map  — build from tree index top layers
+          2. Section select — LLM picks relevant sections
+          3. Targeted extraction — pull pages + tables for selected sections
+          4. Structured data — LLM extracts key-value data
+          5. CoT reasoning + verification
+          6. Missing data recovery (conditional, up to N rounds)
+
+        Returns ``(answer, cluster)`` suitable for the DEEP search return path.
+        """
+        indexer = self._get_tree_indexer()
+        if indexer is None:
+            return "", None
+
+        all_structured: List[str] = []
+
+        for fp in tree_files[: self._DEEP_STRUCTURED_MAX_FILES]:
+            fname = Path(fp).name
+            tree = indexer.load_tree(fp)
+            if tree is None or tree.root is None:
+                continue
+
+            # Phase 1: Section map
+            section_map, sections_meta = self._build_section_map(
+                tree.root, max_depth=self._DEEP_SECTION_MAP_MAX_DEPTH,
+            )
+            if not sections_meta:
+                continue
+
+            await self._logger.info(
+                f"[DeepStructured] Section map for {fname}: "
+                f"{len(sections_meta)} sections"
+            )
+
+            # Phase 2: LLM selects relevant sections
+            selected = await self._select_evidence_sections(
+                query, section_map, sections_meta,
+            )
+            context.increment_loop()
+            if not selected:
+                continue
+
+            await self._logger.info(
+                f"[DeepStructured] Selected {len(selected)} sections: "
+                f"{[s['title'][:30] for s in selected]}"
+            )
+
+            # Phase 3: Targeted page extraction
+            raw_evidence = await self._extract_targeted_pages(
+                fp, selected, query,
+            )
+            if not raw_evidence:
+                continue
+
+            # Per-file evidence accumulator for recovery rounds
+            file_raw_parts: List[str] = [raw_evidence]
+
+            await self._logger.info(
+                f"[DeepStructured] Extracted {len(raw_evidence)} chars "
+                f"from {fname}"
+            )
+
+            # Phase 4: Structured data extraction
+            structured, completeness, missing_items = (
+                await self._extract_structured_data(query, raw_evidence)
+            )
+            context.increment_loop()
+
+            await self._logger.info(
+                f"[DeepStructured] Data extraction: "
+                f"completeness={completeness}, "
+                f"missing={len(missing_items)}"
+            )
+
+            # Phase 4.5: Missing data recovery (per-file loop)
+            recovery_round = 0
+            while (
+                missing_items
+                and completeness != "complete"
+                and recovery_round < self._DEEP_MAX_RECOVERY_ROUNDS
+            ):
+                recovery_round += 1
+                await self._logger.info(
+                    f"[DeepStructured] Recovery round {recovery_round}: "
+                    f"seeking {missing_items}"
+                )
+
+                recovery_query = (
+                    f"{query} — specifically find: "
+                    f"{', '.join(missing_items[:5])}"
+                )
+
+                recovery_selected = await self._select_evidence_sections(
+                    recovery_query, section_map, sections_meta,
+                )
+                context.increment_loop()
+
+                existing_ids = {s["node_id"] for s in selected}
+                new_sections = [
+                    s for s in recovery_selected
+                    if s["node_id"] not in existing_ids
+                ]
+                if not new_sections:
+                    break
+
+                recovery_evidence = await self._extract_targeted_pages(
+                    fp, new_sections, recovery_query,
+                )
+                if not recovery_evidence:
+                    break
+                file_raw_parts.append(recovery_evidence)
+
+                combined = "\n\n".join(file_raw_parts)
+                structured, completeness, missing_items = (
+                    await self._extract_structured_data(
+                        query,
+                        combined[: self._DEEP_STRUCTURED_MAX_CHARS],
+                    )
+                )
+                context.increment_loop()
+                selected.extend(new_sections)
+
+            if structured:
+                all_structured.append(f"[Source: {fname}]\n{structured}")
+
+        if not all_structured:
+            return "", None
+
+        # Phase 5: CoT reasoning with verification
+        combined_data = "\n\n".join(all_structured)
+        answer, confidence, full_reasoning = await self._reason_with_verification(
+            query, combined_data,
+        )
+        context.increment_loop()
+
+        await self._logger.info(
+            f"[DeepStructured] Reasoning complete: "
+            f"confidence={confidence}, answer_len={len(answer)}"
+        )
+
+        # Build a cluster for persistence (strip XML tags for clean content)
+        _clean_reasoning = re.sub(
+            r"</?(?:REASONING|VERIFICATION|ANSWER|CONFIDENCE)>",
+            "", full_reasoning,
+        ).strip()
+        cluster = self._make_answer_cluster(
+            query, _clean_reasoning, "DSR",
+            file_paths=tree_files[: self._DEEP_STRUCTURED_MAX_FILES],
+        )
+
+        if not answer:
+            return "", cluster
+
+        formatted = (
+            f"<SUMMARY>\n{_clean_reasoning}\n</SUMMARY>\n"
+            f"<PRECISE_ANSWER>{answer}</PRECISE_ANSWER>\n"
+            f"<SHOULD_ANSWER>true</SHOULD_ANSWER>\n"
+            f"<SHOULD_SAVE>{'true' if confidence != 'low' else 'false'}"
+            f"</SHOULD_SAVE>"
+        )
+
+        return formatted, cluster
 
     async def _react_refinement(
         self,
