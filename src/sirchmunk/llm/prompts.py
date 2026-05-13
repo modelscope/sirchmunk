@@ -527,63 +527,6 @@ Return ONLY a JSON array of section indices (0-based) from the map above:
 """
 
 
-DEEP_STRUCTURED_EXTRACT = """Extract all data relevant to the query from the provided document content.
-
-### User Query
-{query}
-
-### Document Content
-{evidence}
-
-### Instructions
-1. Extract every data point, number, or fact that could help answer the query.
-2. Preserve exact values, units, and context (e.g. fiscal year, line item name).
-3. For tables, extract the specific rows and columns relevant to the query.
-4. Note the source location (section title or page) for each extracted item.
-5. If the query requires a calculation, identify and extract ALL input values needed.
-
-### Output Format
-<EXTRACTED_DATA>
-- [source]: [data point name] = [value] [unit]
-- [source]: [data point name] = [value] [unit]
-...
-</EXTRACTED_DATA>
-<DATA_COMPLETENESS>complete|partial|insufficient</DATA_COMPLETENESS>
-<MISSING_DATA>
-[List any data items needed to answer the query that were NOT found. Empty if complete.]
-</MISSING_DATA>
-"""
-
-
-DEEP_COT_REASONING = """Answer the query using ONLY the extracted data below. Show complete reasoning.
-
-### User Query
-{query}
-
-### Extracted Data
-{structured_data}
-
-### Instructions
-1. State which data points you will use and why.
-2. Show ALL calculation steps explicitly (one operation per line).
-3. After computing the result, verify it:
-   a. Check units and order of magnitude.
-   b. Cross-check with any alternative data if available.
-   c. Ensure the result directly answers what was asked.
-4. Match the precision and units implied by the query.
-
-### Output Format
-<REASONING>
-[Step-by-step reasoning with explicit calculations]
-</REASONING>
-<VERIFICATION>
-[Sanity checks and cross-validation]
-</VERIFICATION>
-<ANSWER>[Your final answer here]</ANSWER>
-<CONFIDENCE>high|medium|low</CONFIDENCE>
-"""
-
-
 # ---------------------------------------------------------------------------
 # Knowledge Compile prompts
 # ---------------------------------------------------------------------------
