@@ -1294,6 +1294,7 @@ class AgenticSearch(BaseSearch):
             FileReadTool,
             KeywordSearchTool,
             KnowledgeQueryTool,
+            TreeNavigationTool,
             ToolRegistry,
         )
 
@@ -1336,10 +1337,21 @@ class AgenticSearch(BaseSearch):
             from sirchmunk.scan.dir_scanner import DirectoryScanner
 
             if self._dir_scanner is None:
-                self._dir_scanner = DirectoryScanner(llm=self.llm, max_files=500)
+                self._dir_scanner = DirectoryScanner(
+                    llm=self.llm, max_files=500,
+                )
             registry.register(DirScanTool(
                 scanner=self._dir_scanner,
                 paths=paths,
+            ))
+
+        # Tool 5: Tree navigation (when compile artifacts exist)
+        artifacts = self._detect_compile_artifacts(paths)
+        if artifacts and artifacts.tree_available_paths:
+            registry.register(TreeNavigationTool(
+                navigate_fn=self._tree_guided_sample,
+                available_paths=artifacts.tree_available_paths,
+                max_chars=self._FAST_MAX_EVIDENCE_CHARS,
             ))
 
         self._tool_registry = registry
@@ -2000,10 +2012,20 @@ class AgenticSearch(BaseSearch):
                 await self._logger.info(
                     "[Phase 4:Fallback] Launching ReAct refinement"
                 )
-                react_spec = (
-                    f"{spec_context}\n\n{graph_ctx}"
-                    if graph_ctx else spec_context
-                )
+                # Seed ReAct with all available prior context so it
+                # doesn't start from scratch.
+                react_parts: List[str] = []
+                if spec_context:
+                    react_parts.append(spec_context)
+                if graph_ctx:
+                    react_parts.append(graph_ctx)
+                if _pre_nav_evidence:
+                    nav_seed = "\n\n".join(
+                        f"[Pre-navigated: {Path(fp).name}]\n{ev}"
+                        for fp, ev in _pre_nav_evidence.items()
+                    )
+                    react_parts.append(nav_seed)
+                react_spec = "\n\n".join(react_parts)
                 react_answer, context = await self._react_refinement(
                     query=query, paths=paths,
                     initial_keywords=initial_keywords,
