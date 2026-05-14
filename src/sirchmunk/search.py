@@ -27,8 +27,6 @@ from sirchmunk.llm.prompts import (
     DOC_CHUNK_SUMMARY,
     DOC_MERGE_SUMMARIES,
     DEEP_SECTION_SELECT,
-    DEEP_QUESTION_DECOMPOSE,
-    DEEP_CALCULATION_SYNTHESIS,
 )
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.schema.knowledge import (
@@ -182,29 +180,6 @@ class CompileHints:
 
     file_paths: List[str]
     extra_keywords: List[str]
-
-
-@dataclass
-class DeepRetrieval:
-    """Structured output of DEEP Stage 0: file discovery and ranking."""
-
-    file_paths: List[str]
-    keywords: List[str]
-    keyword_idfs: Dict[str, float]
-    catalog_routed: List[str]
-    tree_probed: List[str]
-
-
-@dataclass
-class DeepDecomposition:
-    """Structured output of DEEP Stage 2: question analysis."""
-
-    query_type: str  # "lookup", "calculation", "comparison", "synthesis"
-    sub_questions: List[str] = field(default_factory=list)
-    required_data: List[str] = field(default_factory=list)
-    time_periods: List[str] = field(default_factory=list)
-    entities: List[str] = field(default_factory=list)
-    calculation_steps: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1695,7 +1670,7 @@ class AgenticSearch(BaseSearch):
         return answer
 
     # ------------------------------------------------------------------
-    # DEEP mode — staged evidence-first pipeline
+    # DEEP mode — parallel multi-path retrieval with ReAct fallback
     # ------------------------------------------------------------------
 
     async def _search_deep(
@@ -1713,15 +1688,7 @@ class AgenticSearch(BaseSearch):
         spec_stale_hours: float = 72.0,
         llm_fallback: bool = False,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
-        """Evidence-first DEEP pipeline: retrieve → saturate → decompose → synthesize.
-
-        Stages:
-          0. FAST-style retrieval (1 LLM: query analysis + catalog routing)
-          1. Evidence saturation (tree nav + table digest + rga per file)
-          2. Question decomposition (1 LLM: classify + plan)
-          3. Evidence adequacy check (0 LLM: rule-based gap detection)
-          4. Strategy-routed synthesis (1 LLM: answer generation)
-          5. Persistence (quality-gated cluster save)
+        """Parallel multi-path retrieval pipeline (Phases 0a–5).
 
         Returns:
             ``(answer, cluster, context)`` tuple.
@@ -1732,97 +1699,423 @@ class AgenticSearch(BaseSearch):
         )
         _llm_usage_start = len(self.llm_usages)
 
+        # --- Adaptive compile artifact detection (shared with FAST) ---
         _scope = _PathScope(paths)
         artifacts = self._detect_compile_artifacts(paths)
-        self._tree_nav_cache = _TreeNavCache()
 
-        # --- Short-circuits (Phase 0a + Phase 0) ---
+        # ==============================================================
+        # Phase 0a: Direct document analysis (intent-gated short-circuit)
+        # ==============================================================
         direct = await self._try_direct_doc_analysis(query, paths)
         if direct is not None:
             return direct, self._make_answer_cluster(query, direct, "DQ", file_paths=paths), context
 
+        # ==============================================================
+        # Phase 0: Cluster reuse (instant short-circuit)
+        # When reuse_knowledge=True and a similar cluster is found, we
+        # return here — Phase 5 (Persistence) is not executed for that path.
+        # ==============================================================
         reused = await self._try_reuse_cluster(query, paths)
         if reused is not None:
             return self._enrich_reused_content(reused), reused, context
 
-        await self._logger.info(f"[DEEP] Starting evidence-first pipeline for: '{query[:80]}'")
+        # P2: gradient reuse — extract hints from moderately similar clusters
+        soft_hit = await self._try_soft_reuse(query, paths)
 
-        # ==================== Stage 0: Retrieval ====================
-        retrieval = await self._deep_retrieve(
-            query, paths, artifacts, _scope, context,
-            top_k_files=top_k_files, enable_dir_scan=enable_dir_scan,
-            max_depth=max_depth, include=include, exclude=exclude,
+        await self._logger.info(f"[search] Starting multi-path retrieval for: '{query[:80]}'")
+
+        # ==============================================================
+        # Phase 1: Parallel probing — five paths fire concurrently
+        # ==============================================================
+        await self._logger.info("[Phase 1] Parallel probing: keywords + dir_scan + knowledge + spec_cache + tree_index")
+        context.increment_loop()
+
+        phase1_results = await asyncio.gather(
+            self._probe_keywords(query),
+            self._probe_dir_scan(paths, enable_dir_scan),
+            self._probe_knowledge_cache(query),
+            self._load_spec_context(paths, stale_hours=spec_stale_hours),
+            self._probe_tree_index(query),
+            self._probe_compile_hints([query], scope=_scope),  # query-level hints; keyword-level runs post-Phase 1
+            self._probe_summary_index(query, artifacts, scope=_scope),    # GAP 2: zero-LLM BM25
+            self._probe_catalog_for_deep(query, artifacts),  # GAP 4: zero-LLM keyword overlap
+            return_exceptions=True,
         )
 
-        if not retrieval.file_paths:
-            if llm_fallback:
-                answer, _ = await self._summarise_cluster_fallback(query)
-                return answer, None, context
-            return _NO_RESULTS_MESSAGE, None, context
+        kw_result = phase1_results[0] if not isinstance(phase1_results[0], Exception) else ({}, [])
+        scan_result = phase1_results[1] if not isinstance(phase1_results[1], Exception) else None
+        knowledge_probe = phase1_results[2] if not isinstance(phase1_results[2], Exception) else KnowledgeProbeResult([], [], "")
+        spec_context = phase1_results[3] if not isinstance(phase1_results[3], Exception) else ""
+        tree_hits = phase1_results[4] if not isinstance(phase1_results[4], Exception) else []
+        compile_hints = phase1_results[5] if not isinstance(phase1_results[5], Exception) else CompileHints([], [])
+        summary_index_hits = phase1_results[6] if not isinstance(phase1_results[6], Exception) else []
+        catalog_deep_hits = phase1_results[7] if not isinstance(phase1_results[7], Exception) else []
 
-        # ==================== Stage 1: Evidence saturation ====================
-        evidence = await self._deep_gather_evidence(
-            query, retrieval, artifacts, context,
+        for i, label in enumerate(["keywords", "dir_scan", "knowledge", "spec_cache", "tree_index", "compile_hints", "summary_index", "catalog_deep"]):
+            if isinstance(phase1_results[i], Exception):
+                await self._logger.warning(f"[Phase 1] {label} probe failed: {phase1_results[i]}")
+
+        # Backwards compat: knowledge_probe may be a plain list from old code paths
+        if isinstance(knowledge_probe, list):
+            knowledge_probe = KnowledgeProbeResult(file_paths=knowledge_probe, extra_keywords=[], background_context="")
+
+        query_keywords, initial_keywords = kw_result if isinstance(kw_result, tuple) else ({}, [])
+
+        # P2: inject soft-hit patterns into keywords
+        if soft_hit:
+            for p in soft_hit.patterns:
+                if p not in initial_keywords:
+                    initial_keywords.append(p)
+                if p not in query_keywords:
+                    query_keywords[p] = 0.6
+
+        # P3: inject extra keywords from structured knowledge probe
+        for kw in knowledge_probe.extra_keywords:
+            if kw not in initial_keywords:
+                initial_keywords.append(kw)
+            if kw not in query_keywords:
+                query_keywords[kw] = 0.5
+
+        # P2 + P3: append background context for Phase 4 LLM prompt
+        if soft_hit and soft_hit.context_summary:
+            spec_context = f"{spec_context}\n\n{soft_hit.context_summary}" if spec_context else soft_hit.context_summary
+        if knowledge_probe.background_context:
+            spec_context = f"{spec_context}\n\n{knowledge_probe.background_context}" if spec_context else knowledge_probe.background_context
+
+        await self._logger.info(
+            f"[Phase 1] Results: keywords={len(initial_keywords)}, "
+            f"dir_scan={'OK' if scan_result else 'N/A'}, "
+            f"knowledge_files={len(knowledge_probe.file_paths)}, "
+            f"tree_hits={len(tree_hits)}, "
+            f"compile_hints={len(compile_hints.file_paths)}, "
+            f"summary_index={len(summary_index_hits)}, "
+            f"catalog_deep={len(catalog_deep_hits)}, "
+            f"soft_hit={'YES' if soft_hit else 'NO'}, "
+            f"spec_cache={'YES' if spec_context else 'NO'}"
         )
 
-        if not evidence or len(evidence.strip()) < 50:
-            if llm_fallback:
-                answer, _ = await self._summarise_cluster_fallback(query)
-                return answer, None, context
-            return _NO_RESULTS_MESSAGE, None, context
+        # ==============================================================
+        # Phase 2: Parallel retrieval — keyword search + dir_scan rank
+        # ==============================================================
+        keyword_files: List[str] = []
+        dir_scan_files: List[str] = []
 
-        # ==================== Stage 2: Question decomposition ====================
-        decomposition = await self._deep_decompose_question(query, evidence, context)
+        if _PURE_TREE_SEARCH:
+            # Pure tree search mode: skip rga and dir_scan, rely solely on tree hits
+            await self._logger.info("[Phase 2:PureTree] Skipping rga keyword search and dir_scan")
+            context.increment_loop()
+        else:
+            await self._logger.info("[Phase 2] Parallel retrieval: rga keyword search + dir_scan LLM rank")
+            context.increment_loop()
 
-        # ==================== Stage 3: Adequacy check + gap-fill ====================
-        adequate, gaps = self._deep_check_adequacy(query, evidence, decomposition)
-        needs_gap_fill = (not adequate and gaps) or (
-            decomposition.query_type in ("calculation", "comparison")
-        )
-        if needs_gap_fill:
-            fill_gaps = gaps if gaps else ["numeric data for calculation"]
-            await self._logger.info(
-                f"[DEEP:S3] Gaps detected ({len(fill_gaps)}): {fill_gaps[:3]}"
-            )
-            extra = await self._deep_fill_evidence_gaps(
-                query, fill_gaps, retrieval, artifacts, context,
-                decomposition=decomposition,
-            )
-            if extra:
-                evidence = f"{evidence}\n\n---\n\n{extra}"
+            phase2_tasks = []
 
-        # ==================== Stage 4: Synthesis ====================
-        answer, should_save, should_answer = await self._deep_synthesize(
-            query, evidence, decomposition, artifacts, retrieval, context,
-        )
-
-        # Self-correction: if synthesis rejected, try expanded evidence
-        if not answer:
-            await self._logger.info("[DEEP:S4] First synthesis rejected, trying self-correction")
-            sc_evidence = await self._deep_self_correct(
-                query, retrieval.file_paths, retrieval.keyword_idfs, context,
-            )
-            if sc_evidence:
-                evidence = sc_evidence
-                answer, should_save, should_answer = await self._deep_synthesize(
-                    query, sc_evidence, decomposition, artifacts, retrieval, context,
+            if initial_keywords:
+                phase2_tasks.append(
+                    self._retrieve_by_keywords(
+                        initial_keywords, paths,
+                        max_depth=max_depth, include=include, exclude=exclude,
+                    )
                 )
-
-        # Final fallback
-        if not answer:
-            if llm_fallback:
-                answer, should_save = await self._summarise_cluster_fallback(query)
             else:
-                return _NO_RESULTS_MESSAGE, None, context
+                phase2_tasks.append(self._async_noop([]))
 
-        # ==================== Stage 5: Self-consistency + Verification ====================
-        if answer and decomposition.query_type in ("calculation", "comparison"):
-            answer = await self._deep_self_consistency(
-                query, answer, evidence, decomposition, artifacts, retrieval, context,
+            if scan_result is not None and enable_dir_scan:
+                phase2_tasks.append(
+                    self._rank_dir_scan_candidates(query, scan_result)
+                )
+            else:
+                phase2_tasks.append(self._async_noop([]))
+
+            phase2_results = await asyncio.gather(*phase2_tasks, return_exceptions=True)
+
+            keyword_files = phase2_results[0] if not isinstance(phase2_results[0], Exception) else []
+            dir_scan_files = phase2_results[1] if not isinstance(phase2_results[1], Exception) else []
+
+            for i, label in enumerate(["keyword_search", "dir_scan_rank"]):
+                if isinstance(phase2_results[i], Exception):
+                    await self._logger.warning(f"[Phase 2] {label} failed: {phase2_results[i]}")
+
+        await self._logger.info(
+            f"[Phase 2] Results: keyword_files={len(keyword_files)}, "
+            f"dir_scan_files={len(dir_scan_files)}"
+        )
+
+        # --- Phase 2.5: Parallel tree pre-navigation for top tree hits ---
+        _pre_nav_evidence: Dict[str, str] = {}
+        if tree_hits:
+            _nav_fps = [fp for fp in tree_hits[:self._DEEP_PRE_NAV_MAX_FILES]]
+            if _nav_fps:
+                _nav_results = await asyncio.gather(
+                    *[self._tree_guided_sample(
+                        fp, query, max_chars=self._FAST_MAX_EVIDENCE_CHARS,
+                    ) for fp in _nav_fps],
+                    return_exceptions=True,
+                )
+                for fp, nav_res in zip(_nav_fps, _nav_results):
+                    if isinstance(nav_res, Exception):
+                        await self._logger.warning(
+                            f"[Phase 2.5] Tree pre-nav failed for {Path(fp).name}: {nav_res}"
+                        )
+                    elif isinstance(nav_res, str) and nav_res:
+                        _pre_nav_evidence[fp] = nav_res
+                if _pre_nav_evidence:
+                    await self._logger.info(
+                        f"[Phase 2.5] Pre-navigated {len(_pre_nav_evidence)} tree files"
+                    )
+
+        # ==============================================================
+        # Phase 3: Merge file paths + build KnowledgeCluster
+        # P1 tree hits get highest priority; P2 soft-hit files next
+        # ==============================================================
+        context.increment_loop()
+        extra_knowledge_files = knowledge_probe.file_paths
+        if soft_hit:
+            extra_knowledge_files = soft_hit.file_paths + extra_knowledge_files
+
+        if _PURE_TREE_SEARCH:
+            # Pure tree search: only use tree hits (+ soft-hit fallback if no tree hits)
+            pure_tree_files = list(tree_hits)
+            if not pure_tree_files and soft_hit:
+                pure_tree_files = soft_hit.file_paths
+                await self._logger.info(
+                    f"[Phase 3:PureTree] No tree hits, using {len(pure_tree_files)} soft-hit files"
+                )
+            merged_files = self._merge_file_paths(
+                keyword_files=pure_tree_files,
+                dir_scan_files=[],
+                knowledge_hits=[],
             )
-            answer, _ = self._deep_verify_answer(query, answer, evidence)
+            await self._logger.info(
+                f"[Phase 3:PureTree] Merged {len(merged_files)} tree-only candidate files"
+            )
+        else:
+            merged_files = self._merge_file_paths(
+                keyword_files=list(tree_hits) + catalog_deep_hits + compile_hints.file_paths + summary_index_hits + keyword_files,
+                dir_scan_files=dir_scan_files,
+                knowledge_hits=extra_knowledge_files,
+            )
+            await self._logger.info(f"[Phase 3] Merged {len(merged_files)} unique candidate files")
 
-        # --- Token accounting ---
+        cluster: Optional[KnowledgeCluster] = None
+        if merged_files:
+            cluster = await self._build_cluster(
+                query=query, file_paths=merged_files,
+                query_keywords=query_keywords, top_k_files=top_k_files,
+            )
+
+        # ==============================================================
+        # Phase 3.5: Graph context enrichment (P5)
+        # Append related knowledge from graph neighbours to cluster content
+        # so the answer-generation LLM has richer context.
+        # ==============================================================
+        graph_ctx = ""
+        if cluster:
+            # Merge pre-navigated tree evidence into cluster content
+            if _pre_nav_evidence and cluster.content:
+                pre_nav_parts = []
+                for fp, ev in _pre_nav_evidence.items():
+                    pre_nav_parts.append(f"[Tree evidence: {Path(fp).name}]\n{ev}")
+                if pre_nav_parts:
+                    pre_nav_ctx = "\n\n".join(pre_nav_parts)
+                    if isinstance(cluster.content, list):
+                        cluster.content = "\n".join(cluster.content)
+                    cluster.content = f"{cluster.content}\n\n{pre_nav_ctx}"
+
+            graph_ctx = await self._gather_graph_context(cluster)
+            if graph_ctx and cluster.content:
+                if isinstance(cluster.content, list):
+                    cluster.content = "\n".join(cluster.content)
+                cluster.content = f"{cluster.content}\n\n{graph_ctx}"
+
+        # ==============================================================
+        # Phase 4: Structured Reasoning → Cluster Summary fallback
+        # P0: DEEP mode always goes through full reasoning pipeline —
+        # no fast triage short-circuit.  P4: query complexity determines
+        # whether the heavier section-map SR fires or we go straight to
+        # cluster synthesis.
+        # ==============================================================
+        context.increment_loop()
+        answer = ""
+        should_save = True
+
+        _query_complexity = self._classify_query_complexity(query)
+        await self._logger.info(
+            f"[Phase 4] Query complexity: {_query_complexity}"
+        )
+
+        # Attempt structured reasoning for moderate/complex queries
+        _sr_files: List[str] = []
+        if _query_complexity != "simple":
+            if tree_hits:
+                _sr_files = list(tree_hits[: self._DEEP_STRUCTURED_MAX_FILES])
+            elif artifacts and artifacts.tree_available_paths:
+                _sr_files = list(artifacts.tree_available_paths)[
+                    : self._DEEP_STRUCTURED_MAX_FILES
+                ]
+
+        if _sr_files:
+            await self._logger.info(
+                f"[Phase 4] Launching structured reasoning for "
+                f"{len(_sr_files)} tree-indexed files"
+            )
+            sr_answer, sr_cluster, sr_evidence = await self._deep_structured_reasoning(
+                query, _sr_files, artifacts, context,
+            )
+
+            if sr_answer:
+                answer, should_save, should_answer = self._parse_summary_response(
+                    sr_answer
+                )
+                accepted, accept_reason = self._evaluate_evidence_acceptance(
+                    query, sr_evidence or sr_answer, should_answer,
+                )
+                await self._logger.info(
+                    f"[Phase 4] Structured reasoning: "
+                    f"accepted={accepted} ({accept_reason})"
+                )
+                if accepted:
+                    cluster = sr_cluster or cluster
+                else:
+                    answer = ""
+
+        # Fallback: cluster summary with ROI prompt or ReAct
+        if not answer:
+            if artifacts and artifacts.catalog_map and cluster and cluster.content:
+                _catalog_ctx_parts = []
+                for fp in (cluster.search_results or merged_files)[:3]:
+                    ctx = self._build_answer_context(fp, artifacts)
+                    if ctx:
+                        _catalog_ctx_parts.append(ctx)
+                if _catalog_ctx_parts:
+                    _catalog_context = "\n".join(_catalog_ctx_parts)
+                    if isinstance(cluster.content, list):
+                        cluster.content = "\n".join(cluster.content)
+                    cluster.content = (
+                        f"{cluster.content}\n\n"
+                        f"[Document Context]\n{_catalog_context}"
+                    )
+
+            if cluster and cluster.content:
+                await self._logger.info(
+                    "[Phase 4:Fallback] Generating summary from cluster"
+                )
+                answer, should_save, should_answer = (
+                    await self._summarise_cluster(query, cluster)
+                )
+                cluster_evidence = (
+                    str(cluster.content) if cluster.content else ""
+                )
+                accepted, accept_reason = (
+                    self._evaluate_evidence_acceptance(
+                        query, cluster_evidence, should_answer,
+                    )
+                )
+                if not accepted:
+                    if llm_fallback:
+                        answer, should_save = (
+                            await self._summarise_cluster_fallback(query)
+                        )
+                    else:
+                        # DEEP self-correction before giving up
+                        sc_evidence = await self._deep_self_correct(
+                            query, merged_files, query_keywords, context,
+                        )
+                        if sc_evidence:
+                            sc_cluster = self._make_answer_cluster(
+                                query, sc_evidence[:5000], "DSC",
+                                file_paths=list(merged_files)[:3],
+                            )
+                            sc_cluster.content = sc_evidence
+                            answer, should_save, should_answer = (
+                                await self._summarise_cluster(query, sc_cluster)
+                            )
+                            sc_accepted, _ = self._evaluate_evidence_acceptance(
+                                query, sc_evidence, should_answer,
+                            )
+                            if sc_accepted:
+                                cluster = sc_cluster
+                            else:
+                                return _NO_RESULTS_MESSAGE, None, context
+                        else:
+                            return _NO_RESULTS_MESSAGE, None, context
+                if not cluster.search_results:
+                    cluster.search_results = list(merged_files)
+            elif llm_fallback:
+                answer, should_save = (
+                    await self._summarise_cluster_fallback(query)
+                )
+            else:
+                await self._logger.info(
+                    "[Phase 4:Fallback] Launching ReAct refinement"
+                )
+                # Seed ReAct with all available prior context so it
+                # doesn't start from scratch.
+                react_parts: List[str] = []
+                if spec_context:
+                    react_parts.append(spec_context)
+                if graph_ctx:
+                    react_parts.append(graph_ctx)
+                if _pre_nav_evidence:
+                    nav_seed = "\n\n".join(
+                        f"[Pre-navigated: {Path(fp).name}]\n{ev}"
+                        for fp, ev in _pre_nav_evidence.items()
+                    )
+                    react_parts.append(nav_seed)
+                react_spec = "\n\n".join(react_parts)
+                react_answer, context = await self._react_refinement(
+                    query=query, paths=paths,
+                    initial_keywords=initial_keywords,
+                    spec_context=react_spec,
+                    enable_dir_scan=enable_dir_scan,
+                    max_loops=max_loops,
+                    max_token_budget=max_token_budget,
+                    max_depth=max_depth,
+                    include=include, exclude=exclude,
+                )
+                if not cluster:
+                    cluster = await self._build_cluster_from_context(
+                        query=query, answer=react_answer,
+                        context=context,
+                        query_keywords=query_keywords,
+                        top_k_files=top_k_files,
+                    )
+                elif react_answer and not cluster.content:
+                    cluster.content = react_answer
+                if not cluster:
+                    return _NO_RESULTS_MESSAGE, None, context
+                answer, should_save, should_answer = (
+                    await self._summarise_cluster(query, cluster)
+                )
+                final_evidence = (
+                    str(cluster.content) if cluster.content else ""
+                )
+                final_accepted, _ = self._evaluate_evidence_acceptance(
+                    query, final_evidence, should_answer,
+                )
+                if not final_accepted:
+                    if llm_fallback:
+                        answer, should_save = (
+                            await self._summarise_cluster_fallback(query)
+                        )
+                    else:
+                        sc_evidence = await self._deep_self_correct(
+                            query, merged_files, query_keywords, context,
+                        )
+                        if sc_evidence:
+                            sc_cluster = self._make_answer_cluster(
+                                query, sc_evidence[:5000], "DSC",
+                                file_paths=list(merged_files)[:3],
+                            )
+                            sc_cluster.content = sc_evidence
+                            answer, should_save, _ = (
+                                await self._summarise_cluster(query, sc_cluster)
+                            )
+                            cluster = sc_cluster
+                        else:
+                            return _NO_RESULTS_MESSAGE, None, context
+
+        # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
         for usage in new_usages:
             if usage and isinstance(usage, dict):
@@ -1831,786 +2124,26 @@ class AgenticSearch(BaseSearch):
                     total_tok = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
                 context.add_llm_tokens(total_tok, usage=usage)
 
-        # --- Persistence ---
-        cluster: Optional[KnowledgeCluster] = None
-        if should_save and answer:
-            cluster = self._make_answer_cluster(
-                query, evidence[:5000], "DEEP",
-                file_paths=retrieval.file_paths[:5],
-            )
-            cluster.content = evidence[:10000]
+        # ==============================================================
+        # Phase 5: Persistence (quality-gated)
+        # Skipped when Phase 4 quality check says the answer is low-quality
+        # or when Phase 0 reused a cluster (early-returned above).
+        # ==============================================================
+        phase5_tasks = []
+        if cluster and should_save:
             self._add_query_to_cluster(cluster, query)
-            try:
-                await self._save_cluster_with_embedding(cluster)
-            except Exception as exc:
-                _loguru_logger.warning(f"[DEEP:S5] Cluster save failed: {exc}")
-
-        await self._logger.success(f"[DEEP] Complete: {context.summary()}")
-        return answer, cluster, context
-
-    # ------------------------------------------------------------------
-    # DEEP v2: Staged pipeline methods
-    # ------------------------------------------------------------------
-
-    async def _deep_retrieve(
-        self,
-        query: str,
-        paths: List[str],
-        artifacts: "CompileArtifacts",
-        scope: "_PathScope",
-        context: "SearchContext",
-        *,
-        top_k_files: int = 5,
-        enable_dir_scan: bool = False,
-        max_depth: Optional[int] = 5,
-        include: Optional[List[str]] = None,
-        exclude: Optional[List[str]] = None,
-    ) -> "DeepRetrieval":
-        """Stage 0: FAST-style file discovery and ranking.
-
-        Reuses the proven FAST retrieval pipeline: query analysis (1 LLM)
-        + keyword search (rga) + tree probe (scope-filtered) + catalog
-        routing + compile hints + summary index. Returns a structured
-        DeepRetrieval with ranked file paths.
-        """
-        catalog = artifacts.catalog
-        catalog_routed_files: List[str] = []
-
-        tree_hints = ""
-        if artifacts and artifacts.tree_available_paths:
-            tree_hints = self._build_tree_root_hints(artifacts)
-
-        if catalog:
-            listing = self._build_enriched_catalog_listing(catalog)
-            prompt = FAST_QUERY_ANALYSIS_WITH_CATALOG.format(
-                user_input=query, document_listing=listing,
-            )
-        else:
-            prompt = FAST_QUERY_ANALYSIS.format(user_input=query)
-        if tree_hints:
-            prompt = prompt + tree_hints
-
-        llm_task = self.llm.achat(
-            messages=[{"role": "user", "content": prompt}],
-            stream=False,
-        )
-        compile_task = self._probe_compile_hints([query], scope=scope)
-        tree_task = self._probe_tree_index(query, scope=scope, artifacts=artifacts)
-        summary_task = self._probe_summary_index(query, artifacts, scope=scope)
-        catalog_deep_task = self._probe_catalog_for_deep(query, artifacts)
-
-        results = await asyncio.gather(
-            llm_task, compile_task, tree_task, summary_task, catalog_deep_task,
-            return_exceptions=True,
-        )
-
-        resp = results[0] if not isinstance(results[0], Exception) else None
-        early_hints = results[1] if not isinstance(results[1], Exception) else CompileHints([], [])
-        tree_probed = results[2] if not isinstance(results[2], Exception) else []
-        summary_hits = results[3] if not isinstance(results[3], Exception) else []
-        catalog_deep_hits = results[4] if not isinstance(results[4], Exception) else []
-
-        for i, label in enumerate(["llm", "compile", "tree", "summary", "catalog"]):
-            if isinstance(results[i], Exception):
-                await self._logger.warning(f"[DEEP:S0] {label} failed: {results[i]}")
-
-        if resp and not isinstance(resp, Exception):
-            self.llm_usages.append(resp.usage)
-            if resp.usage and isinstance(resp.usage, dict):
-                context.add_llm_tokens(
-                    resp.usage.get("total_tokens", 0), usage=resp.usage,
-                )
-
-        analysis = self._parse_fast_json(resp.content if resp else "")
-        primary = analysis.get("primary", [])[:2]
-        fallback = analysis.get("fallback", [])[:3]
-        primary_alt = analysis.get("primary_alt", [])[:2]
-        fallback_alt = analysis.get("fallback_alt", [])[:3]
-        if primary_alt:
-            primary = primary + primary_alt
-        if fallback_alt:
-            fallback = fallback + fallback_alt
-        keyword_idfs: Dict[str, float] = analysis.get("idf", {})
-        all_keywords = primary + fallback
-
-        if catalog:
-            for idx in analysis.get("selected_docs", []):
-                if isinstance(idx, int) and 0 <= idx < len(catalog):
-                    fp = catalog[idx]["path"]
-                    if Path(fp).exists():
-                        catalog_routed_files.append(fp)
-
-        kw_hints = await self._probe_compile_hints(all_keywords, scope=scope)
-        compile_hints = self._merge_compile_hints(early_hints, kw_hints)
-        for kw in compile_hints.extra_keywords:
-            if kw not in all_keywords:
-                all_keywords.append(kw)
-                keyword_idfs.setdefault(kw, 0.5)
-
-        context.increment_loop()
-        await self._logger.info(
-            f"[DEEP:S0] keywords={len(all_keywords)}, "
-            f"catalog_routed={len(catalog_routed_files)}, "
-            f"tree_probed={len(tree_probed)}, "
-            f"summary={len(summary_hits)}, "
-            f"catalog_deep={len(catalog_deep_hits)}"
-        )
-
-        rga_kwargs = dict(
-            paths=paths, max_depth=max_depth,
-            include=list(include or []), exclude=exclude,
-        )
-        tree_probed_set = frozenset(tree_probed)
-
-        best_files: Optional[List[Dict[str, Any]]] = None
-
-        if catalog_routed_files and analysis.get("doc_confidence") == "high":
-            best_files = [
-                {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
-                for p in catalog_routed_files[:top_k_files]
-            ]
-
-        if not best_files and tree_probed_set and primary:
-            best_files = await self._fast_find_best_file(
-                primary, paths=list(tree_probed_set),
-                top_k=top_k_files, keyword_idfs=keyword_idfs,
-                query=query, artifacts=artifacts,
-            )
-
-        if not best_files and primary:
-            best_files = await self._fast_find_best_file(
-                primary, top_k=top_k_files, keyword_idfs=keyword_idfs,
-                query=query, artifacts=artifacts,
-                tree_probed_paths=tree_probed_set or None,
-                **rga_kwargs,
-            )
-
-        if not best_files and fallback:
-            best_files = await self._fast_find_best_file(
-                fallback, top_k=top_k_files, keyword_idfs=keyword_idfs,
-                query=query, artifacts=artifacts,
-                tree_probed_paths=tree_probed_set or None,
-                **rga_kwargs,
-            )
-
-        hint_files: List[str] = []
-        seen: set = set()
-        for fp in catalog_routed_files + list(tree_probed) + summary_hits + catalog_deep_hits + compile_hints.file_paths:
-            if fp and fp not in seen:
-                seen.add(fp)
-                hint_files.append(fp)
-
-        if not best_files and hint_files:
-            best_files = [
-                {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
-                for p in hint_files[:top_k_files]
-            ]
-
-        if not best_files and enable_dir_scan:
-            ranked = await self._scan_and_rank_paths(
-                query, paths, top_k=top_k_files, include_medium=True,
-            )
-            if ranked:
-                best_files = [
-                    {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
-                    for p in ranked[:top_k_files]
-                ]
-
-        file_paths: List[str] = []
-        if best_files:
-            fp_set: set = set()
-            for bf in best_files:
-                fp = bf["path"]
-                if fp not in fp_set:
-                    fp_set.add(fp)
-                    file_paths.append(fp)
-            for fp in hint_files:
-                if fp not in fp_set and len(file_paths) < top_k_files:
-                    fp_set.add(fp)
-                    file_paths.append(fp)
-
-        await self._logger.info(
-            f"[DEEP:S0] Retrieved {len(file_paths)} files: "
-            f"{[Path(p).name for p in file_paths[:5]]}"
-        )
-        return DeepRetrieval(
-            file_paths=file_paths,
-            keywords=all_keywords,
-            keyword_idfs=keyword_idfs,
-            catalog_routed=catalog_routed_files,
-            tree_probed=list(tree_probed),
-        )
-
-    async def _deep_gather_evidence(
-        self,
-        query: str,
-        retrieval: "DeepRetrieval",
-        artifacts: "CompileArtifacts",
-        context: "SearchContext",
-    ) -> str:
-        """Stage 1: Evidence saturation for all retrieved files.
-
-        Gathers evidence from multiple sources per file:
-        1. Tree navigation (LLM-guided section targeting)
-        2. Table digest (pre-compiled structured tables, expanded budget)
-        3. Financial statement harvesting (rule-based section title match)
-        4. Tree-guided sampling / rga fallback
-
-        Uses DEEP-specific budgets (_DEEP_EVIDENCE_TOTAL_CHARS) that are
-        larger than FAST's to maximize evidence quality.
-        """
-        if not retrieval.file_paths:
-            return ""
-
-        file_paths = retrieval.file_paths
-        tree_paths = artifacts.tree_available_paths if artifacts else set()
-        max_chars = self._DEEP_EVIDENCE_TOTAL_CHARS
-
-        async def _gather_for_file(fp: str) -> str:
-            parts: List[str] = []
-            fname = Path(fp).name
-
-            nav_ev = ""
-            if fp in tree_paths:
-                try:
-                    nav_ev = await self._navigate_tree_for_evidence(
-                        fp, query,
-                        max_results=self._TREE_NAV_MAX_RESULTS,
-                    ) or ""
-                except Exception:
-                    pass
-            if nav_ev:
-                parts.append(nav_ev)
-
-            table_ev = ""
-            try:
-                from sirchmunk.utils.file_utils import get_fast_hash
-                fh = get_fast_hash(fp)
-                if fh:
-                    tables = self._load_table_digest(self.work_path, fh)
-                    if tables:
-                        budget = (
-                            self._DEEP_TABLE_BUDGET_WITH_NAV if nav_ev
-                            else self._DEEP_TABLE_BUDGET
-                        )
-                        table_ev = self._format_table_evidence(
-                            tables, max_chars=budget, query=query,
-                        ) or ""
-            except Exception:
-                pass
-            if table_ev:
-                parts.append(f"[{fname} - Table Evidence]\n{table_ev}")
-
-            stmt_ev = await self._harvest_financial_statements(fp, query, artifacts)
-            if stmt_ev:
-                parts.append(f"[{fname} - Financial Statements]\n{stmt_ev}")
-
-            if not nav_ev and fp in tree_paths:
-                try:
-                    tree_sample = await self._tree_guided_sample(
-                        fp, query,
-                        max_chars=self._FAST_MAX_EVIDENCE_CHARS,
-                        artifacts=artifacts,
-                    )
-                    if tree_sample:
-                        parts.append(tree_sample)
-                except Exception:
-                    pass
-
-            if not parts:
-                try:
-                    rga_ev = await self._fast_sample_evidence(fp, [])
-                    if rga_ev:
-                        parts.append(rga_ev)
-                except Exception:
-                    pass
-
-            context.mark_file_read(fp)
-            if parts:
-                return f"[Source: {fname}]\n" + "\n\n".join(parts)
-            return ""
-
-        tasks = [_gather_for_file(fp) for fp in file_paths]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        evidence_parts: List[str] = []
-        total_chars = 0
+            phase5_tasks.append(self._save_cluster_with_embedding(cluster))
+        elif not should_save:
+            await self._logger.info("[Phase 5] Quality gate: low-quality answer, skipping cluster save")
+            cluster = None
+        phase5_tasks.append(self._save_spec_context(paths, context, scan_result=scan_result))
+        results = await asyncio.gather(*phase5_tasks, return_exceptions=True)
         for r in results:
             if isinstance(r, Exception):
-                continue
-            if r and total_chars < max_chars:
-                remaining = max_chars - total_chars
-                evidence_parts.append(r[:remaining])
-                total_chars += len(evidence_parts[-1])
+                _loguru_logger.warning(f"[Phase 5] Persistence task failed: {r}")
 
-        context.increment_loop()
-        combined = "\n\n---\n\n".join(evidence_parts)
-        await self._logger.info(
-            f"[DEEP:S1] Evidence: {len(combined)} chars from "
-            f"{len(evidence_parts)} files"
-        )
-        return combined
-
-    async def _harvest_financial_statements(
-        self,
-        file_path: str,
-        query: str,
-        artifacts: "CompileArtifacts",
-    ) -> str:
-        """Proactively extract financial statement sections via tree index.
-
-        Scans tree section titles for income/balance/cashflow patterns and
-        extracts those pages. Complements tree navigation which may focus
-        on narrative sections instead of data-dense statements.
-        """
-        tree_paths = artifacts.tree_available_paths if artifacts else set()
-        if file_path not in tree_paths:
-            return ""
-
-        indexer = self._get_tree_indexer()
-        if indexer is None:
-            return ""
-
-        tree = indexer.load_tree(file_path)
-        if tree is None or tree.root is None:
-            return ""
-
-        statement_sections: List[Dict[str, Any]] = []
-        section_map, sections_meta = self._build_section_map(
-            tree.root, max_depth=self._DEEP_SECTION_MAP_MAX_DEPTH,
-        )
-
-        for sec in sections_meta:
-            title = (sec.get("title") or "").lower()
-            if any(pat.search(title) for pat in self._DEEP_STATEMENT_PATTERNS):
-                if sec.get("page_range"):
-                    statement_sections.append(sec)
-
-        if not statement_sections:
-            return ""
-
-        try:
-            ev = await self._extract_targeted_pages(
-                file_path, statement_sections[:6], query,
-            )
-            return ev or ""
-        except Exception:
-            return ""
-
-    async def _deep_decompose_question(
-        self,
-        query: str,
-        evidence: str,
-        context: "SearchContext",
-    ) -> "DeepDecomposition":
-        """Stage 2: Decompose the question into structured plan (1 LLM call).
-
-        Classifies query type (lookup/calculation/comparison/synthesis),
-        extracts required data points, time periods, entities, and
-        calculation steps.
-        """
-        evidence_summary = evidence[:3000] if evidence else "(no evidence yet)"
-        prompt = DEEP_QUESTION_DECOMPOSE.format(
-            query=query,
-            evidence_summary=evidence_summary,
-        )
-        try:
-            resp = await self.llm.achat(
-                messages=[{"role": "user", "content": prompt}],
-                stream=False,
-            )
-            self.llm_usages.append(resp.usage)
-            if resp.usage and isinstance(resp.usage, dict):
-                context.add_llm_tokens(
-                    resp.usage.get("total_tokens", 0), usage=resp.usage,
-                )
-            context.increment_loop()
-
-            raw = (resp.content or "").strip()
-            parsed = self._parse_fast_json(raw)
-
-            return DeepDecomposition(
-                query_type=parsed.get("query_type", "lookup"),
-                sub_questions=parsed.get("sub_questions", [query]),
-                required_data=parsed.get("required_data", []),
-                time_periods=parsed.get("time_periods", []),
-                entities=parsed.get("entities", []),
-                calculation_steps=parsed.get("calculation_steps", []),
-            )
-        except Exception as exc:
-            await self._logger.warning(f"[DEEP:S2] Decomposition failed: {exc}")
-            return DeepDecomposition(query_type="lookup", sub_questions=[query])
-
-    @staticmethod
-    def _deep_check_adequacy(
-        query: str,
-        evidence: str,
-        decomposition: "DeepDecomposition",
-    ) -> Tuple[bool, List[str]]:
-        """Stage 3: Rule-based evidence adequacy check (0 LLM calls).
-
-        Checks whether the evidence contains the required data points
-        from the decomposition. Returns (adequate, gap_descriptions).
-        """
-        if not evidence or len(evidence.strip()) < 200:
-            return False, ["evidence too short"]
-
-        evidence_lower = evidence.lower()
-        gaps: List[str] = []
-
-        for data_point in decomposition.required_data:
-            tokens = [t.lower() for t in re.findall(r"[A-Za-z0-9]+", data_point) if len(t) >= 3]
-            if tokens and not any(t in evidence_lower for t in tokens):
-                gaps.append(data_point)
-
-        for period in decomposition.time_periods:
-            year_match = re.search(r"(\d{4})", period)
-            if year_match and year_match.group(1) not in evidence:
-                gaps.append(f"time period: {period}")
-
-        if decomposition.query_type == "calculation":
-            numbers = re.findall(r'[\$€£]?\d[\d,]*\.?\d*', evidence)
-            if len(numbers) < 2:
-                gaps.append("insufficient numeric data for calculation")
-
-        adequate = len(gaps) <= len(decomposition.required_data) * 0.3
-        return adequate, gaps
-
-    async def _deep_fill_evidence_gaps(
-        self,
-        query: str,
-        gaps: List[str],
-        retrieval: "DeepRetrieval",
-        artifacts: "CompileArtifacts",
-        context: "SearchContext",
-        decomposition: Optional["DeepDecomposition"] = None,
-    ) -> str:
-        """Fill identified evidence gaps with targeted retrieval.
-
-        Strategy per file:
-          1. Tree section selection with expanded depth for gap-specific terms
-          2. Table digest supplement for numeric gaps
-          3. Keyword rga fallback for non-tree files
-        """
-        extra_parts: List[str] = []
-        tree_paths = artifacts.tree_available_paths if artifacts else set()
-        indexer = self._get_tree_indexer()
-        is_calc = decomposition and decomposition.query_type in ("calculation", "comparison")
-
-        for fp in retrieval.file_paths[:3]:
-            gap_query = f"{query} — specifically looking for: {'; '.join(gaps[:5])}"
-
-            if fp in tree_paths and indexer is not None:
-                tree = indexer.load_tree(fp)
-                if tree is not None and tree.root is not None:
-                    section_map, sections_meta = self._build_section_map(
-                        tree.root, max_depth=self._DEEP_SECTION_MAP_MAX_DEPTH + 2,
-                    )
-                    if sections_meta:
-                        selected = await self._select_evidence_sections(
-                            gap_query, section_map, sections_meta,
-                        )
-                        context.increment_loop()
-                        if selected:
-                            ev = await self._extract_targeted_pages(fp, selected, query)
-                            if ev and len(ev.strip()) > 100:
-                                extra_parts.append(f"[Gap-fill: {Path(fp).name}]\n{ev}")
-                                context.mark_file_read(fp)
-
-            if is_calc and any("numeric" in g or "data" in g for g in gaps):
-                table_index = (artifacts.table_index or {}).get(fp, [])
-                if table_index:
-                    table_ev = self._format_table_evidence(
-                        table_index, max_chars=self._DEEP_TABLE_BUDGET_WITH_NAV, query=query,
-                    )
-                    if table_ev and len(table_ev.strip()) > 100:
-                        extra_parts.append(f"[Table-supplement: {Path(fp).name}]\n{table_ev}")
-
-        if extra_parts:
-            await self._logger.info(
-                f"[DEEP:S3] Gap-fill: {len(extra_parts)} additional evidence sources"
-            )
-        return "\n\n---\n\n".join(extra_parts)
-
-    async def _deep_synthesize(
-        self,
-        query: str,
-        evidence: str,
-        decomposition: "DeepDecomposition",
-        artifacts: "CompileArtifacts",
-        retrieval: "DeepRetrieval",
-        context: "SearchContext",
-    ) -> Tuple[str, bool, bool]:
-        """Stage 4: Strategy-routed answer synthesis.
-
-        Routes to specialized prompts based on query_type:
-        - calculation: DEEP_CALCULATION_SYNTHESIS with explicit computation steps
-        - lookup/comparison/synthesis: ROI_RESULT_SUMMARY with document context
-
-        Pre-processing: prunes evidence by entities/time_periods, and
-        appends format constraints derived from query semantics.
-        """
-        evidence = self._deep_prune_evidence(evidence, decomposition)
-
-        format_hint = self._deep_format_constraint(query)
-
-        doc_context: Optional[str] = None
-        if artifacts and artifacts.catalog_map:
-            ctx_parts = [
-                self._build_answer_context(fp, artifacts)
-                for fp in retrieval.file_paths[:3]
-            ]
-            ctx_parts = [c for c in ctx_parts if c]
-            if ctx_parts:
-                doc_context = "\n".join(ctx_parts)
-
-        if decomposition.query_type == "calculation" and decomposition.calculation_steps:
-            steps_text = "\n".join(
-                f"{i+1}. {s}" for i, s in enumerate(decomposition.calculation_steps)
-            )
-            synth_prompt = DEEP_CALCULATION_SYNTHESIS.format(
-                calculation_steps=steps_text,
-                user_input=query,
-                text_content=evidence[:self._DEEP_SYNTHESIS_MAX_CHARS],
-            )
-        elif doc_context:
-            from sirchmunk.llm.prompts import ROI_RESULT_SUMMARY_WITH_CONTEXT
-            synth_prompt = ROI_RESULT_SUMMARY_WITH_CONTEXT.format(
-                user_input=query,
-                text_content=evidence[:self._DEEP_SYNTHESIS_MAX_CHARS],
-                document_context=doc_context,
-            )
-        else:
-            synth_prompt = ROI_RESULT_SUMMARY.format(
-                user_input=query,
-                text_content=evidence[:self._DEEP_SYNTHESIS_MAX_CHARS],
-            )
-
-        if format_hint:
-            synth_prompt = f"{synth_prompt}\n\n### Format Constraint\n{format_hint}"
-
-        resp = await self.llm.achat(
-            messages=[{"role": "user", "content": synth_prompt}],
-            stream=True,
-        )
-        self.llm_usages.append(resp.usage)
-        if resp.usage and isinstance(resp.usage, dict):
-            context.add_llm_tokens(
-                resp.usage.get("total_tokens", 0), usage=resp.usage,
-            )
-        context.increment_loop()
-
-        answer, should_save, should_answer = self._parse_summary_response(
-            resp.content or ""
-        )
-
-        accepted, accept_reason = self._evaluate_evidence_acceptance(
-            query, evidence, should_answer,
-        )
-
-        if not accepted and decomposition.query_type in ("calculation", "comparison"):
-            accepted = self._deep_relaxed_acceptance(query, evidence)
-            if accepted:
-                accept_reason = "deep_calc_relaxed"
-                should_answer = True
-                should_save = True
-
-        await self._logger.info(
-            f"[DEEP:S4] Synthesis: accepted={accepted} ({accept_reason}), "
-            f"type={decomposition.query_type}"
-        )
-
-        if not accepted:
-            return "", False, False
-        return answer, should_save, should_answer
-
-    @staticmethod
-    def _deep_relaxed_acceptance(query: str, evidence: str) -> bool:
-        """Relaxed acceptance for calculation/comparison queries.
-
-        Accepts when evidence contains >=2 distinct numbers AND at least
-        one query-relevant keyword appears. This prevents false-negative
-        rejections on numeric data that the standard heuristic misses
-        due to low keyword coverage from formula-heavy queries.
-        """
-        numbers = re.findall(r'[\$€£]?\d[\d,]*\.?\d*', evidence[:20000])
-        if len(numbers) < 2:
-            return False
-        kw_coverage = AgenticSearch._compute_keyword_coverage(query, evidence)
-        return kw_coverage >= 0.3
-
-    @staticmethod
-    def _deep_prune_evidence(
-        evidence: str,
-        decomposition: "DeepDecomposition",
-    ) -> str:
-        """Prune evidence paragraphs not matching required time_periods/entities.
-
-        Splits evidence into paragraph-level blocks. Retains a block if it
-        mentions ANY required time period or entity. Blocks that match
-        neither are discarded (unless fewer than 30% of blocks would remain,
-        in which case no pruning is applied to avoid over-filtering).
-        """
-        if not decomposition.time_periods and not decomposition.entities:
-            return evidence
-
-        periods = {p.lower() for p in decomposition.time_periods}
-        year_patterns = {re.search(r"\d{4}", p).group() for p in periods if re.search(r"\d{4}", p)}
-        entities = {e.lower() for e in decomposition.entities}
-
-        blocks = re.split(r'\n{2,}', evidence)
-        if len(blocks) <= 3:
-            return evidence
-
-        kept: List[str] = []
-        for block in blocks:
-            block_lower = block.lower()
-            has_period = any(y in block for y in year_patterns) if year_patterns else True
-            has_entity = any(e in block_lower for e in entities) if entities else True
-            if has_period or has_entity:
-                kept.append(block)
-
-        if len(kept) < len(blocks) * 0.3:
-            return evidence
-        return "\n\n".join(kept)
-
-    @staticmethod
-    def _deep_format_constraint(query: str) -> str:
-        """Derive answer format guidance from query semantics.
-
-        Returns a short instruction string appended to the synthesis prompt
-        to steer PRECISE_ANSWER toward the expected format.
-        """
-        q_lower = query.lower()
-        if re.search(r'\b(is|does|did|was|were|has|have|can|will|should)\b', q_lower) and "?" in query:
-            return "Answer with Yes or No first, then provide justification."
-        if re.search(r'(?:million|billion|mn|bn)\b', q_lower):
-            unit = "billion" if re.search(r'\b(billion|bn)\b', q_lower) else "million"
-            return f"Express the final answer in {unit}s (e.g. $X {unit})."
-        if re.search(r'\bratio\b', q_lower):
-            return "Express the final answer as a decimal ratio (e.g. 1.5x or 0.75)."
-        if re.search(r'\b(percentage|percent|%)\b', q_lower):
-            return "Express the final answer as a percentage (e.g. 25.3%)."
-        if re.search(r'\bgrowth\b.*\brate\b|\brate\b.*\bgrowth\b', q_lower):
-            return "Express the final answer as a percentage change (e.g. +12.5% or -3.2%)."
-        return ""
-
-    async def _deep_self_consistency(
-        self,
-        query: str,
-        first_answer: str,
-        evidence: str,
-        decomposition: "DeepDecomposition",
-        artifacts: "CompileArtifacts",
-        retrieval: "DeepRetrieval",
-        context: "SearchContext",
-    ) -> str:
-        """Run a second synthesis and pick the consistent answer.
-
-        Compares PRECISE_ANSWER from both runs. If they match (within
-        numeric tolerance), returns the first. If they diverge, picks
-        the answer whose PRECISE_ANSWER contains a valid number.
-        """
-        second_answer, _, _ = await self._deep_synthesize(
-            query, evidence, decomposition, artifacts, retrieval, context,
-        )
-        if not second_answer:
-            return first_answer
-
-        precise_1 = re.search(r'\*\*Answer:\s*(.+?)\*\*', first_answer)
-        precise_2 = re.search(r'\*\*Answer:\s*(.+?)\*\*', second_answer)
-        if not precise_1 or not precise_2:
-            return first_answer
-
-        val_1 = re.sub(r'[^\d.\-]', '', precise_1.group(1).replace(',', ''))
-        val_2 = re.sub(r'[^\d.\-]', '', precise_2.group(1).replace(',', ''))
-
-        try:
-            n1, n2 = float(val_1), float(val_2)
-        except (ValueError, TypeError):
-            return first_answer
-
-        tolerance = max(abs(n1) * 0.05, 0.01)
-        if abs(n1 - n2) <= tolerance:
-            return first_answer
-
-        await self._logger.info(
-            f"[DEEP:S5] Self-consistency divergence: {val_1} vs {val_2}, using second"
-        )
-        return second_answer
-
-    @staticmethod
-    def _deep_verify_answer(
-        query: str,
-        answer: str,
-        evidence: str,
-    ) -> Tuple[str, bool]:
-        """Stage 5: Verify calculation answers with Python eval.
-
-        Extracts the COMPUTATION block from the answer, parses variable
-        assignments (``var = expr``), evaluates them in a safe namespace,
-        and compares the final result against PRECISE_ANSWER. When a
-        discrepancy is found, replaces the PRECISE_ANSWER with the
-        recomputed value.
-
-        Returns (potentially_corrected_answer, verified).
-        """
-        computation_match = re.search(
-            r'<COMPUTATION>(.*?)</COMPUTATION>', answer, re.DOTALL,
-        )
-        precise_match = re.search(
-            r'<PRECISE_ANSWER>(.*?)</PRECISE_ANSWER>', answer, re.DOTALL,
-        )
-        if not computation_match:
-            return answer, True
-
-        computation_text = computation_match.group(1)
-        assignments = re.findall(
-            r'(?:^|\n)\s*[\w\s]+?=\s*(.+?)(?:\s*\(|$|\n)',
-            computation_text,
-        )
-        if not assignments:
-            return answer, True
-
-        safe_ns: Dict[str, float] = {}
-        last_result: Optional[float] = None
-
-        for expr_raw in assignments:
-            expr = expr_raw.strip().rstrip("(")
-            expr = re.sub(r'[\$€£,]', '', expr)
-            expr = expr.replace('−', '-').replace('÷', '/').replace('×', '*')
-            expr = re.sub(r'[a-zA-Z%]+$', '', expr).strip()
-            if not expr or not re.search(r'\d', expr):
-                continue
-            try:
-                result = float(eval(expr, {"__builtins__": {}}, safe_ns))  # noqa: S307
-                last_result = result
-            except Exception:
-                continue
-
-        if last_result is None or not precise_match:
-            return answer, True
-
-        precise_text = precise_match.group(1).strip()
-        precise_num = re.sub(r'[^\d.\-]', '', precise_text.replace(',', ''))
-        try:
-            stated = float(precise_num) if precise_num else None
-        except ValueError:
-            stated = None
-
-        if stated is None:
-            return answer, True
-
-        tolerance = max(abs(stated) * 0.02, 0.01)
-        if abs(stated - last_result) <= tolerance:
-            return answer, True
-
-        fmt = f"{last_result:.1f}" if abs(last_result) < 100 else f"{last_result:,.0f}"
-        corrected = answer.replace(
-            precise_match.group(0),
-            f"<PRECISE_ANSWER>{fmt}</PRECISE_ANSWER>",
-        )
-        return corrected, False
+        await self._logger.success(f"[search] Complete: {context.summary()}")
+        return answer, cluster, context
 
     # ------------------------------------------------------------------
     # Phase 0a: Direct document analysis (intent-gated)
@@ -2998,22 +2531,6 @@ class AgenticSearch(BaseSearch):
     """Maximum rounds of missing-data recovery before final answer."""
     _DEEP_STRUCTURED_MAX_FILES: int = 3
     """Maximum files to process through structured reasoning pipeline."""
-
-    # --- DEEP v2 evidence budgets ---
-    _DEEP_EVIDENCE_TOTAL_CHARS: int = 120_000
-    """Total evidence budget for DEEP mode (uses more context than FAST)."""
-    _DEEP_TABLE_BUDGET: int = 40_000
-    """Table digest budget per file in DEEP mode (no tree nav overlap)."""
-    _DEEP_TABLE_BUDGET_WITH_NAV: int = 20_000
-    """Table digest budget per file when tree nav also provides evidence."""
-    _DEEP_SYNTHESIS_MAX_CHARS: int = 60_000
-    """Maximum evidence chars sent to the synthesis LLM call."""
-    _DEEP_STATEMENT_PATTERNS: Tuple[re.Pattern, ...] = (
-        re.compile(r"(?:income|operations|earnings|profit.loss)", re.IGNORECASE),
-        re.compile(r"(?:balance.sheet|financial.position|assets.liab)", re.IGNORECASE),
-        re.compile(r"(?:cash.flow|cash.provided|financing.activities)", re.IGNORECASE),
-    )
-    """Section title patterns for financial statement harvesting."""
 
     # --- Evidence acceptance thresholds ---
     _EVIDENCE_MIN_ACCEPT_LENGTH: int = 800
@@ -6280,27 +5797,15 @@ class AgenticSearch(BaseSearch):
             if Path(pool[idx].file_path).exists()
         ]
 
-    async def _probe_tree_index(
-        self,
-        query: str,
-        *,
-        scope: Optional["_PathScope"] = None,
-        artifacts: Optional["CompileArtifacts"] = None,
-    ) -> List[str]:
+    async def _probe_tree_index(self, query: str) -> List[str]:
         """LLM-driven file discovery via compiled tree root summaries (PageIndex).
 
-        Loads cached document trees, filters them by *scope* and/or
-        *artifacts.tree_available_paths*, presents root summaries to the
-        LLM, and asks it to select the most relevant documents.
+        Loads all cached document trees, presents their root summaries to the
+        LLM, and asks it to select the most relevant documents.  Returns file
+        paths of the most relevant documents.
         """
         try:
             trees = self._load_cached_trees()
-            if not trees:
-                return []
-            if artifacts and artifacts.tree_available_paths:
-                trees = [t for t in trees if t.file_path in artifacts.tree_available_paths]
-            if scope and not scope.is_empty:
-                trees = [t for t in trees if scope.contains(t.file_path)]
             if not trees:
                 return []
             result = await self._llm_select_from_trees(
