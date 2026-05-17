@@ -30,6 +30,10 @@ from sirchmunk.llm.prompts import (
     DOC_CHUNK_SUMMARY,
     DOC_MERGE_SUMMARIES,
     DEEP_SECTION_SELECT,
+    DEEP_DATA_REQUIREMENTS,
+    DEEP_PAGE_SELECT,
+    DEEP_CHECK_REQUIREMENTS,
+    DEEP_TOC_ANALYSIS,
 )
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.schema.knowledge import (
@@ -201,6 +205,27 @@ class CompileArtifacts:
     tree_available_paths: Set[str]  # file paths that have cached tree indices
     manifest_map: Dict[str, Any] = field(default_factory=dict)  # {path: FileManifestEntry}
     summary_index: Optional[Any] = None  # CompileSummaryIndex (lazy-loaded)
+
+
+@dataclass
+class DataRequirements:
+    """Pre-retrieval analysis of what data points a query needs."""
+
+    data_points: List[str]
+    likely_sources: List[str]
+    formula: Optional[str]
+    time_period: Optional[str]
+    intent: str
+
+
+@dataclass
+class RetrievalResult:
+    """Output of the agentic retrieval loop."""
+
+    evidence: str
+    pages_extracted: Dict[str, List[int]]
+    is_complete: bool
+    rounds_used: int
 
 
 class _TreeNavCache:
@@ -1191,9 +1216,8 @@ class AgenticSearch(BaseSearch):
             self.llm_usages.append(resp.usage)
 
             raw = (resp.content or "").strip()
-            match = re.search(r'\{[^}]+\}', raw)
-            if match:
-                data = json.loads(match.group())
+            data = self._extract_json_object(raw)
+            if data:
                 complexity = data.get("complexity", "").lower()
                 intent = data.get("intent", "").lower()
                 if (complexity in self._VALID_COMPLEXITIES
@@ -1210,10 +1234,36 @@ class AgenticSearch(BaseSearch):
         return complexity, intent
 
     @staticmethod
+    def _extract_json_object(raw: str) -> Optional[dict]:
+        """Extract the outermost JSON object from LLM response text."""
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(raw[start : end + 1])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return None
+
+    @staticmethod
+    def _extract_json_array(raw: str) -> Optional[list]:
+        """Extract the outermost JSON array from LLM response text."""
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(raw[start : end + 1])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return None
+
+    @staticmethod
     def _evaluate_evidence_acceptance(
         query: str,
         evidence: str,
         llm_should_answer: bool,
+        *,
+        retrieval_complete: bool = False,
     ) -> Tuple[bool, str]:
         """Multi-factor decision on whether to accept retrieved evidence.
 
@@ -1226,6 +1276,10 @@ class AgenticSearch(BaseSearch):
             boolean decision and *reason* is a human-readable string
             documenting which factor(s) determined the outcome.
         """
+        # Factor 0: Agentic retrieval confirmed data completeness
+        if retrieval_complete:
+            return True, "retrieval_complete"
+
         # Factor 1: LLM direct acceptance
         if llm_should_answer:
             return True, "llm_accepted"
@@ -2015,7 +2069,6 @@ class AgenticSearch(BaseSearch):
 
         # --- Adaptive compile artifact detection (shared with FAST) ---
         _scope = _PathScope(paths)
-        _nav_cache: Dict[str, str] = {}
         artifacts = self._detect_compile_artifacts(paths)
 
         # ==============================================================
@@ -2156,305 +2209,61 @@ class AgenticSearch(BaseSearch):
             f"dir_scan_files={len(dir_scan_files)}"
         )
 
-        # --- Phase 2.5: Full tree evidence collection for DEEP mode ---
-        _tree_evidence: Dict[str, str] = {}
-        if tree_hits:
-            _tree_evidence = await self._collect_deep_tree_evidence(
-                tree_hits, query, scope=_scope, nav_cache=_nav_cache,
-            )
-        _pre_nav_evidence = _tree_evidence
-
         # ==============================================================
-        # Phase 3: Merge file paths + build KnowledgeCluster
-        # P1 tree hits get highest priority; P2 soft-hit files next
+        # Phase 3: Query analysis + file selection
         # ==============================================================
         context.increment_loop()
+        _query_complexity, _query_intent = await self._classify_query_intent(query)
+        data_reqs = await self._analyze_data_requirements(query, _query_intent)
+        context.increment_loop()
+
+        await self._logger.info(
+            f"[Phase 3] Query: complexity={_query_complexity}, "
+            f"intent={_query_intent}, "
+            f"data_points={len(data_reqs.data_points)}, "
+            f"formula={data_reqs.formula or 'N/A'}"
+        )
+
         extra_knowledge_files = knowledge_probe.file_paths
         if soft_hit:
             extra_knowledge_files = soft_hit.file_paths + extra_knowledge_files
 
-        if _PURE_TREE_SEARCH:
-            # Pure tree search: only use tree hits (+ soft-hit fallback if no tree hits)
-            pure_tree_files = list(tree_hits)
-            if not pure_tree_files and soft_hit:
-                pure_tree_files = soft_hit.file_paths
-                await self._logger.info(
-                    f"[Phase 3:PureTree] No tree hits, using {len(pure_tree_files)} soft-hit files"
-                )
-            merged_files = self._merge_file_paths(
-                keyword_files=pure_tree_files,
-                dir_scan_files=[],
-                knowledge_hits=[],
-            )
-            await self._logger.info(
-                f"[Phase 3:PureTree] Merged {len(merged_files)} tree-only candidate files"
-            )
-        else:
-            merged_files = self._merge_file_paths(
-                keyword_files=list(tree_hits) + catalog_deep_hits + compile_hints.file_paths + summary_index_hits + keyword_files,
-                dir_scan_files=dir_scan_files,
-                knowledge_hits=extra_knowledge_files,
-            )
-            await self._logger.info(f"[Phase 3] Merged {len(merged_files)} unique candidate files")
+        merged_files = self._merge_file_paths(
+            keyword_files=list(tree_hits) + catalog_deep_hits + compile_hints.file_paths + summary_index_hits + keyword_files,
+            dir_scan_files=dir_scan_files,
+            knowledge_hits=extra_knowledge_files,
+        )
+        target_files = self._select_target_files(merged_files, _scope, artifacts)
 
-        cluster: Optional[KnowledgeCluster] = None
-        if merged_files:
-            cluster = await self._build_cluster(
-                query=query, file_paths=merged_files,
-                query_keywords=query_keywords, top_k_files=top_k_files,
-            )
-            if _tree_evidence and cluster and cluster.content:
-                pre_nav_parts = [
-                    f"[Tree evidence: {Path(fp).name}]\n{ev}"
-                    for fp, ev in _tree_evidence.items()
-                ]
-                if pre_nav_parts:
-                    pre_nav_ctx = "\n\n".join(pre_nav_parts)
-                    if isinstance(cluster.content, list):
-                        cluster.content = "\n".join(cluster.content)
-                    cluster.content = f"{cluster.content}\n\n{pre_nav_ctx}"
-
-        # ==============================================================
-        # Phase 3.5: Graph context enrichment (P5)
-        # Append related knowledge from graph neighbours to cluster content
-        # so the answer-generation LLM has richer context.
-        # ==============================================================
-        graph_ctx = ""
-        if cluster:
-            graph_ctx = await self._gather_graph_context(cluster)
-            if graph_ctx and cluster.content:
-                if isinstance(cluster.content, list):
-                    cluster.content = "\n".join(cluster.content)
-                cluster.content = f"{cluster.content}\n\n{graph_ctx}"
-
-        # ==============================================================
-        # Phase 3.8: Query classification (feeds Phase 3.75 + Phase 4)
-        # ==============================================================
-        _query_complexity, _query_intent = await self._classify_query_intent(query)
-        context.increment_loop()
         await self._logger.info(
-            f"[Phase 3.8] Query: complexity={_query_complexity}, intent={_query_intent}"
+            f"[Phase 3] Merged {len(merged_files)} files, "
+            f"target {len(target_files)} for agentic retrieval"
         )
 
         # ==============================================================
-        # Phase 3.75: Evidence adequacy closed-loop (Plan D)
-        # For computation/comparison queries, verify required data points
-        # are present and trigger targeted gap-fill if missing.
+        # Phase 4: Agentic retrieval loop
         # ==============================================================
-        if (
-            cluster and cluster.content
-            and _query_intent in ("computation", "comparison")
-        ):
-            _ev_text = (
-                str(cluster.content) if isinstance(cluster.content, str)
-                else "\n".join(cluster.content)
-            )
-            is_complete, missing = await self._check_evidence_completeness(
-                query, _query_intent, _ev_text,
-            )
-            context.increment_loop()
-            if not is_complete and missing:
-                await self._logger.info(
-                    f"[Phase 3.75] Missing data points: {missing}"
-                )
-                gap_evidence = await self._fill_evidence_gaps(
-                    query, missing, merged_files, artifacts,
-                    scope=_scope, nav_cache=_nav_cache,
-                )
-                if gap_evidence:
-                    if isinstance(cluster.content, list):
-                        cluster.content = "\n".join(cluster.content)
-                    cluster.content = (
-                        f"{cluster.content}\n\n"
-                        f"[Gap-fill evidence]\n{gap_evidence}"
-                    )
-                    await self._logger.info(
-                        f"[Phase 3.75] Filled {len(missing)} gaps "
-                        f"({len(gap_evidence)} chars)"
-                    )
+        retrieval = await self._agentic_retrieve(
+            query, data_reqs, target_files, context,
+        )
+
+        await self._logger.info(
+            f"[Phase 4] Retrieval: {retrieval.rounds_used} rounds, "
+            f"complete={retrieval.is_complete}, "
+            f"{sum(len(ps) for ps in retrieval.pages_extracted.values())} pages"
+        )
 
         # ==============================================================
-        # Phase 4: Structured Reasoning → Cluster Summary fallback
+        # Phase 4.5: Synthesis
         # ==============================================================
-        context.increment_loop()
-        answer = ""
-        should_save = True
-
-        # Attempt structured reasoning for moderate/complex queries
-        _sr_files: List[str] = []
-        if _query_complexity != "simple":
-            if tree_hits:
-                _scoped_hits = [fp for fp in tree_hits if _scope.contains(fp)]
-                _sr_files = _scoped_hits[: self._DEEP_STRUCTURED_MAX_FILES]
-            elif artifacts and artifacts.tree_available_paths:
-                _sr_files = [
-                    fp for fp in artifacts.tree_available_paths
-                    if _scope.contains(fp)
-                ][: self._DEEP_STRUCTURED_MAX_FILES]
-
-        if _sr_files:
-            await self._logger.info(
-                f"[Phase 4] Launching structured reasoning for "
-                f"{len(_sr_files)} tree-indexed files"
-            )
-            sr_answer, sr_cluster, sr_evidence = await self._deep_structured_reasoning(
-                query, _sr_files, artifacts, context, _query_intent,
-            )
-
-            if sr_answer:
-                answer, should_save, should_answer = self._parse_summary_response(
-                    sr_answer
-                )
-                accepted, accept_reason = self._evaluate_evidence_acceptance(
-                    query, sr_evidence or sr_answer, should_answer,
-                )
-                await self._logger.info(
-                    f"[Phase 4] Structured reasoning: "
-                    f"accepted={accepted} ({accept_reason})"
-                )
-                if accepted:
-                    cluster = sr_cluster or cluster
-                else:
-                    answer = ""
-
-        # Fallback: cluster summary with ROI prompt or ReAct
-        if not answer:
-            if artifacts and artifacts.catalog_map and cluster and cluster.content:
-                _catalog_ctx_parts = []
-                for fp in (cluster.search_results or merged_files)[:3]:
-                    ctx = self._build_answer_context(fp, artifacts)
-                    if ctx:
-                        _catalog_ctx_parts.append(ctx)
-                if _catalog_ctx_parts:
-                    _catalog_context = "\n".join(_catalog_ctx_parts)
-                    if isinstance(cluster.content, list):
-                        cluster.content = "\n".join(cluster.content)
-                    cluster.content = (
-                        f"{cluster.content}\n\n"
-                        f"[Document Context]\n{_catalog_context}"
-                    )
-
-            if cluster and cluster.content:
-                await self._logger.info(
-                    "[Phase 4:Fallback] Generating summary from cluster"
-                )
-                answer, should_save, should_answer = (
-                    await self._summarise_cluster(query, cluster, _query_intent)
-                )
-                cluster_evidence = (
-                    str(cluster.content) if cluster.content else ""
-                )
-                accepted, accept_reason = (
-                    self._evaluate_evidence_acceptance(
-                        query, cluster_evidence, should_answer,
-                    )
-                )
-                if not accepted:
-                    if llm_fallback:
-                        answer, should_save = (
-                            await self._summarise_cluster_fallback(query)
-                        )
-                    else:
-                        # DEEP self-correction before giving up
-                        sc_evidence = await self._deep_self_correct(
-                            query, merged_files, query_keywords, context,
-                        )
-                        if sc_evidence:
-                            sc_cluster = self._make_answer_cluster(
-                                query, sc_evidence[:5000], "DSC",
-                                file_paths=list(merged_files)[:3],
-                            )
-                            sc_cluster.content = sc_evidence
-                            answer, should_save, should_answer = (
-                                await self._summarise_cluster(query, sc_cluster, _query_intent)
-                            )
-                            sc_accepted, _ = self._evaluate_evidence_acceptance(
-                                query, sc_evidence, should_answer,
-                            )
-                            if sc_accepted:
-                                cluster = sc_cluster
-                            else:
-                                return _NO_RESULTS_MESSAGE, None, context
-                        else:
-                            return _NO_RESULTS_MESSAGE, None, context
-                if not cluster.search_results:
-                    cluster.search_results = list(merged_files)
-            elif llm_fallback:
-                answer, should_save = (
-                    await self._summarise_cluster_fallback(query)
-                )
-            else:
-                await self._logger.info(
-                    "[Phase 4:Fallback] Launching ReAct refinement"
-                )
-                react_parts: List[str] = []
-                if spec_context:
-                    react_parts.append(spec_context)
-                if graph_ctx:
-                    react_parts.append(graph_ctx)
-                if _pre_nav_evidence:
-                    nav_seed = "\n\n".join(
-                        f"[Pre-navigated: {Path(fp).name}]\n{ev}"
-                        for fp, ev in _pre_nav_evidence.items()
-                    )
-                    react_parts.append(nav_seed)
-                react_spec = "\n\n".join(react_parts)
-                react_answer, context = await self._react_refinement(
-                    query=query, paths=paths,
-                    initial_keywords=initial_keywords,
-                    spec_context=react_spec,
-                    enable_dir_scan=enable_dir_scan,
-                    max_loops=max_loops,
-                    max_token_budget=max_token_budget,
-                    max_depth=max_depth,
-                    include=include, exclude=exclude,
-                )
-                if not cluster:
-                    cluster = await self._build_cluster_from_context(
-                        query=query, answer=react_answer,
-                        context=context,
-                        query_keywords=query_keywords,
-                        top_k_files=top_k_files,
-                    )
-                elif react_answer and not cluster.content:
-                    cluster.content = react_answer
-                if not cluster:
-                    return _NO_RESULTS_MESSAGE, None, context
-                answer, should_save, should_answer = (
-                    await self._summarise_cluster(query, cluster, _query_intent)
-                )
-                final_evidence = (
-                    str(cluster.content) if cluster.content else ""
-                )
-                final_accepted, _ = self._evaluate_evidence_acceptance(
-                    query, final_evidence, should_answer,
-                )
-                if not final_accepted:
-                    if llm_fallback:
-                        answer, should_save = (
-                            await self._summarise_cluster_fallback(query)
-                        )
-                    else:
-                        sc_evidence = await self._deep_self_correct(
-                            query, merged_files, query_keywords, context,
-                        )
-                        if sc_evidence:
-                            sc_cluster = self._make_answer_cluster(
-                                query, sc_evidence[:5000], "DSC",
-                                file_paths=list(merged_files)[:3],
-                            )
-                            sc_cluster.content = sc_evidence
-                            answer, should_save, _ = (
-                                await self._summarise_cluster(query, sc_cluster, _query_intent)
-                            )
-                            cluster = sc_cluster
-                        else:
-                            return _NO_RESULTS_MESSAGE, None, context
+        answer, should_save, cluster = await self._synthesize_from_retrieval(
+            query, _query_intent, retrieval, merged_files,
+        )
 
         # ==============================================================
-        # Phase 4.5: Computation verification (Plan E)
+        # Phase 4.75: Computation verification
         # ==============================================================
-        if answer and _query_intent == "computation":
+        if answer and answer != _NO_RESULTS_MESSAGE and _query_intent == "computation":
             answer, was_corrected = await self._verify_computation(query, answer)
             if was_corrected:
                 _, should_save, _ = self._parse_summary_response(answer)
@@ -2886,10 +2695,24 @@ class AgenticSearch(BaseSearch):
     _DEEP_STRUCTURED_MAX_FILES: int = 3
     """Maximum files to process through structured reasoning pipeline."""
 
+    # --- Agentic retrieval ---
+    _AGENTIC_MAX_ROUNDS: int = 3
+    """Maximum retrieval rounds in the agentic loop."""
+    _AGENTIC_MAX_PAGES_PER_ROUND: int = 8
+    """Maximum new pages to extract per round per file."""
+    _AGENTIC_MAX_TOTAL_PAGES: int = 20
+    """Maximum total pages across all rounds."""
+    _AGENTIC_MAX_FILES: int = 3
+    """Maximum files to process through agentic retrieval."""
+    _AGENTIC_SECTION_MAP_DEPTH: int = 8
+    """Section map depth for agentic page selection."""
+    _AGENTIC_EVIDENCE_MAX_CHARS: int = 40_000
+    """Maximum evidence characters to feed to synthesis prompt."""
+
     # --- Evidence acceptance thresholds ---
     _EVIDENCE_MIN_ACCEPT_LENGTH: int = 800
     """Minimum evidence character length for heuristic override."""
-    _EVIDENCE_KEYWORD_COVERAGE_THRESHOLD: float = 0.5
+    _EVIDENCE_KEYWORD_COVERAGE_THRESHOLD: float = 0.3
     """Minimum keyword coverage ratio for heuristic override."""
 
     _NUMERIC_INTENT_KEYWORDS: frozenset = frozenset({
@@ -6858,7 +6681,496 @@ class AgenticSearch(BaseSearch):
         return answer, False  # Never save fallback answers
 
     # ------------------------------------------------------------------
-    # Deep Structured Reasoning pipeline
+    # Agentic retrieval pipeline (DEEP mode)
+    # ------------------------------------------------------------------
+
+    async def _analyze_data_requirements(
+        self, query: str, intent: str,
+    ) -> DataRequirements:
+        """Identify what data points the query needs before any retrieval."""
+        try:
+            prompt = DEEP_DATA_REQUIREMENTS.format(query=query, intent=intent)
+            resp = await self.llm.achat(
+                [{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+            raw = (resp.content or "").strip()
+            data = self._extract_json_object(raw)
+            if data:
+                return DataRequirements(
+                    data_points=data.get("data_points", [query]),
+                    likely_sources=data.get("likely_sources", []),
+                    formula=data.get("formula"),
+                    time_period=data.get("time_period"),
+                    intent=intent,
+                )
+        except Exception as exc:
+            await self._logger.warning(
+                f"[Phase 3] Data requirements analysis failed: {exc}"
+            )
+        return DataRequirements(
+            data_points=[query], likely_sources=[], formula=None,
+            time_period=None, intent=intent,
+        )
+
+    def _select_target_files(
+        self,
+        merged_files: List[str],
+        scope: "_PathScope",
+        artifacts: Optional["CompileArtifacts"],
+    ) -> List[str]:
+        """Select top files for agentic retrieval, preferring tree-indexed ones."""
+        scoped = [fp for fp in merged_files if scope.contains(fp)]
+        if not scoped:
+            scoped = list(merged_files)
+
+        tree_paths = (
+            artifacts.tree_available_paths if artifacts else set()
+        )
+        with_tree = [fp for fp in scoped if fp in tree_paths]
+        without_tree = [fp for fp in scoped if fp not in tree_paths]
+        ranked = with_tree + without_tree
+        return ranked[: self._AGENTIC_MAX_FILES]
+
+    async def _select_pages_for_data(
+        self,
+        query: str,
+        data_reqs: DataRequirements,
+        section_map: str,
+        evidence_so_far: str,
+        fetched_pages: set,
+        sections_meta: Optional[List[Dict[str, Any]]] = None,
+        total_pages: Optional[int] = None,
+    ) -> set:
+        """LLM-driven page selection given document outline and data needs."""
+        reqs_str = "\n".join(
+            f"- {dp}" for dp in data_reqs.data_points
+        )
+        if data_reqs.formula:
+            reqs_str += f"\nFormula: {data_reqs.formula}"
+
+        fetched_str = (
+            ", ".join(str(p) for p in sorted(fetched_pages))
+            if fetched_pages else "None"
+        )
+
+        prompt = DEEP_PAGE_SELECT.format(
+            query=query,
+            data_requirements=reqs_str,
+            section_map=section_map,
+            fetched_pages=fetched_str,
+        )
+        try:
+            resp = await self.llm.achat(
+                [{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+            raw = (resp.content or "").strip()
+            match = re.search(r"\[[\d\s,]+\]", raw)
+            if match:
+                pages = json.loads(match.group())
+                result = {
+                    int(p) for p in pages
+                    if isinstance(p, (int, float)) and int(p) > 0
+                }
+                if result:
+                    return result
+        except Exception as exc:
+            await self._logger.warning(
+                f"[Phase 4] Page selection failed: {exc}"
+            )
+
+        return self._fallback_page_selection(
+            data_reqs, sections_meta, fetched_pages, total_pages,
+        )
+
+    @staticmethod
+    def _fallback_page_selection(
+        data_reqs: DataRequirements,
+        sections_meta: Optional[List[Dict[str, Any]]],
+        fetched_pages: set,
+        total_pages: Optional[int],
+    ) -> set:
+        """Heuristic page selection when LLM fails or returns empty."""
+        candidates: set = set()
+
+        if sections_meta:
+            source_keywords = {
+                s.lower() for s in data_reqs.likely_sources
+            }
+            for sec in sections_meta:
+                title_lower = (sec.get("title") or "").lower()
+                pr = sec.get("page_range")
+                if not pr or not pr[0]:
+                    continue
+                if any(kw in title_lower for kw in source_keywords):
+                    start, end = int(pr[0]), int(pr[1])
+                    for p in range(start, min(start + 4, end + 1)):
+                        candidates.add(p)
+
+        if not candidates and total_pages and total_pages > 10:
+            mid = total_pages // 2
+            last_quarter = total_pages * 3 // 4
+            for p in range(mid, min(mid + 4, total_pages + 1)):
+                candidates.add(p)
+            for p in range(last_quarter, min(last_quarter + 4, total_pages + 1)):
+                candidates.add(p)
+
+        return candidates - fetched_pages
+
+    async def _check_data_requirements(
+        self,
+        query: str,
+        data_reqs: DataRequirements,
+        evidence: str,
+    ) -> Tuple[bool, List[str]]:
+        """Check if evidence satisfies all data requirements.
+
+        Returns ``(is_complete, missing_data_points)``.
+        """
+        try:
+            prompt = DEEP_CHECK_REQUIREMENTS.format(
+                query=query,
+                data_points="\n".join(f"- {dp}" for dp in data_reqs.data_points),
+                formula=data_reqs.formula or "N/A",
+                evidence=evidence[:self._AGENTIC_EVIDENCE_MAX_CHARS],
+            )
+            resp = await self.llm.achat(
+                [{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+            raw = (resp.content or "").strip()
+            json_start = raw.find("{")
+            json_end = raw.rfind("}")
+            if json_start >= 0 and json_end > json_start:
+                data = json.loads(raw[json_start : json_end + 1])
+                is_complete = bool(data.get("complete", True))
+                missing = data.get("missing", [])
+                if isinstance(missing, list) and missing:
+                    return False, [str(m) for m in missing[:5]]
+                return is_complete, []
+        except Exception as exc:
+            await self._logger.warning(
+                f"[Phase 4] Data requirements check failed: {exc}"
+            )
+        return True, []
+
+    async def _agentic_retrieve(
+        self,
+        query: str,
+        data_reqs: DataRequirements,
+        target_files: List[str],
+        context: "SearchContext",
+    ) -> RetrievalResult:
+        """Core agentic retrieval loop: select pages → extract → check → repeat."""
+        indexer = self._get_tree_indexer()
+        evidence_parts: List[str] = []
+        pages_extracted: Dict[str, set] = {}
+        total_pages = 0
+
+        outlines: Dict[str, str] = {}
+        outlines_meta: Dict[str, List[Dict[str, Any]]] = {}
+        file_total_pages: Dict[str, int] = {}
+        for fp in target_files:
+            tree = indexer.load_tree(fp) if indexer else None
+            if tree and tree.total_pages:
+                file_total_pages[fp] = tree.total_pages
+
+            # Strategy 1: LLM-analyzed TOC pages (highest quality)
+            tp = file_total_pages.get(fp)
+            toc_outline, toc_meta = await self._build_outline_from_toc_pages(fp, tp)
+            if toc_outline.strip():
+                outlines[fp] = toc_outline
+                outlines_meta[fp] = toc_meta
+                continue
+
+            # Strategy 2: Tree-index section map (fallback)
+            if tree and tree.root:
+                outline, sec_meta = self._build_section_map(
+                    tree.root, max_depth=self._AGENTIC_SECTION_MAP_DEPTH,
+                )
+                if outline.strip():
+                    outlines[fp] = outline
+                    outlines_meta[fp] = sec_meta
+
+        current_reqs = data_reqs
+
+        for round_idx in range(self._AGENTIC_MAX_ROUNDS):
+            round_fetched_any = False
+
+            for fp in target_files:
+                if total_pages >= self._AGENTIC_MAX_TOTAL_PAGES:
+                    break
+
+                fname = Path(fp).name
+                fetched = pages_extracted.get(fp, set())
+                outline = outlines.get(fp, "")
+                sec_meta = outlines_meta.get(fp)
+                tp = file_total_pages.get(fp)
+
+                if not outline and not tp:
+                    continue
+
+                new_pages = await self._select_pages_for_data(
+                    query, current_reqs, outline or "(no outline available)",
+                    "\n\n".join(evidence_parts)[:8000],
+                    fetched,
+                    sections_meta=sec_meta,
+                    total_pages=tp,
+                )
+                new_pages -= fetched
+                if not new_pages:
+                    continue
+
+                budget = self._AGENTIC_MAX_PAGES_PER_ROUND
+                capped = sorted(new_pages)[:budget]
+                try:
+                    contents = DocumentExtractor.extract_pages(fp, capped)
+                    for pc in contents:
+                        if pc.content and pc.content.strip():
+                            evidence_parts.append(
+                                f"[{fname} p.{pc.page_number}]\n{pc.content}"
+                            )
+                    pages_extracted.setdefault(fp, set()).update(capped)
+                    total_pages += len(capped)
+                    round_fetched_any = True
+                except Exception as exc:
+                    await self._logger.warning(
+                        f"[Phase 4] Page extraction failed for {fname}: {exc}"
+                    )
+
+                # Append table digests for newly fetched pages only
+                try:
+                    from sirchmunk.utils.file_utils import get_fast_hash
+                    fhash = get_fast_hash(fp)
+                    if fhash:
+                        tables = self._load_table_digest(self.work_path, fhash)
+                        if tables:
+                            new_page_set = set(capped)
+                            page_tables = [
+                                t for t in tables
+                                if t.get("page_number") in new_page_set
+                            ]
+                            if page_tables:
+                                table_ev = self._format_table_evidence(
+                                    page_tables,
+                                    max_chars=self._TABLE_EVIDENCE_DEFAULT_CHARS,
+                                    query=query,
+                                )
+                                if table_ev:
+                                    evidence_parts.append(
+                                        f"[{fname} tables]\n{table_ev}"
+                                    )
+                except Exception:
+                    pass
+
+            context.increment_loop()
+
+            if not round_fetched_any:
+                break
+
+            combined = "\n\n".join(evidence_parts)
+            is_complete, missing = await self._check_data_requirements(
+                query, current_reqs, combined,
+            )
+            context.increment_loop()
+
+            await self._logger.info(
+                f"[Phase 4] Round {round_idx + 1}: "
+                f"{total_pages} pages, complete={is_complete}, "
+                f"missing={len(missing)}"
+            )
+
+            if is_complete or not missing:
+                return RetrievalResult(
+                    evidence=combined[:self._AGENTIC_EVIDENCE_MAX_CHARS],
+                    pages_extracted={
+                        fp: sorted(ps) for fp, ps in pages_extracted.items()
+                    },
+                    is_complete=True,
+                    rounds_used=round_idx + 1,
+                )
+
+            current_reqs = DataRequirements(
+                data_points=missing,
+                likely_sources=data_reqs.likely_sources,
+                formula=data_reqs.formula,
+                time_period=data_reqs.time_period,
+                intent=data_reqs.intent,
+            )
+
+        combined = "\n\n".join(evidence_parts)
+        return RetrievalResult(
+            evidence=combined[:self._AGENTIC_EVIDENCE_MAX_CHARS],
+            pages_extracted={
+                fp: sorted(ps) for fp, ps in pages_extracted.items()
+            },
+            is_complete=False,
+            rounds_used=self._AGENTIC_MAX_ROUNDS,
+        )
+
+    async def _synthesize_from_retrieval(
+        self,
+        query: str,
+        intent: str,
+        retrieval: RetrievalResult,
+        file_paths: List[str],
+    ) -> Tuple[str, bool, Optional["KnowledgeCluster"]]:
+        """Synthesize final answer from agentic retrieval evidence."""
+        if not retrieval.evidence.strip():
+            return _NO_RESULTS_MESSAGE, False, None
+
+        synth_prompt = self._select_synthesis_prompt(
+            query, retrieval.evidence, intent,
+        )
+        resp = await self.llm.achat(
+            messages=[{"role": "user", "content": synth_prompt}],
+            stream=True,
+        )
+        self.llm_usages.append(resp.usage)
+
+        raw = resp.content or ""
+        answer, should_save, should_answer = self._parse_summary_response(raw)
+
+        accepted, reason = self._evaluate_evidence_acceptance(
+            query, retrieval.evidence, should_answer,
+            retrieval_complete=retrieval.is_complete,
+        )
+        await self._logger.info(
+            f"[Phase 4.5] Synthesis: accepted={accepted} ({reason})"
+        )
+
+        if not accepted:
+            return _NO_RESULTS_MESSAGE, False, None
+
+        cluster = self._make_answer_cluster(
+            query, retrieval.evidence[:5000], "AGT",
+            file_paths=list(retrieval.pages_extracted.keys())[:3],
+        )
+        cluster.content = retrieval.evidence
+        return answer, should_save, cluster
+
+    # ------------------------------------------------------------------
+    # LLM-powered document outline from TOC pages
+    # ------------------------------------------------------------------
+
+    _TOC_ANALYSIS_PAGES: List[int] = [1, 2, 3]
+
+    async def _build_outline_from_toc_pages(
+        self,
+        file_path: str,
+        total_pages: Optional[int] = None,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Build a section map by extracting and LLM-analyzing TOC pages.
+
+        Extracts the first few pages of a PDF (where the Table of Contents
+        typically resides), sends the text to the LLM for structural parsing,
+        and returns an outline string plus section metadata in the same format
+        as ``_build_section_map()`` for seamless integration.
+
+        Results are cached per file hash to avoid repeated LLM calls.
+        """
+        from sirchmunk.utils.file_utils import get_fast_hash
+
+        fhash = get_fast_hash(file_path)
+        if not fhash:
+            return "", []
+
+        cache_dir = self.work_path / ".cache" / "compile" / "toc_outlines"
+        cache_path = cache_dir / f"{fhash}.json"
+
+        sections_raw: Optional[list] = None
+        if cache_path.exists():
+            try:
+                sections_raw = json.loads(cache_path.read_text())
+            except Exception:
+                pass
+
+        if sections_raw is None:
+            try:
+                contents = DocumentExtractor.extract_pages(
+                    file_path, self._TOC_ANALYSIS_PAGES,
+                )
+                toc_text = "\n\n".join(
+                    f"--- Page {pc.page_number} ---\n{pc.content}"
+                    for pc in contents if pc.content and pc.content.strip()
+                )
+                if len(toc_text.strip()) < 200:
+                    return "", []
+
+                tp = total_pages or len(contents)
+                prompt = DEEP_TOC_ANALYSIS.format(
+                    toc_page_text=toc_text[:6000],
+                    total_pages=tp,
+                )
+                resp = await self.llm.achat(
+                    [{"role": "user", "content": prompt}], stream=False,
+                )
+                self.llm_usages.append(resp.usage)
+
+                raw = (resp.content or "").strip()
+                sections_raw = self._extract_json_array(raw)
+                if sections_raw is None:
+                    sections_raw = []
+
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps(sections_raw, ensure_ascii=False))
+            except Exception as exc:
+                await self._logger.warning(
+                    f"[Phase 4] TOC outline extraction failed: {exc}"
+                )
+                return "", []
+
+        if not sections_raw:
+            return "", []
+
+        return self._toc_sections_to_outline(sections_raw, total_pages)
+
+    @staticmethod
+    def _toc_sections_to_outline(
+        sections_raw: list,
+        total_pages: Optional[int] = None,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Convert raw TOC section list to outline string and metadata."""
+        sections_meta: List[Dict[str, Any]] = []
+        lines: List[str] = []
+
+        for i, sec in enumerate(sections_raw):
+            if not isinstance(sec, dict):
+                continue
+            title = str(sec.get("title", "")).strip()
+            if not title:
+                continue
+
+            ps = sec.get("page_start")
+            pe = sec.get("page_end")
+            level = int(sec.get("level", 1)) - 1
+
+            page_range = None
+            if ps is not None:
+                ps = int(ps)
+                pe = int(pe) if pe is not None else (total_pages or ps)
+                page_range = [ps, pe]
+
+            idx = len(sections_meta)
+            sections_meta.append({
+                "idx": idx,
+                "title": title,
+                "page_range": page_range,
+                "char_range": None,
+                "depth": level,
+                "node_id": f"toc_{idx}",
+                "summary": "",
+            })
+
+            indent = "  " * level
+            page_str = f"(p{page_range[0]}-{page_range[1]})" if page_range else ""
+            lines.append(f"[{idx}] {indent}{title} {page_str}")
+
+        return "\n".join(lines), sections_meta
+
+    # ------------------------------------------------------------------
+    # Deep Structured Reasoning pipeline (legacy, used by older code paths)
     # ------------------------------------------------------------------
 
     @staticmethod

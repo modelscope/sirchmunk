@@ -706,6 +706,97 @@ Revise your answer using the correct arithmetic. Keep the same analysis structur
 """
 
 # ---------------------------------------------------------------------------
+# Agentic retrieval prompts (DEEP mode)
+# ---------------------------------------------------------------------------
+
+DEEP_DATA_REQUIREMENTS = """Given the user's question, identify the specific data points needed to answer it.
+
+### Question
+{query}
+
+### Question Type
+{intent}
+
+### Instructions
+1. List each specific data point needed to answer this question (e.g., "Total Revenue for FY2022", "Accounts Payable as of fiscal year end 2019").
+2. For each data point, identify the likely document section type where it would appear (e.g., "Income Statement", "Balance Sheet", "Cash Flow Statement", "Notes to Financial Statements", "Management Discussion and Analysis", "Segment Information").
+3. If a calculation is required, state the exact formula.
+4. Identify the time period(s) required.
+
+Return ONLY valid JSON on a single line:
+{{"data_points": ["data point 1", "data point 2"], "likely_sources": ["section type 1", "section type 2"], "formula": "formula or null", "time_period": "period or null"}}
+"""
+
+DEEP_PAGE_SELECT = """You are locating specific data in a document. Select pages to fetch.
+
+### Question
+{query}
+
+### Data Still Needed
+{data_requirements}
+
+### Document Outline (with page ranges)
+{section_map}
+
+### Pages Already Fetched
+{fetched_pages}
+
+### Instructions
+- Reason about which sections contain the needed data based on section titles, summaries, and page ranges.
+- Financial statements (Income Statement, Balance Sheet, Cash Flow Statement) typically contain quantitative data needed for calculations.
+- Sections with tables are often high-value for data extraction.
+- Do NOT re-select pages listed in "Pages Already Fetched".
+- Select 3-8 pages that are most likely to contain the missing data.
+- When uncertain, prefer sections deeper in the document (financial statements are usually after narrative sections).
+
+Return ONLY a JSON array of page numbers to fetch: [45, 46, 52, 53]
+"""
+
+DEEP_CHECK_REQUIREMENTS = """Check whether the evidence contains all required data points.
+
+### Question
+{query}
+
+### Required Data Points
+{data_points}
+
+### Formula (if applicable)
+{formula}
+
+### Evidence
+{evidence}
+
+### Instructions
+For each required data point, check if its actual numeric or factual value appears in the evidence. A data point is FOUND only if you can identify its specific value in the text.
+
+Return ONLY valid JSON:
+{{"complete": true, "found": [{{"point": "description", "value": "extracted value"}}], "missing": []}}
+or
+{{"complete": false, "found": [{{"point": "description", "value": "extracted value"}}], "missing": ["description of missing data point"]}}
+"""
+
+DEEP_TOC_ANALYSIS = """Analyze the following pages from the beginning of a document and extract its structural outline.
+
+### Document Pages
+{toc_page_text}
+
+### Total Document Pages
+{total_pages}
+
+### Instructions
+1. Look for a table of contents, section listing, or structural overview.
+2. Extract every section entry with its title, starting page number, and hierarchy level.
+3. Infer page_end from the start of the next section (use {total_pages} for the last section).
+4. If page numbers appear as dot leaders (e.g. "Item 7. MD&A ........ 45"), extract the page number.
+5. If no structural information can be extracted, return an empty array.
+
+Return ONLY valid JSON — an array of section objects:
+[{{"title": "Section Title", "page_start": 3, "page_end": 15, "level": 1}}, ...]
+
+If no structure found, return: []
+"""
+
+# ---------------------------------------------------------------------------
 # Knowledge Compile prompts
 # ---------------------------------------------------------------------------
 
