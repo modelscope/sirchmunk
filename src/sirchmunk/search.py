@@ -8,22 +8,32 @@ import math
 import os
 import re
 import traceback
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 from sirchmunk.base import BaseSearch
 from sirchmunk.learnings.knowledge_base import KnowledgeBase
+from sirchmunk.utils.document_extractor import DocumentExtractor
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import (
     KEYWORD_QUERY_PLACEHOLDER,
     generate_keyword_extraction_prompt,
     FAST_QUERY_ANALYSIS,
+    FAST_QUERY_ANALYSIS_WITH_CATALOG,
     ROI_RESULT_SUMMARY,
-    SEARCH_RESULT_SUMMARY,
+    ROI_LOOKUP_SYNTHESIS,
+    ROI_COMPUTATION_SYNTHESIS,
+    ROI_COMPARISON_SYNTHESIS,
     DOC_SUMMARY,
     DOC_CHUNK_SUMMARY,
     DOC_MERGE_SUMMARIES,
+    DEEP_SECTION_SELECT,
+    DEEP_DATA_REQUIREMENTS,
+    DEEP_PAGE_SELECT,
+    DEEP_CHECK_REQUIREMENTS,
+    DEEP_TOC_ANALYSIS,
 )
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.schema.knowledge import (
@@ -80,6 +90,174 @@ _CHAT_RESPONSE_SYSTEM = (
 )
 
 _NO_RESULTS_MESSAGE = "No results found."
+
+# Soft-similarity threshold for gradient cluster reuse (P2)
+_SOFT_SIM_THRESHOLD = 0.65
+
+
+class _PathScope:
+    """Immutable search-path scope for filtering compile artifacts.
+
+    Resolves the provided search paths into absolute file paths and
+    directory prefixes, then offers ``contains()`` to test whether a
+    given artifact path falls within this scope.
+
+    When the scope is empty (no paths provided), ``contains()`` always
+    returns True — i.e. *no filtering* is applied.
+    """
+
+    __slots__ = ("_files", "_dirs", "_empty")
+
+    def __init__(self, search_paths: Optional[List[str]] = None) -> None:
+        files: Set[str] = set()
+        dirs: List[str] = []
+        if search_paths:
+            for p in search_paths:
+                resolved = str(Path(p).expanduser().resolve())
+                if Path(resolved).is_file():
+                    files.add(resolved)
+                elif Path(resolved).is_dir():
+                    dirs.append(
+                        resolved if resolved.endswith(os.sep)
+                        else resolved + os.sep
+                    )
+                else:
+                    files.add(resolved)
+        self._files = frozenset(files)
+        self._dirs = tuple(dirs)
+        self._empty = not files and not dirs
+
+    def contains(self, file_path: str) -> bool:
+        """Return True when *file_path* falls within the search scope."""
+        if self._empty:
+            return True
+        if not file_path:
+            return False
+        resolved = str(Path(file_path).expanduser().resolve())
+        if resolved in self._files:
+            return True
+        return any(resolved.startswith(d) for d in self._dirs)
+
+    @property
+    def is_empty(self) -> bool:
+        return self._empty
+
+# Pure tree search mode for ablation experiments.
+# When enabled, search relies solely on tree index navigation, skipping rga keyword search.
+_PURE_TREE_SEARCH: bool = os.getenv("SIRCHMUNK_PURE_TREE_SEARCH", "false").lower() == "true"
+
+# Common English stop-words filtered out during keyword coverage computation.
+_STOP_WORDS: frozenset = frozenset({
+    "the", "is", "a", "an", "of", "in", "for", "to", "and", "or",
+    "what", "how", "which", "does", "was", "were", "has", "have", "had",
+    "do", "did", "are", "be", "been", "by", "with", "from", "this",
+    "that", "it", "its", "on", "at", "as", "not", "no",
+})
+
+
+@dataclass
+class SoftClusterHit:
+    """Signals from clusters that are related but below the hard reuse threshold.
+
+    Carries structured hints (keywords, file paths, background context) that
+    downstream retrieval phases can exploit without short-circuiting the search.
+    """
+
+    patterns: List[str]
+    file_paths: List[str]
+    context_summary: str
+    cluster_ids: List[str]
+
+
+@dataclass
+class KnowledgeProbeResult:
+    """Rich result from knowledge cache probing (P3).
+
+    Replaces the flat ``List[str]`` that ``_probe_knowledge_cache`` used to return.
+    """
+
+    file_paths: List[str]
+    extra_keywords: List[str]
+    background_context: str
+
+
+@dataclass
+class CompileHints:
+    """Zero-LLM hints gathered from compile manifest and tree cache (P4)."""
+
+    file_paths: List[str]
+    extra_keywords: List[str]
+
+
+@dataclass
+class CompileArtifacts:
+    """Compile artifact availability context for adaptive activation in FAST mode.
+
+    Created once at the start of ``_search_fast()`` via
+    ``_detect_compile_artifacts()`` and threaded through all pipeline steps.
+    Each step checks the relevant field and falls back gracefully when the
+    artifact is absent.
+    """
+
+    catalog: Optional[List[Dict[str, str]]]
+    catalog_map: Dict[str, Dict[str, str]]  # path -> catalog entry for O(1) lookup
+    tree_indexer: Optional[Any]  # DocumentTreeIndexer (lazy import)
+    tree_available_paths: Set[str]  # file paths that have cached tree indices
+    manifest_map: Dict[str, Any] = field(default_factory=dict)  # {path: FileManifestEntry}
+    summary_index: Optional[Any] = None  # CompileSummaryIndex (lazy-loaded)
+
+
+@dataclass
+class DataRequirements:
+    """Pre-retrieval analysis of what data points a query needs."""
+
+    data_points: List[str]
+    likely_sources: List[str]
+    formula: Optional[str]
+    time_period: Optional[str]
+    intent: str
+
+
+@dataclass
+class RetrievalResult:
+    """Output of the agentic retrieval loop."""
+
+    evidence: str
+    pages_extracted: Dict[str, List[int]]
+    is_complete: bool
+    rounds_used: int
+
+
+class _TreeNavCache:
+    """Per-search-session cache for tree navigation results.
+
+    Avoids duplicate LLM navigation calls for the same file+query pair.
+    Created at the start of each ``_search_fast()`` invocation and reset
+    per search session.
+    """
+
+    __slots__ = ("_store",)
+
+    def __init__(self) -> None:
+        self._store: Dict[str, Optional[List[Any]]] = {}
+
+    @staticmethod
+    def _key(file_path: str, query: str) -> str:
+        import hashlib
+        return hashlib.md5(f"{file_path}:{query}".encode()).hexdigest()
+
+    def get(self, file_path: str, query: str) -> Optional[List[Any]]:
+        """Retrieve cached navigation leaves for a file+query pair."""
+        key = self._key(file_path, query)
+        return self._store.get(key)
+
+    def has(self, file_path: str, query: str) -> bool:
+        """Check whether a cached result exists."""
+        return self._key(file_path, query) in self._store
+
+    def put(self, file_path: str, query: str, leaves: Optional[List[Any]]) -> None:
+        """Store navigation leaves for a file+query pair."""
+        self._store[self._key(file_path, query)] = leaves
 
 
 class AgenticSearch(BaseSearch):
@@ -419,6 +597,14 @@ class AgenticSearch(BaseSearch):
                 )
                 return None
 
+            # P3: skip clusters whose cached answer is a refusal
+            if self._is_refusal_answer(content):
+                await self._logger.info(
+                    f"Cluster {existing_cluster.id} contains a refusal answer, "
+                    "falling back to full search"
+                )
+                return None
+
             # Mutate only after validation passes
             self._add_query_to_cluster(existing_cluster, query)
             existing_cluster.hotness = min(1.0, (existing_cluster.hotness or 0.5) + 0.1)
@@ -460,6 +646,72 @@ class AgenticSearch(BaseSearch):
             )
             return None
 
+    async def _try_soft_reuse(
+        self, query: str, paths: Optional[List[str]] = None,
+    ) -> Optional[SoftClusterHit]:
+        """Gradient reuse: extract structured hints from moderately similar clusters.
+
+        Called when ``_try_reuse_cluster`` misses (similarity < hard threshold).
+        Uses a softer threshold to find clusters that are *related* but not
+        close enough for full reuse.  Returns patterns, file paths, and a
+        background context summary that downstream phases can exploit.
+        """
+        if not self.embedding_client or not self.embedding_client.is_ready():
+            return None
+
+        try:
+            query_embedding = (await self.embedding_client.embed([query]))[0]
+            similar = await self.knowledge_storage.search_similar_clusters(
+                query_embedding=query_embedding,
+                top_k=5,
+                similarity_threshold=_SOFT_SIM_THRESHOLD,
+                search_paths=paths,
+            )
+            if not similar:
+                return None
+
+            patterns: List[str] = []
+            file_paths: List[str] = []
+            context_parts: List[str] = []
+            cluster_ids: List[str] = []
+            seen_paths: set = set()
+
+            for match in similar:
+                cid = match["id"]
+                cluster_ids.append(cid)
+                c = await self.knowledge_storage.get(cid)
+                if not c:
+                    continue
+                for p in getattr(c, "patterns", []) or []:
+                    if p and p not in patterns:
+                        patterns.append(p)
+                for ev in getattr(c, "evidences", []):
+                    fp = str(getattr(ev, "file_or_url", ""))
+                    if fp and fp not in seen_paths and Path(fp).exists():
+                        seen_paths.add(fp)
+                        file_paths.append(fp)
+                content = c.content
+                if isinstance(content, list):
+                    content = "\n".join(content)
+                if content:
+                    context_parts.append(str(content)[:500])
+
+            if not patterns and not file_paths:
+                return None
+
+            await self._logger.info(
+                f"[SoftReuse] {len(similar)} soft hits: "
+                f"{len(patterns)} patterns, {len(file_paths)} files"
+            )
+            return SoftClusterHit(
+                patterns=patterns[:10],
+                file_paths=file_paths[:10],
+                context_summary="\n\n".join(context_parts[:3]),
+                cluster_ids=cluster_ids,
+            )
+        except Exception:
+            return None
+
     def _add_query_to_cluster(self, cluster: KnowledgeCluster, query: str) -> None:
         """
         Add query to cluster's queries list with FIFO strategy.
@@ -477,6 +729,36 @@ class AgenticSearch(BaseSearch):
         if len(cluster.queries) > self.max_queries_per_cluster:
             # Remove oldest queries (from the beginning)
             cluster.queries = cluster.queries[-self.max_queries_per_cluster:]
+
+    @staticmethod
+    def _enrich_reused_content(cluster: KnowledgeCluster) -> str:
+        """Build the answer text from a reused cluster.
+
+        When the cluster carries compiled evidence with non-empty snippets
+        (populated during ``sirchmunk compile``), appends them as supporting
+        excerpts so the user sees both the summary and the underlying source
+        material.
+        """
+        content = cluster.content
+        if isinstance(content, list):
+            content = "\n".join(content)
+        content = str(content or "")
+
+        evidence_parts: List[str] = []
+        for ev in getattr(cluster, "evidences", []):
+            snippets = getattr(ev, "snippets", None)
+            if not snippets:
+                continue
+            source = str(getattr(ev, "file_or_url", "unknown"))
+            for snip in snippets:
+                text = snip if isinstance(snip, str) else snip.get("snippet", "")
+                if text and text.strip():
+                    evidence_parts.append(f"[{Path(source).name}] {text.strip()}")
+
+        if evidence_parts:
+            content += "\n\n---\nSupporting evidence:\n" + "\n\n".join(evidence_parts[:5])
+
+        return content
 
     async def _save_cluster_with_embedding(self, cluster: KnowledgeCluster) -> None:
         """Save knowledge cluster to persistent storage, compute embedding, and flush to parquet.
@@ -734,22 +1016,52 @@ class AgenticSearch(BaseSearch):
             await self._logger.error(f"Traceback: {traceback.format_exc()}")
             return []
 
-    @staticmethod
-    def _parse_summary_response(llm_response: str) -> Tuple[str, bool, bool]:
-        """
-        Parse LLM response to extract summary and quality decisions.
+    _SELF_CORRECTION_PATTERN = re.compile(
+        r'(?:correction|re-?verif|wait,?\s|let me re|actually|self-correction|recalcul)',
+        re.IGNORECASE,
+    )
 
-        Args:
-            llm_response: Raw LLM response containing SUMMARY, SHOULD_ANSWER and SHOULD_SAVE tags
+    _REFUSAL_PATTERN = re.compile(
+        r'cannot\s+(?:be\s+)?determin'
+        r'|data\s+(?:not\s+available|insufficient)'
+        r'|not\s+(?:possible|available)\s+to\s+(?:determin|calculat|answer)'
+        r'|information\s+(?:is\s+)?not\s+(?:available|provided|found)'
+        r'|no\s+(?:relevant|sufficient)\s+(?:data|information|evidence)',
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _is_refusal_answer(cls, text: str) -> bool:
+        """Detect whether *text* is a refusal / no-data answer."""
+        if not text or len(text.strip()) < 20:
+            return True
+        head = text[:500]
+        if re.search(r'\bN/?A\b', head):
+            return True
+        return bool(cls._REFUSAL_PATTERN.search(head))
+
+    @classmethod
+    def _parse_summary_response(cls, llm_response: str) -> Tuple[str, bool, bool]:
+        """Parse LLM response to extract summary, precise answer, and quality decisions.
+
+        When a ``<PRECISE_ANSWER>`` tag is present, its content is prepended to
+        the summary so downstream consumers (evaluation judges, UIs) see the
+        direct answer prominently without needing separate tag awareness.
+
+        The method also detects self-correction patterns in the summary text:
+        when the LLM revised its calculation mid-stream, the last numeric
+        conclusion is used if PRECISE_ANSWER is absent or matches the
+        pre-correction value.
 
         Returns:
             Tuple of (summary_text, should_save_flag, should_answer_flag)
         """
         summary_fields = extract_fields(
             content=llm_response,
-            tags=["SUMMARY", "SHOULD_ANSWER", "SHOULD_SAVE"],
+            tags=["PRECISE_ANSWER", "SUMMARY", "SHOULD_ANSWER", "SHOULD_SAVE"],
         )
 
+        precise = str(summary_fields.get("precise_answer") or "").strip()
         summary = str(summary_fields.get("summary") or "").strip()
         should_answer_str = str(summary_fields.get("should_answer") or "false").strip().lower()
         should_save_str = str(summary_fields.get("should_save") or "false").strip().lower()
@@ -757,14 +1069,513 @@ class AgenticSearch(BaseSearch):
         should_answer = should_answer_str in ["true", "yes", "1"]
         should_save = should_save_str in ["true", "yes", "1"]
 
-        # If extraction failed, use entire response as summary and default to conservative:
-        # not answerable and not saveable.
+        if precise and summary:
+            summary = f"**Answer: {precise}**\n\n{summary}"
+        elif precise:
+            summary = precise
+
         if not summary:
             summary = llm_response.strip()
-            should_answer = False
+            # Fallback: detect **Answer: xxx** markdown format used by models
+            # that ignore <SUMMARY>/<SHOULD_ANSWER> tags (e.g. qwen).
+            _answer_match = re.search(
+                r'\*\*Answer:\s*(.+?)\*\*', llm_response, re.DOTALL,
+            )
+            if _answer_match:
+                _answer_val = _answer_match.group(1).strip()
+                if _answer_val and not cls._is_refusal_answer(_answer_val):
+                    should_answer = True
+                    should_save = True
+                    if not precise:
+                        precise = _answer_val
+                else:
+                    should_answer = False
+                    should_save = False
+            else:
+                should_answer = False
+                should_save = False
+
+        # P3: Never persist refusal/no-data answers to cluster cache
+        if should_save and cls._is_refusal_answer(precise or summary):
             should_save = False
 
         return summary, should_save, should_answer
+
+    # ------------------------------------------------------------------
+    # Multi-factor evidence acceptance helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_keyword_coverage(query: str, evidence: str) -> float:
+        """Compute the fraction of query keywords found in the evidence text.
+
+        Tokenises *query* into lowercase alpha-numeric words (length >= 2),
+        removes common English stop-words, then checks presence in
+        lower-cased *evidence*.
+
+        Returns:
+            Coverage ratio in [0.0, 1.0].  Returns 0.0 when no valid
+            keywords can be extracted from *query*.
+        """
+        tokens = re.findall(r'\b[a-z0-9]{2,}\b', query.lower())
+        keywords = [t for t in tokens if t not in _STOP_WORDS]
+        if not keywords:
+            return 0.0
+        evidence_lower = evidence.lower()
+        matched = sum(1 for kw in keywords if kw in evidence_lower)
+        return matched / len(keywords)
+
+    @staticmethod
+    def _detect_numeric_evidence(query: str, evidence: str) -> bool:
+        """Detect whether *evidence* contains structured numeric data relevant to *query*.
+
+        Returns True when *query* implies a numeric/financial intent AND
+        *evidence* contains numeric patterns (currency amounts, percentages,
+        financial figures).
+        """
+        query_lower = query.lower()
+        has_intent = any(
+            kw in query_lower
+            for kw in AgenticSearch._NUMERIC_INTENT_KEYWORDS
+        )
+        if not has_intent:
+            return False
+        has_numeric = bool(
+            re.search(
+                r'[\$\u20ac\u00a3]\s?\d'
+                r'|(?<!\w)\d[\d,.]*\s?%'
+                r'|\b\d{1,3}(?:,\d{3})+(?:\.\d+)?',
+                evidence,
+            )
+        )
+        return has_numeric
+
+    _COMPLEX_QUERY_PATTERNS = [
+        re.compile(p, re.IGNORECASE) for p in [
+            r'\d+[- ]year average',
+            r'year[- ]over[- ]year',
+            r'compare.*between|between.*and.*fy',
+            r'trend|trajectory',
+            r'fy\d{4}.*(?:to|and|vs).*fy\d{4}',
+            r'(?:3|5|10)[- ]year',
+            r'average.*(?:margin|ratio|growth)',
+            r'change.*from.*to',
+        ]
+    ]
+    _MODERATE_QUERY_PATTERNS = [
+        re.compile(p, re.IGNORECASE) for p in [
+            r'ratio|margin|percentage',
+            r'calculate|compute',
+            r'turnover|conversion|coverage',
+            r'capex|ebitda|eps|roe|roa|dpo',
+            r'what is (?:the )?fy\d{4}',
+            r'how (?:much|many)',
+        ]
+    ]
+
+    @classmethod
+    def _classify_query_complexity(cls, query: str) -> str:
+        """Classify *query* as ``simple``, ``moderate``, or ``complex``.
+
+        Used by DEEP mode to decide whether to invoke the heavier
+        section-map structured reasoning pipeline or go straight to
+        cluster-level synthesis.
+        """
+        if any(p.search(query) for p in cls._COMPLEX_QUERY_PATTERNS):
+            return "complex"
+        if any(p.search(query) for p in cls._MODERATE_QUERY_PATTERNS):
+            return "moderate"
+        return "simple"
+
+    _VALID_COMPLEXITIES = frozenset({"simple", "moderate", "complex"})
+    _VALID_INTENTS = frozenset({"lookup", "computation", "comparison"})
+
+    async def _classify_query_intent(
+        self, query: str,
+    ) -> Tuple[str, str]:
+        """Classify query complexity and intent via LLM.
+
+        Falls back to regex-based ``_classify_query_complexity`` when the
+        LLM call fails or returns unparseable output.
+
+        Returns:
+            ``(complexity, intent)`` where complexity is
+            ``simple|moderate|complex`` and intent is
+            ``lookup|computation|comparison``.
+        """
+        try:
+            from sirchmunk.llm.prompts import DEEP_QUERY_CLASSIFY
+
+            resp = await self.llm.achat(
+                messages=[{
+                    "role": "user",
+                    "content": DEEP_QUERY_CLASSIFY.format(query=query),
+                }],
+                stream=True,
+            )
+            self.llm_usages.append(resp.usage)
+
+            raw = (resp.content or "").strip()
+            data = self._extract_json_object(raw)
+            if data:
+                complexity = data.get("complexity", "").lower()
+                intent = data.get("intent", "").lower()
+                if (complexity in self._VALID_COMPLEXITIES
+                        and intent in self._VALID_INTENTS):
+                    return complexity, intent
+        except Exception as exc:
+            await self._logger.warning(
+                f"[QueryClassify] LLM classification failed: {exc}, "
+                f"falling back to regex"
+            )
+
+        complexity = self._classify_query_complexity(query)
+        intent = "computation" if complexity != "simple" else "lookup"
+        return complexity, intent
+
+    @staticmethod
+    def _extract_json_object(raw: str) -> Optional[dict]:
+        """Extract the outermost JSON object from LLM response text."""
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(raw[start : end + 1])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return None
+
+    @staticmethod
+    def _extract_json_array(raw: str) -> Optional[list]:
+        """Extract the outermost JSON array from LLM response text."""
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(raw[start : end + 1])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return None
+
+    @staticmethod
+    def _evaluate_evidence_acceptance(
+        query: str,
+        evidence: str,
+        llm_should_answer: bool,
+        *,
+        retrieval_complete: bool = False,
+    ) -> Tuple[bool, str]:
+        """Multi-factor decision on whether to accept retrieved evidence.
+
+        Combines the LLM's own SHOULD_ANSWER judgment with heuristic
+        signals (evidence length, keyword coverage, numeric-data presence)
+        to reduce false-negative rejections of valid evidence.
+
+        Returns:
+            A tuple of (*accept*, *reason*) where *accept* is the final
+            boolean decision and *reason* is a human-readable string
+            documenting which factor(s) determined the outcome.
+        """
+        # Factor 0: Agentic retrieval confirmed data completeness
+        if retrieval_complete:
+            return True, "retrieval_complete"
+
+        # Factor 1: LLM direct acceptance
+        if llm_should_answer:
+            return True, "llm_accepted"
+
+        # Factor 2: Heuristic override — length + keyword coverage
+        evidence_len = len(evidence) if evidence else 0
+        kw_coverage = (
+            AgenticSearch._compute_keyword_coverage(query, evidence)
+            if evidence else 0.0
+        )
+
+        if (
+            evidence_len >= AgenticSearch._EVIDENCE_MIN_ACCEPT_LENGTH
+            and kw_coverage >= AgenticSearch._EVIDENCE_KEYWORD_COVERAGE_THRESHOLD
+        ):
+            return True, (
+                f"heuristic_override(len={evidence_len}, "
+                f"kw_coverage={kw_coverage:.2f})"
+            )
+
+        # Factor 3: Numeric evidence detection
+        if AgenticSearch._detect_numeric_evidence(query, evidence or ""):
+            return True, (
+                f"numeric_evidence(len={evidence_len}, "
+                f"kw_coverage={kw_coverage:.2f})"
+            )
+
+        # All factors negative
+        return False, (
+            f"rejected(llm=false, len={evidence_len}, "
+            f"kw_coverage={kw_coverage:.2f}, numeric=false)"
+        )
+
+    # ------------------------------------------------------------------
+    # Plan E: Computation verification
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Plan D: Evidence adequacy closed-loop
+    # ------------------------------------------------------------------
+
+    async def _check_evidence_completeness(
+        self,
+        query: str,
+        intent: str,
+        evidence: str,
+    ) -> Tuple[bool, List[str]]:
+        """Check if evidence contains all data points needed for the query.
+
+        Returns:
+            ``(is_complete, missing)`` where *missing* lists descriptions
+            of data points not found in the evidence.
+        """
+        try:
+            from sirchmunk.llm.prompts import EVIDENCE_COMPLETENESS_CHECK
+
+            prompt = EVIDENCE_COMPLETENESS_CHECK.format(
+                query=query,
+                intent=intent,
+                evidence_excerpt=evidence[:3000],
+            )
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": prompt}],
+                stream=True,
+            )
+            self.llm_usages.append(resp.usage)
+
+            raw = (resp.content or "").strip()
+            match = re.search(r'\{[^}]+\}', raw, re.DOTALL)
+            if match:
+                data = json.loads(match.group())
+                is_complete = bool(data.get("complete", True))
+                missing = data.get("missing", [])
+                if isinstance(missing, list) and missing:
+                    return False, [str(m) for m in missing[:5]]
+                return is_complete, []
+        except Exception as exc:
+            await self._logger.warning(
+                f"[Phase 3.75] Completeness check failed: {exc}"
+            )
+        return True, []
+
+    async def _fill_evidence_gaps(
+        self,
+        query: str,
+        missing: List[str],
+        file_paths: List[str],
+        artifacts: Any,
+        *,
+        scope: Optional["_PathScope"] = None,
+        nav_cache: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        """Targeted evidence retrieval for identified gaps.
+
+        Constructs focused sub-queries from *missing* descriptions and
+        re-navigates tree indices or falls back to keyword retrieval.
+
+        When *scope* is provided, extra files drawn from
+        ``artifacts.tree_available_paths`` are filtered to the scope.
+        When *nav_cache* is provided, navigation results are cached to
+        avoid duplicate LLM calls across phases.
+
+        Returns supplementary evidence text, or None.
+        """
+        sub_query = f"{query} — specifically: {'; '.join(missing)}"
+        parts: List[str] = []
+
+        async def _navigate(fp: str, q: str) -> Optional[str]:
+            if nav_cache is not None:
+                return await self._cached_navigate_tree(fp, q, nav_cache)
+            return await self._navigate_tree_for_evidence(fp, q)
+
+        indexer = self._get_tree_indexer()
+        for fp in file_paths[:3]:
+            try:
+                if indexer and indexer.has_tree(fp):
+                    ev = await _navigate(fp, sub_query)
+                    if ev and len(ev.strip()) > 100:
+                        parts.append(
+                            f"[Gap-fill: {Path(fp).name}]\n{ev}"
+                        )
+                        continue
+                ev = await self._tree_guided_sample(fp, sub_query)
+                if isinstance(ev, str) and len(ev.strip()) > 100:
+                    parts.append(f"[Gap-fill: {Path(fp).name}]\n{ev}")
+            except Exception:
+                continue
+
+        if not parts and artifacts and artifacts.tree_available_paths:
+            extra_fps = [
+                fp for fp in artifacts.tree_available_paths
+                if fp not in file_paths
+                and (not scope or scope.contains(fp))
+            ][:2]
+            for fp in extra_fps:
+                try:
+                    ev = await _navigate(fp, sub_query)
+                    if ev and len(ev.strip()) > 100:
+                        parts.append(
+                            f"[Gap-fill extra: {Path(fp).name}]\n{ev}"
+                        )
+                except Exception:
+                    continue
+
+        if not parts:
+            return None
+        return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Plan E: Computation verification
+    # ------------------------------------------------------------------
+
+    _ARITH_PATTERNS = [
+        re.compile(
+            r'[\$€£]?\s*'
+            r'([\d,]+(?:\.\d+)?)\s*'
+            r'([+\-\*/])\s*'
+            r'[\$€£]?\s*'
+            r'([\d,]+(?:\.\d+)?)\s*'
+            r'=\s*'
+            r'[\$€£]?\s*'
+            r'([\-]?[\d,]+(?:\.\d+)?)\s*%?'
+        ),
+        re.compile(
+            r'\(\s*'
+            r'[\$€£]?\s*([\d,]+(?:\.\d+)?)\s*'
+            r'([+\-])\s*'
+            r'[\$€£]?\s*([\d,]+(?:\.\d+)?)\s*'
+            r'\)\s*[/\*]\s*'
+            r'[\$€£]?\s*([\d,]+(?:\.\d+)?)\s*'
+            r'=\s*'
+            r'[\$€£]?\s*([\-]?[\d,]+(?:\.\d+)?)\s*%?'
+        ),
+    ]
+
+    _SAFE_EVAL_NS: Dict[str, Any] = {"__builtins__": {}, "abs": abs, "round": round}
+    _ARITH_TOLERANCE: float = 0.01
+
+    @classmethod
+    def _extract_arithmetic_expressions(cls, text: str) -> List[Dict[str, Any]]:
+        """Extract arithmetic expressions and their stated results from text.
+
+        Returns list of ``{"expr": str, "stated": float, "computed": float}``.
+        Only includes entries where Python evaluation succeeded.
+        """
+        results: List[Dict[str, Any]] = []
+
+        def _parse_num(s: str) -> float:
+            return float(s.replace(",", ""))
+
+        for line in text.split("\n"):
+            for pat in cls._ARITH_PATTERNS:
+                for m in pat.finditer(line):
+                    groups = m.groups()
+                    try:
+                        if len(groups) == 4:
+                            a, op, b, stated = groups
+                            a_val, b_val = _parse_num(a), _parse_num(b)
+                            expr = f"{a_val} {op} {b_val}"
+                            computed = eval(expr, cls._SAFE_EVAL_NS)
+                            results.append({
+                                "expr": expr,
+                                "stated": _parse_num(stated),
+                                "computed": float(computed),
+                                "raw": m.group(),
+                            })
+                        elif len(groups) == 5:
+                            a, op, b, divisor, stated = groups
+                            a_val, b_val = _parse_num(a), _parse_num(b)
+                            d_val = _parse_num(divisor)
+                            inner = f"{a_val} {op} {b_val}"
+                            inner_result = eval(inner, cls._SAFE_EVAL_NS)
+                            op2 = "/" if "/" in line[m.start():m.end()] else "*"
+                            computed = eval(
+                                f"{inner_result} {op2} {d_val}",
+                                cls._SAFE_EVAL_NS,
+                            )
+                            results.append({
+                                "expr": f"({inner}) {op2} {d_val}",
+                                "stated": _parse_num(stated),
+                                "computed": float(computed),
+                                "raw": m.group(),
+                            })
+                    except Exception:
+                        continue
+        return results
+
+    async def _verify_computation(
+        self,
+        query: str,
+        answer: str,
+    ) -> Tuple[str, bool]:
+        """Verify arithmetic in computation-type answers.
+
+        Extracts arithmetic expressions, evaluates them with Python, and
+        re-prompts the LLM if a discrepancy is detected.
+
+        Returns:
+            ``(corrected_answer, was_corrected)``.
+        """
+        expressions = self._extract_arithmetic_expressions(answer)
+        if not expressions:
+            return answer, False
+
+        discrepancies = []
+        for expr_info in expressions:
+            stated = expr_info["stated"]
+            computed = expr_info["computed"]
+            if stated == 0 and computed == 0:
+                continue
+            denom = max(abs(stated), abs(computed), 1e-9)
+            if abs(stated - computed) / denom > self._ARITH_TOLERANCE:
+                discrepancies.append(expr_info)
+
+        if not discrepancies:
+            return answer, False
+
+        worst = max(
+            discrepancies,
+            key=lambda d: abs(d["stated"] - d["computed"]),
+        )
+
+        await self._logger.info(
+            f"[Phase 4.5:Verify] Arithmetic discrepancy: "
+            f"{worst['expr']} = {worst['stated']} (stated) vs "
+            f"{worst['computed']} (computed)"
+        )
+
+        try:
+            from sirchmunk.llm.prompts import COMPUTATION_CORRECTION
+
+            correction_prompt = COMPUTATION_CORRECTION.format(
+                query=query,
+                original_answer=answer[:3000],
+                expression=worst["expr"],
+                llm_result=worst["stated"],
+                correct_result=worst["computed"],
+            )
+            resp = await self.llm.achat(
+                messages=[{"role": "user", "content": correction_prompt}],
+                stream=True,
+            )
+            self.llm_usages.append(resp.usage)
+
+            corrected = resp.content or ""
+            if corrected and len(corrected) > 100:
+                await self._logger.info(
+                    "[Phase 4.5:Verify] Correction applied"
+                )
+                return corrected, True
+        except Exception as exc:
+            await self._logger.warning(
+                f"[Phase 4.5:Verify] Correction failed: {exc}"
+            )
+
+        return answer, False
 
     @staticmethod
     def _extract_and_validate_multi_level_keywords(
@@ -867,6 +1678,7 @@ class AgenticSearch(BaseSearch):
             FileReadTool,
             KeywordSearchTool,
             KnowledgeQueryTool,
+            TreeNavigationTool,
             ToolRegistry,
         )
 
@@ -909,15 +1721,139 @@ class AgenticSearch(BaseSearch):
             from sirchmunk.scan.dir_scanner import DirectoryScanner
 
             if self._dir_scanner is None:
-                self._dir_scanner = DirectoryScanner(llm=self.llm, max_files=500)
+                self._dir_scanner = DirectoryScanner(
+                    llm=self.llm, max_files=500,
+                )
             registry.register(DirScanTool(
                 scanner=self._dir_scanner,
                 paths=paths,
             ))
 
+        # Tool 5: Tree navigation (when compile artifacts exist)
+        artifacts = self._detect_compile_artifacts(paths)
+        if artifacts and artifacts.tree_available_paths:
+            registry.register(TreeNavigationTool(
+                navigate_fn=self._tree_guided_sample,
+                available_paths=artifacts.tree_available_paths,
+                max_chars=self._FAST_MAX_EVIDENCE_CHARS,
+            ))
+
         self._tool_registry = registry
         self._tool_registry_key = cache_key
         return registry
+
+    # ------------------------------------------------------------------
+    # Knowledge compile entry point
+    # ------------------------------------------------------------------
+
+    async def compile(
+        self,
+        paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
+        *,
+        incremental: bool = True,
+        shallow: bool = False,
+        max_files: Optional[int] = None,
+        concurrency: int = 3,
+    ) -> Dict[str, Any]:
+        """Compile document collections into structured knowledge indices.
+
+        Optional offline pre-processing step that builds tree indices and
+        knowledge clusters.  Products are automatically leveraged by
+        subsequent search() calls.
+
+        Args:
+            paths: Directories or files to compile. Falls back to self.paths.
+            incremental: Skip unchanged files (default True).
+            shallow: Skip tree building — use direct LLM summarisation only.
+            max_files: Cap on files — triggers importance sampling for large sets.
+            concurrency: Max parallel file compilations.
+
+        Returns:
+            CompileReport as a dict.
+        """
+        from sirchmunk.learnings.compiler import KnowledgeCompiler
+        from sirchmunk.learnings.tree_indexer import DocumentTreeIndexer
+
+        resolved = self._resolve_paths(paths)
+        await self._logger.info(
+            f"[Compile] Starting compile for {len(resolved)} path(s)"
+        )
+
+        tree_cache = self.work_path / ".cache" / "compile" / "trees"
+        _cb = getattr(self._logger, 'log_callback', None)
+        tree_indexer = DocumentTreeIndexer(
+            llm=self.llm,
+            cache_dir=tree_cache,
+            log_callback=_cb,
+        )
+
+        compiler = KnowledgeCompiler(
+            llm=self.llm,
+            embedding_client=self.embedding_client,
+            knowledge_storage=self.knowledge_storage,
+            tree_indexer=tree_indexer,
+            work_path=self.work_path,
+            log_callback=_cb,
+        )
+
+        report = await compiler.compile(
+            paths=resolved,
+            incremental=incremental,
+            shallow=shallow,
+            max_files=max_files,
+            concurrency=concurrency,
+        )
+
+        return report.to_dict()
+
+    async def compile_status(
+        self,
+        paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
+    ) -> Dict[str, Any]:
+        """Return current compile status for the given paths."""
+        from sirchmunk.learnings.compiler import KnowledgeCompiler
+        from sirchmunk.learnings.tree_indexer import DocumentTreeIndexer
+
+        resolved = self._resolve_paths(paths)
+
+        tree_cache = self.work_path / ".cache" / "compile" / "trees"
+        tree_indexer = DocumentTreeIndexer(
+            llm=self.llm, cache_dir=tree_cache,
+        )
+
+        compiler = KnowledgeCompiler(
+            llm=self.llm,
+            embedding_client=self.embedding_client,
+            knowledge_storage=self.knowledge_storage,
+            tree_indexer=tree_indexer,
+            work_path=self.work_path,
+        )
+
+        status = await compiler.get_status(resolved)
+        return {
+            "total_compiled_files": status.total_compiled_files,
+            "total_clusters": status.total_clusters,
+            "total_trees": status.total_trees,
+            "last_compile_at": status.last_compile_at,
+            "manifest_path": status.manifest_path,
+        }
+
+    async def compile_lint(
+        self,
+        *,
+        auto_fix: bool = False,
+    ) -> Dict[str, Any]:
+        """Run knowledge health checks and optionally auto-fix issues."""
+        from sirchmunk.learnings.lint import KnowledgeLint
+
+        linter = KnowledgeLint(
+            knowledge_storage=self.knowledge_storage,
+            work_path=self.work_path,
+            log_callback=getattr(self._logger, 'log_callback', None),
+        )
+
+        report = await linter.run(auto_fix=auto_fix)
+        return report.to_dict()
 
     # ------------------------------------------------------------------
     # Unified search entry point
@@ -1044,6 +1980,8 @@ class AgenticSearch(BaseSearch):
                 return ctx
             return msg
 
+        await self._logger.info(f"[SearchConfig] PURE_TREE_SEARCH={'enabled' if _PURE_TREE_SEARCH else 'disabled'}")
+
         # ---- Chat intent short-circuit (rule-based, no LLM cost) ----
         if mode != "FILENAME_ONLY" and self._is_chat_query(query):
             answer, cluster, ctx = await self._respond_chat(query, chat_history=chat_history)
@@ -1129,6 +2067,10 @@ class AgenticSearch(BaseSearch):
         )
         _llm_usage_start = len(self.llm_usages)
 
+        # --- Adaptive compile artifact detection (shared with FAST) ---
+        _scope = _PathScope(paths)
+        artifacts = self._detect_compile_artifacts(paths)
+
         # ==============================================================
         # Phase 0a: Direct document analysis (intent-gated short-circuit)
         # ==============================================================
@@ -1143,17 +2085,17 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         reused = await self._try_reuse_cluster(query, paths)
         if reused is not None:
-            content = reused.content
-            if isinstance(content, list):
-                content = "\n".join(content)
-            return str(content), reused, context
+            return self._enrich_reused_content(reused), reused, context
+
+        # P2: gradient reuse — extract hints from moderately similar clusters
+        soft_hit = await self._try_soft_reuse(query, paths)
 
         await self._logger.info(f"[search] Starting multi-path retrieval for: '{query[:80]}'")
 
         # ==============================================================
-        # Phase 1: Parallel probing — all four paths fire concurrently
+        # Phase 1: Parallel probing — five paths fire concurrently
         # ==============================================================
-        await self._logger.info("[Phase 1] Parallel probing: keywords + dir_scan + knowledge + spec_cache")
+        await self._logger.info("[Phase 1] Parallel probing: keywords + dir_scan + knowledge + spec_cache + tree_index")
         context.increment_loop()
 
         phase1_results = await asyncio.gather(
@@ -1161,60 +2103,106 @@ class AgenticSearch(BaseSearch):
             self._probe_dir_scan(paths, enable_dir_scan),
             self._probe_knowledge_cache(query),
             self._load_spec_context(paths, stale_hours=spec_stale_hours),
+            self._probe_tree_index(query),
+            self._probe_compile_hints([query], scope=_scope),  # query-level hints; keyword-level runs post-Phase 1
+            self._probe_summary_index(query, artifacts, scope=_scope),    # GAP 2: zero-LLM BM25
+            self._probe_catalog_for_deep(query, artifacts),  # GAP 4: zero-LLM keyword overlap
             return_exceptions=True,
         )
 
         kw_result = phase1_results[0] if not isinstance(phase1_results[0], Exception) else ({}, [])
         scan_result = phase1_results[1] if not isinstance(phase1_results[1], Exception) else None
-        knowledge_hits = phase1_results[2] if not isinstance(phase1_results[2], Exception) else []
+        knowledge_probe = phase1_results[2] if not isinstance(phase1_results[2], Exception) else KnowledgeProbeResult([], [], "")
         spec_context = phase1_results[3] if not isinstance(phase1_results[3], Exception) else ""
+        tree_hits = phase1_results[4] if not isinstance(phase1_results[4], Exception) else []
+        compile_hints = phase1_results[5] if not isinstance(phase1_results[5], Exception) else CompileHints([], [])
+        summary_index_hits = phase1_results[6] if not isinstance(phase1_results[6], Exception) else []
+        catalog_deep_hits = phase1_results[7] if not isinstance(phase1_results[7], Exception) else []
 
-        for i, label in enumerate(["keywords", "dir_scan", "knowledge", "spec_cache"]):
+        for i, label in enumerate(["keywords", "dir_scan", "knowledge", "spec_cache", "tree_index", "compile_hints", "summary_index", "catalog_deep"]):
             if isinstance(phase1_results[i], Exception):
                 await self._logger.warning(f"[Phase 1] {label} probe failed: {phase1_results[i]}")
 
+        # Backwards compat: knowledge_probe may be a plain list from old code paths
+        if isinstance(knowledge_probe, list):
+            knowledge_probe = KnowledgeProbeResult(file_paths=knowledge_probe, extra_keywords=[], background_context="")
+
         query_keywords, initial_keywords = kw_result if isinstance(kw_result, tuple) else ({}, [])
+
+        # P2: inject soft-hit patterns into keywords
+        if soft_hit:
+            for p in soft_hit.patterns:
+                if p not in initial_keywords:
+                    initial_keywords.append(p)
+                if p not in query_keywords:
+                    query_keywords[p] = 0.6
+
+        # P3: inject extra keywords from structured knowledge probe
+        for kw in knowledge_probe.extra_keywords:
+            if kw not in initial_keywords:
+                initial_keywords.append(kw)
+            if kw not in query_keywords:
+                query_keywords[kw] = 0.5
+
+        # P2 + P3: append background context for Phase 4 LLM prompt
+        if soft_hit and soft_hit.context_summary:
+            spec_context = f"{spec_context}\n\n{soft_hit.context_summary}" if spec_context else soft_hit.context_summary
+        if knowledge_probe.background_context:
+            spec_context = f"{spec_context}\n\n{knowledge_probe.background_context}" if spec_context else knowledge_probe.background_context
 
         await self._logger.info(
             f"[Phase 1] Results: keywords={len(initial_keywords)}, "
             f"dir_scan={'OK' if scan_result else 'N/A'}, "
-            f"knowledge_hits={len(knowledge_hits)}, "
+            f"knowledge_files={len(knowledge_probe.file_paths)}, "
+            f"tree_hits={len(tree_hits)}, "
+            f"compile_hints={len(compile_hints.file_paths)}, "
+            f"summary_index={len(summary_index_hits)}, "
+            f"catalog_deep={len(catalog_deep_hits)}, "
+            f"soft_hit={'YES' if soft_hit else 'NO'}, "
             f"spec_cache={'YES' if spec_context else 'NO'}"
         )
 
         # ==============================================================
         # Phase 2: Parallel retrieval — keyword search + dir_scan rank
         # ==============================================================
-        await self._logger.info("[Phase 2] Parallel retrieval: rga keyword search + dir_scan LLM rank")
-        context.increment_loop()
+        keyword_files: List[str] = []
+        dir_scan_files: List[str] = []
 
-        phase2_tasks = []
+        if _PURE_TREE_SEARCH:
+            # Pure tree search mode: skip rga and dir_scan, rely solely on tree hits
+            await self._logger.info("[Phase 2:PureTree] Skipping rga keyword search and dir_scan")
+            context.increment_loop()
+        else:
+            await self._logger.info("[Phase 2] Parallel retrieval: rga keyword search + dir_scan LLM rank")
+            context.increment_loop()
 
-        if initial_keywords:
-            phase2_tasks.append(
-                self._retrieve_by_keywords(
-                    initial_keywords, paths,
-                    max_depth=max_depth, include=include, exclude=exclude,
+            phase2_tasks = []
+
+            if initial_keywords:
+                phase2_tasks.append(
+                    self._retrieve_by_keywords(
+                        initial_keywords, paths,
+                        max_depth=max_depth, include=include, exclude=exclude,
+                    )
                 )
-            )
-        else:
-            phase2_tasks.append(self._async_noop([]))
+            else:
+                phase2_tasks.append(self._async_noop([]))
 
-        if scan_result is not None and enable_dir_scan:
-            phase2_tasks.append(
-                self._rank_dir_scan_candidates(query, scan_result)
-            )
-        else:
-            phase2_tasks.append(self._async_noop([]))
+            if scan_result is not None and enable_dir_scan:
+                phase2_tasks.append(
+                    self._rank_dir_scan_candidates(query, scan_result)
+                )
+            else:
+                phase2_tasks.append(self._async_noop([]))
 
-        phase2_results = await asyncio.gather(*phase2_tasks, return_exceptions=True)
+            phase2_results = await asyncio.gather(*phase2_tasks, return_exceptions=True)
 
-        keyword_files = phase2_results[0] if not isinstance(phase2_results[0], Exception) else []
-        dir_scan_files = phase2_results[1] if not isinstance(phase2_results[1], Exception) else []
+            keyword_files = phase2_results[0] if not isinstance(phase2_results[0], Exception) else []
+            dir_scan_files = phase2_results[1] if not isinstance(phase2_results[1], Exception) else []
 
-        for i, label in enumerate(["keyword_search", "dir_scan_rank"]):
-            if isinstance(phase2_results[i], Exception):
-                await self._logger.warning(f"[Phase 2] {label} failed: {phase2_results[i]}")
+            for i, label in enumerate(["keyword_search", "dir_scan_rank"]):
+                if isinstance(phase2_results[i], Exception):
+                    await self._logger.warning(f"[Phase 2] {label} failed: {phase2_results[i]}")
 
         await self._logger.info(
             f"[Phase 2] Results: keyword_files={len(keyword_files)}, "
@@ -1222,91 +2210,64 @@ class AgenticSearch(BaseSearch):
         )
 
         # ==============================================================
-        # Phase 3: Merge file paths + build KnowledgeCluster
+        # Phase 3: Query analysis + file selection
         # ==============================================================
         context.increment_loop()
-        merged_files = self._merge_file_paths(
-            keyword_files=keyword_files,
-            dir_scan_files=dir_scan_files,
-            knowledge_hits=knowledge_hits,
+        _query_complexity, _query_intent = await self._classify_query_intent(query)
+        data_reqs = await self._analyze_data_requirements(query, _query_intent)
+        context.increment_loop()
+
+        await self._logger.info(
+            f"[Phase 3] Query: complexity={_query_complexity}, "
+            f"intent={_query_intent}, "
+            f"data_points={len(data_reqs.data_points)}, "
+            f"formula={data_reqs.formula or 'N/A'}"
         )
-        await self._logger.info(f"[Phase 3] Merged {len(merged_files)} unique candidate files")
 
-        cluster: Optional[KnowledgeCluster] = None
-        if merged_files:
-            cluster = await self._build_cluster(
-                query=query, file_paths=merged_files,
-                query_keywords=query_keywords, top_k_files=top_k_files,
-            )
+        extra_knowledge_files = knowledge_probe.file_paths
+        if soft_hit:
+            extra_knowledge_files = soft_hit.file_paths + extra_knowledge_files
+
+        merged_files = self._merge_file_paths(
+            keyword_files=list(tree_hits) + catalog_deep_hits + compile_hints.file_paths + summary_index_hits + keyword_files,
+            dir_scan_files=dir_scan_files,
+            knowledge_hits=extra_knowledge_files,
+        )
+        target_files = self._select_target_files(merged_files, _scope, artifacts)
+
+        await self._logger.info(
+            f"[Phase 3] Merged {len(merged_files)} files, "
+            f"target {len(target_files)} for agentic retrieval"
+        )
 
         # ==============================================================
-        # Phase 4: Generate answer — cluster summary or ReAct refinement
+        # Phase 4: Agentic retrieval loop
         # ==============================================================
-        context.increment_loop()
-        answer: str = ""
-        should_save: bool = True
+        retrieval = await self._agentic_retrieve(
+            query, data_reqs, target_files, context,
+        )
 
-        if cluster and cluster.content:
-            await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
-            answer, should_save, should_answer = await self._summarise_cluster(query, cluster)
-            if not should_answer:
-                if llm_fallback:
-                    await self._logger.info(
-                        "[Phase 4] Summary gate rejected evidence, llm_fallback=True → LLM fallback"
-                    )
-                    answer, should_save = await self._summarise_cluster_fallback(query)
-                else:
-                    await self._logger.warning(
-                        "[Phase 4] Summary gate rejected evidence and llm_fallback=False "
-                        "→ returning no results"
-                    )
-                    return _NO_RESULTS_MESSAGE, None, context
-            if not cluster.search_results:
-                cluster.search_results = list(merged_files)
-        elif llm_fallback:
-            await self._logger.info(
-                "[Phase 4] Evidence insufficient, llm_fallback=True \u2192 LLM summary"
-            )
-            answer, should_save = await self._summarise_cluster_fallback(query)
-        else:
-            await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
-            react_answer, context = await self._react_refinement(
-                query=query, paths=paths,
-                initial_keywords=initial_keywords, spec_context=spec_context,
-                enable_dir_scan=enable_dir_scan,
-                max_loops=max_loops, max_token_budget=max_token_budget,
-                max_depth=max_depth, include=include, exclude=exclude,
-            )
+        await self._logger.info(
+            f"[Phase 4] Retrieval: {retrieval.rounds_used} rounds, "
+            f"complete={retrieval.is_complete}, "
+            f"{sum(len(ps) for ps in retrieval.pages_extracted.values())} pages"
+        )
 
-            if not cluster:
-                cluster = await self._build_cluster_from_context(
-                    query=query, answer=react_answer, context=context,
-                    query_keywords=query_keywords, top_k_files=top_k_files,
-                )
-            elif react_answer and not cluster.content:
-                cluster.content = react_answer
+        # ==============================================================
+        # Phase 4.5: Synthesis
+        # ==============================================================
+        answer, should_save, cluster = await self._synthesize_from_retrieval(
+            query, _query_intent, retrieval, merged_files,
+            formula=data_reqs.formula,
+        )
 
-            if not cluster:
-                await self._logger.warning(
-                    "[Phase 4] ReAct found no buildable evidence and llm_fallback=False "
-                    "→ returning no results"
-                )
-                return _NO_RESULTS_MESSAGE, None, context
-
-            # Final DEEP decision is always made in the summary call.
-            answer, should_save, should_answer = await self._summarise_cluster(query, cluster)
-            if not should_answer:
-                if llm_fallback:
-                    await self._logger.info(
-                        "[Phase 4] Final summary gate rejected evidence, llm_fallback=True → LLM fallback"
-                    )
-                    answer, should_save = await self._summarise_cluster_fallback(query)
-                else:
-                    await self._logger.warning(
-                        "[Phase 4] Final summary gate rejected evidence and llm_fallback=False "
-                        "→ returning no results"
-                    )
-                    return _NO_RESULTS_MESSAGE, None, context
+        # ==============================================================
+        # Phase 4.75: Computation verification
+        # ==============================================================
+        if answer and answer != _NO_RESULTS_MESSAGE and _query_intent == "computation":
+            answer, was_corrected = await self._verify_computation(query, answer)
+            if was_corrected:
+                _, should_save, _ = self._parse_summary_response(answer)
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -1371,6 +2332,16 @@ class AgenticSearch(BaseSearch):
         # Step 2: LLM intent classification (cheap, stream=False)
         operation = await detect_doc_intent(query, self.llm, self.llm_usages)
         if operation is None:
+            return None
+
+        # Computation/comparison queries need the full evidence pipeline
+        if re.search(
+            r'\b(?:ratio|margin|growth.?rate|turnover|coverage'
+            r'|what is (?:the )?fy\d|calculate|compute'
+            r'|improv(?:ing|ed)|declin(?:ing|ed)'
+            r'|which .{0,30}(?:best|worst|most|least|highest|lowest))\b',
+            query, re.IGNORECASE,
+        ):
             return None
 
         filenames = ", ".join(Path(d.path).name for d in doc_files)
@@ -1594,8 +2565,166 @@ class AgenticSearch(BaseSearch):
         ".css", ".bash", ".java", ".c", ".cpp", ".h", ".go", ".rs",
     }
     _FAST_CONTEXT_WINDOW = 30  # ± lines around each grep hit
-    _FAST_MAX_EVIDENCE_CHARS = 15_000
+    _FAST_MAX_EVIDENCE_CHARS = 40_000
     _FAST_SMALL_FILE_THRESHOLD = 100_000  # 100K chars - read full file instead of grep sampling
+
+    # --- Wiki-enhanced ranking constants ---
+    _WIKI_BLEND_ALPHA = 0.85
+    """TF-IDF weight in the hybrid score; Wiki weight = 1 - alpha."""
+    _WIKI_MAX_SCORE = 10.0
+    """Upper bound for the wiki relevance score."""
+    _WIKI_CATALOG_KEYWORD_OVERLAP_MAX = 5.0
+    """Maximum sub-score for catalog summary keyword overlap."""
+    _WIKI_TREE_AVAILABILITY_BONUS = 0.5
+    """Bonus for files that have a compiled tree index (weak signal)."""
+    _WIKI_CATALOG_PRESENCE_FULL = 2.0
+    """Catalog presence bonus for summaries > 100 chars."""
+    _WIKI_CATALOG_PRESENCE_MEDIUM = 1.5
+    """Catalog presence bonus for summaries > 30 chars (must be < FULL)."""
+    _WIKI_CATALOG_PRESENCE_MINIMAL = 1.0
+    """Catalog presence bonus for summaries > 0 chars."""
+    _TREE_CACHE_SCAN_LIMIT = 200
+    """Max tree JSON files to parse during artifact detection."""
+    _CATALOG_LISTING_MAX_ENTRIES = 20
+    """Max catalog entries in the enriched listing for Step 1."""
+    _ENABLE_EMBEDDING_FALLBACK: bool = True
+    """Enable embedding + BM25 hybrid fallback when rga returns zero results."""
+    _CATALOG_KEYWORD_MIN_LEN = 2
+    """Minimum character length for a catalog keyword token."""
+    _CATALOG_KEYWORD_MAX_LEN = 20
+    """Maximum character length for a catalog keyword token."""
+    _CATALOG_SUMMARY_TRUNCATE = 200
+    """Max chars of catalog summary shown in the listing."""
+    _SUMMARY_INDEX_TOP_K = 3
+    """Maximum files returned by proactive summary index BM25 probe."""
+    _DEEP_CATALOG_TOP_K = 3
+    """Maximum files returned by catalog keyword-overlap probe in DEEP mode."""
+
+    # --- Tree-guided sampling constants ---
+    _TREE_SAMPLE_MAX_SECTIONS = 8
+    """Max tree sections to include per file in tree-guided sampling."""
+    _TREE_SAMPLE_SECTION_MAX_CHARS = 3000
+    """Max chars per tree section."""
+    _TREE_SAMPLE_RGA_SUPPLEMENT = True
+    """Whether to append rga evidence after tree sections as supplementary context."""
+    _TREE_ROOT_HINTS_MAX_FILES = 10
+    """Maximum number of tree roots to include in FAST Step 1 hints."""
+    _DEEP_PRE_NAV_MAX_FILES = 3
+    """Maximum number of tree files to pre-navigate in DEEP Phase 2.5."""
+    _FAST_TREE_PROBE_MAX_FILES = 2
+    """Maximum files returned by active tree probing in FAST mode."""
+    _DEEP_TREE_PROBE_MAX_FILES = 3
+    """Maximum files returned by tree index probing in DEEP mode."""
+    _TREE_ROOT_HINT_TRUNCATE = 150
+    """Max chars of tree root summary in Step 1 structure hints."""
+    _CHAR_RANGE_MAX_SPAN_RATIO: float = 0.8
+    """char_range spanning more than this ratio of the document is treated as invalid."""
+
+    # --- Tree probe / RGA fusion ---
+    _TREE_PROBE_RANKING_BOOST: float = 3.0
+    """Score boost (0-10 scale) for files selected by LLM tree probing."""
+
+    # --- Hierarchical file selection for large tree pools ---
+    _TREE_PREFILTER_THRESHOLD: int = 15
+    """Tree pool size above which rule-based pre-filtering is applied."""
+    _TREE_PREFILTER_MAX_CANDIDATES: int = 10
+    """Maximum candidate trees forwarded to the LLM after pre-filtering."""
+    _TREE_PREFILTER_MIN_SCORE: float = 0.5
+    """Minimum relevance score for a tree to survive pre-filtering."""
+
+    # --- Tree navigation ---
+    _TREE_NAV_MAX_RESULTS: int = 8
+    """Primary max_results for LLM-driven tree navigation."""
+    _NAV_RETRY_MIN_EVIDENCE_CHARS: int = 200
+    """Evidence below this length triggers a retry with expanded results."""
+    _NAV_RETRY_EXPANDED_RESULTS: int = 12
+    """Expanded max_results for retry navigation pass."""
+
+    _CHAR_RANGE_MIN_SPAN: int = 200
+    """Minimum char_range span to trust as substantive content.
+
+    Nodes whose char_range covers fewer characters than this threshold
+    (e.g. a TOC entry that only records the section title) are demoted
+    to page-level extraction when a valid page_range is available.
+    """
+
+    _NAV_COMPLEMENT_MIN_COMPONENTS: int = 2
+    """Minimum query decomposition components to trigger complementary navigation."""
+
+    _NAV_PAGE_MARGIN: int = 1
+    """Extra pages to extract on each side of a leaf's page_range."""
+
+    _NAV_REF_PAGE_MAX: int = 5
+    """Maximum referenced-but-uncovered pages to extract as gap-fill."""
+
+    # --- Table evidence budgets ---
+    _TABLE_EVIDENCE_DEFAULT_CHARS: int = 20_000
+    """Default max_chars for _format_table_evidence."""
+    _TABLE_EVIDENCE_PER_RANGE_CHARS: int = 8_000
+    """Max chars for per-page-range table supplement in tree nav."""
+    _TABLE_EVIDENCE_STANDALONE_CHARS: int = 20_000
+    """Max chars for standalone table digest fallback when tree nav evidence is thin."""
+    _TABLE_CROSS_SECTION_CHARS: int = 6_000
+    """Max chars for cross-section table supplement drawn from pages outside
+    the navigated leaf ranges.  Ensures data-dense tables in distant
+    document sections (e.g. financial statements when leaves are in
+    management discussion) are included."""
+    _TABLE_EVIDENCE_NAV_OVERLAP_CHARS: int = 8_000
+    """Reduced table evidence budget for files that are already receiving
+    parallel tree navigation.  Since tree_ev will provide targeted evidence,
+    the RGA path uses a smaller budget to supply incremental tables,
+    leaving room for more diverse evidence."""
+    _DEEP_CROSS_SECTION_MIN_EVIDENCE: int = 8_000
+    """Cross-section table supplement is skipped when existing tree-nav
+    evidence already exceeds this threshold (chars), preventing overload."""
+
+    # --- Self-correction expanded sampling ---
+    _SELF_CORRECT_EXPANDED_NAV_RESULTS: int = 10
+    """Expanded tree navigation leaf count for same-file re-sampling (default nav uses 5)."""
+    _SELF_CORRECT_EXPANDED_SECTIONS: int = 8
+    """Expanded tree sample sections for same-file re-sampling (default uses 5)."""
+
+    # --- Deep Structured Reasoning ---
+    _DEEP_SECTION_MAP_MAX_DEPTH: int = 3
+    """Maximum tree depth for section map construction (top-N layers)."""
+    _DEEP_MAX_EXTRACT_PAGES: int = 12
+    """Maximum pages to extract per file in targeted page extraction."""
+    _DEEP_STRUCTURED_MAX_CHARS: int = 30_000
+    """Maximum character budget for structured evidence per file."""
+    _DEEP_MAX_RECOVERY_ROUNDS: int = 3
+    """Maximum rounds of missing-data recovery before final answer."""
+    _DEEP_STRUCTURED_MAX_FILES: int = 3
+    """Maximum files to process through structured reasoning pipeline."""
+
+    # --- Agentic retrieval ---
+    _AGENTIC_MAX_ROUNDS: int = 3
+    """Maximum retrieval rounds in the agentic loop."""
+    _AGENTIC_MAX_PAGES_PER_ROUND: int = 8
+    """Maximum new pages to extract per round per file."""
+    _AGENTIC_MAX_TOTAL_PAGES: int = 20
+    """Maximum total pages across all rounds."""
+    _AGENTIC_MAX_FILES: int = 3
+    """Maximum files to process through agentic retrieval."""
+    _AGENTIC_SECTION_MAP_DEPTH: int = 8
+    """Section map depth for agentic page selection."""
+    _AGENTIC_EVIDENCE_MAX_CHARS: int = 40_000
+    """Maximum evidence characters to feed to synthesis prompt."""
+    _SHORT_DOC_THRESHOLD: int = 30
+    """Documents with this many pages or fewer are extracted in full."""
+
+    # --- Evidence acceptance thresholds ---
+    _EVIDENCE_MIN_ACCEPT_LENGTH: int = 800
+    """Minimum evidence character length for heuristic override."""
+    _EVIDENCE_KEYWORD_COVERAGE_THRESHOLD: float = 0.3
+    """Minimum keyword coverage ratio for heuristic override."""
+
+    _NUMERIC_INTENT_KEYWORDS: frozenset = frozenset({
+        "revenue", "margin", "ratio", "ebitda", "income", "profit", "loss",
+        "cash", "debt", "equity", "eps", "dpo", "growth", "rate",
+        "percentage", "amount", "total", "net", "gross", "cost", "expense",
+        "sales", "fy", "fiscal",
+    })
+    """Keywords indicating numeric/financial intent in a query."""
 
     _LLM_FALLBACK_EVIDENCE = (
         "[No relevant documents found]\n\n"
@@ -1632,26 +2761,86 @@ class AgenticSearch(BaseSearch):
         context = SearchContext()
         await self._logger.info(f"[FAST] Starting greedy search for: '{query[:80]}'")
 
+        # Reset per-session tree navigation cache
+        self._tree_nav_cache = _TreeNavCache()
+
+        # --- Adaptive compile artifact detection (one-shot, zero LLM) ---
+        _scope = _PathScope(paths)
+        artifacts = self._detect_compile_artifacts(paths)
+        if artifacts.catalog or artifacts.tree_available_paths:
+            await self._logger.info(
+                f"[FAST:Artifacts] catalog={'yes' if artifacts.catalog else 'no'} "
+                f"({len(artifacts.catalog) if artifacts.catalog else 0} docs), "
+                f"trees={len(artifacts.tree_available_paths)}"
+            )
+
         # ==============================================================
         # Step 0: Cluster reuse — instant short-circuit (no LLM cost)
         # When reuse succeeds we return here; no persistence step runs.
         # ==============================================================
         reused = await self._try_reuse_cluster(query, paths)
         if reused is not None:
-            content = reused.content
-            if isinstance(content, list):
-                content = "\n".join(content)
             await self._logger.success("[FAST] Reused cached knowledge cluster")
-            return str(content), reused, context
+            return self._enrich_reused_content(reused), reused, context
+
+        # P2: gradient reuse — structured hints from moderately similar clusters
+        soft_hit = await self._try_soft_reuse(query, paths)
 
         # ==============================================================
-        # Step 1: LLM query analysis only (dir scan deferred until needed)
+        # Step 1: Fused LLM query analysis + document routing
+        # When a compiled document catalog exists, the LLM sees all
+        # document summaries and selects the most relevant ones in the
+        # same call that extracts keywords (zero extra LLM cost).
         # ==============================================================
-        prompt = FAST_QUERY_ANALYSIS.format(user_input=query)
-        resp = await self.llm.achat(
+        catalog = artifacts.catalog
+        catalog_routed_files: List[str] = []
+        catalog_confidence: str = "low"
+
+        # Build tree root hints for enhanced query analysis
+        tree_hints = ""
+        if artifacts and artifacts.tree_available_paths:
+            tree_hints = self._build_tree_root_hints(artifacts)
+
+        if catalog:
+            listing = self._build_enriched_catalog_listing(catalog)
+            prompt = FAST_QUERY_ANALYSIS_WITH_CATALOG.format(
+                user_input=query, document_listing=listing,
+            )
+        else:
+            prompt = FAST_QUERY_ANALYSIS.format(user_input=query)
+
+        # Append tree structure hints to the prompt when available
+        if tree_hints:
+            prompt = prompt + tree_hints
+
+        # Step 1 LLM call + compile hints + tree probe run in parallel
+        # (GAP 3: hints前置化, GAP 1: 树导航主动化)
+        _step1_llm_task = self.llm.achat(
             messages=[{"role": "user", "content": prompt}],
             stream=False,
         )
+        _compile_hints_task = self._probe_compile_hints([query], scope=_scope)
+        _tree_probe_task = self._probe_tree_for_fast(query, artifacts)
+
+        _parallel_results = await asyncio.gather(
+            _step1_llm_task, _compile_hints_task, _tree_probe_task,
+            return_exceptions=True,
+        )
+        resp = _parallel_results[0]
+        _early_compile_hints = _parallel_results[1]
+        _tree_probed_files = _parallel_results[2]
+
+        if isinstance(resp, Exception):
+            await self._logger.warning(f"[FAST:Step1] LLM call failed: {resp}")
+            return f"Search analysis failed: {resp}", None, context
+        if isinstance(_early_compile_hints, Exception):
+            await self._logger.warning(f"[FAST:Step1] Compile hints pre-fetch failed: {_early_compile_hints}")
+            _early_compile_hints = CompileHints([], [])
+        if isinstance(_tree_probed_files, Exception):
+            await self._logger.warning(f"[FAST:Step1] Tree probe failed: {_tree_probed_files}")
+            _tree_probed_files = []
+        _tree_probed_set: frozenset[str] = frozenset(_tree_probed_files)
+
         self.llm_usages.append(resp.usage)
         if resp.usage and isinstance(resp.usage, dict):
             context.add_llm_tokens(
@@ -1661,6 +2850,21 @@ class AgenticSearch(BaseSearch):
         analysis = self._parse_fast_json(resp.content)
         query_type = analysis.get("type", "search")
         file_hints = analysis.get("file_hints", [])
+
+        # Extract catalog-routed files from the fused response
+        if catalog:
+            selected_indices = analysis.get("selected_docs", [])
+            catalog_confidence = analysis.get("doc_confidence", "low")
+            for idx in selected_indices:
+                if isinstance(idx, int) and 0 <= idx < len(catalog):
+                    fp = catalog[idx]["path"]
+                    if Path(fp).exists():
+                        catalog_routed_files.append(fp)
+            if catalog_routed_files:
+                await self._logger.info(
+                    f"[FAST:Step1] Catalog routing ({catalog_confidence}): "
+                    f"{[Path(p).name for p in catalog_routed_files]}"
+                )
 
         if query_type == "chat":
             chat_reply = analysis.get("response", "")
@@ -1720,13 +2924,76 @@ class AgenticSearch(BaseSearch):
             msg = f"Could not extract search terms from query: '{query}'"
             return msg, None, context
 
+        # ==============================================================
+        # Step 1.5: Compile-aware enrichment (P2 + P4, zero LLM calls)
+        # Catalog-routed files from the fused Step 1 are merged here.
+        # ==============================================================
+        all_kw_set = set(primary + fallback)
+
+        # P2: inject soft-hit patterns as fallback keywords
+        if soft_hit:
+            for p in soft_hit.patterns:
+                if p not in all_kw_set:
+                    fallback.append(p)
+                    all_kw_set.add(p)
+                    keyword_idfs.setdefault(p, 0.6)
+
+        # P4: compile hints — pre-fetched (query-level) + keyword-level supplement
+        _kw_compile_hints = await self._probe_compile_hints(primary + fallback, scope=_scope)
+        compile_hints = self._merge_compile_hints(_early_compile_hints, _kw_compile_hints)
+        for kw in compile_hints.extra_keywords:
+            if kw not in all_kw_set:
+                fallback.append(kw)
+                all_kw_set.add(kw)
+                keyword_idfs.setdefault(kw, 0.5)
+
+        compile_hint_files: List[str] = []
+        # Catalog-routed files get highest priority
+        seen_hint_paths: set = set()
+        for fp in catalog_routed_files:
+            if fp not in seen_hint_paths:
+                seen_hint_paths.add(fp)
+                compile_hint_files.append(fp)
+        # Active tree probe files: second priority (GAP 1)
+        for fp in (_tree_probed_files or []):
+            if fp not in seen_hint_paths:
+                seen_hint_paths.add(fp)
+                compile_hint_files.append(fp)
+        # Summary index BM25 files: proactive zero-LLM discovery (GAP 2)
+        _summary_hint_files = await self._probe_summary_index(query, artifacts, scope=_scope)
+        for fp in _summary_hint_files:
+            if fp not in seen_hint_paths:
+                seen_hint_paths.add(fp)
+                compile_hint_files.append(fp)
+        if soft_hit:
+            for fp in soft_hit.file_paths:
+                if fp not in seen_hint_paths:
+                    seen_hint_paths.add(fp)
+                    compile_hint_files.append(fp)
+        for fp in compile_hints.file_paths:
+            if fp not in seen_hint_paths:
+                seen_hint_paths.add(fp)
+                compile_hint_files.append(fp)
+
+        if compile_hint_files:
+            await self._logger.info(
+                f"[FAST:Step1.5] Compile hints: {len(compile_hint_files)} files "
+                f"(catalog={len(catalog_routed_files)}, "
+                f"tree={len(_tree_probed_files) if _tree_probed_files else 0}, "
+                f"summary={len(_summary_hint_files)}, "
+                f"soft={len(soft_hit.file_paths) if soft_hit else 0}), "
+                f"{len(compile_hints.extra_keywords)} extra keywords"
+            )
+
         await self._logger.info(
             f"[FAST:Step1] Primary: {primary}, Fallback: {fallback}"
         )
 
         # ==============================================================
         # Step 2: rga cascade — primary first, fallback only if needed
-        # Dir scan runs only when enabled, for fallback when rga misses.
+        # When catalog routing has high confidence, catalog-routed files
+        # are used directly (skipping rga) to avoid noise from unrelated
+        # files.  Otherwise rga runs first and catalog acts as fallback.
         # ==============================================================
         context.add_search(query)
         include_patterns = list(include or [])
@@ -1742,32 +3009,120 @@ class AgenticSearch(BaseSearch):
         best_files: Optional[List[Dict[str, Any]]] = None
         used_level = "primary"
         evidence = ""
+        file_path: Optional[str] = None  # set when best_files found
 
-        if primary:
-            best_files = await self._fast_find_best_file(
-                primary, top_k=top_k_files, keyword_idfs=keyword_idfs, **rga_kwargs
-            )
-
-        if not best_files and fallback:
-            used_level = "fallback"
-            await self._logger.info(
-                "[FAST:Step2] Primary miss, trying fine-grained fallback"
-            )
-            best_files = await self._fast_find_best_file(
-                fallback, top_k=top_k_files, keyword_idfs=keyword_idfs, **rga_kwargs
-            )
-
-        # --- Fallback: use dir_scan only when rga misses and dir scan is enabled ---
-        if not best_files and enable_dir_scan:
-            scan_result = await self._probe_dir_scan(paths, enable=True, max_files=300)
-            if scan_result is not None:
-                await self._logger.info("[FAST:Step2] rga miss — falling back to dir_scan ranking")
-                ranked_paths = await self._rank_dir_scan_candidates(
-                    query, scan_result, top_k=10, include_medium=True,
+        # --- Pure tree search mode: skip rga, use tree probe results directly ---
+        if _PURE_TREE_SEARCH:
+            if _tree_probed_files:
+                used_level = "pure_tree"
+                best_files = [
+                    {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
+                    for p in _tree_probed_files[:top_k_files]
+                ]
+                print(f"SEARCH_WIKI_DEBUG [D7] _tree_probed_files={_tree_probed_files}", flush=True)
+                print(f"SEARCH_WIKI_DEBUG [D8] best_files={[bf['path'] for bf in best_files]}", flush=True)
+                await self._logger.info(
+                    f"[FAST:PureTree] Using {len(best_files)} tree-probed files: "
+                    f"{[Path(p).name for p in _tree_probed_files[:top_k_files]]}"
                 )
-                if ranked_paths:
-                    used_level = "dir_scan"
-                    best_files = [{"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0} for p in ranked_paths[:top_k_files]]
+            elif compile_hint_files:
+                # Tree probe returned nothing but compile hints have tree files
+                used_level = "pure_tree_hint"
+                best_files = [
+                    {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
+                    for p in compile_hint_files[:top_k_files]
+                ]
+                await self._logger.info(
+                    f"[FAST:PureTree] No tree probes, falling back to "
+                    f"{len(best_files)} compile-hint files"
+                )
+            else:
+                # Graceful degradation: fall back to keyword search when no tree is available
+                await self._logger.info(
+                    "[FAST:PureTree] No tree probes available, falling back to keyword search"
+                )
+                best_files = await self._fast_find_best_file(
+                    primary, top_k=top_k_files, keyword_idfs=keyword_idfs,
+                    query=query, artifacts=artifacts, **rga_kwargs,
+                )
+                if not best_files and fallback:
+                    best_files = await self._fast_find_best_file(
+                        fallback, top_k=top_k_files, keyword_idfs=keyword_idfs,
+                        query=query, artifacts=artifacts, **rga_kwargs,
+                    )
+                if not best_files:
+                    return _NO_RESULTS_MESSAGE, None, context
+        else:
+            # --- Original rga-based retrieval logic ---
+            # High-confidence catalog routing: skip rga, use catalog directly
+            if catalog_routed_files and catalog_confidence == "high":
+                used_level = "catalog_route"
+                await self._logger.info(
+                    f"[FAST:Step2] High-confidence catalog routing → "
+                    f"{[Path(p).name for p in catalog_routed_files[:top_k_files]]}"
+                )
+                best_files = [
+                    {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
+                    for p in catalog_routed_files[:top_k_files]
+                ]
+
+            # Narrow-scope RGA: search within tree-probed files first
+            if not best_files and _tree_probed_set and primary:
+                best_files = await self._fast_find_best_file(
+                    primary, paths=list(_tree_probed_set),
+                    top_k=top_k_files, keyword_idfs=keyword_idfs,
+                    query=query, artifacts=artifacts,
+                )
+                if best_files:
+                    used_level = "tree_rga"
+                    await self._logger.info(
+                        f"[FAST:Step2] Narrow-scope tree+rga hit → "
+                        f"{[Path(f['path']).name for f in best_files]}"
+                    )
+
+            # Full-scope RGA with tree probe boost
+            if not best_files and primary:
+                best_files = await self._fast_find_best_file(
+                    primary, top_k=top_k_files, keyword_idfs=keyword_idfs,
+                    query=query, artifacts=artifacts,
+                    tree_probed_paths=_tree_probed_set or None,
+                    **rga_kwargs,
+                )
+
+            if not best_files and fallback:
+                used_level = "fallback"
+                await self._logger.info(
+                    "[FAST:Step2] Primary miss, trying fine-grained fallback"
+                )
+                best_files = await self._fast_find_best_file(
+                    fallback, top_k=top_k_files, keyword_idfs=keyword_idfs,
+                    query=query, artifacts=artifacts,
+                    tree_probed_paths=_tree_probed_set or None,
+                    **rga_kwargs,
+                )
+
+            # --- Fallback: compile-hint files when rga misses (catalog + P2 + P4) ---
+            if not best_files and compile_hint_files:
+                used_level = "compile_hint"
+                await self._logger.info(
+                    f"[FAST:Step2] rga miss — using {len(compile_hint_files)} compile-hint files"
+                )
+                best_files = [
+                    {"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0}
+                    for p in compile_hint_files[:top_k_files]
+                ]
+
+            # --- Fallback: use dir_scan only when rga misses and dir scan is enabled ---
+            if not best_files and enable_dir_scan:
+                scan_result = await self._probe_dir_scan(paths, enable=True, max_files=300)
+                if scan_result is not None:
+                    await self._logger.info("[FAST:Step2] rga miss — falling back to dir_scan ranking")
+                    ranked_paths = await self._rank_dir_scan_candidates(
+                        query, scan_result, top_k=10, include_medium=True,
+                    )
+                    if ranked_paths:
+                        used_level = "dir_scan"
+                        best_files = [{"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0} for p in ranked_paths[:top_k_files]]
 
         if not best_files:
             if llm_fallback:
@@ -1784,77 +3139,227 @@ class AgenticSearch(BaseSearch):
         if best_files:
             file_path = best_files[0]["path"]
             match_objects = best_files[0].get("matches", [])
+            wiki_info = ""
+            if best_files[0].get("wiki_relevance") is not None:
+                wiki_info = f", wiki={best_files[0]['wiki_relevance']:.1f}"
             await self._logger.info(
                 f"[FAST:Step2] Best file ({used_level}): {Path(file_path).name} "
-                f"({best_files[0].get('total_matches', 0)} hits, score={best_files[0].get('weighted_score', 0):.2f})"
+                f"({best_files[0].get('total_matches', 0)} hits, "
+                f"score={best_files[0].get('weighted_score', 0):.2f}{wiki_info})"
             )
 
             # ==============================================================
-            # Step 3: Context sampling around grep hits (no LLM)
-            # Multi-file evidence aggregation
+            # Step 2.5 + Step 3: Tree navigation (1 LLM call) runs in
+            # parallel with rga evidence sampling (0 LLM).  The merged
+            # result is higher quality than either alone.
+            # Tree-guided sampling is integrated into _rga_evidence() for
+            # secondary files; the primary file gets a dedicated parallel
+            # tree_task to avoid blocking rga.
             # ==============================================================
-            evidence_parts = []
-            total_evidence_chars = 0
-            for bf in best_files:
-                if total_evidence_chars >= self._FAST_MAX_EVIDENCE_CHARS:
-                    break
 
-                file_path = bf["path"]
-                fname = Path(file_path).name
-                ext = Path(file_path).suffix.lower()
+            # Track files already receiving parallel tree navigation to
+            # avoid duplicate LLM calls inside _rga_evidence().
+            tree_nav_done: Set[str] = set()
+            tree_nav_target = best_files[0]["path"]
 
-                # Small file short-circuit: read full content instead of grep sampling
-                ev = None
-                if ext in self._FAST_TEXT_EXTENSIONS:
-                    try:
-                        file_size = Path(file_path).stat().st_size
-                        if file_size < self._FAST_SMALL_FILE_THRESHOLD:
-                            full_text = Path(file_path).read_text(errors="replace")
-                            if len(full_text) < self._FAST_SMALL_FILE_THRESHOLD:
-                                ev = f"[{fname}]\n{full_text}"
-                                await self._logger.info(
-                                    f"[FAST] Small file short-circuit: reading full content of {fname} "
-                                    f"({len(full_text)} chars)"
+            print(f"SEARCH_WIKI_DEBUG [D9] tree_nav_target={tree_nav_target}", flush=True)
+            print(f"SEARCH_WIKI_DEBUG [D10] tree_nav_match={tree_nav_target in (artifacts.tree_available_paths if artifacts else set())}", flush=True)
+            if artifacts and tree_nav_target not in artifacts.tree_available_paths:
+                print(f"SEARCH_WIKI_DEBUG [D11] MISMATCH! tree_available_paths={artifacts.tree_available_paths}", flush=True)
+
+            if artifacts and tree_nav_target in artifacts.tree_available_paths:
+                tree_task = self._navigate_tree_for_evidence(
+                    tree_nav_target, query,
+                    max_results=self._TREE_NAV_MAX_RESULTS,
+                    match_objects=best_files[0].get("matches"),
+                )
+                tree_nav_done.add(tree_nav_target)
+            else:
+                tree_task = self._async_noop(None)
+
+            async def _rga_evidence() -> str:
+                """Collect evidence from best_files: tree-guided when available, rga fallback."""
+                parts: List[str] = []
+                chars = 0
+                for bf in best_files:
+                    if chars >= self._FAST_MAX_EVIDENCE_CHARS:
+                        break
+                    fp = bf["path"]
+                    fn = Path(fp).name
+                    ext = Path(fp).suffix.lower()
+                    ev = None
+
+                    print(f"SEARCH_WIKI_DEBUG [D12] _rga_evidence: fp={fp}", flush=True)
+
+                    # 0. Excel digest priority (pre-compiled evidence)
+                    if artifacts and artifacts.manifest_map:
+                        manifest_entry = artifacts.manifest_map.get(fp)
+                        if manifest_entry and getattr(manifest_entry, 'has_xlsx_digest', False):
+                            digest_path = (
+                                self.work_path / ".cache" / "compile" / "xlsx_digests"
+                                / f"{manifest_entry.file_hash}.txt"
+                            )
+                            if digest_path.exists():
+                                try:
+                                    digest_content = digest_path.read_text(encoding="utf-8")
+                                    if digest_content.strip():
+                                        ev = f"[{fn} - Pre-compiled Evidence]\n{digest_content}"
+                                except Exception:
+                                    pass
+
+                    # 0.5 Table digest priority (pre-compiled PDF table evidence)
+                    _all_tables = None
+                    if ev is None and artifacts:
+                        # Primary: manifest-based lookup
+                        if artifacts.manifest_map:
+                            _me = artifacts.manifest_map.get(fp)
+                            if _me and getattr(_me, 'has_table_digest', False):
+                                _all_tables = self._load_table_digest(
+                                    self.work_path, _me.file_hash,
                                 )
-                    except Exception:
-                        pass  # Fall through to normal evidence extraction
 
-                # Normal path: grep-based evidence sampling
-                if ev is None:
-                    ev = await self._fast_sample_evidence(file_path, bf.get("matches", []))
+                        # Fallback: direct hash-based lookup when manifest misses
+                        if not _all_tables:
+                            try:
+                                from sirchmunk.utils.file_utils import get_fast_hash
+                                _file_hash = get_fast_hash(fp)
+                                if _file_hash:
+                                    _all_tables = self._load_table_digest(
+                                        self.work_path, _file_hash,
+                                    )
+                            except Exception:
+                                pass
 
-                if ev:
-                    remaining = self._FAST_MAX_EVIDENCE_CHARS - total_evidence_chars
-                    chunk = ev[:remaining]
-                    evidence_parts.append(chunk)
-                    total_evidence_chars += len(chunk)
-                    context.mark_file_read(file_path)
+                        print(f"SEARCH_WIKI_DEBUG [D13] table_digest: manifest_lookup={'found' if artifacts.manifest_map and artifacts.manifest_map.get(fp) else 'miss'}, has_table_digest={getattr(artifacts.manifest_map.get(fp), 'has_table_digest', False) if artifacts.manifest_map else 'N/A'}, hash_fallback={'tried' if not _all_tables else 'skipped'}, tables_count={len(_all_tables) if _all_tables else 0}", flush=True)
 
-            evidence = "\n\n---\n\n".join(evidence_parts)
+                        if _all_tables:
+                            _td_budget = (
+                                self._TABLE_EVIDENCE_NAV_OVERLAP_CHARS
+                                if fp in tree_nav_done
+                                else self._TABLE_EVIDENCE_DEFAULT_CHARS
+                            )
+                            _table_ev = self._format_table_evidence(
+                                _all_tables,
+                                max_chars=_td_budget,
+                                query=query,
+                            )
+                            if _table_ev:
+                                ev = f"[{fn} - Table Evidence]\n{_table_ev}"
+
+                    # 1. Tree-guided sampling for tree-indexed files
+                    # (skipped when a parallel tree_task already covers this file)
+                    _tree_cond = artifacts and fp in artifacts.tree_available_paths and fp not in tree_nav_done
+                    print(f"SEARCH_WIKI_DEBUG [D14] tree_sample: cond={_tree_cond}, in_tree_paths={fp in (artifacts.tree_available_paths if artifacts else set())}, in_nav_done={fp in tree_nav_done}", flush=True)
+                    if (
+                        artifacts
+                        and fp in artifacts.tree_available_paths
+                        and fp not in tree_nav_done
+                    ):
+                        try:
+                            tree_ev_inner = await self._tree_guided_sample(
+                                fp, query,
+                                match_objects=bf.get("matches", []),
+                                max_chars=self._FAST_MAX_EVIDENCE_CHARS - chars,
+                                artifacts=artifacts,
+                            )
+                            if tree_ev_inner:
+                                if ev:
+                                    ev = ev + "\n\n" + tree_ev_inner
+                                else:
+                                    ev = tree_ev_inner
+                                await self._logger.info(
+                                    f"[FAST:Step3] Tree-guided sample for {fn} "
+                                    f"({len(tree_ev_inner)} chars)"
+                                )
+                        except Exception:
+                            pass
+
+                    # 2. Small file: read entirely (only if tree didn't provide evidence)
+                    if ev is None and ext in self._FAST_TEXT_EXTENSIONS:
+                        try:
+                            sz = Path(fp).stat().st_size
+                            if sz < self._FAST_SMALL_FILE_THRESHOLD:
+                                full = Path(fp).read_text(errors="replace")
+                                if len(full) < self._FAST_SMALL_FILE_THRESHOLD:
+                                    ev = f"[{fn}]\n{full}"
+                        except Exception:
+                            pass
+
+                    # 3. Fallback: rga sampling (existing logic)
+                    if ev is None:
+                        ev = await self._fast_sample_evidence(fp, bf.get("matches", []))
+
+                    if ev:
+                        remaining = self._FAST_MAX_EVIDENCE_CHARS - chars
+                        parts.append(ev[:remaining])
+                        chars += len(parts[-1])
+                        context.mark_file_read(fp)
+
+                    _ev_source = "none"
+                    if ev:
+                        if "Table Evidence" in ev: _ev_source = "table_digest"
+                        elif "Pre-compiled" in ev: _ev_source = "excel_digest"
+                        elif "TreeSample" in str(ev)[:50] or "TreeNav" in str(ev)[:50]: _ev_source = "tree"
+                        else: _ev_source = "rga_or_other"
+                    print(f"SEARCH_WIKI_DEBUG [D15] ev_source={_ev_source}, ev_len={len(ev) if ev else 0}", flush=True)
+                return "\n\n---\n\n".join(parts)
+
+            # Launch tree navigation alongside rga evidence collection.
+            rga_ev, tree_ev = await asyncio.gather(_rga_evidence(), tree_task)
+
+            # Merge: tree evidence first (highest quality), then rga
+            if tree_ev and rga_ev:
+                rga_ev = self._deduplicate_table_sections(tree_ev, rga_ev)
+            evidence_parts_final: List[str] = []
+            if tree_ev:
+                evidence_parts_final.append(tree_ev)
+            if rga_ev:
+                evidence_parts_final.append(rga_ev)
+            evidence = "\n\n---\n\n".join(evidence_parts_final)
+
+            print(f"SEARCH_WIKI_DEBUG [D16] tree_ev: {'yes' if tree_ev else 'no'}, len={len(tree_ev) if tree_ev else 0}", flush=True)
+            print(f"SEARCH_WIKI_DEBUG [D17] rga_ev: {'yes' if rga_ev else 'no'}, len={len(rga_ev) if rga_ev else 0}", flush=True)
+            print(f"SEARCH_WIKI_DEBUG [D18] final_evidence_len={len(evidence)}", flush=True)
 
             if not evidence or len(evidence.strip()) < 20:
                 if llm_fallback:
                     await self._logger.info(
-                        "[FAST:Step3] No usable evidence, llm_fallback=True \u2192 LLM summary"
+                        "[FAST:Step3] No usable evidence, llm_fallback=True → LLM summary"
                     )
                     evidence = self._LLM_FALLBACK_EVIDENCE
                 else:
                     await self._logger.warning("[FAST:Step3] No usable evidence extracted")
                     return _NO_RESULTS_MESSAGE, None, context
 
+            tree_available = file_path in artifacts.tree_available_paths if artifacts else False
             await self._logger.info(
-                f"[FAST:Step3] Evidence: {len(evidence)} chars from {Path(file_path).name}"
+                f"[FAST:Step3] Evidence: {len(evidence)} chars "
+                f"(tree={'yes' if tree_ev else 'no'}, rga={'yes' if rga_ev else 'no'}, "
+                f"tree_indexed={'yes' if tree_available else 'no'})"
             )
 
         keywords_used = primary if used_level == "primary" else fallback
 
         # ==============================================================
         # Step 4: LLM answer from focused evidence (single call)
+        # Wiki-enhanced: inject document context when catalog available.
         # ==============================================================
-        answer_prompt = ROI_RESULT_SUMMARY.format(
-            user_input=query,
-            text_content=evidence,
-        )
+        doc_context = self._build_answer_context(file_path, artifacts) if best_files else None
+        if doc_context:
+            from sirchmunk.llm.prompts import ROI_RESULT_SUMMARY_WITH_CONTEXT
+            answer_prompt = ROI_RESULT_SUMMARY_WITH_CONTEXT.format(
+                user_input=query,
+                text_content=evidence,
+                document_context=doc_context,
+            )
+            await self._logger.info(
+                f"[FAST:Step4] Wiki-enhanced answer generation with catalog context"
+            )
+        else:
+            answer_prompt = ROI_RESULT_SUMMARY.format(
+                user_input=query,
+                text_content=evidence,
+            )
         answer_resp = await self.llm.achat(
             messages=[{"role": "user", "content": answer_prompt}],
             stream=True,
@@ -1868,25 +3373,72 @@ class AgenticSearch(BaseSearch):
         answer, should_save, should_answer = self._parse_summary_response(
             answer_resp.content or ""
         )
-        if not should_answer:
+
+        # --- Multi-factor evidence acceptance (P2+P3+P4) ---
+        accepted, accept_reason = self._evaluate_evidence_acceptance(
+            query, evidence, should_answer,
+        )
+        await self._logger.info(
+            f"[FAST:Step4] Evidence acceptance: {accepted} ({accept_reason})"
+        )
+
+        # ==============================================================
+        # Step 5: Self-correction retry (conditional, ≤1 extra LLM call)
+        # When the answer gate rejects the first attempt, try alternative
+        # evidence sources before giving up.
+        # ==============================================================
+        if not accepted:
+            retry_evidence = await self._fast_self_correct(
+                query, best_files, catalog_routed_files, context,
+            )
+            if retry_evidence:
+                await self._logger.info(
+                    f"[FAST:Step5] Retrying with {len(retry_evidence)} chars of alternative evidence"
+                )
+                retry_prompt = ROI_RESULT_SUMMARY.format(
+                    user_input=query, text_content=retry_evidence,
+                )
+                retry_resp = await self.llm.achat(
+                    messages=[{"role": "user", "content": retry_prompt}],
+                    stream=True,
+                )
+                self.llm_usages.append(retry_resp.usage)
+                if retry_resp.usage and isinstance(retry_resp.usage, dict):
+                    context.add_llm_tokens(
+                        retry_resp.usage.get("total_tokens", 0), usage=retry_resp.usage,
+                    )
+                answer, should_save, retry_should_answer = self._parse_summary_response(
+                    retry_resp.content or ""
+                )
+                retry_accepted, retry_reason = self._evaluate_evidence_acceptance(
+                    query, retry_evidence, retry_should_answer,
+                )
+                await self._logger.info(
+                    f"[FAST:Step5] Retry evidence acceptance: {retry_accepted} ({retry_reason})"
+                )
+                if retry_accepted:
+                    accepted = True
+
+        if not accepted:
             if llm_fallback:
                 await self._logger.info(
-                    "[FAST:Step4] Summary gate rejected evidence, llm_fallback=True → LLM fallback"
+                    "[FAST:Step5] Retry also rejected, llm_fallback=True → LLM fallback"
                 )
                 answer, should_save = await self._summarise_fast_fallback(query, context)
             else:
                 await self._logger.warning(
-                    "[FAST:Step4] Summary gate rejected evidence and llm_fallback=False "
+                    "[FAST:Step5] Evidence rejected after retry, llm_fallback=False "
                     "→ returning no results"
                 )
                 return _NO_RESULTS_MESSAGE, None, context
+
         if not should_save:
             await self._logger.info("[FAST] Quality gate: low-quality answer, skipping cluster save")
-            await self._logger.success("[FAST] Search complete (2 LLM calls, no persist)")
+            await self._logger.success("[FAST] Search complete (no persist)")
             return answer, None, context
 
         cluster = self._build_fast_cluster(
-            query, answer, file_path, evidence, keywords_used,
+            query, answer, file_path or "", evidence, keywords_used,
         )
         self._add_query_to_cluster(cluster, query)
         try:
@@ -1896,7 +3448,7 @@ class AgenticSearch(BaseSearch):
                 f"[FAST] Failed to save cluster with embedding: {exc}"
             )
 
-        await self._logger.success("[FAST] Search complete (2 LLM calls)")
+        await self._logger.success("[FAST] Search complete")
         return answer, cluster, context
 
     # ---- FAST helpers ----
@@ -2037,6 +3589,90 @@ class AgenticSearch(BaseSearch):
         # Cap at top_k
         return result[:top_k]
 
+    @staticmethod
+    def _compute_wiki_relevance(
+        file_path: str,
+        query: str,
+        keywords: List[str],
+        catalog_map: Dict[str, Dict[str, str]],
+        tree_available_paths: Set[str],
+    ) -> float:
+        """Compute wiki-based relevance score for a candidate file (0-10 scale).
+
+        Uses three sub-scores derived from compile artifacts:
+
+        1. **Catalog summary overlap** (0-``_WIKI_CATALOG_KEYWORD_OVERLAP_MAX``):
+           proportion of query keywords that appear in the catalog entry's
+           summary.  When *keywords* is empty, falls back to whole-query
+           substring matching against the summary to avoid returning 0 for
+           valid queries.
+        2. **Tree availability bonus** (0-``_WIKI_TREE_AVAILABILITY_BONUS``):
+           a file with a compiled tree index likely has rich structure.
+        3. **Catalog presence bonus** (0-``_WIKI_CATALOG_PRESENCE_FULL``):
+           files important enough to be in the catalog get a baseline boost.
+
+        All scoring is pure text matching — no LLM, no embedding.
+
+        Args:
+            file_path: Absolute path of the candidate file.
+            query: Original user query.
+            keywords: Extracted search keywords from FAST Step 1.
+            catalog_map: ``{path: catalog_entry}`` from CompileArtifacts.
+            tree_available_paths: Set of file paths with cached tree indices.
+
+        Returns:
+            Float in [0, 10] representing wiki-derived relevance.
+        """
+        cls = AgenticSearch  # access class constants from static method
+        score = 0.0
+
+        entry = catalog_map.get(file_path)
+
+        # Sub-score 1: Catalog summary keyword overlap
+        if entry:
+            summary_lower = (entry.get("summary", "") + " " + entry.get("name", "")).lower()
+            query_lower = query.lower()
+            matches = 0
+            total = 0
+            summary_tokens = cls._tokenize_for_matching(summary_lower)
+            for kw in keywords:
+                if kw:
+                    total += 1
+                    kw_low = kw.lower()
+                    if kw_low in summary_tokens:
+                        matches += 1          # Full token match
+                    elif kw_low in summary_lower:
+                        matches += 0.5        # Substring-only match (lower confidence)
+            # Also check whole query as a substring
+            if len(query_lower) >= 2 and query_lower in summary_lower:
+                matches += 1
+                total += 1
+            # When keywords list is empty but query is non-empty, fall back to
+            # character-level overlap so the sub-score is not silently 0.
+            if total == 0 and query_lower:
+                # Simple overlap: count how many query chars appear in summary
+                overlap = sum(1 for ch in query_lower if ch in summary_lower)
+                ratio = overlap / max(len(query_lower), 1)
+                score += ratio * cls._WIKI_CATALOG_KEYWORD_OVERLAP_MAX
+            elif total > 0:
+                score += (matches / total) * cls._WIKI_CATALOG_KEYWORD_OVERLAP_MAX
+
+        # Sub-score 2: Tree availability bonus
+        if file_path in tree_available_paths:
+            score += cls._WIKI_TREE_AVAILABILITY_BONUS
+
+        # Sub-score 3: Catalog presence bonus
+        if entry:
+            summary_len = len(entry.get("summary", ""))
+            if summary_len > 100:
+                score += cls._WIKI_CATALOG_PRESENCE_FULL
+            elif summary_len > 30:
+                score += cls._WIKI_CATALOG_PRESENCE_MEDIUM
+            elif summary_len > 0:
+                score += cls._WIKI_CATALOG_PRESENCE_MINIMAL
+
+        return min(score, cls._WIKI_MAX_SCORE)
+
     async def _fast_find_best_file(
         self,
         keywords: List[str],
@@ -2046,9 +3682,29 @@ class AgenticSearch(BaseSearch):
         exclude: Optional[List[str]] = None,
         top_k: int = 1,
         keyword_idfs: Optional[Dict[str, float]] = None,
+        query: str = "",
+        artifacts: Optional["CompileArtifacts"] = None,
+        tree_probed_paths: Optional[Set[str]] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Search per keyword via rga and return the top-k best-matching files
-        ranked by IDF-weighted log-TF scoring.
+        ranked by IDF-weighted log-TF scoring, optionally enhanced with
+        wiki-derived relevance from compile artifacts.
+
+        When *tree_probed_paths* is provided, files that were selected by
+        LLM-driven tree probing receive a ranking boost, ensuring the tree
+        probe's high-quality signal influences the final file ordering.
+
+        Args:
+            keywords: Search keywords from FAST Step 1.
+            paths: Search paths.
+            max_depth: Maximum directory depth for rga.
+            include: Glob patterns to include.
+            exclude: Glob patterns to exclude.
+            top_k: Number of top files to return.
+            keyword_idfs: Pre-computed IDF values for keywords.
+            query: Original user query (used for wiki relevance scoring).
+            artifacts: Compile artifacts for adaptive wiki-enhanced ranking.
+            tree_probed_paths: File paths selected by tree probing (receive boost).
 
         Returns:
             List of merged file dicts (path, matches, lines, total_matches, weighted_score) or None.
@@ -2116,6 +3772,53 @@ class AgenticSearch(BaseSearch):
                 await self._logger.warning(
                     f"[FAST] filename search failed: {exc}"
                 )
+
+        # Layer 4: Embedding + BM25 hybrid fallback
+        # Triggered ONLY when layers 1-3 all return empty results
+        if (not all_raw
+                and self._ENABLE_EMBEDDING_FALLBACK
+                and artifacts is not None
+                and artifacts.summary_index is not None):
+            try:
+                query_emb = None
+                query_tokens: List[str] = []
+
+                # Compute query embedding (if embedding client available)
+                if (self.embedding_client
+                        and self.embedding_client.is_ready()
+                        and artifacts.summary_index.has_embeddings):
+                    query_emb = (await self.embedding_client.embed([query]))[0]
+
+                # Tokenize query for BM25
+                from sirchmunk.utils.tokenizer_util import TokenizerUtil
+                _tokenizer = TokenizerUtil()
+                query_tokens = _tokenizer.segment(query)
+
+                if query_emb is not None or query_tokens:
+                    results = artifacts.summary_index.search(
+                        query_embedding=query_emb,
+                        query_tokens=query_tokens,
+                        top_k=top_k or 3,
+                    )
+
+                    for file_path, score in results:
+                        if Path(file_path).exists():
+                            all_raw.append({
+                                "path": file_path,
+                                "matches": [],
+                                "weighted_score": score * self._WIKI_MAX_SCORE,
+                            })
+
+                    if all_raw:
+                        await self._logger.info(
+                            f"[FAST] Embedding+BM25 fallback found {len(all_raw)} candidates"
+                        )
+            except Exception as exc:
+                await self._logger.warning(
+                    f"[FAST] Embedding+BM25 fallback failed: {exc}"
+                )
+
+        if not all_raw:
             return None
 
         merged = GrepRetriever.merge_results(all_raw, limit=20)
@@ -2137,6 +3840,30 @@ class AgenticSearch(BaseSearch):
                     idf = _idfs.get(kw, max(0.5, min(1.0, len(kw) / 5.0)))
                     score += idf * (1.0 + math.log(tf))
             f["weighted_score"] = score
+
+        # --- Wiki-enhanced hybrid scoring (adaptive: only when artifacts exist) ---
+        if artifacts and artifacts.catalog_map:
+            # Normalize TF-IDF scores to [0, 10] to align with Wiki score range
+            max_tf_idf = max((f["weighted_score"] for f in merged), default=1.0)
+            if max_tf_idf <= 0:
+                max_tf_idf = 1.0
+            for f in merged:
+                wiki_score = self._compute_wiki_relevance(
+                    f["path"], query, keywords,
+                    artifacts.catalog_map, artifacts.tree_available_paths,
+                )
+                f["wiki_relevance"] = wiki_score
+                # Normalize TF-IDF to [0, 10] before blending
+                tf_idf_norm = (f["weighted_score"] / max_tf_idf) * self._WIKI_MAX_SCORE
+                f["weighted_score"] = (
+                    self._WIKI_BLEND_ALPHA * tf_idf_norm
+                    + (1 - self._WIKI_BLEND_ALPHA) * wiki_score
+                )
+
+        if tree_probed_paths:
+            for f in merged:
+                if f["path"] in tree_probed_paths:
+                    f["weighted_score"] += self._TREE_PROBE_RANKING_BOOST
 
         merged.sort(key=lambda f: f["weighted_score"], reverse=True)
         pruned = self._prune_by_score(merged, top_k=top_k)
@@ -2170,7 +3897,7 @@ class AgenticSearch(BaseSearch):
 
         # Diagnostic logging when falling back to snippet mode
         if not hit_lines and match_objects:
-            await self._logger.warning(
+            await self._logger.info(
                 f"[FAST] No line_number in {len(match_objects)} match(es) for {fname}, "
                 f"falling back to snippet mode"
             )
@@ -2296,6 +4023,1604 @@ class AgenticSearch(BaseSearch):
             pass
         return ""
 
+    def _load_document_catalog(self) -> Optional[List[Dict[str, str]]]:
+        """Load the compiled document catalog for fused query+route prompt.
+
+        Returns None when compile has not been run or catalog is missing.
+        """
+        catalog_path = self.work_path / ".cache" / "compile" / "document_catalog.json"
+        if not catalog_path.exists():
+            return None
+        try:
+            entries = json.loads(catalog_path.read_text(encoding="utf-8"))
+            if isinstance(entries, list) and entries:
+                return entries
+        except Exception:
+            pass
+        return None
+
+    def _detect_compile_artifacts(
+        self,
+        search_paths: Optional[List[str]] = None,
+    ) -> CompileArtifacts:
+        """One-shot probe of all compile artifacts for adaptive FAST activation.
+
+        Reads the document catalog and scans the tree cache directory to
+        determine which compile products are available.  Called once at the
+        start of ``_search_fast()``; the result is passed to downstream
+        helpers so they can enable enhanced logic only when artifacts exist.
+
+        When *search_paths* is provided, all returned artifacts are filtered
+        to only include entries whose file paths fall within the search scope.
+        This ensures downstream consumers (catalog routing, tree probing,
+        summary index) never see documents outside the requested scope.
+
+        Cost: one JSON read (catalog) + one directory listing (tree cache).
+        Tree path results are cached in ``_tree_paths_cache`` so subsequent
+        calls within the same instance avoid re-parsing every JSON file.
+        Returns a ``CompileArtifacts`` with ``None``/empty fields when
+        compile has not been run.
+        """
+        scope = _PathScope(search_paths)
+
+        catalog = self._load_document_catalog()
+        catalog_map: Dict[str, Dict[str, str]] = {}
+        if catalog:
+            for entry in catalog:
+                p = entry.get("path", "")
+                if p:
+                    catalog_map[p] = entry
+
+        # Load manifest for rich metadata (size, has_tree, cluster_ids)
+        manifest_map: Dict[str, Any] = {}
+        manifest_path = self.work_path / ".cache" / "compile" / "manifest.json"
+        if manifest_path.exists():
+            try:
+                from sirchmunk.learnings.compiler import CompileManifest
+                manifest = CompileManifest.from_json(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+                manifest_map = manifest.files  # {file_path: FileManifestEntry}
+            except Exception:
+                pass
+
+        indexer = self._get_tree_indexer()
+        # Use cached tree paths when available to avoid re-parsing all JSONs
+        tree_paths: Set[str] = getattr(self, "_tree_paths_cache", None) or set()
+        if not tree_paths:
+            # Prefer manifest-based detection (fast, O(1) per file)
+            if manifest_map:
+                tree_paths = {fp for fp, entry in manifest_map.items() if entry.has_tree}
+            # Always try directory fallback if manifest-based detection found nothing
+            if not tree_paths and indexer is not None:
+                tree_cache = self.work_path / ".cache" / "compile" / "trees"
+                if tree_cache.exists():
+                    try:
+                        from sirchmunk.learnings.tree_indexer import DocumentTree
+                        for tf in sorted(tree_cache.glob("*.json"))[:self._TREE_CACHE_SCAN_LIMIT]:
+                            try:
+                                tree = DocumentTree.from_json(
+                                    tf.read_text(encoding="utf-8")
+                                )
+                                if tree.file_path:
+                                    tree_paths.add(tree.file_path)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            # Cache for future calls within this instance
+            self._tree_paths_cache = tree_paths
+
+        # Load summary index for embedding fallback (optional)
+        summary_index = None
+        summary_index_path = self.work_path / ".cache" / "compile" / "summary_index.json"
+        if summary_index_path.exists():
+            try:
+                from sirchmunk.learnings.summary_index import CompileSummaryIndex
+                summary_index = CompileSummaryIndex.load(summary_index_path)
+            except Exception:
+                pass
+
+        # --- Apply search-path scope filtering ---
+        if not scope.is_empty:
+            if catalog:
+                catalog = [e for e in catalog if scope.contains(e.get("path", ""))]
+            catalog_map = {p: e for p, e in catalog_map.items() if scope.contains(p)}
+            tree_paths = {p for p in tree_paths if scope.contains(p)}
+            manifest_map = {p: e for p, e in manifest_map.items() if scope.contains(p)}
+
+        print(f"SEARCH_WIKI_DEBUG [D1] manifest_map: {len(manifest_map)} entries, keys={list(manifest_map.keys())[:3]}", flush=True)
+        print(f"SEARCH_WIKI_DEBUG [D2] tree_available_paths: {tree_paths}", flush=True)
+        print(f"SEARCH_WIKI_DEBUG [D3] manifest_fallback_executed: {manifest_map and not tree_paths}", flush=True)
+        return CompileArtifacts(
+            catalog=catalog,
+            catalog_map=catalog_map,
+            tree_indexer=indexer,
+            tree_available_paths=tree_paths,
+            manifest_map=manifest_map,
+            summary_index=summary_index,
+        )
+
+    def _build_tree_root_hints(self, artifacts: CompileArtifacts) -> str:
+        """Build tree root summary hints for FAST Step 1 query analysis.
+
+        Loads root summaries from cached trees and formats them as context
+        for the LLM to understand document-level structure.
+
+        Args:
+            artifacts: Compile artifact context with tree metadata.
+
+        Returns:
+            Formatted hint string, or empty string when no trees are available.
+        """
+        if not artifacts.tree_available_paths:
+            return ""
+        indexer = artifacts.tree_indexer
+        if indexer is None:
+            return ""
+        hints: List[str] = []
+        for i, fp in enumerate(sorted(artifacts.tree_available_paths)):
+            if i >= self._TREE_ROOT_HINTS_MAX_FILES:
+                break
+            tree = indexer.load_tree(fp)
+            if tree and tree.root and tree.root.summary:
+                name = Path(fp).name
+                hints.append(f"[{i}] {name}: {tree.root.summary[:self._TREE_ROOT_HINT_TRUNCATE]}")
+        if not hints:
+            return ""
+        return "\nDocument structure hints:\n" + "\n".join(hints) + "\n"
+
+    @staticmethod
+    def _tokenize_for_matching(text: str) -> Set[str]:
+        """Tokenize text into meaningful units for keyword matching.
+
+        Splits on whitespace and CJK/Latin punctuation boundaries, then
+        generates 2-3 char n-grams for CJK-heavy tokens to handle
+        unsegmented Chinese text.  Returns a set of lowercased tokens.
+        """
+        import re
+        tokens: Set[str] = set()
+        raw = re.split(r'[\s,;.!?，；。！？：:、\u201c\u201d\u2018\u2019（）()\[\]{}<>《》\-/]+', text.lower())
+        for t in raw:
+            t = t.strip()
+            if not t:
+                continue
+            tokens.add(t)
+            if len(t) >= 2 and any('\u4e00' <= c <= '\u9fff' for c in t):
+                for n in (2, 3):
+                    for i in range(len(t) - n + 1):
+                        tokens.add(t[i:i + n])
+        return tokens
+
+    @staticmethod
+    def _extract_catalog_keywords(summary: str, max_kw: int = 3) -> List[str]:
+        """Extract salient keywords from a catalog summary via simple heuristics.
+
+        Uses word-length filtering, Chinese character detection, and CJK n-gram
+        extraction to pick the most informative tokens.  For CJK-heavy text
+        (which does not use whitespace word boundaries), consecutive CJK
+        character runs are extracted as additional candidate tokens.
+
+        No LLM or embedding involved.
+
+        Args:
+            summary: Document summary text from the compiled catalog.
+            max_kw: Maximum number of keywords to return.
+
+        Returns:
+            List of up to *max_kw* keywords.
+        """
+        cls = AgenticSearch
+        if max_kw <= 0:
+            return []
+        summary_text = str(summary or "").strip()
+        if not summary_text:
+            return []
+        import re as _re
+
+        # Split on whitespace and common punctuation (incl. CJK punctuation)
+        tokens = _re.split(
+            r'[\s,;\uff0c\uff1b\u3001\u3002\uff1a:!?\uff01\uff1f()\[\]{}\u201c\u201d\u2018\u2019\u0022\u0027/\\|`~@#$%^&*=+<>]+',
+            summary_text,
+        )
+
+        # For CJK text, also extract consecutive CJK character runs (2-6 chars)
+        # so that e.g. "停车位申请条件" yields ["停车位申请条件", "停车位", "申请条件", ...]
+        cjk_runs = _re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]{2,}', summary_text)
+        # Generate sub-phrases from long CJK runs (bigrams/trigrams/4-grams)
+        cjk_ngrams: List[str] = []
+        max_ngram_per_run = 40
+        for run in cjk_runs:
+            cjk_ngrams.append(run)
+            if len(run) > 4:
+                # Extract 2-4 char sub-phrases from each run
+                added = 0
+                for n in (4, 3, 2):
+                    for i in range(len(run) - n + 1):
+                        cjk_ngrams.append(run[i:i + n])
+                        added += 1
+                        if added >= max_ngram_per_run:
+                            break
+                    if added >= max_ngram_per_run:
+                        break
+
+        tokens = tokens + cjk_ngrams
+
+        # Filter: keep tokens with appropriate length and not purely numeric
+        candidates = [
+            t for t in tokens
+            if t
+            and len(t) >= cls._CATALOG_KEYWORD_MIN_LEN
+            and not t.isdigit()
+            and len(t) <= cls._CATALOG_KEYWORD_MAX_LEN
+            and not _re.fullmatch(r"[_\-.]+", t)
+        ]
+        # Prefer longer tokens (more specific)
+        candidates.sort(key=len, reverse=True)
+        # Deduplicate case-insensitively
+        seen: Set[str] = set()
+        chosen_norms: List[str] = []
+        result: List[str] = []
+        for c in candidates:
+            lower = c.lower()
+            if lower not in seen:
+                # Avoid noisy micro-fragments when a longer token already exists.
+                if len(lower) <= 4 and any(lower in kept for kept in chosen_norms):
+                    continue
+                seen.add(lower)
+                chosen_norms.append(lower)
+                result.append(c)
+            if len(result) >= max_kw:
+                break
+        return result
+
+    def _build_enriched_catalog_listing(
+        self,
+        catalog: List[Dict[str, str]],
+        max_entries: Optional[int] = None,
+    ) -> str:
+        """Build an enriched catalog listing with keywords for FAST Step 1.
+
+        Compared to the plain ``[i] name: summary[:200]`` format, this adds
+        extracted keywords to help the LLM make more informed document
+        selections.
+
+        Args:
+            catalog: Entries from ``document_catalog.json``.
+            max_entries: Cap to prevent prompt overflow.
+
+        Returns:
+            Formatted listing string for injection into the FAST query
+            analysis prompt.
+        """
+        if not isinstance(catalog, list) or not catalog:
+            return ""
+        lines: List[str] = []
+        _max = max_entries if max_entries is not None else self._CATALOG_LISTING_MAX_ENTRIES
+        if _max <= 0:
+            return ""
+        _trunc = self._CATALOG_SUMMARY_TRUNCATE
+        for i, entry in enumerate(catalog[:_max]):
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or entry.get("path") or "")
+            summary = str(entry.get("summary") or "")
+            # Keep one-line prompt entries to avoid accidental prompt pollution.
+            name = " ".join(name.split())
+            summary = " ".join(summary.split())
+            if not name:
+                name = f"doc_{i}"
+            kws = AgenticSearch._extract_catalog_keywords(summary)
+            kw_str = ", ".join(kws) if kws else ""
+            shown_summary = summary[:_trunc]
+            if len(summary) > _trunc:
+                shown_summary += "..."
+            if kw_str:
+                lines.append(f"[{i}] {name}: {shown_summary}  [Keywords: {kw_str}]")
+            else:
+                lines.append(f"[{i}] {name}: {shown_summary}")
+        return "\n".join(lines)
+
+    def _build_answer_context(
+        self,
+        best_file_path: str,
+        artifacts: CompileArtifacts,
+    ) -> Optional[str]:
+        """Build document context from catalog for wiki-enhanced answer generation.
+
+        Returns a short context string describing the source document, or
+        None when no catalog entry exists for *best_file_path*.
+
+        Args:
+            best_file_path: Path of the top-ranked file from Step 2.
+            artifacts: Compile artifact availability context.
+
+        Returns:
+            Context string or None.
+        """
+        if not artifacts.catalog_map:
+            return None
+        entry = artifacts.catalog_map.get(best_file_path)
+        if not entry:
+            return None
+        name = entry.get("name", Path(best_file_path).name)
+        summary = entry.get("summary", "")
+        if not summary:
+            return None
+        return f"Source Document: {name}\nDocument Overview: {summary}"
+
+    async def _tree_guided_sample(
+        self,
+        file_path: str,
+        query: str,
+        *,
+        match_objects: Optional[List[Dict[str, Any]]] = None,
+        max_chars: int = 0,
+        artifacts: Optional["CompileArtifacts"] = None,
+        pre_navigated_leaves: Optional[List[Any]] = None,
+    ) -> Optional[str]:
+        """Tree-guided evidence sampling: use compiled tree index to locate
+        relevant sections, then read precise char_range content.
+
+        Falls back to None when no tree index is available, letting callers
+        use their default sampling strategy (rga windows, Monte Carlo, etc.).
+
+        This method is designed to be called from both FAST and DEEP modes:
+        - FAST: called inside _rga_evidence() per-file loop
+        - DEEP: called before/alongside Monte Carlo sampling
+
+        Args:
+            file_path: Absolute path to the target file.
+            query: User query for LLM-driven branch selection.
+            match_objects: Optional rga match objects for hybrid evidence.
+            max_chars: Character budget for this file's evidence.
+                Uses ``_FAST_MAX_EVIDENCE_CHARS`` when 0.
+            artifacts: Compile artifact context; when None, probes lazily.
+            pre_navigated_leaves: Pre-computed leaf nodes from a prior
+                ``navigate()`` call.  When provided the method skips the
+                LLM navigation step (avoids duplicate LLM calls).
+
+        Returns:
+            Formatted evidence string with tree-navigated sections, or None
+            when tree index is unavailable (caller should fall back).
+        """
+        if max_chars <= 0:
+            max_chars = self._FAST_MAX_EVIDENCE_CHARS
+
+        print(f"SEARCH_WIKI_DEBUG [S1] _tree_guided_sample: file_path={file_path}", flush=True)
+
+        # --- Guard: tree availability ---
+        if artifacts is not None:
+            if file_path not in artifacts.tree_available_paths:
+                return None
+        else:
+            # Lazy probe when artifacts not provided (DEEP mode entry)
+            indexer = self._get_tree_indexer()
+            if indexer is None or not indexer.has_tree(file_path):
+                return None
+
+        fname = Path(file_path).name
+
+        # --- Obtain leaf nodes ---
+        leaves = pre_navigated_leaves
+        if leaves is None:
+            try:
+                indexer = self._get_tree_indexer()
+                if indexer is None:
+                    return None
+                tree = indexer.load_tree(file_path)
+                if tree is None or tree.root is None:
+                    return None
+                leaves = await indexer.navigate(
+                    tree, query,
+                    max_results=self._TREE_SAMPLE_MAX_SECTIONS,
+                )
+            except Exception:
+                return None
+
+        if not leaves:
+            return None
+
+        # --- Classify leaves by extraction method ---
+        trimmed = leaves[: self._TREE_SAMPLE_MAX_SECTIONS]
+        page_leaves, char_leaves, table_and_summary = self._classify_leaves(trimmed)
+        print(f"SEARCH_WIKI_DEBUG [S2] classify_leaves: page={len(page_leaves)}, char={len(char_leaves)}, table_summary={len(table_and_summary)}", flush=True)
+
+        # Collect (leaf, segment) pairs preserving original leaf order
+        leaf_segments: List[tuple] = []  # (leaf, segment_text)
+
+        # -- Phase A: table / summary-only leaves --
+        for leaf in table_and_summary:
+            leaf_segments.append((leaf, leaf.summary))
+
+        # -- Phase B: batch page-level extraction (single IO) --
+        page_segment_map: dict = {}  # id(leaf) -> segment
+        if page_leaves:
+            all_pages: set = set()
+            for _leaf, (sp, ep) in page_leaves:
+                all_pages.update(range(sp, ep + 1))
+            try:
+                page_contents = DocumentExtractor.extract_pages(
+                    file_path, sorted(all_pages),
+                )
+                page_map = {pc.page_number: pc.content for pc in page_contents}
+
+                for leaf, (sp, ep) in page_leaves:
+                    seg_parts = []
+                    for p in range(sp, ep + 1):
+                        text = page_map.get(p, "")
+                        if text.strip():
+                            seg_parts.append(text)
+                    if seg_parts:
+                        page_segment_map[id(leaf)] = "\n".join(seg_parts)
+                    elif getattr(leaf, 'summary', None):
+                        page_segment_map[id(leaf)] = leaf.summary
+            except (FileNotFoundError, PermissionError):
+                raise  # 文件系统错误应传播
+            except Exception as e:
+                _loguru_logger.warning(
+                    f"[TreeSample] Page extraction failed for {fname}: {e}, "
+                    f"falling back to char_range for {len(page_leaves)} leaves"
+                )
+                # Demote page_leaves → char_leaves
+                for leaf, _ in page_leaves:
+                    if hasattr(leaf, 'char_range') and leaf.char_range:
+                        char_leaves.append(leaf)
+                    elif getattr(leaf, 'summary', None):
+                        leaf_segments.append((leaf, leaf.summary))
+                page_leaves_ok = False
+            else:
+                page_leaves_ok = True
+
+            if page_leaves_ok:
+                for leaf, _ in page_leaves:
+                    seg = page_segment_map.get(id(leaf))
+                    if seg:
+                        leaf_segments.append((leaf, seg))
+        # If page extraction failed, demoted leaves are now in char_leaves
+
+        # -- Phase C: char_range extraction (compile-consistent content) --
+        if char_leaves:
+            full_text = self._load_compile_content(self.work_path, file_path)
+            if not full_text:
+                try:
+                    from sirchmunk.utils.file_utils import fast_extract
+                    extraction = await fast_extract(file_path=file_path)
+                    full_text = extraction.content or ""
+                except Exception:
+                    full_text = ""
+
+            for leaf in char_leaves:
+                start, end = leaf.char_range
+                if self._is_valid_char_range(start, end, len(full_text)) and full_text:
+                    segment = full_text[start:end]
+                    if segment.strip():
+                        leaf_segments.append((leaf, segment))
+                    elif getattr(leaf, 'summary', None):
+                        leaf_segments.append((leaf, leaf.summary))
+                elif getattr(leaf, 'summary', None):
+                    _loguru_logger.debug(
+                        f"[TreeSample] char_range degraded for '{leaf.title}' "
+                        f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), using summary"
+                    )
+                    leaf_segments.append((leaf, leaf.summary))
+
+        # --- Build parts with budget control ---
+        parts: List[str] = []
+        total_chars = 0
+        for leaf, segment in leaf_segments:
+            segment = segment[: self._TREE_SAMPLE_SECTION_MAX_CHARS]
+            if not segment.strip():
+                continue
+            page_info = ""
+            if getattr(leaf, 'page_range', None):
+                ps, pe = leaf.page_range
+                page_info = f" (pp.{ps}-{pe})" if ps != pe else f" (p.{ps})"
+            type_tag = " [TABLE]" if getattr(leaf, 'content_type', 'text') == 'table' else ""
+            header = f"[{fname} \u2192 {leaf.title}{page_info}{type_tag}]"
+            chunk = f"{header}\n{segment}"
+            if total_chars + len(chunk) > max_chars:
+                remaining = max_chars - total_chars
+                if remaining > 200:
+                    parts.append(chunk[:remaining])
+                    total_chars += remaining
+                break
+            parts.append(chunk)
+            total_chars += len(chunk)
+
+        # --- Optional rga supplement ---
+        if (
+            self._TREE_SAMPLE_RGA_SUPPLEMENT
+            and match_objects
+            and total_chars < max_chars
+        ):
+            hit_lines: List[int] = []
+            for m in match_objects:
+                ln = m.get("data", {}).get("line_number")
+                if isinstance(ln, int):
+                    hit_lines.append(ln)
+            if hit_lines:
+                ext = Path(file_path).suffix.lower()
+                if ext in self._FAST_TEXT_EXTENSIONS:
+                    rga_ctx = self._read_context_windows(
+                        file_path, hit_lines,
+                        window=self._FAST_CONTEXT_WINDOW,
+                        max_chars=max_chars - total_chars,
+                    )
+                    if rga_ctx:
+                        rga_section = f"[{fname} \u2192 rga hits]\n{rga_ctx}"
+                        parts.append(rga_section)
+                        total_chars += len(rga_section)
+
+        if not parts:
+            return None
+
+        evidence = "\n\n".join(parts)
+        print(f"SEARCH_WIKI_DEBUG [S3] _tree_guided_sample result: len={len(evidence) if evidence else 0}", flush=True)
+        await self._logger.info(
+            f"[TreeSample] {fname}: "
+            f"{len(parts)} sections, {total_chars} chars "
+            f"(pre_nav={'yes' if pre_navigated_leaves else 'no'})"
+        )
+        return evidence
+
+    async def _cached_navigate_tree(
+        self,
+        file_path: str,
+        query: str,
+        nav_cache: Dict[str, str],
+    ) -> Optional[str]:
+        """``_navigate_tree_for_evidence`` with per-query dedup cache."""
+        cache_key = f"{file_path}::{query}"
+        if cache_key in nav_cache:
+            return nav_cache[cache_key]
+        result = await self._navigate_tree_for_evidence(file_path, query)
+        if isinstance(result, str) and result.strip():
+            nav_cache[cache_key] = result
+        return result
+
+    async def _collect_deep_tree_evidence(
+        self,
+        file_paths: List[str],
+        query: str,
+        *,
+        scope: Optional["_PathScope"] = None,
+        nav_cache: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        """Full tree navigation for DEEP mode primary files.
+
+        Runs ``_navigate_tree_for_evidence`` (complement nav, table supplement,
+        referenced-page gap-fill) on each file.  Returns a dict mapping
+        file paths to raw evidence text.  The evidence is used to
+        **supplement** (not replace) Monte Carlo sampling.
+
+        When *scope* is provided, only files within the search path scope
+        are navigated — prevents cross-document evidence contamination.
+        When *nav_cache* is provided, results are cached to avoid
+        duplicate navigation across pipeline phases.
+        """
+        indexer = self._get_tree_indexer()
+        if indexer is None:
+            return {}
+
+        if scope:
+            file_paths = [fp for fp in file_paths if scope.contains(fp)]
+            if not file_paths:
+                return {}
+
+        nav_fps = [fp for fp in file_paths[:self._DEEP_PRE_NAV_MAX_FILES]
+                   if indexer.has_tree(fp)]
+        if not nav_fps:
+            return {}
+
+        if nav_cache is not None:
+            results = await asyncio.gather(
+                *[self._cached_navigate_tree(fp, query, nav_cache) for fp in nav_fps],
+                return_exceptions=True,
+            )
+        else:
+            results = await asyncio.gather(
+                *[self._navigate_tree_for_evidence(fp, query) for fp in nav_fps],
+                return_exceptions=True,
+            )
+
+        evidence_dict: Dict[str, str] = {}
+        for fp, res in zip(nav_fps, results):
+            if isinstance(res, Exception):
+                await self._logger.warning(
+                    f"[Phase 2.5:DirectTree] Navigation failed for "
+                    f"{Path(fp).name}: {res}"
+                )
+            elif isinstance(res, str) and res.strip():
+                evidence_dict[fp] = res
+
+        if evidence_dict:
+            total_len = sum(len(v) for v in evidence_dict.values())
+            await self._logger.info(
+                f"[Phase 2.5:DirectTree] {len(evidence_dict)} files, "
+                f"{total_len} chars"
+            )
+        return evidence_dict
+
+    @classmethod
+    def _classify_leaves(cls, leaves: list) -> Tuple[List[tuple], List, List]:
+        """Classify leaf nodes by preferred extraction strategy.
+
+        For non-table leaves, **char_range** (kreuzberg markdown) is preferred
+        over page_range (pypdf raw text) because compile-time extraction
+        preserves table layout and column structure far better than pypdf's
+        ``extract_text()``.  page_range remains available on each leaf for
+        table-supplement filtering even when the leaf is routed to char_leaves.
+
+        Thin char_range nodes (span < ``_CHAR_RANGE_MIN_SPAN``) are demoted
+        to page-level extraction when a valid page_range exists, as they
+        typically represent TOC entries whose char offsets only cover the
+        section title rather than the actual content.
+
+        Returns:
+            (page_leaves, char_leaves, summary_leaves) triple:
+            - page_leaves: list of (leaf, page_range) — page-level extraction
+            - char_leaves: list of leaf — kreuzberg char_range extraction
+            - summary_leaves: list of leaf — only summary available
+        """
+        page_leaves: List[tuple] = []
+        char_leaves: List = []
+        summary_leaves: List = []
+        min_span = cls._CHAR_RANGE_MIN_SPAN
+
+        for leaf in leaves:
+            # Table nodes: prefer page-level extraction for raw original content
+            if getattr(leaf, 'content_type', 'text') == 'table':
+                page_range = getattr(leaf, 'page_range', None)
+                if (
+                    page_range
+                    and len(page_range) == 2
+                    and page_range[0] is not None
+                    and page_range[0] > 0
+                ):
+                    page_leaves.append((leaf, page_range))
+                elif getattr(leaf, 'summary', None):
+                    summary_leaves.append(leaf)
+                else:
+                    char_leaves.append(leaf)
+                continue
+
+            # Non-table leaves: prefer char_range (kreuzberg markdown) over
+            # page_range (pypdf raw text) for higher-fidelity table rendering.
+            has_char = hasattr(leaf, 'char_range') and leaf.char_range
+            page_range = getattr(leaf, 'page_range', None)
+            has_page = (
+                page_range
+                and len(page_range) == 2
+                and page_range[0] is not None
+                and page_range[0] > 0
+            )
+
+            if has_char:
+                start, end = leaf.char_range
+                span = end - start if end > start else 0
+                if span < min_span and has_page:
+                    page_leaves.append((leaf, page_range))
+                else:
+                    char_leaves.append(leaf)
+            elif has_page:
+                page_leaves.append((leaf, page_range))
+            elif getattr(leaf, 'summary', None):
+                summary_leaves.append(leaf)
+
+        return page_leaves, char_leaves, summary_leaves
+
+    def _is_valid_char_range(
+        self, start: int, end: int, text_len: int,
+    ) -> bool:
+        """Check whether a char_range is valid for slicing.
+
+        A range is invalid when it covers more than
+        ``_CHAR_RANGE_MAX_SPAN_RATIO`` of the document (likely a
+        whole-document fallback) or when *end <= start*.
+        """
+        if start < 0 or end <= start or text_len <= 0:
+            return False
+        span_ratio = (end - start) / text_len
+        return span_ratio < self._CHAR_RANGE_MAX_SPAN_RATIO
+
+    @staticmethod
+    def _is_evidence_sufficient(evidence: str, min_chars: int = 0) -> bool:
+        """Check whether collected evidence has enough substance to answer a query.
+
+        Uses a length threshold as a lightweight, domain-agnostic proxy.
+        Empty or near-empty evidence (e.g., only headers with no data)
+        fails the check, triggering a retry with expanded parameters.
+        """
+        if not evidence:
+            return False
+        stripped = evidence.strip()
+        return len(stripped) >= min_chars
+
+    _MULTI_COMPONENT_PATTERNS: Tuple[Tuple[str, ...], ...] = (
+        ("balance sheet", "income statement"),
+        ("balance sheet", "cash flow"),
+        ("income statement", "cash flow"),
+        ("accounts payable", "cost of"),
+        ("accounts payable", "inventory"),
+        ("current assets", "current liabilities"),
+        ("revenue", "net income", "earnings"),
+        ("operating income", "depreciation"),
+    )
+
+    @staticmethod
+    def _decompose_query_components(query: str) -> List[str]:
+        """Extract distinct data-source components from a multi-part query.
+
+        Scans for known multi-component patterns (e.g. a ratio needing data
+        from both Balance Sheet and Income Statement) and returns a list of
+        component phrases that the evidence should cover.
+        """
+        q = query.lower()
+        components: List[str] = []
+        for group in AgenticSearch._MULTI_COMPONENT_PATTERNS:
+            hits = [phrase for phrase in group if phrase in q]
+            if len(hits) >= 2:
+                components.extend(hits)
+        if not components:
+            financial_keywords = [
+                "balance sheet", "income statement", "cash flow",
+                "accounts payable", "accounts receivable", "inventory",
+                "current liabilities", "current assets", "total assets",
+                "revenue", "cost of", "cogs", "depreciation", "amortization",
+                "operating income", "net income", "earnings",
+            ]
+            for kw in financial_keywords:
+                if kw in q:
+                    components.append(kw)
+        seen: set = set()
+        return [c for c in components if not (c in seen or seen.add(c))]
+
+    @staticmethod
+    def _check_leaf_coverage(
+        leaves: list, components: List[str],
+    ) -> Tuple[List[str], List[str]]:
+        """Check which query components are covered by the navigated leaves.
+
+        Returns:
+            (covered, missing) — lists of component phrases.
+        """
+        if not leaves or not components:
+            return [], list(components)
+        leaf_text = " ".join(
+            (getattr(l, 'title', '') or '') + " " + (getattr(l, 'summary', '') or '')
+            for l in leaves
+        ).lower()
+        covered = [c for c in components if c in leaf_text]
+        missing = [c for c in components if c not in leaf_text]
+        return covered, missing
+
+    @staticmethod
+    def _extract_referenced_pages(text: str) -> Set[int]:
+        """Extract page numbers referenced in evidence text.
+
+        Detects cross-references like 'page 60', 'pages 45-47', 'pp. 12-15'
+        that hint at data-bearing pages not yet included in evidence.
+        """
+        pages: Set[int] = set()
+        for m in re.finditer(
+            r"\b(?:pages?|pp?\.)\s*(\d+)\s*[-\u2013]\s*(\d+)",
+            text, re.IGNORECASE,
+        ):
+            start, end = int(m.group(1)), int(m.group(2))
+            if 0 < start <= end and end - start <= 10:
+                pages.update(range(start, end + 1))
+        for m in re.finditer(
+            r"\b(?:pages?|pp?\.)\s*(\d+)\b", text, re.IGNORECASE,
+        ):
+            p = int(m.group(1))
+            if 0 < p <= 500:
+                pages.add(p)
+        return pages
+
+    @staticmethod
+    def _load_compile_content(
+        work_path: Path, file_path: str,
+    ) -> Optional[str]:
+        """Load the ENHANCED content cached at compile time.
+
+        Compile stores the kreuzberg ENHANCED-profile content alongside the
+        tree index so that search-time ``char_range`` slicing operates on
+        the *same* text the ranges were computed from.  Returns ``None``
+        when the cache file is missing (e.g. pre-cache compile run).
+        """
+        try:
+            from sirchmunk.utils.file_utils import get_fast_hash
+            file_hash = get_fast_hash(file_path)
+            if not file_hash:
+                return None
+            cache_path = (
+                work_path / ".cache" / "compile" / "content" / f"{file_hash}.txt"
+            )
+            if cache_path.exists():
+                return cache_path.read_text(encoding="utf-8")
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _load_table_digest(
+        work_path: Path, file_hash: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Load pre-compiled table digest for a file.
+
+        Returns the list of table entries from the digest JSON, or None
+        if no digest exists or loading fails.
+        """
+        digest_path = (
+            work_path / ".cache" / "compile" / "table_digests" / f"{file_hash}.json"
+        )
+        if not digest_path.exists():
+            return None
+        try:
+            data = json.loads(digest_path.read_text(encoding="utf-8"))
+            return data.get("tables", [])
+        except Exception:
+            return None
+
+    @staticmethod
+    def _filter_tables_by_page_range(
+        tables: List[Dict[str, Any]],
+        page_start: int,
+        page_end: int,
+    ) -> List[Dict[str, Any]]:
+        """Filter tables whose page_number falls within the given range (inclusive)."""
+        return [
+            t for t in tables
+            if t.get("page_number") is not None
+            and page_start <= t["page_number"] <= page_end
+        ]
+
+    _TABLE_RELEVANCE_MIN_PREFIX = 5
+    _TABLE_STRUCTURE_BONUS: float = 0.25
+    """Bonus score for tables exhibiting structured data characteristics
+    (high row count, numeric density).  Applied additively to the keyword
+    relevance score so that data-rich tables are preferred when keyword
+    scores tie."""
+    _TABLE_STRUCTURE_MIN_ROWS: int = 5
+    """Minimum ``|``-delimited rows for a table to qualify for the
+    structure bonus."""
+    _TABLE_STRUCTURE_MIN_NUMERIC_RATIO: float = 0.15
+    """Minimum ratio of numeric tokens to total tokens for the bonus."""
+
+    @staticmethod
+    def _score_table_relevance(
+        markdown: str, query_tokens: frozenset,
+    ) -> float:
+        """Score a table's relevance to the query via token overlap.
+
+        Uses two matching strategies per token:
+
+        1. **Exact substring** — fast check whether the token appears
+           anywhere in the table text (original behaviour).
+        2. **Prefix match** — handles morphological variation such as
+           plural/singular (*inventory* ↔ *inventories*) by comparing
+           word prefixes of at least ``_TABLE_RELEVANCE_MIN_PREFIX``
+           characters.  Only attempted when the exact match misses.
+
+        Returns a value in [0, 1] representing the fraction of
+        *query_tokens* matched.
+        """
+        if not markdown or not query_tokens:
+            return 0.0
+
+        min_pfx = AgenticSearch._TABLE_RELEVANCE_MIN_PREFIX
+        md_lower = markdown.lower()
+        md_words = None  # lazily built on first prefix-match attempt
+
+        hits = 0
+        for tok in query_tokens:
+            if tok in md_lower:
+                hits += 1
+                continue
+            # Prefix-match fallback
+            pfx_len = min(len(tok), min_pfx)
+            if pfx_len < 4:
+                continue
+            if md_words is None:
+                md_words = frozenset(md_lower.split())
+            prefix = tok[:pfx_len]
+            if any(
+                w[:pfx_len] == prefix
+                for w in md_words
+                if len(w) >= pfx_len
+            ):
+                hits += 1
+
+        return hits / len(query_tokens)
+
+    @staticmethod
+    def _score_table_structure(markdown: str) -> float:
+        """Score a table's structural richness (row count + numeric density).
+
+        Data-dense tables (financial statements, balance sheets) score
+        higher than narrative paragraphs that happen to contain a small
+        embedded table.  The score is in [0, 1] and is added as a bonus
+        to the keyword relevance score during table ranking.
+        """
+        if not markdown:
+            return 0.0
+
+        rows = markdown.count("\n")
+        if rows < AgenticSearch._TABLE_STRUCTURE_MIN_ROWS:
+            return 0.0
+
+        tokens = markdown.split()
+        if not tokens:
+            return 0.0
+
+        numeric_count = sum(
+            1 for t in tokens
+            if any(c.isdigit() for c in t)
+        )
+        numeric_ratio = numeric_count / len(tokens)
+
+        if numeric_ratio < AgenticSearch._TABLE_STRUCTURE_MIN_NUMERIC_RATIO:
+            return 0.0
+
+        row_score = min(rows / 30.0, 1.0)
+        num_score = min(numeric_ratio / 0.4, 1.0)
+        return (row_score * 0.5 + num_score * 0.5)
+
+    @staticmethod
+    def _deduplicate_table_sections(
+        primary_ev: str, secondary_ev: str,
+    ) -> str:
+        """Remove table sections from *secondary_ev* whose pages already
+        appear in *primary_ev*.
+
+        Matching is based on ``[Table from page N]`` and ``[Tables pp.X-Y]``
+        headers.  Non-table content in *secondary_ev* is preserved intact.
+        """
+        if not primary_ev or not secondary_ev:
+            return secondary_ev
+
+        covered: Set[int] = {
+            int(m.group(1))
+            for m in re.finditer(r"\[Table from page (\d+)\]", primary_ev)
+        }
+        for m in re.finditer(r"\[Tables pp\.(\d+)-(\d+)\]", primary_ev):
+            covered.update(range(int(m.group(1)), int(m.group(2)) + 1))
+
+        if not covered:
+            return secondary_ev
+
+        blocks = secondary_ev.split("\n\n")
+        kept: List[str] = []
+        for block in blocks:
+            page_m = re.search(r"\[Table from page (\d+)\]", block)
+            if page_m and int(page_m.group(1)) in covered:
+                continue
+            kept.append(block)
+
+        result = "\n\n".join(kept)
+        return result if result.strip() else ""
+
+    @staticmethod
+    def _format_table_evidence(
+        tables: List[Dict[str, Any]],
+        max_chars: int = 20_000,
+        query: str = "",
+    ) -> str:
+        """Format table digest entries as LLM-friendly evidence text.
+
+        When *query* is provided, tables are **sorted by relevance** to the
+        query before budget truncation, ensuring critical tables are included
+        even when they appear late in page order.
+
+        Strategy:
+        - Query-relevant tables are prioritised via keyword overlap scoring
+        - Each table prefixed with "[Table from page N]"
+        - Large tables truncated with "(truncated)" note
+
+        Returns concatenated formatted table evidence string.
+        """
+        if not tables:
+            return ""
+
+        ordered = tables
+        if query:
+            query_tokens = frozenset(
+                tok for tok in query.lower().split() if len(tok) >= 2
+            )
+            if query_tokens:
+                struct_bonus = AgenticSearch._TABLE_STRUCTURE_BONUS
+                scored = [
+                    (
+                        AgenticSearch._score_table_relevance(
+                            t.get("markdown", ""), query_tokens,
+                        )
+                        + struct_bonus * AgenticSearch._score_table_structure(
+                            t.get("markdown", ""),
+                        ),
+                        idx,
+                        t,
+                    )
+                    for idx, t in enumerate(tables)
+                ]
+                scored.sort(key=lambda x: (-x[0], x[1]))
+                ordered = [t for _, _, t in scored]
+
+        parts: List[str] = []
+        remaining = max_chars
+
+        for table in ordered:
+            if remaining <= 0:
+                break
+
+            page = table.get("page_number", "?")
+            markdown = table.get("markdown", "")
+
+            if not markdown:
+                continue
+
+            header = f"[Table from page {page}]"
+
+            if len(markdown) <= remaining:
+                parts.append(f"{header}\n{markdown}")
+                remaining -= len(markdown) + len(header) + 2
+            else:
+                truncated = markdown[:remaining]
+                parts.append(f"{header}\n{truncated}\n(truncated)")
+                remaining = 0
+
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _append_evidence_part(
+        parts: List[str], fname: str, leaf, segment: str,
+        *, max_chars: int = 3000,
+    ) -> None:
+        """Format and append one leaf's evidence to *parts* (in-place)."""
+        text = segment[:max_chars]
+        if not text.strip():
+            return
+        page_info = ""
+        if getattr(leaf, 'page_range', None):
+            ps, pe = leaf.page_range
+            page_info = f" (pp.{ps}-{pe})" if ps != pe else f" (p.{ps})"
+        type_tag = " [TABLE]" if getattr(leaf, 'content_type', 'text') == 'table' else ""
+        header = f"[{fname} \u2192 {leaf.title}{page_info}{type_tag}]"
+        parts.append(f"{header}\n{text}")
+
+    async def _navigate_tree_for_evidence(
+        self,
+        file_path: str,
+        query: str,
+        *,
+        max_results: int = 8,
+        match_objects: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[str]:
+        """LLM-driven tree navigation: select relevant sections and read leaf content.
+
+        Uses 1 LLM call to drill into the compiled tree index for
+        *file_path*, returning concatenated leaf content as evidence.
+        Returns None when no tree cache is available.
+
+        When *match_objects* (RGA hit dicts) are provided, keyword-level
+        context windows are appended as supplementary evidence after tree
+        navigation, fusing structural and keyword signals.
+
+        Extraction priority (highest first):
+          1. char_range   – compile-time ENHANCED content slice (preserves tables)
+          2. page_range   – page-level extraction via DocumentExtractor (fallback)
+          3. leaf.summary – last resort
+        """
+        indexer = self._get_tree_indexer()
+        print(f"SEARCH_WIKI_DEBUG [N1] _navigate_tree_for_evidence: file_path={file_path}", flush=True)
+        if indexer is None:
+            return None
+        tree = indexer.load_tree(file_path)
+        if tree is None or tree.root is None:
+            return None
+
+        try:
+            leaves = await indexer.navigate(tree, query, max_results=max_results)
+        except Exception:
+            return None
+
+        print(f"SEARCH_WIKI_DEBUG [N2] navigate_result: {len(leaves) if leaves else 0} leaves", flush=True)
+
+        if not leaves:
+            return None
+
+        fname = Path(file_path).name
+        parts: List[str] = []
+
+        # ── Phase 1: classify leaves by available extraction method ──
+        page_leaves, char_leaves, summary_only = self._classify_leaves(leaves)
+        print(f"SEARCH_WIKI_DEBUG [N3] classify_leaves: page={len(page_leaves)}, char={len(char_leaves)}, summary={len(summary_only)}", flush=True)
+
+        for leaf in summary_only:
+            self._append_evidence_part(
+                parts, fname, leaf, leaf.summary,
+            )
+
+        # ── Phase 2: batch page-level extraction (single IO) ──
+        if page_leaves:
+            all_pages: set = set()
+            for _leaf, (sp, ep) in page_leaves:
+                all_pages.update(range(
+                    max(1, sp - self._NAV_PAGE_MARGIN),
+                    ep + self._NAV_PAGE_MARGIN + 1,
+                ))
+            try:
+                page_contents = DocumentExtractor.extract_pages(
+                    file_path, sorted(all_pages),
+                )
+                page_map = {pc.page_number: pc.content for pc in page_contents}
+
+                for leaf, (sp, ep) in page_leaves:
+                    segment_parts = []
+                    for p in range(sp, ep + 1):
+                        text = page_map.get(p, "")
+                        if text.strip():
+                            segment_parts.append(text)
+                    if segment_parts:
+                        self._append_evidence_part(
+                            parts, fname, leaf, "\n".join(segment_parts),
+                        )
+                    elif getattr(leaf, 'summary', None):
+                        self._append_evidence_part(
+                            parts, fname, leaf, leaf.summary,
+                        )
+            except (FileNotFoundError, PermissionError):
+                raise  # 文件系统错误应传播
+            except Exception as e:
+                _loguru_logger.warning(
+                    f"[TreeNav] Page extraction failed for {fname}: {e}, "
+                    f"falling back to char_range for {len(page_leaves)} leaves"
+                )
+                # Demote page_leaves → char_leaves for char_range fallback
+                for leaf, _ in page_leaves:
+                    if hasattr(leaf, 'char_range') and leaf.char_range:
+                        char_leaves.append(leaf)
+                    elif getattr(leaf, 'summary', None):
+                        self._append_evidence_part(
+                            parts, fname, leaf, leaf.summary,
+                        )
+                print(f"SEARCH_WIKI_DEBUG [N4] page_extraction: page_leaves_ok=False", flush=True)
+            else:
+                print(f"SEARCH_WIKI_DEBUG [N4] page_extraction: page_leaves_ok=True", flush=True)
+
+        # ── Phase 3: char_range extraction (compile-consistent content) ──
+        if char_leaves:
+            # Prefer compile-time ENHANCED content (matches char_range offsets
+            # exactly).  Fall back to fast_extract only when cache is absent.
+            full_text = self._load_compile_content(self.work_path, file_path)
+            if not full_text:
+                try:
+                    from sirchmunk.utils.file_utils import fast_extract
+                    extraction = await fast_extract(file_path=file_path)
+                    full_text = extraction.content or ""
+                except Exception:
+                    full_text = ""
+
+            # Leaves whose char_range is invalid but have a valid page_range
+            # are demoted to page extraction instead of discarding to summary.
+            page_fallback_leaves: List[tuple] = []
+
+            for leaf in char_leaves:
+                start, end = leaf.char_range
+                if self._is_valid_char_range(start, end, len(full_text)) and full_text:
+                    segment = full_text[start:end]
+                    if segment.strip():
+                        self._append_evidence_part(
+                            parts, fname, leaf, segment,
+                        )
+                    elif getattr(leaf, 'summary', None):
+                        self._append_evidence_part(
+                            parts, fname, leaf, leaf.summary,
+                        )
+                else:
+                    # char_range covers too much of the document (or text is
+                    # empty).  Try page_range extraction before falling back
+                    # to summary.
+                    pr = getattr(leaf, 'page_range', None)
+                    if (
+                        pr
+                        and len(pr) == 2
+                        and pr[0] is not None
+                        and pr[0] > 0
+                    ):
+                        page_fallback_leaves.append((leaf, pr))
+                    elif getattr(leaf, 'summary', None):
+                        _loguru_logger.debug(
+                            f"[TreeNav] char_range degraded for '{leaf.title}' "
+                            f"(span_ratio={(end - start) / max(len(full_text), 1):.2f}), "
+                            f"using summary"
+                        )
+                        self._append_evidence_part(
+                            parts, fname, leaf, leaf.summary,
+                        )
+
+            # Batch page extraction for demoted leaves (same pattern as Phase 2)
+            if page_fallback_leaves:
+                all_fb_pages: set = set()
+                for _lf, (sp, ep) in page_fallback_leaves:
+                    all_fb_pages.update(range(
+                        max(1, sp - self._NAV_PAGE_MARGIN),
+                        ep + self._NAV_PAGE_MARGIN + 1,
+                    ))
+                try:
+                    fb_contents = DocumentExtractor.extract_pages(
+                        file_path, sorted(all_fb_pages),
+                    )
+                    fb_map = {pc.page_number: pc.content for pc in fb_contents}
+                    for lf, (sp, ep) in page_fallback_leaves:
+                        seg_parts = [
+                            fb_map[p] for p in range(sp, ep + 1)
+                            if fb_map.get(p, "").strip()
+                        ]
+                        if seg_parts:
+                            self._append_evidence_part(
+                                parts, fname, lf, "\n".join(seg_parts),
+                            )
+                        elif getattr(lf, 'summary', None):
+                            self._append_evidence_part(
+                                parts, fname, lf, lf.summary,
+                            )
+                except Exception:
+                    for lf, _ in page_fallback_leaves:
+                        if getattr(lf, 'summary', None):
+                            self._append_evidence_part(
+                                parts, fname, lf, lf.summary,
+                            )
+
+        # ── Phase 4: Complementary navigation for multi-component queries ──
+        # When a query requires data from multiple document sections (e.g.
+        # Balance Sheet + Income Statement for a ratio), the initial navigate
+        # may only reach one component.  Detect missing components and run a
+        # focused second navigate pass with a refined query.
+        _query_components = self._decompose_query_components(query)
+        if len(_query_components) >= self._NAV_COMPLEMENT_MIN_COMPONENTS:
+            _covered, _missing = self._check_leaf_coverage(leaves, _query_components)
+            if _missing:
+                _complement_query = f"{query} — focus on: {', '.join(_missing)}"
+                try:
+                    _existing_ids = {id(l) for l in leaves}
+                    comp_leaves = await indexer.navigate(
+                        tree, _complement_query, max_results=max_results,
+                    )
+                    comp_new = [l for l in (comp_leaves or []) if id(l) not in _existing_ids]
+                    if comp_new:
+                        c_page, c_char, c_summary = self._classify_leaves(comp_new)
+                        for cl in c_summary:
+                            self._append_evidence_part(parts, fname, cl, cl.summary)
+                        if c_page:
+                            c_all_pages: set = set()
+                            for _cl, (csp, cep) in c_page:
+                                c_all_pages.update(range(csp, cep + 1))
+                            try:
+                                c_contents = DocumentExtractor.extract_pages(
+                                    file_path, sorted(c_all_pages),
+                                )
+                                c_map = {pc.page_number: pc.content for pc in c_contents}
+                                for cl, (csp, cep) in c_page:
+                                    c_seg = [c_map[p] for p in range(csp, cep + 1) if c_map.get(p, "").strip()]
+                                    if c_seg:
+                                        self._append_evidence_part(parts, fname, cl, "\n".join(c_seg))
+                            except Exception:
+                                pass
+                        if c_char:
+                            c_text = self._load_compile_content(self.work_path, file_path) or ""
+                            for cl in c_char:
+                                s, e = cl.char_range
+                                if self._is_valid_char_range(s, e, len(c_text)) and c_text:
+                                    seg = c_text[s:e]
+                                    if seg.strip():
+                                        self._append_evidence_part(parts, fname, cl, seg)
+                        leaves = list(leaves) + comp_new
+                        print(
+                            f"SEARCH_WIKI_DEBUG [N3.2] complement_nav: "
+                            f"missing={_missing}, new_leaves={len(comp_new)}",
+                            flush=True,
+                        )
+                except Exception:
+                    pass
+
+        # ── Plan 3: Retry with expanded results if evidence is insufficient ──
+        # Triggers on: (a) zero evidence parts, OR (b) evidence too thin.
+        _current_ev_text = "\n\n".join(parts)
+        _needs_retry = (
+            max_results < self._NAV_RETRY_EXPANDED_RESULTS
+            and not self._is_evidence_sufficient(
+                _current_ev_text, self._NAV_RETRY_MIN_EVIDENCE_CHARS,
+            )
+        )
+        if _needs_retry:
+            try:
+                retry_leaves = await indexer.navigate(
+                    tree, query,
+                    max_results=self._NAV_RETRY_EXPANDED_RESULTS,
+                )
+                if retry_leaves:
+                    r_page, r_char, r_summary = self._classify_leaves(retry_leaves)
+                    for rl in r_summary:
+                        self._append_evidence_part(parts, fname, rl, rl.summary)
+
+                    # Page-level extraction for retry (mirrors Phase 2)
+                    if r_page:
+                        r_all_pages: set = set()
+                        for _rl, (rsp, rep) in r_page:
+                            r_all_pages.update(range(rsp, rep + 1))
+                        try:
+                            r_page_contents = DocumentExtractor.extract_pages(
+                                file_path, sorted(r_all_pages),
+                            )
+                            r_page_map = {pc.page_number: pc.content for pc in r_page_contents}
+                            for rl, (rsp, rep) in r_page:
+                                r_seg = [r_page_map[p] for p in range(rsp, rep + 1) if r_page_map.get(p, "").strip()]
+                                if r_seg:
+                                    self._append_evidence_part(parts, fname, rl, "\n".join(r_seg))
+                        except Exception:
+                            pass
+
+                    # Char-range extraction for retry (mirrors Phase 3)
+                    if r_char:
+                        r_text = self._load_compile_content(self.work_path, file_path) or ""
+                        for rl in r_char:
+                            s, e = rl.char_range
+                            if self._is_valid_char_range(s, e, len(r_text)) and r_text:
+                                seg = r_text[s:e]
+                                if seg.strip():
+                                    self._append_evidence_part(parts, fname, rl, seg)
+
+                    leaves = retry_leaves
+                    print(f"SEARCH_WIKI_DEBUG [N3.1] retry_nav: {len(retry_leaves)} leaves", flush=True)
+            except Exception:
+                pass
+
+        if not parts:
+            return None
+
+        # Supplement with table evidence if available
+        _all_tables = None
+        try:
+            from sirchmunk.utils.file_utils import get_fast_hash
+            _file_hash = get_fast_hash(file_path)
+            if _file_hash:
+                _all_tables = self._load_table_digest(
+                    self.work_path, _file_hash,
+                )
+                if _all_tables and leaves:
+                    _seen_pages: set = set()
+                    for leaf in leaves:
+                        if leaf.page_range:
+                            ps, pe = leaf.page_range
+                            page_key = (ps, pe)
+                            if page_key in _seen_pages:
+                                continue
+                            _seen_pages.add(page_key)
+                            leaf_tables = self._filter_tables_by_page_range(
+                                _all_tables, ps, pe,
+                            )
+                            if leaf_tables:
+                                table_text = self._format_table_evidence(
+                                    leaf_tables,
+                                    max_chars=self._TABLE_EVIDENCE_PER_RANGE_CHARS,
+                                    query=query,
+                                )
+                                if table_text:
+                                    parts.append(
+                                        f"[Tables pp.{ps}-{pe}]\n{table_text}"
+                                    )
+        except Exception:
+            pass
+
+        # ── Phase 5.5: Cross-section table supplement (conditional) ──
+        # Only supplements when existing evidence is below threshold
+        # to prevent evidence overload for queries already well-served.
+        _current_ev_len = sum(len(p) for p in parts)
+        if _all_tables and leaves and _current_ev_len < self._DEEP_CROSS_SECTION_MIN_EVIDENCE:
+            _leaf_page_set: Set[int] = set()
+            for _lf in leaves:
+                _pr = getattr(_lf, "page_range", None)
+                if _pr and len(_pr) == 2 and _pr[0] is not None:
+                    _leaf_page_set.update(range(
+                        max(1, _pr[0] - self._NAV_PAGE_MARGIN),
+                        _pr[1] + self._NAV_PAGE_MARGIN + 1,
+                    ))
+            _cross_tables = [
+                t for t in _all_tables
+                if t.get("page_number") is not None
+                and t["page_number"] not in _leaf_page_set
+            ]
+            if _cross_tables:
+                _cross_ev = self._format_table_evidence(
+                    _cross_tables,
+                    max_chars=self._TABLE_CROSS_SECTION_CHARS,
+                    query=query,
+                )
+                if _cross_ev:
+                    parts.append(
+                        f"[{fname} - Cross-section Tables]\n{_cross_ev}"
+                    )
+                    print(
+                        f"SEARCH_WIKI_DEBUG [N5.3] cross_section_tables: "
+                        f"uncovered_tables={len(_cross_tables)}, "
+                        f"ev_len={len(_cross_ev)}",
+                        flush=True,
+                    )
+
+        # Plan 3: If evidence is still too thin, add full table digest as standalone
+        evidence = "\n\n".join(parts)
+        if (
+            not self._is_evidence_sufficient(
+                evidence, self._NAV_RETRY_MIN_EVIDENCE_CHARS,
+            )
+            and _all_tables
+        ):
+            standalone_table_ev = self._format_table_evidence(
+                _all_tables,
+                max_chars=self._TABLE_EVIDENCE_STANDALONE_CHARS,
+                query=query,
+            )
+            if standalone_table_ev:
+                parts.append(
+                    f"[{fname} - Standalone Table Evidence]\n{standalone_table_ev}"
+                )
+                evidence = "\n\n".join(parts)
+                print(f"SEARCH_WIKI_DEBUG [N5.1] standalone_table_fallback: len={len(standalone_table_ev)}", flush=True)
+
+        print(f"SEARCH_WIKI_DEBUG [N5] table_supplement: tables_loaded={len(_all_tables) if _all_tables else 0}", flush=True)
+
+        # ── Phase 6: Referenced-page gap-fill ──
+        # Scan evidence for page cross-references (e.g. TOC entries
+        # pointing to financial statements) and extract any that were
+        # not covered by the navigated leaves.
+        if parts:
+            _covered_pages: Set[int] = set()
+            for leaf in leaves:
+                pr = getattr(leaf, "page_range", None)
+                if pr and len(pr) == 2 and pr[0] is not None:
+                    _covered_pages.update(range(
+                        max(1, pr[0] - self._NAV_PAGE_MARGIN),
+                        pr[1] + self._NAV_PAGE_MARGIN + 1,
+                    ))
+            _referenced = self._extract_referenced_pages("\n\n".join(parts))
+            _gap_pages = sorted(_referenced - _covered_pages)[
+                : self._NAV_REF_PAGE_MAX
+            ]
+            if _gap_pages:
+                try:
+                    _gap_contents = DocumentExtractor.extract_pages(
+                        file_path, _gap_pages,
+                    )
+                    for pc in _gap_contents:
+                        if pc.content and pc.content.strip():
+                            parts.append(
+                                f"[{fname} \u2192 referenced p.{pc.page_number}]"
+                                f"\n{pc.content}"
+                            )
+                    evidence = "\n\n".join(parts)
+                    print(
+                        f"SEARCH_WIKI_DEBUG [N5.2] ref_page_gap_fill: "
+                        f"pages={_gap_pages}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+
+        # --- RGA keyword supplement: fuse keyword hits into tree evidence ---
+        if match_objects:
+            _ev_len = sum(len(p) for p in parts)
+            _rga_budget = max(0, self._FAST_MAX_EVIDENCE_CHARS - _ev_len)
+            if _rga_budget > 200:
+                hit_lines: List[int] = [
+                    m.get("data", {}).get("line_number")
+                    for m in match_objects
+                    if isinstance(m.get("data", {}).get("line_number"), int)
+                ]
+                ext = Path(file_path).suffix.lower()
+                rga_ctx: Optional[str] = None
+                if ext in self._FAST_TEXT_EXTENSIONS and hit_lines:
+                    rga_ctx = self._read_context_windows(
+                        file_path, hit_lines,
+                        window=self._FAST_CONTEXT_WINDOW,
+                        max_chars=_rga_budget,
+                    )
+                else:
+                    snippet_parts: List[str] = []
+                    snippet_total = 0
+                    for m in match_objects:
+                        text = m.get("data", {}).get("lines", {}).get("text", "").rstrip()
+                        if text and snippet_total + len(text) < _rga_budget:
+                            snippet_parts.append(text)
+                            snippet_total += len(text)
+                    if snippet_parts:
+                        rga_ctx = "\n".join(snippet_parts)
+                if rga_ctx:
+                    parts.append(f"[{fname} \u2192 keyword hits]\n{rga_ctx}")
+                    evidence = "\n\n".join(parts)
+
+        print(f"SEARCH_WIKI_DEBUG [N6] _navigate_tree_for_evidence result: len={len(evidence) if evidence else 0}", flush=True)
+        await self._logger.info(
+            f"[FAST:TreeNav] Extracted {len(parts)} sections, "
+            f"{len(evidence)} chars from {fname}"
+        )
+        return evidence
+
+    async def _fast_self_correct(
+        self,
+        query: str,
+        best_files: Optional[List[Dict[str, Any]]],
+        catalog_routed_files: List[str],
+        context: SearchContext,
+    ) -> Optional[str]:
+        """Attempt to gather alternative evidence when the first answer is rejected.
+
+        Four strategies tried in order:
+        D) Re-sample the same primary file with expanded parameters (deeper sampling).
+        A) Tree-navigate a 2nd catalog-routed file not yet tried.
+        B) Retrieve the most semantically similar compiled cluster's content.
+        C) Tree-navigate the 2nd-best rga file if available.
+
+        Returns alternative evidence string, or None if all strategies fail.
+        """
+        first_file = best_files[0]["path"] if best_files else ""
+
+        # Strategy D: Re-sample the SAME primary file with expanded parameters.
+        # The file was correct but the initial sampling may have missed key sections.
+        if first_file:
+            expanded_tree_ev = await self._navigate_tree_for_evidence(
+                first_file, query,
+                max_results=self._SELF_CORRECT_EXPANDED_NAV_RESULTS,
+            )
+            if expanded_tree_ev and len(expanded_tree_ev.strip()) > 50:
+                await self._logger.info(
+                    "[FAST:SelfCorrect] Strategy D succeeded: "
+                    "expanded same-file tree navigation"
+                )
+                return expanded_tree_ev
+
+        # Strategy A: 2nd catalog-routed file via tree navigation
+        for fp in catalog_routed_files:
+            if fp == first_file:
+                continue
+            tree_ev = await self._navigate_tree_for_evidence(fp, query)
+            if tree_ev and len(tree_ev.strip()) > 50:
+                context.mark_file_read(fp)
+                return tree_ev
+
+        # Strategy B: cluster content from knowledge storage
+        if self.embedding_client and self.knowledge_storage:
+            try:
+                qe = self.embedding_client.encode(query)
+                if qe is not None:
+                    vec = qe.tolist() if hasattr(qe, "tolist") else list(qe)
+                    hits = await self.knowledge_storage.search_similar_clusters(
+                        query_embedding=vec, top_k=2, similarity_threshold=0.50,
+                    )
+                    if hits:
+                        parts: List[str] = []
+                        for h in hits[:2]:
+                            c = await self.knowledge_storage.get(h["id"])
+                            if c and c.content:
+                                parts.append(str(c.content)[:3000])
+                                for ev in (c.evidences or [])[:3]:
+                                    for s in (ev.snippets or [])[:2]:
+                                        parts.append(s[:500])
+                        if parts:
+                            return "\n\n---\n\n".join(parts)
+            except Exception:
+                pass
+
+        # Strategy C: 2nd rga file via tree navigation
+        if best_files and len(best_files) > 1:
+            fp2 = best_files[1]["path"]
+            tree_ev = await self._navigate_tree_for_evidence(fp2, query)
+            if tree_ev and len(tree_ev.strip()) > 50:
+                context.mark_file_read(fp2)
+                return tree_ev
+
+        return None
+
     @staticmethod
     def _parse_fast_json(text: str) -> Dict[str, Any]:
         """Extract JSON from the FAST query analysis LLM response."""
@@ -2330,6 +5655,11 @@ class AgenticSearch(BaseSearch):
         Also extracts cross-lingual alternative keywords from the
         ``<KEYWORDS_ALT>`` block and merges them into the result list.
 
+        Additionally synthesises rga-friendly compound phrases from
+        Level 1 keywords so that downstream ``_retrieve_by_keywords``
+        tries exact multi-word matches before falling back to atomic
+        terms (mirrors the strategy used by FAST mode).
+
         Returns:
             Tuple of (keyword_idf_dict, keyword_list).
         """
@@ -2353,9 +5683,26 @@ class AgenticSearch(BaseSearch):
         for kw_set in keyword_sets:
             if kw_set:
                 merged = {**kw_set, **alt_keywords}
-                kw_list = list(merged.keys())
-                await self._logger.info(f"[Probe:Keywords] Extracted: {kw_list}")
-                return merged, kw_list
+                # Synthesise rga-friendly compound phrases: promote
+                # multi-word Level-1 keywords to the front with boosted
+                # IDF so _retrieve_by_keywords tries them first as exact
+                # phrases (similar to FAST's primary/fallback strategy).
+                compound_phrases: Dict[str, float] = {}
+                atomic_terms: Dict[str, float] = {}
+                for kw, idf in merged.items():
+                    if " " in kw.strip() and len(kw.split()) >= 2:
+                        compound_phrases[kw] = max(idf, 7.0)
+                    else:
+                        atomic_terms[kw] = idf
+                # Compounds first, then atomics — preserves ordering for
+                # _retrieve_by_keywords which iterates keywords in order.
+                ordered = {**compound_phrases, **atomic_terms}
+                kw_list = list(ordered.keys())
+                await self._logger.info(
+                    f"[Probe:Keywords] Extracted: {kw_list} "
+                    f"(compounds={len(compound_phrases)})"
+                )
+                return ordered, kw_list
 
         if alt_keywords:
             return alt_keywords, list(alt_keywords.keys())
@@ -2479,30 +5826,519 @@ class AgenticSearch(BaseSearch):
 
     async def _probe_knowledge_cache(
         self, query: str,
-    ) -> List[str]:
-        """Search knowledge cache for related clusters, return known file paths.
+    ) -> KnowledgeProbeResult:
+        """Structured knowledge probe: embedding search with graph expansion.
 
-        Returns:
-            List of file paths from previously cached clusters.
+        Uses embedding similarity (threshold 0.50) when available, falling back
+        to SQL LIKE.  Extracts file paths, topic keywords, and background
+        context from matched clusters and their graph neighbours.
         """
+        empty = KnowledgeProbeResult([], [], "")
         try:
-            clusters = await self.knowledge_storage.find(query, limit=3)
-            if not clusters:
-                return []
+            clusters: List[KnowledgeCluster] = []
 
+            # Prefer embedding search for semantic quality
+            if self.embedding_client and self.embedding_client.is_ready():
+                try:
+                    qe = (await self.embedding_client.embed([query]))[0]
+                    similar = await self.knowledge_storage.search_similar_clusters(
+                        query_embedding=qe, top_k=5, similarity_threshold=0.50,
+                    )
+                    for m in (similar or []):
+                        c = await self.knowledge_storage.get(m["id"])
+                        if c:
+                            clusters.append(c)
+                except Exception:
+                    pass
+
+            # Fallback to SQL LIKE when embedding unavailable or empty
+            if not clusters:
+                clusters = await self.knowledge_storage.find(query, limit=3)
+
+            if not clusters:
+                return empty
+
+            seen_paths: set = set()
             file_paths: List[str] = []
-            for c in clusters:
+            extra_keywords: List[str] = []
+            context_parts: List[str] = []
+            seen_kw: set = set()
+
+            def _collect_cluster(c: KnowledgeCluster) -> None:
                 for ev in getattr(c, "evidences", []):
                     fp = str(getattr(ev, "file_or_url", ""))
-                    if fp and Path(fp).exists():
+                    if fp and fp not in seen_paths and Path(fp).exists():
+                        seen_paths.add(fp)
                         file_paths.append(fp)
+                for p in getattr(c, "patterns", []) or []:
+                    if p and p.lower() not in seen_kw:
+                        seen_kw.add(p.lower())
+                        extra_keywords.append(p)
+                content = c.content
+                if isinstance(content, list):
+                    content = "\n".join(content)
+                if content:
+                    context_parts.append(str(content)[:500])
+
+            for c in clusters:
+                _collect_cluster(c)
+
+            # One-hop graph expansion via WeakSemanticEdge
+            neighbour_ids: set = set()
+            for c in clusters:
+                for edge in getattr(c, "related_clusters", []):
+                    tid = getattr(edge, "target_cluster_id", None)
+                    if tid and tid not in neighbour_ids:
+                        neighbour_ids.add(tid)
+
+            for nid in list(neighbour_ids)[:6]:
+                try:
+                    neighbour = await self.knowledge_storage.get(nid)
+                    if neighbour:
+                        _collect_cluster(neighbour)
+                except Exception:
+                    pass
 
             if file_paths:
                 await self._logger.info(
-                    f"[Probe:Knowledge] Found {len(file_paths)} files from cached clusters"
+                    f"[Probe:Knowledge] {len(file_paths)} files, "
+                    f"{len(extra_keywords)} keywords from "
+                    f"{len(clusters)} clusters + {len(neighbour_ids)} neighbours"
+                )
+
+            return KnowledgeProbeResult(
+                file_paths=file_paths,
+                extra_keywords=extra_keywords[:15],
+                background_context="\n\n".join(context_parts[:3]),
+            )
+        except Exception:
+            return empty
+
+    def _load_cached_trees(self) -> list:
+        """Load DocumentTree objects from the tree cache directory.
+
+        Returns a list of ``DocumentTree`` instances whose file paths exist
+        on disk.  Returns an empty list when the tree cache is absent or
+        contains no valid entries.
+        """
+        tree_cache = self.work_path / ".cache" / "compile" / "trees"
+        if not tree_cache.exists():
+            return []
+        try:
+            from sirchmunk.learnings.tree_indexer import DocumentTree
+
+            trees = []
+            for tree_file in sorted(tree_cache.glob("*.json"))[:self._TREE_CACHE_SCAN_LIMIT]:
+                try:
+                    t = DocumentTree.from_json(
+                        tree_file.read_text(encoding="utf-8")
+                    )
+                    if t.root and t.file_path and Path(t.file_path).exists():
+                        trees.append(t)
+                except Exception:
+                    continue
+            return trees
+        except Exception:
+            return []
+
+    @staticmethod
+    def _prefilter_trees_by_query(
+        query: str, trees: list, max_candidates: int, min_score: float,
+    ) -> list:
+        """Rule-based pre-filter: score trees by query-token overlap with filenames.
+
+        Extracts meaningful tokens from the query (alphanumeric words, 4-digit
+        years, multi-word entity fragments) and scores each tree's filename by
+        weighted token overlap.  Returns the top-scoring candidates, or the
+        full list if fewer than *max_candidates* pass the threshold.
+
+        This avoids sending hundreds of root summaries to the LLM.
+        """
+        raw_tokens = re.findall(r"[A-Za-z0-9]+", query.lower())
+        tokens = [t for t in raw_tokens if len(t) >= 2 and t not in _STOP_WORDS]
+        if not tokens:
+            return trees
+
+        # Extract years: bare "2018" and compound prefixed forms "fy2018", "cy2023"
+        year_tokens: Set[str] = set()
+        for t in tokens:
+            if re.fullmatch(r"(?:19|20)\d{2}", t):
+                year_tokens.add(t)
+            else:
+                m = re.search(r"((?:19|20)\d{2})", t)
+                if m:
+                    year_tokens.add(m.group(1))
+        entity_tokens = {t for t in tokens if len(t) >= 2 and t not in year_tokens}
+
+        scored: List[Tuple[float, int]] = []
+        for idx, tree in enumerate(trees):
+            name_lower = Path(tree.file_path).stem.lower()
+            name_parts = set(re.findall(r"[a-z0-9]+", name_lower))
+
+            score = 0.0
+            for tok in entity_tokens:
+                if tok in name_lower:
+                    score += 2.0
+                elif any(tok[:4] in part for part in name_parts if len(tok) >= 4):
+                    score += 0.5
+            for yr in year_tokens:
+                if yr in name_lower:
+                    score += 3.0
+
+            scored.append((score, idx))
+
+        scored.sort(key=lambda x: -x[0])
+
+        candidates = [trees[idx] for sc, idx in scored if sc >= min_score]
+        if not candidates:
+            return [trees[idx] for _, idx in scored[:max_candidates]]
+        return candidates[:max_candidates]
+
+    async def _llm_select_from_trees(
+        self, query: str, trees: list, max_select: int,
+    ) -> List[str]:
+        """Two-stage LLM-driven file selection from tree root summaries.
+
+        Stage 1 (rule-based): when the pool exceeds ``_TREE_PREFILTER_THRESHOLD``,
+        narrow candidates by query-token / filename overlap.
+        Stage 2 (LLM): present root summaries of the narrowed set for precise selection.
+
+        When the number of trees is at most *max_select*, returns all paths
+        without an LLM call.
+        """
+        if not trees:
+            return []
+        if len(trees) <= max_select:
+            return [t.file_path for t in trees]
+
+        pool = trees
+        if len(pool) > self._TREE_PREFILTER_THRESHOLD:
+            pool = self._prefilter_trees_by_query(
+                query, pool,
+                max_candidates=self._TREE_PREFILTER_MAX_CANDIDATES,
+                min_score=self._TREE_PREFILTER_MIN_SCORE,
+            )
+            if len(pool) <= max_select:
+                return [t.file_path for t in pool]
+
+        listing = "\n".join(
+            f"[{i}] {Path(t.file_path).name}: "
+            f"{(t.root.summary or '')[:self._CATALOG_SUMMARY_TRUNCATE]}"
+            for i, t in enumerate(pool)
+        )
+        prompt = (
+            f'Given the query: "{query}"\n\n'
+            f"Select the 1-{max_select} most relevant documents "
+            f"(by index number):\n{listing}\n\n"
+            f"Return ONLY a JSON array of index numbers, e.g. [0, 2]"
+        )
+        resp = await self.llm.achat([{"role": "user", "content": prompt}])
+        self.llm_usages.append(resp.usage)
+
+        selected_indices: List[int] = []
+        try:
+            raw = resp.content.strip()
+            m = re.search(r"\[[\d\s,]+\]", raw)
+            if m:
+                selected_indices = [
+                    idx for idx in json.loads(m.group())
+                    if isinstance(idx, int) and 0 <= idx < len(pool)
+                ]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        if not selected_indices:
+            selected_indices = list(range(min(max_select, len(pool))))
+
+        return [
+            pool[idx].file_path
+            for idx in selected_indices[:max_select]
+            if Path(pool[idx].file_path).exists()
+        ]
+
+    async def _probe_tree_index(self, query: str) -> List[str]:
+        """LLM-driven file discovery via compiled tree root summaries (PageIndex).
+
+        Loads all cached document trees, presents their root summaries to the
+        LLM, and asks it to select the most relevant documents.  Returns file
+        paths of the most relevant documents.
+        """
+        try:
+            trees = self._load_cached_trees()
+            if not trees:
+                return []
+            result = await self._llm_select_from_trees(
+                query, trees, max_select=self._DEEP_TREE_PROBE_MAX_FILES,
+            )
+            if result:
+                await self._logger.info(
+                    f"[Probe:TreeIndex] LLM selected {len(result)} documents "
+                    f"from {len(trees)} tree indices"
+                )
+            return result
+        except Exception:
+            return []
+
+    async def _probe_compile_hints(
+        self,
+        keywords: List[str],
+        *,
+        scope: Optional["_PathScope"] = None,
+    ) -> CompileHints:
+        """Zero-LLM enrichment from compile manifest and tree cache.
+
+        Scans the compile manifest for clusters whose patterns overlap with
+        the query keywords, and scans cached tree root summaries for keyword
+        matches.  No LLM calls — only local JSON reads and in-memory DB lookups.
+
+        When *scope* is provided, only file paths falling within the scope
+        are included in the returned hints.
+        """
+        empty = CompileHints([], [])
+        if not keywords:
+            return empty
+
+        kw_lower = {k.lower() for k in keywords}
+        file_paths: List[str] = []
+        extra_keywords: List[str] = []
+        seen_paths: set = set()
+        seen_kw: set = set(kw_lower)
+
+        def _accept(fp: str) -> bool:
+            return bool(fp) and fp not in seen_paths and Path(fp).exists() and (
+                scope is None or scope.contains(fp)
+            )
+
+        # --- Cluster pattern matching via manifest ---
+        manifest_path = self.work_path / ".cache" / "compile" / "manifest.json"
+        if manifest_path.exists():
+            try:
+                from sirchmunk.learnings.compiler import CompileManifest
+                manifest = CompileManifest.from_json(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+                cluster_ids: set = set()
+                for entry in manifest.files.values():
+                    cluster_ids.update(entry.cluster_ids)
+
+                for cid in list(cluster_ids)[:50]:
+                    try:
+                        c = await self.knowledge_storage.get(cid)
+                    except Exception:
+                        continue
+                    if not c:
+                        continue
+                    cluster_patterns = [
+                        p.lower() for p in (getattr(c, "patterns", []) or []) if p
+                    ]
+                    if kw_lower & set(cluster_patterns):
+                        for ev in getattr(c, "evidences", []):
+                            fp = str(getattr(ev, "file_or_url", ""))
+                            if _accept(fp):
+                                seen_paths.add(fp)
+                                file_paths.append(fp)
+                        for p in cluster_patterns:
+                            if p not in seen_kw:
+                                seen_kw.add(p)
+                                extra_keywords.append(p)
+            except Exception:
+                pass
+
+        # --- Tree root summary scanning (keyword substring match) ---
+        tree_cache = self.work_path / ".cache" / "compile" / "trees"
+        if tree_cache.exists():
+            try:
+                from sirchmunk.learnings.tree_indexer import DocumentTree
+                for tree_file in sorted(tree_cache.glob("*.json"))[:100]:
+                    try:
+                        tree = DocumentTree.from_json(
+                            tree_file.read_text(encoding="utf-8")
+                        )
+                    except Exception:
+                        continue
+                    if not tree.root or not tree.file_path:
+                        continue
+                    summary_lower = (tree.root.summary or "").lower()
+                    if any(kw in summary_lower for kw in kw_lower):
+                        fp = tree.file_path
+                        if _accept(fp):
+                            seen_paths.add(fp)
+                            file_paths.append(fp)
+            except Exception:
+                pass
+
+        return CompileHints(
+            file_paths=file_paths[:15],
+            extra_keywords=extra_keywords[:10],
+        )
+
+    @staticmethod
+    def _merge_compile_hints(base: "CompileHints", supplement: "CompileHints") -> "CompileHints":
+        """Merge two CompileHints, deduplicating file paths and keywords."""
+        seen_fps = set(base.file_paths)
+        merged_fps = list(base.file_paths)
+        for fp in supplement.file_paths:
+            if fp not in seen_fps:
+                seen_fps.add(fp)
+                merged_fps.append(fp)
+        seen_kws = set(base.extra_keywords)
+        merged_kws = list(base.extra_keywords)
+        for kw in supplement.extra_keywords:
+            if kw not in seen_kws:
+                seen_kws.add(kw)
+                merged_kws.append(kw)
+        return CompileHints(file_paths=merged_fps[:15], extra_keywords=merged_kws[:10])
+
+    async def _probe_summary_index(
+        self,
+        query: str,
+        artifacts: Optional["CompileArtifacts"] = None,
+        *,
+        scope: Optional["_PathScope"] = None,
+    ) -> List[str]:
+        """Zero-LLM file discovery via compile-time summary index (BM25 only).
+
+        Uses the pre-built summary index's BM25 channel to find files whose
+        summaries are lexically similar to the query.  No LLM or embedding
+        calls — pure local computation.
+
+        When *scope* is provided, results are post-filtered to only include
+        file paths within the search scope.
+
+        Args:
+            query: User query string.
+            artifacts: Compile artifacts (uses summary_index field).
+            scope: Optional path scope for filtering results.
+
+        Returns:
+            File paths of top-k matching documents, or empty list.
+        """
+        if artifacts is None or artifacts.summary_index is None:
+            return []
+
+        try:
+            from sirchmunk.utils.tokenizer_util import TokenizerUtil
+            _tokenizer = TokenizerUtil()
+            query_tokens = _tokenizer.segment(query)
+
+            if not query_tokens:
+                return []
+
+            # BM25-only search: pass query_embedding=None to skip embedding channel
+            results = artifacts.summary_index.search(
+                query_embedding=None,
+                query_tokens=query_tokens,
+                top_k=self._SUMMARY_INDEX_TOP_K,
+            )
+
+            file_paths = [
+                fp for fp, score in results
+                if score > 0.0 and Path(fp).exists()
+                and (scope is None or scope.contains(fp))
+            ]
+
+            if file_paths:
+                await self._logger.info(
+                    f"[SummaryIndex:BM25] Found {len(file_paths)} files "
+                    f"from {artifacts.summary_index.num_entries} indexed docs"
                 )
             return file_paths
-        except Exception:
+        except Exception as exc:
+            await self._logger.warning(f"[SummaryIndex:BM25] Probe failed: {exc}")
+            return []
+
+    async def _probe_catalog_for_deep(
+        self,
+        query: str,
+        artifacts: Optional["CompileArtifacts"] = None,
+    ) -> List[str]:
+        """Zero-LLM file discovery via document catalog keyword overlap.
+
+        Scores each catalog entry by counting query token overlap with the
+        document summary.  Returns top-k file paths sorted by overlap score.
+
+        Args:
+            query: User query string.
+            artifacts: Compile artifacts (uses catalog field).
+
+        Returns:
+            File paths of top-k matching documents, or empty list.
+        """
+        if not artifacts or not artifacts.catalog:
+            return []
+
+        try:
+            query_tokens = self._tokenize_for_matching(query.lower())
+            if not query_tokens:
+                return []
+
+            scored: List[Tuple[str, float]] = []
+            for entry in artifacts.catalog:
+                fp = entry.get("path", "")
+                if not fp or not Path(fp).exists():
+                    continue
+                summary = (entry.get("summary", "") or "").lower()
+                name = (entry.get("name", "") or "").lower()
+                doc_tokens = self._tokenize_for_matching(f"{name} {summary}")
+                overlap = len(query_tokens & doc_tokens)
+                if overlap > 0:
+                    # Normalize by query length to avoid bias toward long summaries
+                    score = overlap / max(1, len(query_tokens))
+                    scored.append((fp, score))
+
+            if not scored:
+                return []
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            result_paths = [fp for fp, _ in scored[:self._DEEP_CATALOG_TOP_K]]
+
+            if result_paths:
+                await self._logger.info(
+                    f"[DEEP:CatalogProbe] Found {len(result_paths)} files "
+                    f"from {len(artifacts.catalog)} catalog entries"
+                )
+            return result_paths
+        except Exception as exc:
+            await self._logger.warning(f"[DEEP:CatalogProbe] Failed: {exc}")
+            return []
+
+    async def _probe_tree_for_fast(
+        self, query: str, artifacts: Optional["CompileArtifacts"] = None,
+    ) -> List[str]:
+        """Active tree-based file discovery for FAST mode (1 LLM call).
+
+        When compiled tree indices are available and cover more than 2 files,
+        asks the LLM to select the most relevant 1-2 documents from root
+        summaries.  Delegates to the shared ``_llm_select_from_trees`` helper.
+
+        Returns file paths of selected documents, or empty list when trees
+        are unavailable or cover too few files to justify an LLM call.
+        """
+        print(f"SEARCH_WIKI_DEBUG [D4] _probe_tree_for_fast: tree_available_paths={len(artifacts.tree_available_paths) if artifacts else 0}", flush=True)
+        if not artifacts or not artifacts.tree_available_paths:
+            return []
+
+        try:
+            trees = self._load_cached_trees()
+            # Scope-filter: only keep trees whose files are in artifacts
+            if artifacts and artifacts.tree_available_paths:
+                scoped = artifacts.tree_available_paths
+                trees = [t for t in trees if t.file_path in scoped]
+            print(f"SEARCH_WIKI_DEBUG [D5] loaded_trees: {len(trees)} trees, paths={[t.file_path for t in trees][:3]}", flush=True)
+            if not trees:
+                return []
+            result = await self._llm_select_from_trees(
+                query, trees, max_select=self._FAST_TREE_PROBE_MAX_FILES,
+            )
+            print(f"SEARCH_WIKI_DEBUG [D6] llm_select_result: {result}", flush=True)
+            if result:
+                await self._logger.info(
+                    f"[FAST:TreeProbe] Selected {len(result)} files "
+                    f"from {len(trees)} tree indices"
+                )
+            return result
+        except Exception as exc:
+            await self._logger.warning(f"[FAST:TreeProbe] Failed: {exc}")
             return []
 
     @staticmethod
@@ -2631,6 +6467,20 @@ class AgenticSearch(BaseSearch):
 
         return merged
 
+    def _get_tree_indexer(self):
+        """Lazily construct a DocumentTreeIndexer for search-time tree navigation."""
+        from sirchmunk.learnings.tree_indexer import DocumentTreeIndexer
+
+        tree_cache = self.work_path / ".cache" / "compile" / "trees"
+        if not tree_cache.exists():
+            return None
+        _cb = getattr(self._logger, 'log_callback', None)
+        return DocumentTreeIndexer(
+            llm=self.llm,
+            cache_dir=tree_cache,
+            log_callback=_cb,
+        )
+
     async def _build_cluster(
         self,
         query: str,
@@ -2642,7 +6492,9 @@ class AgenticSearch(BaseSearch):
         """Build a KnowledgeCluster via knowledge_base.build().
 
         Constructs the Request wrapper and delegates to the knowledge
-        base for parallel Monte Carlo evidence sampling.
+        base for parallel Monte Carlo evidence sampling.  When compiled
+        tree indices exist, passes a ``tree_indexer`` so that evidence
+        extraction can navigate to relevant sections before sampling.
         """
         try:
             request = Request(
@@ -2662,6 +6514,7 @@ class AgenticSearch(BaseSearch):
                 top_k_files=top_k_files,
                 top_k_snippets=top_k_snippets,
                 verbose=self.verbose,
+                tree_indexer=self._get_tree_indexer(),
             )
             self.llm_usages.extend(self.knowledge_base.llm_usages)
             self.knowledge_base.llm_usages.clear()
@@ -2676,14 +6529,90 @@ class AgenticSearch(BaseSearch):
             await self._logger.warning(f"[Phase 3] knowledge_base.build() failed: {exc}")
             return None
 
+    async def _gather_graph_context(self, cluster: KnowledgeCluster) -> str:
+        """Enrich answer context with knowledge from graph neighbours.
+
+        Traverses the cluster's ``related_clusters`` edges (sorted by weight),
+        fetches the top neighbours, and returns a joined summary string that
+        can be appended to the cluster content before answer generation.
+        """
+        edges = sorted(
+            getattr(cluster, "related_clusters", []) or [],
+            key=lambda e: getattr(e, "weight", 0),
+            reverse=True,
+        )
+        if not edges:
+            return ""
+
+        parts: List[str] = []
+        for edge in edges[:3]:
+            tid = getattr(edge, "target_cluster_id", None)
+            if not tid:
+                continue
+            try:
+                neighbour = await self.knowledge_storage.get(tid)
+            except Exception:
+                continue
+            if not neighbour:
+                continue
+            content = neighbour.content
+            if isinstance(content, list):
+                content = "\n".join(content)
+            name = getattr(neighbour, "name", "") or ""
+            snippet = str(content or "")[:300]
+            if snippet:
+                parts.append(f"- {name}: {snippet}")
+
+        if not parts:
+            return ""
+        await self._logger.info(
+            f"[Phase 3.5] Graph context: {len(parts)} neighbour summaries"
+        )
+        return "Related knowledge:\n" + "\n".join(parts)
+
     # ------------------------------------------------------------------
     # Phase 4: Answer generation
     # ------------------------------------------------------------------
 
+    _INTENT_PROMPT_MAP = {
+        "lookup": ROI_LOOKUP_SYNTHESIS,
+        "computation": ROI_COMPUTATION_SYNTHESIS,
+        "comparison": ROI_COMPARISON_SYNTHESIS,
+    }
+
+    @classmethod
+    def _select_synthesis_prompt(
+        cls,
+        query: str,
+        evidence: str,
+        intent: str = "",
+        *,
+        document_context: Optional[str] = None,
+    ) -> str:
+        """Select and format the synthesis prompt based on query intent.
+
+        Falls back to ``ROI_RESULT_SUMMARY`` for unknown intents or when
+        the caller passes no intent (FAST mode compatibility).
+        """
+        template = cls._INTENT_PROMPT_MAP.get(intent, ROI_RESULT_SUMMARY)
+
+        prompt = template.format(user_input=query, text_content=evidence)
+
+        if document_context:
+            prompt = (
+                f"{prompt}\n\n### Document Context\n{document_context}"
+            )
+        return prompt
+
     async def _summarise_cluster(
         self, query: str, cluster: KnowledgeCluster,
+        intent: str = "",
     ) -> Tuple[str, bool, bool]:
         """Generate a final answer summary from a KnowledgeCluster.
+
+        When *intent* is provided, selects a specialised synthesis prompt
+        (lookup / computation / comparison).  Falls back to the general
+        ``ROI_RESULT_SUMMARY`` for FAST mode or unknown intents.
 
         Returns:
             ``(summary_text, should_save, should_answer)`` where:
@@ -2697,9 +6626,8 @@ class AgenticSearch(BaseSearch):
             f"{cluster.content if isinstance(cluster.content, str) else sep.join(cluster.content)}"
         )
 
-        result_sum_prompt = SEARCH_RESULT_SUMMARY.format(
-            user_input=query,
-            text_content=cluster_text_content,
+        result_sum_prompt = self._select_synthesis_prompt(
+            query, cluster_text_content, intent,
         )
 
         await self._logger.info("[Phase 4] Generating search result summary...")
@@ -2713,13 +6641,12 @@ class AgenticSearch(BaseSearch):
         return summary, should_save, should_answer
 
     async def _summarise_cluster_fallback(self, query: str) -> Tuple[str, bool]:
-        """Generate an answer using the DEEP summary prompt with fallback evidence.
+        """Generate an answer using the ROI summary prompt with fallback evidence.
 
-        Reuses the existing ``SEARCH_RESULT_SUMMARY`` prompt, feeding it the
-        standard fallback text so that the LLM answers from its own knowledge
-        without adding an extra LLM call to the pipeline.
+        Feeds the standard fallback text so the LLM answers from its own
+        knowledge without adding an extra LLM call to the pipeline.
         """
-        result_sum_prompt = SEARCH_RESULT_SUMMARY.format(
+        result_sum_prompt = ROI_RESULT_SUMMARY.format(
             user_input=query,
             text_content=self._LLM_FALLBACK_EVIDENCE,
         )
@@ -2755,6 +6682,1063 @@ class AgenticSearch(BaseSearch):
             )
         answer, _, _ = self._parse_summary_response(answer_resp.content or "")
         return answer, False  # Never save fallback answers
+
+    # ------------------------------------------------------------------
+    # Agentic retrieval pipeline (DEEP mode)
+    # ------------------------------------------------------------------
+
+    async def _analyze_data_requirements(
+        self, query: str, intent: str,
+    ) -> DataRequirements:
+        """Identify what data points the query needs before any retrieval."""
+        try:
+            prompt = DEEP_DATA_REQUIREMENTS.format(query=query, intent=intent)
+            resp = await self.llm.achat(
+                [{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+            raw = (resp.content or "").strip()
+            data = self._extract_json_object(raw)
+            if data:
+                return DataRequirements(
+                    data_points=data.get("data_points", [query]),
+                    likely_sources=data.get("likely_sources", []),
+                    formula=data.get("formula"),
+                    time_period=data.get("time_period"),
+                    intent=intent,
+                )
+        except Exception as exc:
+            await self._logger.warning(
+                f"[Phase 3] Data requirements analysis failed: {exc}"
+            )
+        return DataRequirements(
+            data_points=[query], likely_sources=[], formula=None,
+            time_period=None, intent=intent,
+        )
+
+    def _select_target_files(
+        self,
+        merged_files: List[str],
+        scope: "_PathScope",
+        artifacts: Optional["CompileArtifacts"],
+    ) -> List[str]:
+        """Select top files for agentic retrieval, preferring tree-indexed ones."""
+        scoped = [fp for fp in merged_files if scope.contains(fp)]
+        if not scoped:
+            scoped = list(merged_files)
+
+        tree_paths = (
+            artifacts.tree_available_paths if artifacts else set()
+        )
+        with_tree = [fp for fp in scoped if fp in tree_paths]
+        without_tree = [fp for fp in scoped if fp not in tree_paths]
+        ranked = with_tree + without_tree
+        return ranked[: self._AGENTIC_MAX_FILES]
+
+    async def _select_pages_for_data(
+        self,
+        query: str,
+        data_reqs: DataRequirements,
+        section_map: str,
+        evidence_so_far: str,
+        fetched_pages: set,
+        sections_meta: Optional[List[Dict[str, Any]]] = None,
+        total_pages: Optional[int] = None,
+    ) -> set:
+        """LLM-driven page selection given document outline and data needs."""
+        reqs_str = "\n".join(
+            f"- {dp}" for dp in data_reqs.data_points
+        )
+        if data_reqs.formula:
+            reqs_str += f"\nFormula: {data_reqs.formula}"
+
+        fetched_str = (
+            ", ".join(str(p) for p in sorted(fetched_pages))
+            if fetched_pages else "None"
+        )
+
+        evidence_summary = (
+            evidence_so_far[:2000] if evidence_so_far.strip() else "None yet"
+        )
+
+        prompt = DEEP_PAGE_SELECT.format(
+            query=query,
+            data_requirements=reqs_str,
+            section_map=section_map,
+            fetched_pages=fetched_str,
+            evidence_summary=evidence_summary,
+        )
+        try:
+            resp = await self.llm.achat(
+                [{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+            raw = (resp.content or "").strip()
+            match = re.search(r"\[[\d\s,]+\]", raw)
+            if match:
+                pages = json.loads(match.group())
+                result = {
+                    int(p) for p in pages
+                    if isinstance(p, (int, float)) and int(p) > 0
+                }
+                if result:
+                    return result
+        except Exception as exc:
+            await self._logger.warning(
+                f"[Phase 4] Page selection failed: {exc}"
+            )
+
+        return self._fallback_page_selection(
+            data_reqs, sections_meta, fetched_pages, total_pages,
+        )
+
+    @staticmethod
+    def _fallback_page_selection(
+        data_reqs: DataRequirements,
+        sections_meta: Optional[List[Dict[str, Any]]],
+        fetched_pages: set,
+        total_pages: Optional[int],
+    ) -> set:
+        """Heuristic page selection when LLM fails or returns empty."""
+        candidates: set = set()
+
+        if sections_meta:
+            source_keywords = {
+                s.lower() for s in data_reqs.likely_sources
+            }
+            for sec in sections_meta:
+                title_lower = (sec.get("title") or "").lower()
+                pr = sec.get("page_range")
+                if not pr or not pr[0]:
+                    continue
+                if any(kw in title_lower for kw in source_keywords):
+                    start, end = int(pr[0]), int(pr[1])
+                    for p in range(start, min(start + 4, end + 1)):
+                        candidates.add(p)
+
+        if not candidates and total_pages and total_pages > 10:
+            mid = total_pages // 2
+            last_quarter = total_pages * 3 // 4
+            for p in range(mid, min(mid + 4, total_pages + 1)):
+                candidates.add(p)
+            for p in range(last_quarter, min(last_quarter + 4, total_pages + 1)):
+                candidates.add(p)
+
+        return candidates - fetched_pages
+
+    async def _check_data_requirements(
+        self,
+        query: str,
+        data_reqs: DataRequirements,
+        evidence: str,
+    ) -> Tuple[bool, List[str]]:
+        """Check if evidence satisfies all data requirements.
+
+        Returns ``(is_complete, missing_data_points)``.
+        """
+        try:
+            prompt = DEEP_CHECK_REQUIREMENTS.format(
+                query=query,
+                data_points="\n".join(f"- {dp}" for dp in data_reqs.data_points),
+                formula=data_reqs.formula or "N/A",
+                evidence=evidence[:self._AGENTIC_EVIDENCE_MAX_CHARS],
+            )
+            resp = await self.llm.achat(
+                [{"role": "user", "content": prompt}], stream=False,
+            )
+            self.llm_usages.append(resp.usage)
+            raw = (resp.content or "").strip()
+            json_start = raw.find("{")
+            json_end = raw.rfind("}")
+            if json_start >= 0 and json_end > json_start:
+                data = json.loads(raw[json_start : json_end + 1])
+                is_complete = bool(data.get("complete", True))
+                missing = data.get("missing", [])
+                if isinstance(missing, list) and missing:
+                    return False, [str(m) for m in missing[:5]]
+                return is_complete, []
+        except Exception as exc:
+            await self._logger.warning(
+                f"[Phase 4] Data requirements check failed: {exc}"
+            )
+        return True, []
+
+    async def _agentic_retrieve(
+        self,
+        query: str,
+        data_reqs: DataRequirements,
+        target_files: List[str],
+        context: "SearchContext",
+    ) -> RetrievalResult:
+        """Core agentic retrieval loop: select pages → extract → check → repeat."""
+        indexer = self._get_tree_indexer()
+        evidence_parts: List[str] = []
+        pages_extracted: Dict[str, set] = {}
+        total_pages = 0
+
+        outlines: Dict[str, str] = {}
+        outlines_meta: Dict[str, List[Dict[str, Any]]] = {}
+        file_total_pages: Dict[str, int] = {}
+        outline_target_files: List[str] = []
+
+        for fp in target_files:
+            tree = indexer.load_tree(fp) if indexer else None
+            if tree and tree.total_pages:
+                file_total_pages[fp] = tree.total_pages
+            if fp not in file_total_pages:
+                try:
+                    from pypdf import PdfReader
+                    file_total_pages[fp] = len(PdfReader(fp).pages)
+                except Exception:
+                    pass
+
+            tp = file_total_pages.get(fp)
+            if tp and tp <= self._SHORT_DOC_THRESHOLD:
+                fname = Path(fp).name
+                try:
+                    all_pages = list(range(1, tp + 1))
+                    contents = DocumentExtractor.extract_pages(fp, all_pages)
+                    for pc in contents:
+                        if pc.content and pc.content.strip():
+                            evidence_parts.append(
+                                f"[{fname} p.{pc.page_number}]\n{pc.content}"
+                            )
+                    pages_extracted[fp] = set(all_pages)
+                    total_pages += tp
+                except Exception as exc:
+                    await self._logger.warning(
+                        f"[Phase 4] Full extraction of short doc {fname} failed: {exc}"
+                    )
+                    outline_target_files.append(fp)
+                continue
+            outline_target_files.append(fp)
+
+        for fp in outline_target_files:
+            tp = file_total_pages.get(fp)
+
+            # Strategy 1: LLM-analyzed TOC pages (highest quality)
+            toc_outline, toc_meta = await self._build_outline_from_toc_pages(fp, tp)
+            if toc_outline.strip():
+                outlines[fp] = toc_outline
+                outlines_meta[fp] = toc_meta
+                continue
+
+            # Strategy 2: Tree-index section map (fallback)
+            tree = indexer.load_tree(fp) if indexer else None
+            if tree and tree.root:
+                outline, sec_meta = self._build_section_map(
+                    tree.root, max_depth=self._AGENTIC_SECTION_MAP_DEPTH,
+                )
+                if outline.strip():
+                    outlines[fp] = outline
+                    outlines_meta[fp] = sec_meta
+                    continue
+
+            # Strategy 3: Sampled content outline for docs with known page count
+            if tp:
+                sampled_outline, sampled_meta = self._build_sampled_outline(
+                    fp, tp,
+                )
+                outlines[fp] = sampled_outline
+                outlines_meta[fp] = sampled_meta
+
+        current_reqs = data_reqs
+
+        if not outline_target_files and evidence_parts:
+            combined = "\n\n".join(evidence_parts)
+            return RetrievalResult(
+                evidence=combined[:self._AGENTIC_EVIDENCE_MAX_CHARS],
+                pages_extracted={
+                    fp: sorted(ps) for fp, ps in pages_extracted.items()
+                },
+                is_complete=True,
+                rounds_used=0,
+            )
+
+        for round_idx in range(self._AGENTIC_MAX_ROUNDS):
+            round_fetched_any = False
+
+            for fp in outline_target_files:
+                if total_pages >= self._AGENTIC_MAX_TOTAL_PAGES:
+                    break
+
+                fname = Path(fp).name
+                fetched = pages_extracted.get(fp, set())
+                outline = outlines.get(fp, "")
+                sec_meta = outlines_meta.get(fp)
+                tp = file_total_pages.get(fp)
+
+                if not outline and not tp:
+                    continue
+
+                new_pages = await self._select_pages_for_data(
+                    query, current_reqs, outline or "(no outline available)",
+                    "\n\n".join(evidence_parts)[:8000],
+                    fetched,
+                    sections_meta=sec_meta,
+                    total_pages=tp,
+                )
+                new_pages -= fetched
+                if not new_pages:
+                    continue
+
+                budget = self._AGENTIC_MAX_PAGES_PER_ROUND
+                capped = sorted(new_pages)[:budget]
+                try:
+                    contents = DocumentExtractor.extract_pages(fp, capped)
+                    for pc in contents:
+                        if pc.content and pc.content.strip():
+                            evidence_parts.append(
+                                f"[{fname} p.{pc.page_number}]\n{pc.content}"
+                            )
+                    pages_extracted.setdefault(fp, set()).update(capped)
+                    total_pages += len(capped)
+                    round_fetched_any = True
+                except Exception as exc:
+                    await self._logger.warning(
+                        f"[Phase 4] Page extraction failed for {fname}: {exc}"
+                    )
+
+                # Append table digests for newly fetched pages only
+                try:
+                    from sirchmunk.utils.file_utils import get_fast_hash
+                    fhash = get_fast_hash(fp)
+                    if fhash:
+                        tables = self._load_table_digest(self.work_path, fhash)
+                        if tables:
+                            new_page_set = set(capped)
+                            page_tables = [
+                                t for t in tables
+                                if t.get("page_number") in new_page_set
+                            ]
+                            if page_tables:
+                                table_ev = self._format_table_evidence(
+                                    page_tables,
+                                    max_chars=self._TABLE_EVIDENCE_DEFAULT_CHARS,
+                                    query=query,
+                                )
+                                if table_ev:
+                                    evidence_parts.append(
+                                        f"[{fname} tables]\n{table_ev}"
+                                    )
+                except Exception:
+                    pass
+
+            context.increment_loop()
+
+            if not round_fetched_any:
+                break
+
+            combined = "\n\n".join(evidence_parts)
+            is_complete, missing = await self._check_data_requirements(
+                query, current_reqs, combined,
+            )
+            context.increment_loop()
+
+            await self._logger.info(
+                f"[Phase 4] Round {round_idx + 1}: "
+                f"{total_pages} pages, complete={is_complete}, "
+                f"missing={len(missing)}"
+            )
+
+            if is_complete or not missing:
+                return RetrievalResult(
+                    evidence=combined[:self._AGENTIC_EVIDENCE_MAX_CHARS],
+                    pages_extracted={
+                        fp: sorted(ps) for fp, ps in pages_extracted.items()
+                    },
+                    is_complete=True,
+                    rounds_used=round_idx + 1,
+                )
+
+            current_reqs = DataRequirements(
+                data_points=missing,
+                likely_sources=data_reqs.likely_sources,
+                formula=data_reqs.formula,
+                time_period=data_reqs.time_period,
+                intent=data_reqs.intent,
+            )
+
+        combined = "\n\n".join(evidence_parts)
+        return RetrievalResult(
+            evidence=combined[:self._AGENTIC_EVIDENCE_MAX_CHARS],
+            pages_extracted={
+                fp: sorted(ps) for fp, ps in pages_extracted.items()
+            },
+            is_complete=False,
+            rounds_used=self._AGENTIC_MAX_ROUNDS,
+        )
+
+    async def _synthesize_from_retrieval(
+        self,
+        query: str,
+        intent: str,
+        retrieval: RetrievalResult,
+        file_paths: List[str],
+        formula: Optional[str] = None,
+    ) -> Tuple[str, bool, Optional["KnowledgeCluster"]]:
+        """Synthesize final answer from agentic retrieval evidence."""
+        if not retrieval.evidence.strip():
+            return _NO_RESULTS_MESSAGE, False, None
+
+        evidence = retrieval.evidence
+        if formula and intent == "computation":
+            evidence = f"[Required Formula: {formula}]\n\n{evidence}"
+
+        synth_prompt = self._select_synthesis_prompt(
+            query, evidence, intent,
+        )
+        resp = await self.llm.achat(
+            messages=[{"role": "user", "content": synth_prompt}],
+            stream=True,
+        )
+        self.llm_usages.append(resp.usage)
+
+        raw = resp.content or ""
+        answer, should_save, should_answer = self._parse_summary_response(raw)
+
+        accepted, reason = self._evaluate_evidence_acceptance(
+            query, retrieval.evidence, should_answer,
+            retrieval_complete=retrieval.is_complete,
+        )
+        await self._logger.info(
+            f"[Phase 4.5] Synthesis: accepted={accepted} ({reason})"
+        )
+
+        if not accepted:
+            return _NO_RESULTS_MESSAGE, False, None
+
+        cluster = self._make_answer_cluster(
+            query, retrieval.evidence[:5000], "AGT",
+            file_paths=list(retrieval.pages_extracted.keys())[:3],
+        )
+        cluster.content = retrieval.evidence
+        return answer, should_save, cluster
+
+    # ------------------------------------------------------------------
+    # LLM-powered document outline from TOC pages
+    # ------------------------------------------------------------------
+
+    _TOC_ANALYSIS_PAGES: List[int] = [1, 2, 3, 4, 5]
+
+    async def _build_outline_from_toc_pages(
+        self,
+        file_path: str,
+        total_pages: Optional[int] = None,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Build a section map by extracting and LLM-analyzing TOC pages.
+
+        Extracts the first few pages of a PDF (where the Table of Contents
+        typically resides), sends the text to the LLM for structural parsing,
+        and returns an outline string plus section metadata in the same format
+        as ``_build_section_map()`` for seamless integration.
+
+        Results are cached per file hash to avoid repeated LLM calls.
+        """
+        from sirchmunk.utils.file_utils import get_fast_hash
+
+        fhash = get_fast_hash(file_path)
+        if not fhash:
+            return "", []
+
+        cache_dir = self.work_path / ".cache" / "compile" / "toc_outlines"
+        cache_path = cache_dir / f"{fhash}.json"
+
+        sections_raw: Optional[list] = None
+        if cache_path.exists():
+            try:
+                sections_raw = json.loads(cache_path.read_text())
+            except Exception:
+                pass
+
+        if sections_raw is None:
+            try:
+                contents = DocumentExtractor.extract_pages(
+                    file_path, self._TOC_ANALYSIS_PAGES,
+                )
+                toc_text = "\n\n".join(
+                    f"--- Page {pc.page_number} ---\n{pc.content}"
+                    for pc in contents if pc.content and pc.content.strip()
+                )
+                if len(toc_text.strip()) < 200:
+                    return "", []
+
+                tp = total_pages or len(contents)
+                prompt = DEEP_TOC_ANALYSIS.format(
+                    toc_page_text=toc_text[:12000],
+                    total_pages=tp,
+                )
+                resp = await self.llm.achat(
+                    [{"role": "user", "content": prompt}], stream=False,
+                )
+                self.llm_usages.append(resp.usage)
+
+                raw = (resp.content or "").strip()
+                sections_raw = self._extract_json_array(raw)
+                if sections_raw is None:
+                    sections_raw = []
+
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps(sections_raw, ensure_ascii=False))
+            except Exception as exc:
+                await self._logger.warning(
+                    f"[Phase 4] TOC outline extraction failed: {exc}"
+                )
+                return "", []
+
+        if not sections_raw:
+            return "", []
+
+        return self._toc_sections_to_outline(sections_raw, total_pages)
+
+    @staticmethod
+    def _toc_sections_to_outline(
+        sections_raw: list,
+        total_pages: Optional[int] = None,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Convert raw TOC section list to outline string and metadata."""
+        sections_meta: List[Dict[str, Any]] = []
+
+        for i, sec in enumerate(sections_raw):
+            if not isinstance(sec, dict):
+                continue
+            title = str(sec.get("title", "")).strip()
+            if not title:
+                continue
+
+            ps = sec.get("page_start")
+            pe = sec.get("page_end")
+            level = int(sec.get("level", 1)) - 1
+
+            page_range = None
+            if ps is not None:
+                ps = int(ps)
+                pe = int(pe) if pe is not None else (total_pages or ps)
+                page_range = [ps, pe]
+
+            idx = len(sections_meta)
+            sections_meta.append({
+                "idx": idx,
+                "title": title,
+                "page_range": page_range,
+                "char_range": None,
+                "depth": level,
+                "node_id": f"toc_{idx}",
+                "summary": "",
+            })
+
+        # Post-process: fix page_range errors from LLM inference
+        for i, sec in enumerate(sections_meta):
+            pr = sec.get("page_range")
+            if not pr:
+                continue
+            needs_fix = pr[1] < pr[0]
+            if not needs_fix and pr[1] == pr[0] and i + 1 < len(sections_meta):
+                next_pr = sections_meta[i + 1].get("page_range")
+                needs_fix = next_pr and next_pr[0] == pr[0]
+            if needs_fix:
+                for j in range(i + 1, len(sections_meta)):
+                    next_pr = sections_meta[j].get("page_range")
+                    if next_pr and next_pr[0] > pr[0]:
+                        pr[1] = next_pr[0] - 1
+                        break
+                else:
+                    pr[1] = total_pages or pr[0]
+
+        lines: List[str] = []
+        for sec in sections_meta:
+            pr = sec.get("page_range")
+            indent = "  " * sec["depth"]
+            page_str = f"(p{pr[0]}-{pr[1]})" if pr else ""
+            lines.append(f"[{sec['idx']}] {indent}{sec['title']} {page_str}")
+
+        return "\n".join(lines), sections_meta
+
+    @staticmethod
+    def _build_sampled_outline(
+        file_path: str,
+        total_pages: int,
+        interval: int = 10,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Build an outline by sampling page content at regular intervals.
+
+        Used as a fallback when TOC parsing and tree indices are unavailable.
+        Gives the LLM enough context to make informed page selections.
+        """
+        sample_pages = list(range(1, total_pages + 1, interval))
+        if total_pages not in sample_pages:
+            sample_pages.append(total_pages)
+
+        sections_meta: List[Dict[str, Any]] = []
+        lines: List[str] = []
+
+        try:
+            contents = DocumentExtractor.extract_pages(file_path, sample_pages)
+            page_snippets = {
+                pc.page_number: (pc.content or "").strip()[:200]
+                for pc in contents if pc.content
+            }
+        except Exception:
+            page_snippets = {}
+
+        for i, pg in enumerate(sample_pages):
+            snippet = page_snippets.get(pg, "")
+            snippet_clean = " ".join(snippet.split())[:150]
+            next_pg = sample_pages[i + 1] if i + 1 < len(sample_pages) else total_pages
+            page_range = [pg, next_pg]
+
+            title = f'p{pg}: "{snippet_clean}..."' if snippet_clean else f"p{pg}"
+            sections_meta.append({
+                "idx": i, "title": title,
+                "page_range": page_range, "char_range": None,
+                "depth": 0, "node_id": f"sample_{i}", "summary": "",
+            })
+            lines.append(f"[{i}] {title} (p{page_range[0]}-{page_range[1]})")
+
+        return "\n".join(lines), sections_meta
+
+    # ------------------------------------------------------------------
+    # Deep Structured Reasoning pipeline (legacy, used by older code paths)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_section_map(
+        root: Any,
+        max_depth: int = 2,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Build a lightweight section map from the top layers of a tree index.
+
+        Args:
+            root: A ``TreeNode`` root from a ``DocumentTree``.
+
+        Returns a human-readable map string (with numbered indices so the LLM
+        can reference specific sections) and a parallel list of section
+        metadata dicts for programmatic use.
+        """
+        sections: List[Dict[str, Any]] = []
+
+        def _walk(node: Any, depth: int) -> None:
+            if depth > max_depth:
+                return
+            pr = node.page_range
+            idx = len(sections)
+            sections.append({
+                "idx": idx,
+                "title": node.title,
+                "page_range": list(pr) if pr else None,
+                "char_range": list(node.char_range) if getattr(node, "char_range", None) else None,
+                "depth": depth,
+                "node_id": node.node_id,
+                "summary": (node.summary or "")[:120],
+            })
+            for child in node.children:
+                _walk(child, depth + 1)
+
+        children = root.children if root.children else [root]
+        while len(children) == 1 and children[0].children and not children[0].leaf:
+            children = children[0].children
+
+        for child in children:
+            _walk(child, 0)
+
+        map_lines: List[str] = []
+        for sec in sections:
+            indent = "  " * sec["depth"]
+            pr = sec.get("page_range")
+            page_str = f"(p{pr[0]}-{pr[1]})" if pr and pr[0] else ""
+            map_lines.append(f"[{sec['idx']}] {indent}{sec['title']} {page_str}")
+
+        return "\n".join(map_lines), sections
+
+    async def _select_evidence_sections(
+        self,
+        query: str,
+        section_map: str,
+        sections_meta: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """LLM-driven selection of relevant sections from a section map.
+
+        Returns the metadata dicts for the selected sections.
+        """
+        prompt = DEEP_SECTION_SELECT.format(
+            query=query,
+            section_map=section_map,
+        )
+        resp = await self.llm.achat(
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+        self.llm_usages.append(resp.usage)
+
+        raw = (resp.content or "").strip()
+        # Parse JSON array of indices
+        try:
+            match = re.search(r"\[[\s\d,]*\]", raw)
+            if match:
+                indices = json.loads(match.group(0))
+                return [
+                    sections_meta[i]
+                    for i in indices
+                    if isinstance(i, int) and 0 <= i < len(sections_meta)
+                ]
+        except (json.JSONDecodeError, IndexError):
+            pass
+
+        # Fallback: return sections that have page_range data
+        return [s for s in sections_meta if s.get("page_range")][:3]
+
+    async def _extract_targeted_pages(
+        self,
+        file_path: str,
+        selected_sections: List[Dict[str, Any]],
+        query: str,
+    ) -> str:
+        """Extract content for LLM-selected sections.
+
+        Two extraction strategies (tried in order):
+          1. **Page-based** — ``DocumentExtractor.extract_pages`` for PDFs.
+          2. **Char-range** — direct text slice from compile cache or
+             fast_extract for any file type.
+
+        Table digests are appended when available.  Caps output at
+        ``_DEEP_STRUCTURED_MAX_CHARS``.
+        """
+        parts: List[str] = []
+
+        # Strategy 1: page-based extraction (PDF)
+        pages_needed: Set[int] = set()
+        for sec in selected_sections:
+            pr = sec.get("page_range")
+            if pr and len(pr) == 2 and pr[0]:
+                pages_needed.update(range(
+                    max(1, pr[0] - self._NAV_PAGE_MARGIN),
+                    pr[1] + self._NAV_PAGE_MARGIN + 1,
+                ))
+
+        if pages_needed:
+            sorted_pages = sorted(pages_needed)[: self._DEEP_MAX_EXTRACT_PAGES]
+            try:
+                page_contents = DocumentExtractor.extract_pages(
+                    file_path, sorted_pages,
+                )
+                for pc in page_contents:
+                    if pc.content and pc.content.strip():
+                        parts.append(f"[Page {pc.page_number}]\n{pc.content}")
+            except Exception as e:
+                await self._logger.warning(
+                    f"[DeepStructured] Page extraction failed for "
+                    f"{Path(file_path).name}: {e}"
+                )
+
+        # Strategy 2: char_range fallback (non-PDF or when pages failed)
+        if not parts:
+            full_text = self._load_compile_content(self.work_path, file_path)
+            if not full_text:
+                try:
+                    from sirchmunk.utils.file_utils import fast_extract
+                    extraction = await fast_extract(file_path=file_path)
+                    full_text = extraction.content or ""
+                except Exception:
+                    full_text = ""
+            if full_text:
+                for sec in selected_sections:
+                    cr = sec.get("char_range")
+                    if cr and len(cr) == 2 and cr[0] is not None:
+                        start, end = cr
+                        if 0 <= start < end <= len(full_text):
+                            segment = full_text[start:end]
+                            if segment.strip():
+                                parts.append(
+                                    f"[{sec.get('title', 'Section')}]\n{segment}"
+                                )
+
+        # Append relevant table digests when available
+        if pages_needed:
+            try:
+                from sirchmunk.utils.file_utils import get_fast_hash
+                fhash = get_fast_hash(file_path)
+                if fhash:
+                    tables = self._load_table_digest(self.work_path, fhash)
+                    if tables:
+                        page_tables = [
+                            t for t in tables
+                            if t.get("page_number") in pages_needed
+                        ]
+                        if page_tables:
+                            table_ev = self._format_table_evidence(
+                                page_tables,
+                                max_chars=self._TABLE_EVIDENCE_DEFAULT_CHARS,
+                                query=query,
+                            )
+                            if table_ev:
+                                parts.append(f"[Table Evidence]\n{table_ev}")
+            except Exception:
+                pass
+
+        evidence = "\n\n".join(parts)
+        return evidence[: self._DEEP_STRUCTURED_MAX_CHARS]
+
+    async def _deep_structured_reasoning(
+        self,
+        query: str,
+        tree_files: List[str],
+        artifacts: Any,
+        context: "SearchContext",
+        intent: str = "",
+    ) -> Tuple[str, Optional["KnowledgeCluster"], str]:
+        """Orchestrate the Deep Structured Reasoning pipeline.
+
+        Phases:
+          1. Section map  — build from tree index top layers (no LLM)
+          2. Section select — LLM picks relevant sections (1 LLM)
+          3. Targeted extraction — pull pages + tables for sections (no LLM)
+          4. Synthesis — intent-aware prompt on targeted evidence (1 LLM)
+          5. Recovery — if refused, expand sections and re-synthesize
+
+        Returns ``(raw_llm_output, cluster, combined_evidence)`` where
+        *combined_evidence* is the raw document text fed to the LLM so
+        callers can use it for evidence-acceptance checks instead of
+        the LLM's answer text.
+        """
+        indexer = self._get_tree_indexer()
+        if indexer is None:
+            return "", None, ""
+
+        all_evidence_parts: List[str] = []
+
+        for fp in tree_files[: self._DEEP_STRUCTURED_MAX_FILES]:
+            fname = Path(fp).name
+            tree = indexer.load_tree(fp)
+            if tree is None or tree.root is None:
+                continue
+
+            section_map, sections_meta = self._build_section_map(
+                tree.root, max_depth=self._DEEP_SECTION_MAP_MAX_DEPTH,
+            )
+            if not sections_meta:
+                continue
+
+            await self._logger.info(
+                f"[DeepSR] Section map for {fname}: "
+                f"{len(sections_meta)} sections"
+            )
+
+            selected = await self._select_evidence_sections(
+                query, section_map, sections_meta,
+            )
+            context.increment_loop()
+            if not selected:
+                continue
+
+            await self._logger.info(
+                f"[DeepSR] Selected {len(selected)} sections: "
+                f"{[s['title'][:30] for s in selected]}"
+            )
+
+            raw_evidence = await self._extract_targeted_pages(
+                fp, selected, query,
+            )
+            if not raw_evidence:
+                continue
+
+            await self._logger.info(
+                f"[DeepSR] Extracted {len(raw_evidence)} chars from {fname}"
+            )
+
+            all_evidence_parts.append(f"[Source: {fname}]\n{raw_evidence}")
+
+        if not all_evidence_parts:
+            return "", None, ""
+
+        combined_evidence = "\n\n---\n\n".join(all_evidence_parts)
+
+        # Build document context from artifacts when available
+        doc_context: Optional[str] = None
+        if artifacts and artifacts.catalog_map:
+            ctx_parts = [
+                self._build_answer_context(fp, artifacts)
+                for fp in tree_files[: self._DEEP_STRUCTURED_MAX_FILES]
+            ]
+            ctx_parts = [c for c in ctx_parts if c]
+            if ctx_parts:
+                doc_context = "\n".join(ctx_parts)
+
+        # Synthesize answer using intent-aware prompt
+        synth_prompt = self._select_synthesis_prompt(
+            query, combined_evidence, intent,
+            document_context=doc_context,
+        )
+
+        resp = await self.llm.achat(
+            messages=[{"role": "user", "content": synth_prompt}],
+            stream=True,
+        )
+        self.llm_usages.append(resp.usage)
+        context.increment_loop()
+
+        raw_response = resp.content or ""
+        _, _, should_answer = self._parse_summary_response(raw_response)
+
+        await self._logger.info(
+            f"[DeepSR] Synthesis complete: should_answer={should_answer}, "
+            f"len={len(raw_response)}"
+        )
+
+        # Recovery: if the answer is a refusal, try expanding sections
+        if (not should_answer or self._is_refusal_answer(raw_response[:500])):
+            for recovery_round in range(1, self._DEEP_MAX_RECOVERY_ROUNDS + 1):
+                await self._logger.info(
+                    f"[DeepSR] Recovery round {recovery_round}"
+                )
+                expanded_parts: List[str] = list(all_evidence_parts)
+                found_new = False
+                for fp in tree_files[: self._DEEP_STRUCTURED_MAX_FILES]:
+                    tree = indexer.load_tree(fp)
+                    if tree is None or tree.root is None:
+                        continue
+                    section_map, sections_meta = self._build_section_map(
+                        tree.root,
+                        max_depth=self._DEEP_SECTION_MAP_MAX_DEPTH + recovery_round,
+                    )
+                    if not sections_meta:
+                        continue
+                    recovery_selected = await self._select_evidence_sections(
+                        query, section_map, sections_meta,
+                    )
+                    context.increment_loop()
+                    if not recovery_selected:
+                        continue
+                    recovery_ev = await self._extract_targeted_pages(
+                        fp, recovery_selected, query,
+                    )
+                    if recovery_ev and recovery_ev not in combined_evidence:
+                        expanded_parts.append(
+                            f"[Recovery source: {Path(fp).name}]\n{recovery_ev}"
+                        )
+                        found_new = True
+                if not found_new:
+                    break
+                combined_evidence = "\n\n---\n\n".join(expanded_parts)
+                synth_prompt = self._select_synthesis_prompt(
+                    query,
+                    combined_evidence[:self._DEEP_STRUCTURED_MAX_CHARS],
+                    intent,
+                    document_context=doc_context,
+                )
+                resp = await self.llm.achat(
+                    messages=[{"role": "user", "content": synth_prompt}],
+                    stream=True,
+                )
+                self.llm_usages.append(resp.usage)
+                context.increment_loop()
+                raw_response = resp.content or ""
+                _, _, should_answer = self._parse_summary_response(raw_response)
+                if should_answer and not self._is_refusal_answer(
+                    raw_response[:500]
+                ):
+                    break
+
+        cluster = self._make_answer_cluster(
+            query, combined_evidence[:5000], "DSR",
+            file_paths=tree_files[: self._DEEP_STRUCTURED_MAX_FILES],
+        )
+
+        return raw_response, cluster, combined_evidence
+
+    async def _deep_self_correct(
+        self,
+        query: str,
+        merged_files: List[str],
+        query_keywords: Dict[str, float],
+        context: "SearchContext",
+    ) -> Optional[str]:
+        """Gather alternative evidence when DEEP Phase 4 answer is rejected.
+
+        Four strategies tried in order, stopping at first success:
+          A) Expanded tree-guided sampling on the primary file.
+          B) rga keyword window extraction on primary files using
+             Phase-1 keywords (reuses the rga infrastructure).
+          C) Semantically similar cluster from knowledge storage.
+          D) Tree-guided sampling on secondary merged files.
+
+        Returns alternative evidence text, or ``None`` when every
+        strategy fails.
+        """
+        primary_files = merged_files[:2]
+        secondary_files = merged_files[2:5]
+
+        # Strategy A: expanded tree sampling on primary file
+        for fp in primary_files:
+            expanded_ev = await self._tree_guided_sample(
+                fp, query,
+                max_chars=self._FAST_MAX_EVIDENCE_CHARS * 2,
+            )
+            if isinstance(expanded_ev, str) and len(expanded_ev.strip()) > 100:
+                await self._logger.info(
+                    "[DEEP:SelfCorrect] Strategy A succeeded: "
+                    f"expanded tree sample from {Path(fp).name}"
+                )
+                return expanded_ev
+
+        # Strategy B: tree-navigated evidence with expanded parameters
+        for fp in primary_files:
+            try:
+                nav_ev = await self._navigate_tree_for_evidence(
+                    fp, query,
+                    max_results=self._SELF_CORRECT_EXPANDED_NAV_RESULTS,
+                )
+                if nav_ev and len(nav_ev.strip()) > 100:
+                    await self._logger.info(
+                        "[DEEP:SelfCorrect] Strategy B succeeded: "
+                        f"expanded tree navigation on {Path(fp).name}"
+                    )
+                    return nav_ev
+            except Exception:
+                pass
+
+        # Strategy C: semantically similar cluster from knowledge storage
+        if self.embedding_client and self.knowledge_storage:
+            try:
+                qe = self.embedding_client.encode(query)
+                if qe is not None:
+                    vec = qe.tolist() if hasattr(qe, "tolist") else list(qe)
+                    hits = await self.knowledge_storage.search_similar_clusters(
+                        query_embedding=vec, top_k=2, similarity_threshold=0.50,
+                    )
+                    if hits:
+                        parts: List[str] = []
+                        for h in hits[:2]:
+                            c = await self.knowledge_storage.get(h["id"])
+                            if c and c.content:
+                                parts.append(str(c.content)[:3000])
+                                for ev in (c.evidences or [])[:3]:
+                                    for s in (ev.snippets or [])[:2]:
+                                        parts.append(s[:500])
+                        if parts:
+                            await self._logger.info(
+                                "[DEEP:SelfCorrect] Strategy C succeeded: "
+                                "knowledge storage cluster"
+                            )
+                            return "\n\n---\n\n".join(parts)
+            except Exception:
+                pass
+
+        # Strategy D: tree sampling on secondary files
+        for fp in secondary_files:
+            tree_ev = await self._tree_guided_sample(
+                fp, query,
+                max_chars=self._FAST_MAX_EVIDENCE_CHARS,
+            )
+            if isinstance(tree_ev, str) and len(tree_ev.strip()) > 100:
+                context.mark_file_read(fp)
+                await self._logger.info(
+                    "[DEEP:SelfCorrect] Strategy D succeeded: "
+                    f"secondary file {Path(fp).name}"
+                )
+                return tree_ev
+
+        await self._logger.info("[DEEP:SelfCorrect] All strategies exhausted")
+        return None
 
     async def _react_refinement(
         self,

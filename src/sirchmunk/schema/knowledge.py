@@ -57,6 +57,12 @@ class EvidenceUnit:
     # IDs of conflict group if this evidence contradicts others
     conflict_group: Optional[List[str]] = None
 
+    # Tree-index node path from root to the matched node (e.g. ["N000000", "N001234"])
+    tree_path: Optional[List[str]] = None
+
+    # Character range within the document for precise evidence location
+    page_range: Optional[List[int]] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """
         Serialize EvidenceUnit to a dictionary.
@@ -69,6 +75,8 @@ class EvidenceUnit:
             "snippets": self.snippets,
             "extracted_at": self.extracted_at.isoformat(),
             "conflict_group": self.conflict_group,
+            "tree_path": self.tree_path,
+            "page_range": self.page_range,
         }
 
 
@@ -234,6 +242,9 @@ class KnowledgeCluster:
     # Used for semantic similarity matching and cluster reuse
     queries: List[str] = None
 
+    # Number of times this cluster has been merged with new evidence during compile
+    merge_count: int = 0
+
     def __post_init__(self):
         if self.related_clusters is None:
             self.related_clusters = []
@@ -391,5 +402,6 @@ class KnowledgeCluster:
             "related_clusters": [rc.to_dict() for rc in self.related_clusters],
             "search_results": self.search_results,
             "queries": self.queries,
+            "merge_count": self.merge_count,
         }
 

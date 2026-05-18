@@ -568,3 +568,120 @@ class KnowledgeQueryTool(BaseTool):
         )
 
         return result_text, {"query": query, "clusters_found": len(clusters)}
+
+
+# ---------------------------------------------------------------------------
+# Tool 5: Tree Navigation (medium cost — LLM-guided tree index navigation)
+# ---------------------------------------------------------------------------
+
+class TreeNavigationTool(BaseTool):
+    """Navigate a document's compiled tree index to extract targeted evidence.
+
+    Uses an LLM-driven tree navigation strategy: the model selects
+    the most relevant branches/sections from a hierarchical document
+    index, then extracts the corresponding page or char-range content.
+
+    This tool bridges the gap between keyword search (which finds
+    *where* a term appears) and file read (which returns *everything*).
+    Tree navigation returns the most relevant *sections* of a document
+    without reading the whole file.
+
+    Requires compile artifacts (tree indices) to be available for the
+    target files.
+    """
+
+    def __init__(
+        self,
+        navigate_fn: Any,
+        available_paths: Optional[set] = None,
+        max_chars: int = 15_000,
+    ) -> None:
+        self._navigate_fn = navigate_fn
+        self._available_paths = available_paths or set()
+        self._max_chars = max_chars
+
+    @property
+    def name(self) -> str:
+        return "tree_navigate"
+
+    def get_schema(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": (
+                "Navigate a document's compiled tree index to extract "
+                "targeted sections relevant to the query. More precise "
+                "than file_read — returns only relevant sections instead "
+                "of the entire file. Works with PDF, DOCX, and other "
+                "compiled document types. Medium token cost."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path of the document to navigate."
+                        ),
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "What information to look for in the document."
+                        ),
+                    },
+                },
+                "required": ["file_path", "query"],
+            },
+        }
+
+    async def execute(
+        self,
+        context: SearchContext,
+        **kwargs,
+    ) -> Tuple[str, Dict[str, Any]]:
+        file_path: str = kwargs.get("file_path", "")
+        query: str = kwargs.get("query", "")
+        if not file_path or not query:
+            return "file_path and query are required.", {}
+
+        if (
+            self._available_paths
+            and file_path not in self._available_paths
+        ):
+            return (
+                f"No tree index available for {Path(file_path).name}. "
+                "Use file_read instead."
+            ), {"file_path": file_path, "indexed": False}
+
+        try:
+            result = await self._navigate_fn(
+                file_path, query, max_chars=self._max_chars,
+            )
+        except Exception as exc:
+            return (
+                f"Tree navigation failed: {exc}"
+            ), {"file_path": file_path, "error": str(exc)}
+
+        if not result:
+            return (
+                f"No relevant sections found in "
+                f"{Path(file_path).name} for this query."
+            ), {"file_path": file_path, "chars": 0}
+
+        total_chars = len(result)
+        approx_tokens = total_chars // 4
+        context.add_log(
+            tool_name=self.name,
+            tokens=approx_tokens,
+            metadata={
+                "file_path": file_path,
+                "chars": total_chars,
+            },
+        )
+
+        header = f"[Tree navigation: {Path(file_path).name}]"
+        return f"{header}\n{result}", {
+            "file_path": file_path,
+            "chars": total_chars,
+            "tokens": approx_tokens,
+        }
