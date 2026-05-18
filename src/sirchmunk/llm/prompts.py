@@ -424,7 +424,7 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
 4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
 5. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
-6. **Precision**: Preserve the precision from the source data. If the source says "$8.70 billion" or "36.8%", report that exact value. Only round when converting between units (e.g., $381,603 thousands → "$382 million"). When the query specifies a rounding rule, follow it exactly.
+6. **Value precision**: Preserve the precision from the source data. If the source says "$8.70 billion" or "36.8%", report that exact value. Only round when converting between units (e.g., $381,603 thousands → "$382 million"). When the query specifies a rounding rule, follow it exactly.
 7. **Best-effort answering**: Always attempt to answer based on available evidence. When the query requests a specific metric, ratio, or calculation, compute it from whatever relevant data is available — even if the data is partial. Do not refuse to calculate a metric solely because you believe it is unconventional or less applicable for a given entity type. Only mark SHOULD_ANSWER as "false" when the evidence is entirely unrelated to the query.
 
 ### Input Data
@@ -467,7 +467,7 @@ Leverage the document context below for better understanding of the source mater
 3. **Style**: Keep it professional, objective, and clear. Avoid fluff.
 4. **Precision**: When the query asks for a specific value, ratio, number, percentage, or yes/no determination, you MUST compute it and state the precise result. Show key calculation steps when applicable.
 5. **Verify before answering**: For numerical calculations, complete ALL computation steps in the SUMMARY section FIRST. Only write the PRECISE_ANSWER tag AFTER you have verified the final result. If you discover an error during computation, use the corrected value in PRECISE_ANSWER.
-6. **Precision**: Preserve the precision from the source data. If the source says "$8.70 billion" or "36.8%", report that exact value. Only round when converting between units (e.g., $381,603 thousands → "$382 million"). When the query specifies a rounding rule, follow it exactly.
+6. **Value precision**: Preserve the precision from the source data. If the source says "$8.70 billion" or "36.8%", report that exact value. Only round when converting between units (e.g., $381,603 thousands → "$382 million"). When the query specifies a rounding rule, follow it exactly.
 7. **Best-effort answering**: Always attempt to answer based on available evidence. When the query requests a specific metric, ratio, or calculation, compute it from whatever relevant data is available — even if the data is partial. Do not refuse to calculate a metric solely because you believe it is unconventional or less applicable for a given entity type. Only mark SHOULD_ANSWER as "false" when the evidence is entirely unrelated to the query.
 
 ### Document Context
@@ -565,7 +565,7 @@ Extract the specific value requested from the evidence and present it clearly.
 ### Constraints
 1. **Language Continuity**: The output must be in the SAME language as the User Input.
 2. Find the value stated in the evidence. If the exact total is not stated but its components are clearly present, compute it by summing the components.
-3. **Precision**: Preserve the precision from the source data. If the source says "36.8%", report "36.8%", not "37%". If the source says "$8.70 billion", report "$8.70 billion", not "$9 billion". Only round when explicitly converting between units (e.g., $302,578 thousands → "$303 million"; $381,603 thousands → "$382 million"). When converting, round to the nearest whole number in the target unit. When the query specifies a rounding rule (e.g., "round to one decimal place"), follow it exactly.
+3. **Value precision**: Preserve the precision from the source data. If the source says "36.8%", report "36.8%", not "37%". If the source says "$8.70 billion", report "$8.70 billion", not "$9 billion". Only round when explicitly converting between units (e.g., $302,578 thousands → "$303 million"; $381,603 thousands → "$382 million"). When the query specifies a rounding rule (e.g., "round to one decimal place"), follow it exactly.
 4. If multiple candidate values exist, select based on the closest match to the query's time period, entity, and metric.
 5. Quote the source passage containing the value.
 6. Only mark SHOULD_ANSWER as "false" when no relevant data exists in the evidence. Always prefer attempting an answer over refusing.
@@ -601,7 +601,7 @@ Answer the query by extracting data from the evidence and performing the require
    c) **SUBSTITUTION**: Plug in the extracted values into the formula.
    d) **CALCULATION**: Show arithmetic step by step. For each step, write the operation and its result.
    e) **VERIFICATION**: Re-compute the final result independently to confirm.
-3. **Precision**: Preserve meaningful precision in computed results.
+3. **Value precision**: Preserve meaningful precision in computed results.
    - Dollar amounts: when converting units, round to the nearest whole number in the target unit. Example: $381,603 thousands → "$382 million". Otherwise preserve the precision of the input values.
    - Percentages: round to 1 decimal place by default. If the query says "round to one decimal place", follow exactly. If the query says "round to nearest whole number" or the context clearly calls for it, round to whole.
    - Ratios: round to 2 decimal places.

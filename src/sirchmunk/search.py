@@ -6942,14 +6942,6 @@ class AgenticSearch(BaseSearch):
                 outlines[fp] = sampled_outline
                 outlines_meta[fp] = sampled_meta
 
-        for fp in outline_target_files:
-            if fp in outlines and fp in outlines_meta:
-                refined, refined_meta = self._refine_large_sections(
-                    fp, outlines[fp], outlines_meta[fp],
-                )
-                outlines[fp] = refined
-                outlines_meta[fp] = refined_meta
-
         current_reqs = data_reqs
 
         if not outline_target_files and evidence_parts:
@@ -7304,101 +7296,6 @@ class AgenticSearch(BaseSearch):
             lines.append(f"[{i}] {title} (p{page_range[0]}-{page_range[1]})")
 
         return "\n".join(lines), sections_meta
-
-    _LARGE_SECTION_THRESHOLD: int = 15
-    """Sections spanning more pages than this get sub-section sampling."""
-
-    @staticmethod
-    def _refine_large_sections(
-        file_path: str,
-        outline: str,
-        sections_meta: List[Dict[str, Any]],
-    ) -> Tuple[str, List[Dict[str, Any]]]:
-        """Expand sections spanning many pages with sampled sub-entries.
-
-        For each section whose page range exceeds ``_LARGE_SECTION_THRESHOLD``,
-        sample pages at ~5-page intervals within the section and insert
-        sub-entries so the LLM has finer-grained navigation.
-        """
-        threshold = 15
-        large_sections = []
-        for sec in sections_meta:
-            pr = sec.get("page_range")
-            if pr and (pr[1] - pr[0] + 1) > threshold:
-                large_sections.append(sec)
-
-        if not large_sections:
-            return outline, sections_meta
-
-        sample_pages_needed: List[int] = []
-        for sec in large_sections:
-            pr = sec["page_range"]
-            start, end = pr[0], pr[1]
-            interval = max(5, (end - start) // 8)
-            for p in range(start, end + 1, interval):
-                if p not in sample_pages_needed:
-                    sample_pages_needed.append(p)
-
-        try:
-            contents = DocumentExtractor.extract_pages(
-                file_path, sorted(sample_pages_needed),
-            )
-            page_snippets = {
-                pc.page_number: " ".join(
-                    (pc.content or "").strip()[:200].split()
-                )[:150]
-                for pc in contents if pc.content and pc.content.strip()
-            }
-        except Exception:
-            return outline, sections_meta
-
-        if not page_snippets:
-            return outline, sections_meta
-
-        new_meta: List[Dict[str, Any]] = []
-        large_set = {id(s) for s in large_sections}
-
-        for sec in sections_meta:
-            if id(sec) not in large_set:
-                sec_copy = dict(sec)
-                sec_copy["idx"] = len(new_meta)
-                new_meta.append(sec_copy)
-                continue
-
-            pr = sec["page_range"]
-            start, end = pr[0], pr[1]
-            interval = max(5, (end - start) // 8)
-            sub_pages = list(range(start, end + 1, interval))
-
-            parent_idx = len(new_meta)
-            parent_copy = dict(sec)
-            parent_copy["idx"] = parent_idx
-            new_meta.append(parent_copy)
-
-            for i, sp in enumerate(sub_pages):
-                snippet = page_snippets.get(sp, "")
-                sub_end = sub_pages[i + 1] - 1 if i + 1 < len(sub_pages) else end
-                if not snippet:
-                    continue
-                sub_idx = len(new_meta)
-                new_meta.append({
-                    "idx": sub_idx,
-                    "title": f'"{snippet}..."',
-                    "page_range": [sp, sub_end],
-                    "char_range": None,
-                    "depth": sec.get("depth", 0) + 1,
-                    "node_id": f"subsample_{parent_idx}_{i}",
-                    "summary": "",
-                })
-
-        lines: List[str] = []
-        for sec in new_meta:
-            pr = sec.get("page_range")
-            indent = "  " * sec.get("depth", 0)
-            page_str = f"(p{pr[0]}-{pr[1]})" if pr else ""
-            lines.append(f"[{sec['idx']}] {indent}{sec['title']} {page_str}")
-
-        return "\n".join(lines), new_meta
 
     # ------------------------------------------------------------------
     # Deep Structured Reasoning pipeline (legacy, used by older code paths)
