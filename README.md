@@ -284,7 +284,7 @@ from sirchmunk.llm import OpenAIChat
 llm = OpenAIChat(
     api_key="your-minimax-api-key",
     base_url="https://api.minimax.io/v1",
-    model="MiniMax-M2.7"           # or "MiniMax-M2.7-highspeed"
+    model="MiniMax-M3"             # or "MiniMax-M2.7" / "MiniMax-M2.7-highspeed"
 )
 ```
 
@@ -1039,7 +1039,7 @@ Sirchmunk takes an **indexless approach**:
 
 Any OpenAI-compatible API endpoint, including (but not limited to):
 - OpenAI (GPT-5.2, ...)
-- [MiniMax](https://platform.minimax.io) (MiniMax-M2.7, MiniMax-M2.7-highspeed, MiniMax-M2.5)
+- [MiniMax](https://platform.minimax.io) (MiniMax-M3, MiniMax-M2.7, MiniMax-M2.7-highspeed)
 - DeepSeek, Moonshot, Mistral, Groq, Together AI, Cohere
 - Google Gemini, Zhipu (GLM), Baichuan, Yi, SiliconFlow, Volcengine
 - Azure OpenAI
@@ -1050,7 +1050,7 @@ To use MiniMax, configure:
 ```bash
 LLM_BASE_URL=https://api.minimax.io/v1
 LLM_API_KEY=your-minimax-api-key
-LLM_MODEL_NAME=MiniMax-M2.7
+LLM_MODEL_NAME=MiniMax-M3
 ```
 
 For more details, see [MiniMax OpenAI-Compatible API](https://platform.minimax.io/docs/api-reference/text-openai-api).

@@ -48,7 +48,7 @@ docker run -d \
 |---|---|---|---|
 | `-e LLM_API_KEY` | **Yes** | | API key from your LLM provider |
 | `-e LLM_BASE_URL` | No | `https://api.openai.com/v1` | OpenAI-compatible API endpoint (e.g., `https://api.minimax.io/v1` for MiniMax) |
-| `-e LLM_MODEL_NAME` | No | `gpt-5.2` | LLM model name (e.g., `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`) |
+| `-e LLM_MODEL_NAME` | No | `gpt-5.2` | LLM model name (e.g., `MiniMax-M3`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`) |
 | `-e LLM_TIMEOUT` | No | `60.0` | LLM request timeout in seconds |
 | `-e UI_THEME` | No | `light` | WebUI theme (`light` / `dark`) |
 | `-e UI_LANGUAGE` | No | `en` | WebUI language (`en` / `zh`) |

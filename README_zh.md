@@ -282,7 +282,7 @@ llm = OpenAIChat(
     api_key="your-minimax-api-key",
     base_url="https://api.minimax.io/v1",     # 海外版
     # base_url="https://api.minimaxi.com/v1", # 国内版
-    model="MiniMax-M2.7"                       # 或 "MiniMax-M2.7-highspeed"
+    model="MiniMax-M3"                         # 或 "MiniMax-M2.7" / "MiniMax-M2.7-highspeed"
 )
 ```
 
@@ -1037,7 +1037,7 @@ Sirchmunk 采用 **无索引** 方法：
 
 任何 OpenAI 兼容 API 端点，包括但不限于：
 - OpenAI（GPT-5.2, ...）
-- [MiniMax](https://platform.minimax.io)（MiniMax-M2.7、MiniMax-M2.7-highspeed、MiniMax-M2.5）
+- [MiniMax](https://platform.minimax.io)（MiniMax-M3、MiniMax-M2.7、MiniMax-M2.7-highspeed）
 - DeepSeek、Moonshot、Mistral、Groq、Together AI、Cohere
 - Google Gemini、智谱（GLM）、百川、零一万物、硅基流动、火山引擎
 - Azure OpenAI
@@ -1049,7 +1049,7 @@ Sirchmunk 采用 **无索引** 方法：
 LLM_BASE_URL=https://api.minimax.io/v1        # 海外版
 # LLM_BASE_URL=https://api.minimaxi.com/v1    # 国内版
 LLM_API_KEY=your-minimax-api-key
-LLM_MODEL_NAME=MiniMax-M2.7
+LLM_MODEL_NAME=MiniMax-M3
 ```
 
 详见 [MiniMax OpenAI 兼容 API 文档](https://platform.minimax.io/docs/api-reference/text-openai-api)。
