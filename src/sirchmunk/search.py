@@ -6174,14 +6174,14 @@ class AgenticSearch(BaseSearch):
         Returns:
             Discovered file paths (possibly empty), capped for downstream use.
         """
-        from sirchmunk.agentic.react_agent import ReActAgent
+        from sirchmunk.agentic.react_agent import ReActSearchAgent
 
         search_paths = list(paths or [])
         if not search_paths:
             return []
 
         registry = self._ensure_tool_registry(search_paths, enable_dir_scan=True)
-        agent = ReActAgent(
+        agent = ReActSearchAgent(
             llm=self.llm,
             tool_registry=registry,
             max_loops=max_loops,
