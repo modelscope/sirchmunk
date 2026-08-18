@@ -299,6 +299,25 @@ llm = OpenAIChat(
 
 </details>
 
+<details>
+<summary><b>使用 OrcaRouter</b></summary>
+
+[OrcaRouter](https://www.orcarouter.ai) 是 OpenAI 兼容路由器，一个 API key 即可
+访问 200+ 模型。模型 id 使用路由器自身的 `provider/model` 格式，例如
+`openai/gpt-4o`：
+
+```python
+from sirchmunk.llm import OpenAIChat
+
+llm = OpenAIChat(
+    api_key="sk-orca-...",
+    base_url="https://api.orcarouter.ai/v1",
+    model="openai/gpt-4o"          # 或 "openai/gpt-4o-mini" / "deepseek/deepseek-v4-flash"
+)
+```
+
+</details>
+
 
 ### 命令行界面
 
@@ -1087,6 +1106,7 @@ Sirchmunk 采用 **无索引** 方法：
 任何 OpenAI 兼容 API 端点，包括但不限于：
 - OpenAI（GPT-5.2, ...）
 - [MiniMax](https://platform.minimax.io)（MiniMax-M3、MiniMax-M2.7、MiniMax-M2.7-highspeed）
+- [OrcaRouter](https://www.orcarouter.ai)（openai/gpt-4o、openai/gpt-4o-mini、deepseek/deepseek-v4-flash、...）
 - DeepSeek、Moonshot、Mistral、Groq、Together AI、Cohere
 - Google Gemini、智谱（GLM）、百川、零一万物、硅基流动、火山引擎
 - Azure OpenAI
@@ -1102,6 +1122,15 @@ LLM_MODEL_NAME=MiniMax-M3
 ```
 
 详见 [MiniMax OpenAI 兼容 API 文档](https://platform.minimax.io/docs/api-reference/text-openai-api)。
+
+使用 OrcaRouter 的配置示例：
+```bash
+LLM_BASE_URL=https://api.orcarouter.ai/v1
+LLM_API_KEY=your-orcarouter-api-key
+LLM_MODEL_NAME=openai/gpt-4o
+```
+
+OrcaRouter 一个 API key 即可访问 200+ 模型（OpenAI、Anthropic、Google、DeepSeek 等）；模型 id 使用路由器自身的 `provider/model` 格式（如 `openai/gpt-4o`、`deepseek/deepseek-v4-flash`）。
 
 </details>
 
