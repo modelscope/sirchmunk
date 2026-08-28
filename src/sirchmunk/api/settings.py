@@ -25,6 +25,13 @@ router = APIRouter(prefix="/api/v1/settings", tags=["settings"])
 _DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
 _DEFAULT_LLM_MODEL_NAME = "gpt-5.2"
 _DEFAULT_GREP_CONCURRENT_LIMIT = "5"
+_DEFAULT_GREP_KEYWORD_CONCURRENT_LIMIT = "2"
+_DEFAULT_GREP_FALLBACK_CONCURRENT_LIMIT = "2"
+_DEFAULT_GREP_TIMEOUT = "60.0"
+_DEFAULT_GREP_QUEUE_TIMEOUT = "10.0"
+_DEFAULT_GREP_FALLBACK_TIMEOUT = "15.0"
+_DEFAULT_GREP_PROCESS_KILL_TIMEOUT = "5.0"
+_DEFAULT_GREP_RGA_BACKOFF_SECONDS = "60.0"
 _DEFAULT_WORK_PATH = os.path.expanduser("~/.sirchmunk")
 
 # Keys that must have non-empty values in target .env to "load and reuse" when switching work path
@@ -142,6 +149,23 @@ class EnvironmentVariables(BaseModel):
     EMBEDDING_MODEL_ID: Optional[str] = None
     EMBEDDING_CACHE_DIR: Optional[str] = None
     GREP_CONCURRENT_LIMIT: Optional[int] = None
+    GREP_KEYWORD_CONCURRENT_LIMIT: Optional[int] = None
+    GREP_FALLBACK_CONCURRENT_LIMIT: Optional[int] = None
+    GREP_TIMEOUT: Optional[float] = None
+    GREP_QUEUE_TIMEOUT: Optional[float] = None
+    GREP_FALLBACK_TIMEOUT: Optional[float] = None
+    GREP_PROCESS_KILL_TIMEOUT: Optional[float] = None
+    GREP_RGA_BACKOFF_SECONDS: Optional[float] = None
+    GREP_FALLBACK_TO_RG: Optional[bool] = None
+    SIRCHMUNK_SCOPE_PLANNER_ENABLED: Optional[bool] = None
+    SIRCHMUNK_SCOPE_PLANNER_CONFIDENCE: Optional[float] = None
+    SIRCHMUNK_SCOPE_PLANNER_MAX_PATHS: Optional[int] = None
+    SIRCHMUNK_DIRECTORY_PROFILE_MAX_ENTRIES: Optional[int] = None
+    SIRCHMUNK_DIRECTORY_PROFILE_MAX_DEPTH: Optional[int] = None
+    SIRCHMUNK_FILE_LIST_PAGE_SIZE: Optional[int] = None
+    SIRCHMUNK_FILE_READ_MAX_CHARS: Optional[int] = None
+    SIRCHMUNK_FILE_READ_SMALL_FILE_CHARS: Optional[int] = None
+    SIRCHMUNK_FILE_READ_WINDOW_LINES: Optional[int] = None
     CHAT_HISTORY_MAX_TURNS: Optional[int] = None
     CHAT_HISTORY_MAX_TOKENS: Optional[int] = None
 
@@ -212,8 +236,110 @@ def get_current_env_variables() -> Dict[str, Any]:
         "GREP_CONCURRENT_LIMIT": {
             "value": os.getenv("GREP_CONCURRENT_LIMIT", _DEFAULT_GREP_CONCURRENT_LIMIT),
             "default": _DEFAULT_GREP_CONCURRENT_LIMIT,
-            "description": "Maximum concurrent grep requests",
-            "category": "system"
+            "description": "Maximum concurrent rga subprocesses",
+            "category": "search"
+        },
+        "GREP_KEYWORD_CONCURRENT_LIMIT": {
+            "value": os.getenv("GREP_KEYWORD_CONCURRENT_LIMIT", _DEFAULT_GREP_KEYWORD_CONCURRENT_LIMIT),
+            "default": _DEFAULT_GREP_KEYWORD_CONCURRENT_LIMIT,
+            "description": "Maximum concurrent keyword subprocesses per search",
+            "category": "search"
+        },
+        "GREP_FALLBACK_CONCURRENT_LIMIT": {
+            "value": os.getenv("GREP_FALLBACK_CONCURRENT_LIMIT", _DEFAULT_GREP_FALLBACK_CONCURRENT_LIMIT),
+            "default": _DEFAULT_GREP_FALLBACK_CONCURRENT_LIMIT,
+            "description": "Maximum concurrent native rg fallback subprocesses",
+            "category": "search"
+        },
+        "GREP_TIMEOUT": {
+            "value": os.getenv("GREP_TIMEOUT", _DEFAULT_GREP_TIMEOUT),
+            "default": _DEFAULT_GREP_TIMEOUT,
+            "description": "rga execution timeout in seconds",
+            "category": "search"
+        },
+        "GREP_QUEUE_TIMEOUT": {
+            "value": os.getenv("GREP_QUEUE_TIMEOUT", _DEFAULT_GREP_QUEUE_TIMEOUT),
+            "default": _DEFAULT_GREP_QUEUE_TIMEOUT,
+            "description": "Maximum time to wait for a search subprocess slot",
+            "category": "search"
+        },
+        "GREP_FALLBACK_TIMEOUT": {
+            "value": os.getenv("GREP_FALLBACK_TIMEOUT", _DEFAULT_GREP_FALLBACK_TIMEOUT),
+            "default": _DEFAULT_GREP_FALLBACK_TIMEOUT,
+            "description": "Native rg fallback timeout in seconds",
+            "category": "search"
+        },
+        "GREP_PROCESS_KILL_TIMEOUT": {
+            "value": os.getenv("GREP_PROCESS_KILL_TIMEOUT", _DEFAULT_GREP_PROCESS_KILL_TIMEOUT),
+            "default": _DEFAULT_GREP_PROCESS_KILL_TIMEOUT,
+            "description": "Maximum time to reap timed-out search subprocesses",
+            "category": "search"
+        },
+        "GREP_RGA_BACKOFF_SECONDS": {
+            "value": os.getenv("GREP_RGA_BACKOFF_SECONDS", _DEFAULT_GREP_RGA_BACKOFF_SECONDS),
+            "default": _DEFAULT_GREP_RGA_BACKOFF_SECONDS,
+            "description": "Time to skip rga after an execution timeout",
+            "category": "search"
+        },
+        "GREP_FALLBACK_TO_RG": {
+            "value": os.getenv("GREP_FALLBACK_TO_RG", "true"),
+            "default": "true",
+            "description": "Fall back to native rg when rga is unavailable or times out",
+            "category": "search"
+        },
+        "SIRCHMUNK_SCOPE_PLANNER_ENABLED": {
+            "value": os.getenv("SIRCHMUNK_SCOPE_PLANNER_ENABLED", "true"),
+            "default": "true",
+            "description": "Enable deterministic directory profiling and conservative scope narrowing",
+            "category": "search"
+        },
+        "SIRCHMUNK_SCOPE_PLANNER_CONFIDENCE": {
+            "value": os.getenv("SIRCHMUNK_SCOPE_PLANNER_CONFIDENCE", "0.75"),
+            "default": "0.75",
+            "description": "Minimum confidence required to narrow search roots",
+            "category": "search"
+        },
+        "SIRCHMUNK_SCOPE_PLANNER_MAX_PATHS": {
+            "value": os.getenv("SIRCHMUNK_SCOPE_PLANNER_MAX_PATHS", "4"),
+            "default": "4",
+            "description": "Maximum high-confidence paths selected by the scope planner",
+            "category": "search"
+        },
+        "SIRCHMUNK_DIRECTORY_PROFILE_MAX_ENTRIES": {
+            "value": os.getenv("SIRCHMUNK_DIRECTORY_PROFILE_MAX_ENTRIES", "100000"),
+            "default": "100000",
+            "description": "Maximum metadata entries collected during directory profiling",
+            "category": "search"
+        },
+        "SIRCHMUNK_DIRECTORY_PROFILE_MAX_DEPTH": {
+            "value": os.getenv("SIRCHMUNK_DIRECTORY_PROFILE_MAX_DEPTH", "8"),
+            "default": "8",
+            "description": "Maximum directory depth used for lightweight profiling",
+            "category": "search"
+        },
+        "SIRCHMUNK_FILE_LIST_PAGE_SIZE": {
+            "value": os.getenv("SIRCHMUNK_FILE_LIST_PAGE_SIZE", "100"),
+            "default": "100",
+            "description": "Default page size for the file_list built-in tool",
+            "category": "search"
+        },
+        "SIRCHMUNK_FILE_READ_MAX_CHARS": {
+            "value": os.getenv("SIRCHMUNK_FILE_READ_MAX_CHARS", "60000"),
+            "default": "60000",
+            "description": "Maximum characters returned by file_read",
+            "category": "search"
+        },
+        "SIRCHMUNK_FILE_READ_SMALL_FILE_CHARS": {
+            "value": os.getenv("SIRCHMUNK_FILE_READ_SMALL_FILE_CHARS", "30000"),
+            "default": "30000",
+            "description": "Files at or below this size can be read fully by file_read auto mode",
+            "category": "search"
+        },
+        "SIRCHMUNK_FILE_READ_WINDOW_LINES": {
+            "value": os.getenv("SIRCHMUNK_FILE_READ_WINDOW_LINES", "80"),
+            "default": "80",
+            "description": "Default context window for file_read window mode",
+            "category": "search"
         },
         "CHAT_HISTORY_MAX_TURNS": {
             "value": os.getenv("CHAT_HISTORY_MAX_TURNS", "10"),

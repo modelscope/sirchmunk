@@ -29,6 +29,34 @@ async def fast_extract(file_path: Union[str, Path]) -> ExtractionOutput:
     return await DocumentExtractor.extract(file_path)
 
 
+def looks_like_plain_text_file(
+    file_path: Union[str, Path],
+    *,
+    sample_bytes: int = 4096,
+) -> bool:
+    """Return whether a file sample is likely UTF-8-compatible plain text."""
+    path = Path(file_path)
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(max(1, sample_bytes))
+    except OSError:
+        return False
+    if not raw:
+        return True
+    if b"\x00" in raw:
+        return False
+    decoded = raw.decode("utf-8", errors="replace")
+    if not decoded:
+        return False
+    replacement_count = decoded.count("\ufffd")
+    if replacement_count > max(1, len(decoded) // 100):
+        return False
+    textish_count = sum(
+        1 for char in decoded if char.isprintable() or char in "\r\n\t"
+    )
+    return textish_count / max(len(decoded), 1) >= 0.85
+
+
 def get_fast_hash(file_path: Union[str, Path], sample_size: int = 8192):
     """
     Computes a partial hash (fingerprint) by combining:

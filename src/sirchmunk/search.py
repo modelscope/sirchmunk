@@ -51,7 +51,12 @@ from sirchmunk.schema.knowledge import (
 )
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
-from sirchmunk.utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH, GREP_TIMEOUT
+from sirchmunk.utils.constants import (
+    DEFAULT_SIRCHMUNK_WORK_PATH,
+    FILE_READ_MAX_CHARS,
+    GREP_TIMEOUT,
+    SCOPE_PLANNER_ENABLED,
+)
 from sirchmunk.utils.embedding_util import EmbeddingUtil
 from sirchmunk.utils.deps import check_dependencies
 from sirchmunk.utils import create_logger, LogCallback
@@ -1835,7 +1840,7 @@ class AgenticSearch(BaseSearch):
     def _ensure_tool_registry(
         self,
         paths: List[str],
-        enable_dir_scan: bool = False,
+        enable_dir_scan: bool = True,
         max_depth: Optional[int] = 5,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
@@ -1855,6 +1860,7 @@ class AgenticSearch(BaseSearch):
         Returns:
             Ready-to-use ToolRegistry.
         """
+        from sirchmunk.agentic.file_system_tools import FileListTool
         from sirchmunk.agentic.tools import (
             FileReadTool,
             KeywordSearchTool,
@@ -1869,6 +1875,7 @@ class AgenticSearch(BaseSearch):
             max_depth,
             tuple(include) if include else None,
             tuple(exclude) if exclude else None,
+            bool(enable_dir_scan),
         )
         if (
                 self._tool_registry is not None
@@ -1894,7 +1901,12 @@ class AgenticSearch(BaseSearch):
         )
 
         # Tool 3: File read (medium cost)
-        registry.register(FileReadTool(max_chars_per_file=30000))
+        registry.register(
+            FileReadTool(max_chars_per_file=FILE_READ_MAX_CHARS, allowed_roots=paths)
+        )
+
+        # Tool 3.5: deterministic file listing / directory profile (zero LLM).
+        registry.register(FileListTool(paths))
 
         # Tool 4: Directory scan (optional, medium cost)
         if enable_dir_scan:
@@ -2066,6 +2078,40 @@ class AgenticSearch(BaseSearch):
             return context.answer
         return render_search_response(context)
 
+    async def _plan_search_scope(
+        self,
+        query: str,
+        paths: List[str],
+        *,
+        max_depth: Optional[int] = None,
+    ) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+        """Conservatively narrow directory roots using filesystem metadata only."""
+        if not SCOPE_PLANNER_ENABLED or not self._has_directory_paths(paths):
+            return paths, None
+        try:
+            from sirchmunk.agentic.scope_planner import ScopePlanner
+
+            planner = ScopePlanner(paths)
+            plan = await asyncio.to_thread(
+                planner.plan,
+                query,
+                max_depth=max_depth if max_depth is not None else 4,
+            )
+            payload = plan.to_dict()
+            if plan.narrowed:
+                await self._logger.info(
+                    f"[ScopePlanner] Narrowed {len(paths)} root(s) to "
+                    f"{len(plan.effective_paths)} path(s), confidence={plan.confidence:.2f}"
+                )
+                return list(plan.effective_paths), payload
+            await self._logger.info(
+                f"[ScopePlanner] Preserved original scope, confidence={plan.confidence:.2f}"
+            )
+            return paths, payload
+        except Exception as exc:
+            await self._logger.warning(f"[ScopePlanner] Scope planning failed: {exc}")
+            return paths, None
+
     # ------------------------------------------------------------------
     # Unified search entry point
     # ------------------------------------------------------------------
@@ -2080,7 +2126,7 @@ class AgenticSearch(BaseSearch):
         max_token_budget: int = 128000,
         max_depth: Optional[int] = 5,
         top_k_files: int = 5,
-        enable_dir_scan: bool = False,
+        enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         return_context: Optional[bool] = None,
@@ -2224,6 +2270,11 @@ class AgenticSearch(BaseSearch):
             await self._logger.success(f"Retrieved {len(results)} matching files")
             return results
 
+        # ---- Scope planning: metadata-only, conservative narrowing ----
+        paths, scope_plan = await self._plan_search_scope(
+            query, paths, max_depth=max_depth
+        )
+
         # ---- FAST / DEEP → both produce (answer, cluster, context) ----
         if mode == "FAST":
             answer, cluster, context = await self._search_fast(
@@ -2231,6 +2282,7 @@ class AgenticSearch(BaseSearch):
                 top_k_files=top_k_files, enable_dir_scan=enable_dir_scan,
                 include=include, exclude=exclude,
                 llm_fallback=llm_fallback,
+                scope_plan=scope_plan,
             )
         else:
             answer, cluster, context = await self._search_deep(
@@ -2241,6 +2293,7 @@ class AgenticSearch(BaseSearch):
                 include=include, exclude=exclude,
                 spec_stale_hours=spec_stale_hours,
                 llm_fallback=llm_fallback,
+                scope_plan=scope_plan,
             )
 
         # ---- Knowledge evolution ----
@@ -2301,11 +2354,12 @@ class AgenticSearch(BaseSearch):
         max_token_budget: int = 128000,
         max_depth: Optional[int] = 5,
         top_k_files: int = 5,
-        enable_dir_scan: bool = False,
+        enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         spec_stale_hours: float = 72.0,
         llm_fallback: bool = False,
+        scope_plan: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Parallel multi-path retrieval pipeline (Phases 0a–5).
 
@@ -2326,6 +2380,14 @@ class AgenticSearch(BaseSearch):
         # Reset per-search format-agnostic retrieval state.
         self._snippet_article_map = {}
         self._jsonlines_cache = {}
+        if scope_plan:
+            self._record_context_telemetry(
+                context,
+                scope_plan=scope_plan,
+                scope_planner_used=True,
+                scope_planner_narrowed=scope_plan.get("narrowed"),
+                scope_planner_tools=scope_plan.get("recommended_tools"),
+            )
         _llm_usage_start = len(self.llm_usages)
 
         # --- Adaptive compile artifact detection (shared with FAST) ---
@@ -3197,10 +3259,11 @@ class AgenticSearch(BaseSearch):
         *,
         max_depth: Optional[int] = 5,
         top_k_files: int = 3,
-        enable_dir_scan: bool = False,
+        enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         llm_fallback: bool = False,
+        scope_plan: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Greedy search: 2-3 LLM calls, single best file, focused evidence.
 
@@ -3215,6 +3278,14 @@ class AgenticSearch(BaseSearch):
             so the caller can handle both modes uniformly.
         """
         context = SearchContext()
+        if scope_plan:
+            self._record_context_telemetry(
+                context,
+                scope_plan=scope_plan,
+                scope_planner_used=True,
+                scope_planner_narrowed=scope_plan.get("narrowed"),
+                scope_planner_tools=scope_plan.get("recommended_tools"),
+            )
         await self._logger.info(f"[FAST] Starting greedy search for: '{query[:80]}'")
 
         # Reset per-session tree navigation cache
@@ -7501,7 +7572,7 @@ class AgenticSearch(BaseSearch):
         paths: List[str],
         scan_result,
         *,
-        enable_dir_scan: bool = False,
+        enable_dir_scan: bool = True,
         max_depth: Optional[int] = 5,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
@@ -10560,6 +10631,7 @@ class AgenticSearch(BaseSearch):
 
         Returns ``(answer, should_save)``.
         """
+        from sirchmunk.agentic.file_system_tools import FileListTool
         from sirchmunk.agentic.react_agent import ReActSearchAgent
         from sirchmunk.agentic.tools import (
             FileReadTool,
@@ -10587,7 +10659,8 @@ class AgenticSearch(BaseSearch):
             paths=paths,
             max_results=20,
         ))
-        registry.register(FileReadTool(max_chars_per_file=30_000))
+        registry.register(FileReadTool(max_chars_per_file=FILE_READ_MAX_CHARS, allowed_roots=paths))
+        registry.register(FileListTool(paths))
 
         preloaded = await self._build_prior_observations(
             query, target_files[:effective_max_files], match_snippets, context, data_reqs=data_reqs,

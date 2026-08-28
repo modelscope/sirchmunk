@@ -8,6 +8,7 @@ file reading and knowledge base querying.  All tools are stateless;
 side-effects (token accounting, dedup) are recorded via SearchContext.
 """
 import logging
+import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -15,30 +16,16 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
-from sirchmunk.utils.constants import GREP_KEYWORD_CONCURRENT_LIMIT, GREP_TIMEOUT
-from sirchmunk.utils.file_utils import fast_extract
+from sirchmunk.utils.constants import (
+    FILE_READ_MAX_CHARS,
+    FILE_READ_SMALL_FILE_CHARS,
+    FILE_READ_WINDOW_LINES,
+    GREP_KEYWORD_CONCURRENT_LIMIT,
+    GREP_TIMEOUT,
+)
+from sirchmunk.utils.file_utils import fast_extract, looks_like_plain_text_file
 
 logger = logging.getLogger(__name__)
-
-
-def _looks_like_plain_text_file(path: Path, *, sample_bytes: int = 4096) -> bool:
-    """Return True for extensionless/raw files that are likely UTF-8 text."""
-    try:
-        raw = path.read_bytes()[:sample_bytes]
-    except OSError:
-        return False
-    if not raw:
-        return True
-    if b"\x00" in raw:
-        return False
-    decoded = raw.decode("utf-8", errors="replace")
-    if not decoded:
-        return False
-    replacement_count = decoded.count("\ufffd")
-    if replacement_count > max(1, len(decoded) // 100):
-        return False
-    textish_count = sum(1 for ch in decoded if ch.isprintable() or ch in "\r\n\t")
-    return textish_count / max(len(decoded), 1) >= 0.85
 
 
 # ---------------------------------------------------------------------------
@@ -479,14 +466,28 @@ class KeywordSearchTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 class FileReadTool(BaseTool):
-    """Read full content of specified files.
+    """Read approved files using adaptive full, window, range, or section modes."""
 
-    Supports all formats via kreuzberg extraction (PDF, DOCX, XLSX, etc.).
-    Tracks read files in SearchContext to prevent redundant reads.
-    """
+    _TEXT_EXTENSIONS = {
+        ".txt", ".md", ".py", ".js", ".ts", ".json", ".yaml",
+        ".yml", ".xml", ".csv", ".log", ".rst", ".html", ".css",
+        ".sh", ".bash", ".toml", ".cfg", ".ini", ".conf",
+    }
 
-    def __init__(self, max_chars_per_file: int = 30000) -> None:
-        self._max_chars = max_chars_per_file
+    def __init__(
+        self,
+        max_chars_per_file: int = FILE_READ_MAX_CHARS,
+        *,
+        allowed_roots: Optional[List[Union[str, Path]]] = None,
+        small_file_chars: int = FILE_READ_SMALL_FILE_CHARS,
+        default_window_lines: int = FILE_READ_WINDOW_LINES,
+    ) -> None:
+        self._max_chars = max(1000, max_chars_per_file)
+        self._small_file_chars = max(1000, small_file_chars)
+        self._default_window_lines = max(1, default_window_lines)
+        self._allowed_roots = [
+            Path(root).expanduser().resolve() for root in (allowed_roots or [])
+        ]
 
     @property
     def name(self) -> str:
@@ -496,9 +497,10 @@ class FileReadTool(BaseTool):
         return {
             "name": self.name,
             "description": (
-                "Read the full content of one or more files. Supports PDF, "
-                "DOCX, XLSX, TXT, MD, and other formats. Use this after "
-                "keyword_search identifies promising files. Higher token cost."
+                "Read approved files with adaptive evidence extraction. Use auto for "
+                "normal operation, full for small files or summaries, window around "
+                "query terms, range for known line/character bounds, and section for "
+                "a named Markdown/text section."
             ),
             "parameters": {
                 "type": "object",
@@ -506,78 +508,268 @@ class FileReadTool(BaseTool):
                     "file_paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Absolute paths of files to read.",
+                        "description": "Paths inside the configured search roots.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "full", "window", "range", "section"],
+                        "default": "auto",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Terms used to select the best context window.",
+                    },
+                    "section": {
+                        "type": "string",
+                        "description": "Section heading to extract in section mode.",
+                    },
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1},
+                    "start_char": {"type": "integer", "minimum": 0},
+                    "end_char": {"type": "integer", "minimum": 0},
+                    "context_lines": {
+                        "type": "integer",
+                        "default": self._default_window_lines,
+                        "minimum": 1,
+                        "maximum": 500,
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "default": self._max_chars,
+                        "minimum": 1000,
                     },
                 },
                 "required": ["file_paths"],
             },
         }
 
+    def _resolve_path(self, value: Union[str, Path]) -> Path:
+        raw = Path(value).expanduser()
+        candidates = [raw] if raw.is_absolute() else [
+            root / raw for root in self._allowed_roots
+        ]
+        if not candidates and not raw.is_absolute():
+            candidates = [raw]
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if not resolved.is_file():
+                continue
+            if not self._allowed_roots or any(
+                resolved == root or root in resolved.parents
+                for root in self._allowed_roots
+            ):
+                return resolved
+        raise ValueError("file path must exist within the configured search roots")
+
+    @classmethod
+    def _is_text_file(cls, path: Path) -> bool:
+        return path.suffix.lower() in cls._TEXT_EXTENSIONS or looks_like_plain_text_file(path)
+
+    async def _extract_content(self, path: Path) -> str:
+        if self._is_text_file(path):
+            return path.read_text(encoding="utf-8", errors="replace")
+        extraction = await fast_extract(path)
+        return extraction.content if extraction else ""
+
+    @staticmethod
+    def _line_range(content: str, start_line: int, end_line: int) -> str:
+        lines = content.splitlines()
+        start = max(1, start_line)
+        end = max(start, end_line)
+        return "\n".join(
+            f"L{index}: {lines[index - 1]}"
+            for index in range(start, min(end, len(lines)) + 1)
+        )
+
+    @staticmethod
+    def _query_window(content: str, query: str, context_lines: int) -> str:
+        lines = content.splitlines()
+        terms = {
+            token.lower()
+            for token in re.findall(r"[a-z0-9\u4e00-\u9fff]+", query or "")
+            if len(token) > 1
+        }
+        if not lines or not terms:
+            return "\n".join(lines[:context_lines])
+        scores = [
+            sum(term in line.lower() for term in terms)
+            for line in lines
+        ]
+        best = max(range(len(scores)), key=scores.__getitem__)
+        if scores[best] == 0:
+            return "\n".join(lines[:context_lines])
+        half = max(1, context_lines // 2)
+        start = max(0, best - half)
+        end = min(len(lines), start + context_lines)
+        return "\n".join(
+            f"L{index + 1}: {lines[index]}" for index in range(start, end)
+        )
+
+    @staticmethod
+    def _section(content: str, section: str) -> str:
+        if not section.strip():
+            return ""
+        lines = content.splitlines()
+        target = section.strip().lower()
+        start: Optional[int] = None
+        heading_level = 0
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            heading = stripped.lstrip("#").strip()
+            if target in heading.lower():
+                start = index
+                heading_level = len(stripped) - len(stripped.lstrip("#"))
+                break
+        if start is None:
+            return ""
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            stripped = lines[index].strip()
+            level = len(stripped) - len(stripped.lstrip("#"))
+            if heading_level and level and level <= heading_level:
+                end = index
+                break
+        return "\n".join(lines[start:end])
+
+    def _select_content(
+        self,
+        content: str,
+        *,
+        mode: str,
+        query: str,
+        section: str,
+        start_line: Optional[int],
+        end_line: Optional[int],
+        start_char: Optional[int],
+        end_char: Optional[int],
+        context_lines: int,
+        max_chars: int,
+    ) -> Tuple[str, str, bool]:
+        effective_mode = mode
+        if mode == "auto":
+            if section:
+                effective_mode = "section"
+            elif len(content) <= self._small_file_chars:
+                effective_mode = "full"
+            elif query:
+                effective_mode = "window"
+            else:
+                effective_mode = "range"
+
+        if effective_mode == "section":
+            selected = self._section(content, section)
+            if not selected:
+                selected = self._query_window(content, query or section, context_lines)
+                effective_mode = "window"
+        elif effective_mode == "window":
+            selected = self._query_window(content, query, context_lines)
+        elif effective_mode == "range":
+            if start_line is not None or end_line is not None:
+                selected = self._line_range(
+                    content,
+                    start_line or 1,
+                    end_line or (start_line or 1) + context_lines - 1,
+                )
+            else:
+                start = max(0, start_char or 0)
+                end = max(start, end_char or start + max_chars)
+                selected = content[start:end]
+        else:
+            selected = content
+            effective_mode = "full"
+
+        truncated = len(selected) > max_chars
+        if truncated:
+            selected = selected[:max_chars] + "\n... [truncated]"
+        return selected, effective_mode, truncated
+
     async def execute(
         self,
         context: SearchContext,
         **kwargs,
     ) -> Tuple[str, Dict[str, Any]]:
-        file_paths: List[str] = kwargs.get("file_paths", [])
+        raw_paths = kwargs.get("file_paths", [])
+        file_paths: List[str]
+        if isinstance(raw_paths, (str, Path)):
+            file_paths = [str(raw_paths)]
+        else:
+            file_paths = [str(item) for item in (raw_paths or [])]
         if not file_paths:
             return "No file paths provided.", {}
+        mode = str(kwargs.get("mode", "auto") or "auto").lower()
+        if mode not in {"auto", "full", "window", "range", "section"}:
+            return "Invalid read mode.", {"error": "invalid_mode"}
+        max_chars = min(
+            self._max_chars,
+            max(1000, int(kwargs.get("max_chars", self._max_chars))),
+        )
+        start_line = (
+            int(kwargs["start_line"]) if kwargs.get("start_line") is not None else None
+        )
+        end_line = (
+            int(kwargs["end_line"]) if kwargs.get("end_line") is not None else None
+        )
+        start_char = (
+            int(kwargs["start_char"]) if kwargs.get("start_char") is not None else None
+        )
+        end_char = (
+            int(kwargs["end_char"]) if kwargs.get("end_char") is not None else None
+        )
+        context_lines = min(
+            500,
+            max(1, int(kwargs.get("context_lines", self._default_window_lines))),
+        )
 
         outputs: List[str] = []
         files_read: List[str] = []
+        read_modes: Dict[str, str] = {}
         total_chars = 0
 
-        for fp in file_paths:
-            fp_str = str(fp)
-
-            # Dedup: skip already-read files
-            if context.is_file_read(fp_str):
-                outputs.append(f"[{fp_str}] (already read, skipped)")
-                continue
-
-            # Budget check
+        for value in file_paths:
             if context.is_budget_exceeded():
-                outputs.append(f"[{fp_str}] (skipped — token budget exceeded)")
+                outputs.append(f"[{value}] (skipped — token budget exceeded)")
                 break
-
             try:
-                path = Path(fp_str)
-                if not path.exists():
-                    outputs.append(f"[{fp_str}] File not found.")
-                    continue
-
-                # Text-like files: read directly; others: use kreuzberg
-                text_extensions = {
-                    ".txt", ".md", ".py", ".js", ".ts", ".json", ".yaml",
-                    ".yml", ".xml", ".csv", ".log", ".rst", ".html", ".css",
-                    ".sh", ".bash", ".toml", ".cfg", ".ini", ".conf",
-                }
-                if path.suffix.lower() in text_extensions or _looks_like_plain_text_file(path):
-                    content = path.read_text(encoding="utf-8", errors="replace")
-                else:
-                    extraction = await fast_extract(path)
-                    content = extraction.content if extraction else ""
-
-                # Truncate if needed
-                if len(content) > self._max_chars:
-                    content = content[: self._max_chars] + "\n... [truncated]"
-
-                outputs.append(f"[{fp_str}]\n{content}")
-                total_chars += len(content)
-                context.mark_file_read(fp_str)
-                files_read.append(fp_str)
-
+                path = self._resolve_path(value)
+                content = await self._extract_content(path)
+                selected, effective_mode, truncated = self._select_content(
+                    content,
+                    mode=mode,
+                    query=str(kwargs.get("query", "") or ""),
+                    section=str(kwargs.get("section", "") or ""),
+                    start_line=start_line,
+                    end_line=end_line,
+                    start_char=start_char,
+                    end_char=end_char,
+                    context_lines=context_lines,
+                    max_chars=max_chars,
+                )
+                outputs.append(f"[{path}] mode={effective_mode}\n{selected}")
+                total_chars += len(selected)
+                files_read.append(str(path))
+                read_modes[str(path)] = effective_mode
+                if effective_mode == "full" and not truncated:
+                    context.mark_file_read(str(path))
             except Exception as exc:
-                outputs.append(f"[{fp_str}] Read error: {exc}")
+                outputs.append(f"[{value}] Read error: {exc}")
 
-        result_text = "\n\n---\n\n".join(outputs)
         approx_tokens = total_chars // 4
         context.add_log(
             tool_name=self.name,
             tokens=approx_tokens,
-            metadata={"files_read": files_read, "files_requested": file_paths},
+            metadata={
+                "files_read": files_read,
+                "files_requested": file_paths,
+                "read_modes": read_modes,
+                "chars_read": total_chars,
+            },
         )
-
-        return result_text, {"files_read": files_read, "tokens": approx_tokens}
+        return "\n\n---\n\n".join(outputs), {
+            "files_read": files_read,
+            "read_modes": read_modes,
+            "chars_read": total_chars,
+            "tokens": approx_tokens,
+        }
 
 
 # ---------------------------------------------------------------------------

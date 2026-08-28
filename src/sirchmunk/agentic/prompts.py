@@ -26,10 +26,12 @@ Example:
 ```
 
 ## Strategy
-1. **keyword_search first**: Use targeted keywords to locate relevant files. Start with the most specific terms from the query.
-2. **file_read second**: Read the most promising files identified by keyword_search to extract detailed evidence.
-3. **knowledge_query**: Check the knowledge cache if you suspect previously-searched topics.
-4. **dir_scan** (if available): Scan directories to discover document candidates when keyword_search returns no results.
+1. **file_list first for unfamiliar directories**: When the search root is broad or you do not know what files exist, call `file_list` with `view="profile"` or `view="tree"` before guessing paths.
+2. **keyword_search for fact location**: Use targeted keywords to locate relevant files or passages. Start with the most specific entities from the query.
+3. **file_read for richer evidence**: Once a promising file is known, use `file_read` with `mode="auto"`, `mode="window"`, `mode="range"`, or `mode="section"` to collect enough surrounding context.
+4. **tree_navigate when available**: Prefer `tree_navigate` for long structured documents with compiled tree indexes.
+5. **knowledge_query**: Check the knowledge cache if you suspect previously-searched topics.
+6. **dir_scan** (if available): Use it for LLM-ranked document discovery after the directory profile indicates many plausible candidates.
 
 ## Rules
 - Think step-by-step before each tool call.

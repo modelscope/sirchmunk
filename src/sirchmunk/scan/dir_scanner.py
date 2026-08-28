@@ -9,11 +9,11 @@ ranks the most promising document candidates for a given query.
 This is a *zero-index* approach — no pre-built vector indices required.
 """
 import asyncio
-import random
 import json
 import logging
 import mimetypes
 import os
+import re
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -28,7 +28,8 @@ except ImportError:
     _pypdf = None  # type: ignore[assignment]
 
 from sirchmunk.llm.openai_chat import OpenAIChat
-from sirchmunk.utils.file_utils import fast_extract
+from sirchmunk.utils.constants import DIRECTORY_PROFILE_MAX_ENTRIES
+from sirchmunk.utils.file_utils import looks_like_plain_text_file
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,7 @@ class ScanResult:
     total_dirs: int = 0
     scan_duration_ms: float = 0.0
     rank_duration_ms: float = 0.0
+    discovery_truncated: bool = False
 
     @property
     def high_relevance(self) -> List[FileCandidate]:
@@ -264,6 +266,7 @@ class DirectoryScanner:
         exclude_patterns: Optional[List[str]] = None,
         max_file_size_bytes: Optional[int] = None,
         oversized_pdf_timeout_s: float = 1.0,
+        max_discovered_files: int = DIRECTORY_PROFILE_MAX_ENTRIES,
     ) -> None:
         self.llm = llm
         self.max_depth = max_depth
@@ -275,6 +278,7 @@ class DirectoryScanner:
         self.exclude_patterns.update(self.DEFAULT_EXCLUDE)
         self.max_file_size_bytes = max_file_size_bytes
         self.oversized_pdf_timeout_s = oversized_pdf_timeout_s
+        self.max_discovered_files = max(self.max_files, max_discovered_files)
 
     # ---- Public API ----
 
@@ -365,7 +369,9 @@ class DirectoryScanner:
         t_start = datetime.now()
 
         if len(scan_result.candidates) > top_k:
-            candidates_to_rank = random.sample(scan_result.candidates, top_k)
+            candidates_to_rank = self._deterministic_prefilter(
+                query, scan_result.candidates, top_k
+            )
         else:
             candidates_to_rank = scan_result.candidates
 
@@ -416,6 +422,41 @@ class DirectoryScanner:
 
     # ---- Filesystem walking ----
 
+    @staticmethod
+    def _deterministic_prefilter(
+        query: str,
+        candidates: List[FileCandidate],
+        limit: int,
+    ) -> List[FileCandidate]:
+        """Select candidates deterministically using metadata overlap."""
+        query_tokens = set(re.findall(r"[a-z0-9\u4e00-\u9fff]+", query.lower()))
+
+        def score(candidate: FileCandidate) -> Tuple[float, int, str]:
+            text = " ".join(
+                [
+                    candidate.path,
+                    candidate.filename,
+                    candidate.title,
+                    " ".join(candidate.keywords),
+                ]
+            ).lower()
+            candidate_tokens = set(
+                re.findall(r"[a-z0-9\u4e00-\u9fff]+", text)
+            )
+            overlap = len(query_tokens & candidate_tokens)
+            phrase_bonus = 2.0 if query.lower() in text else 0.0
+            return (-(overlap + phrase_bonus), candidate.size_bytes, candidate.path)
+
+        return sorted(candidates, key=score)[: max(1, limit)]
+
+    def _is_scannable_file(self, path: Path) -> bool:
+        extension = path.suffix.lower()
+        return extension in _SCANNABLE_EXTENSIONS or (
+            not extension and looks_like_plain_text_file(path)
+        )
+
+    # ---- Filesystem walking ----
+
     def _walk(
         self,
         root: Path,
@@ -424,9 +465,10 @@ class DirectoryScanner:
         depth: int,
     ) -> None:
         """Recursive directory walk with depth limiting and exclusion."""
-        if depth > self.max_depth:
+        if depth > self.max_depth or result.discovery_truncated:
             return
-        if len(out) >= self.max_files:
+        if len(out) >= self.max_discovered_files:
+            result.discovery_truncated = True
             return
 
         result.total_dirs += 1
@@ -438,7 +480,8 @@ class DirectoryScanner:
             return
 
         for entry in entries:
-            if len(out) >= self.max_files:
+            if len(out) >= self.max_discovered_files:
+                result.discovery_truncated = True
                 return
 
             name = entry.name
@@ -454,10 +497,8 @@ class DirectoryScanner:
 
             if entry.is_dir():
                 self._walk(entry, out, result, depth + 1)
-            elif entry.is_file():
-                ext = entry.suffix.lower()
-                if ext in _SCANNABLE_EXTENSIONS:
-                    out.append(entry)
+            elif entry.is_file() and self._is_scannable_file(entry):
+                out.append(entry)
 
     @staticmethod
     def _stratified_sample(files: List[Path], budget: int) -> List[Path]:
@@ -526,9 +567,14 @@ class DirectoryScanner:
             size_bytes=stat.st_size,
             modified_at=datetime.fromtimestamp(stat.st_mtime).isoformat(),
             created_at=datetime.fromtimestamp(stat.st_ctime).isoformat(),
-            mime_type=_MIME_MAP.get(
-                ext,
-                mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+            mime_type=(
+                "text/plain"
+                if not ext and looks_like_plain_text_file(file_path)
+                else _MIME_MAP.get(
+                    ext,
+                    mimetypes.guess_type(str(file_path))[0]
+                    or "application/octet-stream",
+                )
             ),
         )
 
@@ -538,7 +584,9 @@ class DirectoryScanner:
                 self._extract_pdf_metadata(file_path, candidate)
             elif ext in (".docx", ".pptx", ".xlsx"):
                 self._extract_office_metadata(file_path, candidate)
-            elif ext in _TEXT_EXTENSIONS:
+            elif ext in _TEXT_EXTENSIONS or (
+                not ext and looks_like_plain_text_file(file_path)
+            ):
                 self._extract_text_metadata(file_path, candidate)
         except Exception as exc:
             logger.debug(f"[DirScanner] Content extraction failed for {file_path}: {exc}")
@@ -570,15 +618,22 @@ class DirectoryScanner:
             size_bytes=stat.st_size,
             modified_at=datetime.fromtimestamp(stat.st_mtime).isoformat(),
             created_at=datetime.fromtimestamp(stat.st_ctime).isoformat(),
-            mime_type=_MIME_MAP.get(
-                ext,
-                mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+            mime_type=(
+                "text/plain"
+                if not ext and looks_like_plain_text_file(file_path)
+                else _MIME_MAP.get(
+                    ext,
+                    mimetypes.guess_type(str(file_path))[0]
+                    or "application/octet-stream",
+                )
             ),
         )
 
         if ext == ".pdf":
             self._extract_pdf_first_page(file_path, candidate, timeout_s=self.oversized_pdf_timeout_s)
-        elif ext in _TEXT_EXTENSIONS:
+        elif ext in _TEXT_EXTENSIONS or (
+            not ext and looks_like_plain_text_file(file_path)
+        ):
             self._extract_text_head(file_path, candidate)
 
         logger.debug(
