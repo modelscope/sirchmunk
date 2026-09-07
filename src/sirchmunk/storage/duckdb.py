@@ -119,19 +119,17 @@ class DuckDBManager:
         logger.info(
             f"Stale WAL detected at {wal_file}, checkpointing before load"
         )
+        tmp_conn = None
         try:
             tmp_conn = duckdb.connect(db_file)
             tmp_conn.execute("CHECKPOINT")
-            tmp_conn.close()
             logger.info(f"WAL checkpoint completed for {db_file}")
         except Exception as e:
-            logger.warning(f"WAL checkpoint failed for {db_file}: {e}")
-            # Last resort: remove the stale WAL so READ_ONLY ATTACH can proceed
-            try:
-                wal_file.unlink()
-                logger.info(f"Removed stale WAL file {wal_file}")
-            except Exception:
-                pass
+            logger.error(f"WAL checkpoint failed for {db_file}: {e}")
+            raise
+        finally:
+            if tmp_conn is not None:
+                tmp_conn.close()
 
     @staticmethod
     def _cleanup_wal(db_file: str):
