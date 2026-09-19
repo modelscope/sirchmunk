@@ -306,6 +306,25 @@ llm = OpenAIChat(
 
 </details>
 
+<details>
+<summary><b>Using with OrcaRouter</b></summary>
+
+[OrcaRouter](https://www.orcarouter.ai) is an OpenAI-compatible router exposing
+200+ models behind a single API key. Model ids use the router's own
+`provider/model` format, e.g. `openai/gpt-4o`:
+
+```python
+from sirchmunk.llm import OpenAIChat
+
+llm = OpenAIChat(
+    api_key="sk-orca-...",
+    base_url="https://api.orcarouter.ai/v1",
+    model="openai/gpt-4o"          # or "openai/gpt-4o-mini" / "deepseek/deepseek-v4-flash"
+)
+```
+
+</details>
+
 
 ### Command Line Interface
 
@@ -1099,6 +1118,7 @@ Sirchmunk takes an **indexless approach**:
 Any OpenAI-compatible API endpoint, including (but not limited to):
 - OpenAI (GPT-5.2, ...)
 - [MiniMax](https://platform.minimax.io) (MiniMax-M3, MiniMax-M2.7, MiniMax-M2.7-highspeed)
+- [OrcaRouter](https://www.orcarouter.ai) (openai/gpt-4o, openai/gpt-4o-mini, deepseek/deepseek-v4-flash, ...)
 - DeepSeek, Moonshot, Mistral, Groq, Together AI, Cohere
 - Google Gemini, Zhipu (GLM), Baichuan, Yi, SiliconFlow, Volcengine
 - Azure OpenAI
@@ -1113,6 +1133,15 @@ LLM_MODEL_NAME=MiniMax-M3
 ```
 
 For more details, see [MiniMax OpenAI-Compatible API](https://platform.minimax.io/docs/api-reference/text-openai-api).
+
+To use OrcaRouter, configure:
+```bash
+LLM_BASE_URL=https://api.orcarouter.ai/v1
+LLM_API_KEY=your-orcarouter-api-key
+LLM_MODEL_NAME=openai/gpt-4o
+```
+
+OrcaRouter exposes 200+ models (OpenAI, Anthropic, Google, DeepSeek, ...) behind a single API key; model ids use the router's own `provider/model` format (e.g. `openai/gpt-4o`, `deepseek/deepseek-v4-flash`).
 
 </details>
 

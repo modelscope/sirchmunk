@@ -94,6 +94,7 @@ _PROVIDERS: Dict[str, _ProviderProfile] = {
     "groq":        _ProviderProfile("groq"),
     "cohere":      _ProviderProfile("cohere"),
     "minimax":     _ProviderProfile("minimax"),
+    "orcarouter":  _ProviderProfile("orcarouter"),
 }
 
 # URL substring → provider name.  More specific patterns must precede less
@@ -116,6 +117,7 @@ _URL_PATTERNS = [
     ("cohere",            "cohere"),
     ("baichuan-ai.com",   "baichuan"),
     ("minimax",           "minimax"),
+    ("orcarouter.ai",     "orcarouter"),
 ]
 
 _DEFAULT_PROFILE = _ProviderProfile("generic")
