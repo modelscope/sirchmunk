@@ -7,6 +7,7 @@ from sirchmunk.learnings.compiler import (
     ImportanceSampler,
     KnowledgeCompiler,
 )
+from sirchmunk.learnings.corpus_topic_map import CorpusTopicMap
 from sirchmunk.learnings.lint import KnowledgeLint, LintReport
 from sirchmunk.learnings.tree_indexer import (
     DocumentTree,
@@ -18,6 +19,7 @@ __all__ = [
     "CompileManifest",
     "CompileReport",
     "CompileStatus",
+    "CorpusTopicMap",
     "DocumentTree",
     "DocumentTreeIndexer",
     "ImportanceSampler",

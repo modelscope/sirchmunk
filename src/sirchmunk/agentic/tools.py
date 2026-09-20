@@ -7,6 +7,7 @@ at different granularities — from lightweight keyword search to deep
 file reading and knowledge base querying.  All tools are stateless;
 side-effects (token accounting, dedup) are recorded via SearchContext.
 """
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -308,11 +309,30 @@ class KeywordSearchTool(BaseTool):
 
         context.add_search(" ".join(keywords))
 
-        # Strategy 1: per-keyword literal search (safe for metacharacters,
-        # avoids the `-F` + `|` bug where rga treats `|` literally)
-        results, search_failures = await self._do_search_per_term(
-            keywords, literal=True, regex=False
+        # Strategy 1: literal rga and targeted native-format fallback run in
+        # parallel.  Native extraction is restricted to discriminative terms
+        # and formats with known rga adapter gaps, then cached by file signature.
+        literal_result, native_result = await asyncio.gather(
+            self._do_search_per_term(keywords, literal=True, regex=False),
+            self._retriever.retrieve_native_formats(
+                keywords,
+                path=self._paths,
+                max_depth=self._max_depth,
+                include=self._include,
+                exclude=self._exclude,
+                max_results=self._max_results * 2,
+                max_lines=self._max_snippet_lines,
+            ),
+            return_exceptions=True,
         )
+        if isinstance(literal_result, Exception):
+            results, search_failures = [], [f"literal search: {literal_result}"]
+        else:
+            results, search_failures = literal_result
+        if isinstance(native_result, Exception):
+            search_failures.append(f"native format fallback: {native_result}")
+        else:
+            results.extend(native_result)
 
         # Strategy 2: escaped-regex OR search (single rga call, handles
         # adapters that only work in regex mode — e.g. some PDF/DOCX)
@@ -373,17 +393,43 @@ class KeywordSearchTool(BaseTool):
         # Approximate token count (~4 chars per token)
         approx_tokens = total_chars // 4
         discovered_paths = list(deduped.keys())
-        search_backends = sorted({
-            str(match.get("_search_backend", "rga"))
+        all_matches = [
+            match
             for item in results
             for match in item.get("matches", [])
             if isinstance(match, dict)
+        ]
+        search_backends = sorted({
+            str(match.get("_search_backend", "rga"))
+            for match in all_matches
         })
         fallback_reasons = sorted({
             str(match["_fallback_reason"])
-            for item in results
-            for match in item.get("matches", [])
-            if isinstance(match, dict) and match.get("_fallback_reason")
+            for match in all_matches if match.get("_fallback_reason")
+        })
+        search_elapsed_ms = max([
+            float(match.get("_search_elapsed_ms", 0.0) or 0.0)
+            for match in all_matches
+        ] or [0.0])
+        queue_wait_ms = max([
+            float(match.get("_search_queue_wait_ms", 0.0) or 0.0)
+            for match in all_matches
+        ] or [0.0])
+        adapter_execution_ms = max([
+            float(match.get("_search_execution_ms", 0.0) or 0.0)
+            for match in all_matches
+        ] or [0.0])
+        fallback_elapsed_ms = max([
+            float(match.get("_fallback_elapsed_ms", 0.0) or 0.0)
+            for match in all_matches
+        ] or [0.0])
+        native_cache_states = [
+            bool(match["_search_cache_hit"])
+            for match in all_matches if "_search_cache_hit" in match
+        ]
+        primary_failure_stages = sorted({
+            str(match["_primary_failure_stage"])
+            for match in all_matches if match.get("_primary_failure_stage")
         })
         context.add_log(
             tool_name=self.name,
@@ -395,8 +441,17 @@ class KeywordSearchTool(BaseTool):
                 "search_failures": search_failures,
                 "search_backends": search_backends,
                 "fallback_reasons": fallback_reasons,
-                "fallback_used": "rg" in search_backends,
-                "degraded": bool(search_failures),
+                "fallback_used": any(
+                    backend in {"rg", "native_extract"} for backend in search_backends
+                ),
+                "search_elapsed_ms": round(search_elapsed_ms, 3),
+                "queue_wait_ms": round(queue_wait_ms, 3),
+                "adapter_execution_ms": round(adapter_execution_ms, 3),
+                "fallback_elapsed_ms": round(fallback_elapsed_ms, 3),
+                "native_cache_hits": sum(native_cache_states),
+                "native_cache_misses": len(native_cache_states) - sum(native_cache_states),
+                "primary_failure_stages": primary_failure_stages,
+                "degraded": bool(search_failures or fallback_reasons),
             },
         )
 
@@ -412,7 +467,10 @@ class KeywordSearchTool(BaseTool):
             "search_failures": search_failures,
             "search_backends": search_backends,
             "fallback_reasons": fallback_reasons,
-            "fallback_used": "rg" in search_backends,
+            "fallback_used": any(
+                backend in {"rg", "native_extract"} for backend in search_backends
+            ),
+            "search_elapsed_ms": round(search_elapsed_ms, 3),
             "degraded": bool(search_failures),
         }
 

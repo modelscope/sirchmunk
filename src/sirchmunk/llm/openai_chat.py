@@ -1,6 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import asyncio
+import contextvars
+import json
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -30,6 +33,23 @@ _RETRYABLE_ERRORS = (
 _DEFAULT_MAX_RETRIES = 3
 _DEFAULT_BASE_DELAY = 1.0   # seconds
 _DEFAULT_MAX_DELAY = 30.0   # seconds
+
+
+class LLMTokenBudgetExceeded(RuntimeError):
+    """Raised before a call that cannot fit in the bound request budget."""
+
+
+@dataclass
+class _TokenBudgetState:
+    limit: int
+    consumed: int = 0
+    reserved: int = 0
+    exhausted: bool = False
+
+
+_TOKEN_BUDGET: "contextvars.ContextVar[Optional[_TokenBudgetState]]" = (
+    contextvars.ContextVar("sirchmunk_llm_token_budget", default=None)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +277,18 @@ class OpenAIChat:
         }
 
         if enable_thinking is not None and profile.thinking_param:
-            if profile.thinking_param == "reasoning_effort":
+            # DeepSeek V4 uses the nested OpenAI-compatible thinking switch.
+            # Keep the legacy boolean parameter for all other providers/models
+            # so their request payloads remain unchanged.
+            is_deepseek_v4 = (
+                profile.name == "deepseek"
+                and (self._model or "").lower().startswith("deepseek-v4-")
+            )
+            if is_deepseek_v4:
+                extra_body["thinking"] = {
+                    "type": "enabled" if enable_thinking else "disabled"
+                }
+            elif profile.thinking_param == "reasoning_effort":
                 if enable_thinking:
                     extra_body["reasoning_effort"] = "high"
             else:
@@ -382,6 +413,80 @@ class OpenAIChat:
         """Return True if *exc* is a transient error worth retrying."""
         return isinstance(exc, _RETRYABLE_ERRORS)
 
+    @staticmethod
+    def bind_token_budget(limit: int):
+        """Bind a task-local hard token budget and return its reset token."""
+        if os.getenv("LENS_HARD_TOKEN_BUDGET", "true").lower() != "true":
+            return _TOKEN_BUDGET.set(None)
+        return _TOKEN_BUDGET.set(_TokenBudgetState(limit=max(0, int(limit))))
+
+    @staticmethod
+    def reset_token_budget(token) -> None:
+        _TOKEN_BUDGET.reset(token)
+
+    @staticmethod
+    def token_budget_snapshot() -> Dict[str, Any]:
+        state = _TOKEN_BUDGET.get()
+        if state is None:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "limit": state.limit,
+            "consumed": state.consumed,
+            "reserved": state.reserved,
+            "remaining": max(0, state.limit - state.consumed - state.reserved),
+            "exhausted": state.exhausted,
+        }
+
+    @staticmethod
+    def _estimate_message_tokens(messages: List[Dict[str, Any]]) -> int:
+        serialized = json.dumps(messages, ensure_ascii=False, default=str)
+        # Conservative for mixed English/CJK without loading a model tokenizer.
+        return max(len(serialized) // 2, len(serialized.encode("utf-8")) // 2) + 8 * len(messages)
+
+    @staticmethod
+    def _reserve_budget(
+        messages: List[Dict[str, Any]], kwargs: Dict[str, Any],
+    ) -> int:
+        state = _TOKEN_BUDGET.get()
+        if state is None:
+            return 0
+        prompt_estimate = OpenAIChat._estimate_message_tokens(messages)
+        remaining = state.limit - state.consumed - state.reserved
+        requested = int(
+            kwargs.get("max_tokens")
+            or kwargs.get("max_completion_tokens")
+            or os.getenv("LENS_MAX_COMPLETION_TOKENS", "4096")
+        )
+        max_completion = min(requested, max(0, remaining - prompt_estimate))
+        if max_completion < 128:
+            state.exhausted = True
+            raise LLMTokenBudgetExceeded(
+                f"LLM token budget exhausted: remaining={remaining}, "
+                f"estimated_prompt={prompt_estimate}"
+            )
+        kwargs["max_tokens"] = max_completion
+        kwargs.pop("max_completion_tokens", None)
+        reservation = prompt_estimate + max_completion
+        state.reserved += reservation
+        return reservation
+
+    @staticmethod
+    def _settle_budget(reservation: int, response: Optional[OpenAIChatResponse]) -> None:
+        state = _TOKEN_BUDGET.get()
+        if state is None or reservation <= 0:
+            return
+        state.reserved = max(0, state.reserved - reservation)
+        usage = response.usage if response is not None else {}
+        actual = int(usage.get("total_tokens", 0) or 0)
+        if actual <= 0:
+            actual = int(usage.get("prompt_tokens", 0) or 0) + int(
+                usage.get("completion_tokens", 0) or 0
+            )
+        state.consumed += actual
+        if state.consumed >= state.limit:
+            state.exhausted = True
+
     def chat(
             self,
             messages: List[Dict[str, Any]],
@@ -407,15 +512,19 @@ class OpenAIChat:
         Returns:
             OpenAIChatResponse: The structured response containing content, usage, etc.
         """
+        reservation = self._reserve_budget(messages, kwargs)
         request_kwargs = self._build_request_kwargs(stream, enable_thinking, **kwargs)
         last_exc: Optional[Exception] = None
 
         for attempt in range(self._max_retries + 1):
             try:
-                return self._do_chat(messages, stream, request_kwargs)
+                response = self._do_chat(messages, stream, request_kwargs)
+                self._settle_budget(reservation, response)
+                return response
             except Exception as exc:
                 last_exc = exc
                 if not self._is_retryable(exc) or attempt >= self._max_retries:
+                    self._settle_budget(reservation, None)
                     raise
                 delay = self._backoff_delay(attempt)
                 logger.warning(
@@ -489,15 +598,19 @@ class OpenAIChat:
         Returns:
             OpenAIChatResponse: The structured response containing content, usage, etc.
         """
+        reservation = self._reserve_budget(messages, kwargs)
         request_kwargs = self._build_request_kwargs(stream, enable_thinking, **kwargs)
         last_exc: Optional[Exception] = None
 
         for attempt in range(self._max_retries + 1):
             try:
-                return await self._do_achat(messages, stream, request_kwargs)
+                response = await self._do_achat(messages, stream, request_kwargs)
+                self._settle_budget(reservation, response)
+                return response
             except Exception as exc:
                 last_exc = exc
                 if not self._is_retryable(exc) or attempt >= self._max_retries:
+                    self._settle_budget(reservation, None)
                     raise
                 delay = self._backoff_delay(attempt)
                 logger.warning(

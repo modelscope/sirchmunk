@@ -83,6 +83,7 @@ class MonteCarloEvidenceSampling:
         verbose: bool = True,
         log_callback: LogCallback = None,
         lens_config: Optional[LensConfig] = None,
+        initial_anchors: Optional[List[Tuple[int, int, float]]] = None,
     ):
         self.llm = llm
         self.doc = doc_content
@@ -114,6 +115,7 @@ class MonteCarloEvidenceSampling:
 
         # --- LENS evaluator (strategy pattern) ---
         self.lens_config = lens_config or LensConfig.from_env()
+        self.initial_anchors = list(initial_anchors or [])
 
         # Deferred imports to avoid circular dependency
         # (lens_protocols and batch_ranking_evaluator import SampleWindow from this module)
@@ -554,15 +556,27 @@ class MonteCarloEvidenceSampling:
             if self.verbose:
                 await self._log.info(f"--- Round {r}/{self.max_rounds} ---")
 
-            # 1. Sampling (strategy dispatch)
-            current_samples = await self._sampling_strategy.next_round(
-                round_num=r,
-                query=query,
-                keywords=keywords,
-                prev_candidates=all_candidates if r > 1 else None,
-                doc_content=self.doc,
-                doc_len=self.doc_len,
-            )
+            # 1. Sampling (strategy dispatch).  On round one, compiled-tree or
+            # grep anchors can warm-start the multi-arm navigator while still
+            # reserving global arms for coverage outside the hinted regions.
+            if (
+                r == 1
+                and self.initial_anchors
+                and hasattr(self._sampling_strategy, "initialize_with_anchors")
+            ):
+                current_samples = self._sampling_strategy.initialize_with_anchors(
+                    self.doc_len,
+                    self.initial_anchors,
+                )
+            else:
+                current_samples = await self._sampling_strategy.next_round(
+                    round_num=r,
+                    query=query,
+                    keywords=keywords,
+                    prev_candidates=all_candidates if r > 1 else None,
+                    doc_content=self.doc,
+                    doc_len=self.doc_len,
+                )
 
             if not current_samples:
                 if self.verbose:

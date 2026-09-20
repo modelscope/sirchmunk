@@ -1,125 +1,352 @@
 # AGENTS.md
 
-本文件定义 Sirchmunk 项目中 AI agent、自动化助手和协作者在修改代码、文档、实验配置与 Web 界面时必须遵守的协作规约。其目标是保护项目结构、核心检索算法链路、对外接口、实验可复现性和 Web 用户体验，避免未经确认的破坏性改动。
+This document defines the collaboration rules that AI agents, automated
+assistants, and human contributors MUST follow when modifying code,
+documentation, experiment configuration, or the web interface in the Sirchmunk
+project. Its purpose is to protect the project structure, the core retrieval
+algorithm pipeline, public interfaces, experiment reproducibility, and the web
+user experience, and to prevent unapproved breaking changes.
 
-## 1. 总体原则
+## Normative Terminology
 
-- 默认优先保持现有架构、目录边界、公共接口和实验协议稳定。
-- 任何涉及项目边界、核心行为、公共 API、Web 布局或论文级实验协议的改动，都必须先说明影响范围、风险和回滚方式。
-- 严禁硬编码配置项、路径、阈值、模型名、数据集路径、端口、密钥或运行环境假设；必须通过参数、配置文件、环境变量或集中常量管理。
-- 不得提交真实密钥、token、私有数据路径或未脱敏的环境快照。
-- 不能为了让测试通过而降低质量门控、跳过验证、删除关键检查或静默吞掉错误。
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
+"SHOULD NOT", "MAY", and "OPTIONAL" in this document are to be interpreted as
+described in RFC 2119 and RFC 8174: they denote explicit requirement levels, not
+stylistic preferences. "Owner" means the project owner (or an explicitly
+delegated maintainer). "Agent" means any AI or automated contributor acting on
+the repository.
 
-## 2. 必须项目 Owner 确认的改动
+## 1. General Principles
 
-以下改动在实施前必须获得项目 owner 明确确认。若当前任务中没有明确授权，agent 必须先停下来提出方案，不得直接修改。
+- Preserving the existing architecture, directory boundaries, public
+  interfaces, and experiment protocols is the default. Changes to them MUST be
+  justified before implementation.
+- Any change affecting project boundaries, core behavior, public APIs, web
+  layout, or paper-grade experiment protocols MUST first state its scope of
+  impact, risks, and rollback plan, and MUST obtain the approvals defined in
+  Sections 2 and 3.
+- Configuration values, paths, thresholds, model names, dataset paths, ports,
+  secrets, and runtime-environment assumptions MUST NOT be hardcoded. They MUST
+  be supplied via parameters, configuration files, environment variables, or
+  centralized constants.
+- Real secrets, tokens, private data paths, and non-redacted environment
+  snapshots MUST NOT be committed.
+- Quality gates MUST NOT be weakened, verification skipped, critical checks
+  removed, or errors silently swallowed in order to make tests pass.
+- Implementations MUST generalize. They MUST NOT overfit to any specific
+  dataset or benchmark at the cost of generalization ability (see Section 9,
+  and in particular the prohibition in Section 9.5).
 
-### 2.1 项目结构与模块边界
+## 2. Changes Requiring Explicit Owner Approval
 
-- 新增、删除、移动、重命名顶层目录或核心模块目录。
-- 改变 `src/`、`benchmarks/`、`web/`、`requirements/`、`config/`、`scripts/`、`docker/` 等目录的职责边界。
-- 修改 Python package 名称、import 根路径、entry points、构建配置或发布配置。
-- 大规模重构文件布局、抽取公共模块、合并模块或拆分模块。
+The following changes MUST obtain explicit approval from the owner before
+implementation. Absent explicit authorization in the current task, the agent
+MUST stop and propose a plan rather than editing directly.
 
-### 2.2 核心算法链路
+### 2.1 Project Structure and Module Boundaries
 
-以下属于高风险核心链路，必须先取得 owner 确认，并在动手前提供技术方案：
+- Adding, deleting, moving, or renaming top-level directories or core module
+  directories.
+- Changing the responsibility boundaries of directories such as `src/`,
+  `benchmarks/`, `web/`, `requirements/`, `config/`, `scripts/`, `docker/`.
+- Changing the Python package name, import root paths, entry points, build
+  configuration, or release configuration.
+- Large-scale refactoring of file layout, extraction of shared modules, or
+  merging/splitting modules.
 
-- `src/sirchmunk/search.py` 中 FAST / DEEP / FILENAME_ONLY 主检索链路。
-- DEEP 模式的并行检索、证据采样、ReAct refinement、自修正、树导航、知识复用、编译产物复用等流程。
-- 影响答案生成、证据选择、文件选择、telemetry、token budget、fallback 策略的逻辑。
-- 影响 source fidelity、raw-corpus 检索、无扩展名纯文本语料、特定数据集原始分片读取的逻辑。
-- 任何可能改变 benchmark 主结果、论文指标或用户可见搜索行为的算法策略。
+### 2.2 Core Algorithm Pipeline
 
-### 2.3 对外关键接口和函数入口
+These are high-risk core paths. Owner approval and a written technical plan are
+REQUIRED before any edit:
 
-以下改动必须 owner 确认：
+- The FAST / DEEP / FILENAME_ONLY primary retrieval pipelines in
+  `src/sirchmunk/search.py`.
+- DEEP-mode parallel retrieval, evidence sampling, ReAct refinement,
+  self-correction, tree navigation, knowledge reuse, and compiled-artifact
+  reuse.
+- Logic affecting answer generation, evidence selection, file selection,
+  telemetry, token budget, or fallback strategy.
+- Logic affecting source fidelity, raw-corpus retrieval, extensionless
+  plain-text corpora, or dataset-specific raw-shard reading.
+- Any algorithmic strategy that could change benchmark headline results, paper
+  metrics, or user-visible search behavior.
 
-- Public Python API、SDK 入口、类名、函数签名、返回结构或异常语义。
-- CLI 参数、默认值、输出格式、退出码或脚本职责变化。
-- MCP server、API route、HTTP endpoint、schema、payload 格式或鉴权行为。
-- `pyproject.toml`、`setup.py`、entry points、package data、依赖范围等发布相关改动。
-- 被 README、论文实验、benchmark 流程或外部用户依赖的函数入口。
+### 2.3 Public Interfaces and Entry Points
 
-### 2.4 Web 端功能模块与布局
+Owner approval is REQUIRED for:
 
-以下 Web 改动必须 owner 确认：
+- Public Python APIs, SDK entry points, class names, function signatures, return
+  structures, or exception semantics.
+- CLI arguments, defaults, output formats, exit codes, or script
+  responsibilities.
+- MCP server, API routes, HTTP endpoints, schemas, payload formats, or
+  authentication behavior.
+- Release-related changes in `pyproject.toml`, `setup.py`, entry points, package
+  data, or dependency ranges.
+- Entry points relied upon by the README, paper experiments, benchmark
+  workflows, or external users.
 
-- `web/app/` 路由结构、页面层级、layout、导航、全局样式或响应式布局。
-- `web/components/` 中核心交互组件、图表、监控面板、上传/检索入口和状态展示组件。
-- `web/context/`、`web/hooks/`、`web/lib/` 中影响全局状态、请求封装、数据流或错误处理的逻辑。
-- 用户可见的交互流程、加载状态、错误提示、结果展示方式、监控指标含义。
-- 任何可能破坏现有截图、演示视频、README 展示或产品叙事的一致性改动。
+### 2.4 Web Feature Modules and Layout
 
-### 2.5 Benchmark 与 ResearchOps 实验治理
+Owner approval is REQUIRED for:
 
-以下实验治理改动必须 owner 确认：
+- `web/app/` routing structure, page hierarchy, layout, navigation, global
+  styles, or responsive layout.
+- Core interactive components, charts, monitoring panels, upload/search entry
+  points, and status components in `web/components/`.
+- Logic in `web/context/`, `web/hooks/`, `web/lib/` affecting global state,
+  request wrapping, data flow, or error handling.
+- User-visible interaction flows, loading states, error messages, result
+  presentation, or the meaning of monitoring metrics.
+- Any change that could break the consistency of existing screenshots, demo
+  videos, README presentation, or the product narrative.
 
-- 核心 benchmark 的 sampling protocol、GoldenSet、sample IDs、checksum、诊断子集、固定样本复现等相关逻辑。
-- Frozen evaluation 门控、validator error/warning 等级、artifact schema、report schema。
-- Baseline lifecycle、setup/index/storage cost、failure classification、import coverage、paired statistics。
-- `run_quickstart.py`、`run_sampling.py`、`run_evaluation.py`、`run_lifecycle_eval.py`、`run_scaling_study.py` 的职责或关键参数。
-- 任何会改变论文主表、sample pairing、frozen stage、cache policy、实验统计口径或可复现性的默认行为。
+### 2.5 Benchmark and ResearchOps Experiment Governance
 
-## 3. 必须二次确认的高风险改动
+Owner approval is REQUIRED for:
 
-以下改动即使 owner 已同意总体方向，也必须在实际编辑前进行二次确认。二次确认应列出具体文件、函数、行为变化、验证计划和回滚方式。
+- Core benchmark sampling protocols, GoldenSet, sample IDs, checksums,
+  diagnostic subsets, and fixed-sample reproduction logic.
+- Frozen-evaluation gates, validator error/warning levels, artifact schema, and
+  report schema.
+- Baseline lifecycle, setup/index/storage cost, failure classification, import
+  coverage, and paired statistics.
+- The responsibilities or key parameters of `run_quickstart.py`,
+  `run_sampling.py`, `run_evaluation.py`, `run_lifecycle_eval.py`,
+  `run_scaling_study.py`.
+- Any change to default behavior that would alter paper headline tables, sample
+  pairing, frozen stages, cache policy, experiment statistical definitions, or
+  reproducibility.
 
-- DEEP 模式主链路、证据采样、ReAct、自修正和树导航逻辑。
-- 对外 API / CLI / MCP / Web route 的 breaking change。
-- Web layout、导航结构、核心页面交互方式。
-- 论文级 benchmark protocol、GoldenSet、validator error gate、sample checksum 或主实验统计口径。
-- 删除兼容逻辑、迁移数据格式、改变默认配置或默认模型行为。
-- 大范围自动格式化、批量重命名、批量移动文件。
+## 3. High-Risk Changes Requiring Secondary Confirmation
 
-## 4. 可以直接执行的低风险改动
+Even when the owner has approved the overall direction, the following changes
+REQUIRE a secondary confirmation immediately before editing. The confirmation
+MUST list the specific files, functions, behavioral changes, verification plan,
+and rollback plan.
 
-在不触碰上述高风险范围的情况下，以下改动通常可以直接执行：
+- DEEP-mode primary pipeline, evidence sampling, ReAct, self-correction, and
+  tree navigation.
+- Breaking changes to public API / CLI / MCP / web routes.
+- Web layout, navigation structure, or core page interactions.
+- Paper-grade benchmark protocol, GoldenSet, validator error gate, sample
+  checksum, or primary experiment statistics.
+- Removing compatibility logic, migrating data formats, or changing default
+  configuration or default model behavior.
+- Large-scale auto-formatting, bulk renaming, or bulk file moves.
 
-- 明确的错别字、注释、局部文档措辞修复。
-- 不改变行为的局部类型标注、lint 修复、格式修复。
-- 新增非默认启用的测试、fixture、示例脚本。
-- 对已存在配置项补充说明，不改变默认值。
-- 用户在当前任务中明确指定的单文件小范围修改。
+## 4. Low-Risk Changes That MAY Proceed Directly
 
-即使属于低风险改动，也必须保持最小影响面，不得顺手重构无关代码。
+Provided none of the high-risk areas above are touched, the following MAY
+proceed directly:
 
-## 5. 实施前检查清单
+- Clear typo, comment, or localized documentation wording fixes.
+- Behavior-preserving local type annotations, lint fixes, or formatting fixes.
+- Adding tests, fixtures, or example scripts that are not enabled by default.
+- Adding explanatory notes to existing configuration items without changing
+  their defaults.
+- Small, single-file edits explicitly specified by the user in the current task.
 
-在修改前，agent 应完成以下检查：
+Even for low-risk changes, the impact surface MUST be kept minimal; unrelated
+code MUST NOT be refactored opportunistically.
 
-- 确认当前分支、工作区状态和是否存在用户未提交改动。
-- 明确本次改动是否触发 owner 确认或二次确认规则。
-- 阅读相关模块现有实现，不凭猜测修改。
-- 对 benchmark / ResearchOps 相关改动，确认是否影响 frozen stage、sample IDs、validator gates、report artifacts 和统计口径。
-- 对 Web 改动，确认是否影响 layout、路由、全局状态或用户可见流程。
+## 5. Pre-Implementation Checklist
 
-## 6. 实施后验证要求
+Before editing, the agent SHOULD:
 
-修改完成后，应根据改动范围执行最小但充分的验证：
+- Confirm the current branch, working-tree state, and whether uncommitted user
+  changes exist.
+- Determine whether the change triggers the owner-approval or
+  secondary-confirmation rules.
+- Read the existing implementation of the relevant modules; do not modify by
+  guesswork.
+- For benchmark / ResearchOps changes, confirm the impact on frozen stages,
+  sample IDs, validator gates, report artifacts, and statistical definitions.
+- For web changes, confirm the impact on layout, routing, global state, or
+  user-visible flows.
 
-- Python 代码优先运行 `py_compile`、相关 CLI `--help`、局部 smoke test 或对应单元测试。
-- Web 改动优先运行类型检查、lint、构建或本地页面 smoke test。
-- Benchmark 改动必须验证 sample ID 一致性、manifest/checksum、validator 输出、关键 CLI 参数和统计口径。
-- 文档改动需确认路径、标题、术语和最新实现一致。
-- 若验证无法运行，必须在最终说明中明确原因和风险。
+## 6. Post-Implementation Verification
 
-## 7. 沟通与记录规范
+After editing, run the minimal-but-sufficient verification for the change scope:
 
-- 对高风险改动，先给出方案、影响面、风险和验证计划，再等待 owner 确认。
-- 对二次确认改动，必须再次明确即将修改的文件和函数，不得用笼统描述代替。
-- 最终回复应说明修改内容、验证结果、未验证项和剩余风险。
-- 不得隐藏失败、跳过失败或把失败降级为成功。
+- Python code: prefer `py_compile`, the relevant CLI `--help`, localized smoke
+  tests, or the corresponding unit tests.
+- Web changes: prefer type checking, lint, build, or a local page smoke test.
+- Benchmark changes: MUST verify sample-ID consistency, manifest/checksum,
+  validator output, key CLI arguments, and statistical definitions.
+- Documentation changes: confirm paths, titles, terminology, and consistency
+  with the latest implementation.
+- If verification cannot be run, the final report MUST state the reason and the
+  residual risk.
 
-## 8. 特别保护的项目主张
+## 7. Communication and Reporting
 
-Sirchmunk / LENS 的核心实验主张是：在动态原始数据场景下，于免预处理和源保真约束下保持竞争性质量，并显式报告 setup、indexing、storage、update 和 query 的全生命周期成本。
+- For high-risk changes, present the plan, impact surface, risks, and
+  verification plan, then wait for owner approval.
+- For secondary-confirmation changes, restate the exact files and functions to
+  be modified; a vague description is not acceptable.
+- The final reply MUST describe what was changed, the verification results, any
+  unverified items, and the residual risks.
+- Failures MUST NOT be hidden, skipped, or reported as success.
 
-任何修改若会削弱以下能力，必须 owner 确认：
+## 8. Protected Project Claims
 
-- raw-corpus / indexless / embedding-free 的核心叙事。
-- source fidelity 与 evidence traceability。
-- 论文级 raw-corpus protocol。
-- frozen stratified subset、paired statistics、sample checksum。
-- 外部 index-heavy baseline 的 lifecycle feasibility 对比。
-- Web 和文档中对上述主张的表达一致性。
+The core experimental claim of Sirchmunk / LENS is: under dynamic raw-data
+conditions, it sustains competitive quality within preprocessing-free and
+source-fidelity constraints, while explicitly reporting the full lifecycle cost
+of setup, indexing, storage, update, and query.
+
+Any change that would weaken the following capabilities REQUIRES owner approval:
+
+- The raw-corpus / indexless / embedding-free core narrative.
+- Source fidelity and evidence traceability.
+- The paper-grade raw-corpus protocol.
+- Frozen stratified subsets, paired statistics, and sample checksums.
+- The lifecycle-feasibility comparison against external index-heavy baselines.
+- Consistency of how the above claims are expressed in the web UI and
+  documentation.
+
+## 9. Anti-Hardcoding and Generalization-First Rules
+
+This section targets the "hardcoded hard rules" most likely to appear in the
+retrieval pipeline and answer handling. Such rules typically hardcode entity
+naming, column positions, field formats, fixed word lists, or language
+assumptions in order to pass one specific benchmark; they do not generalize to
+real corpora, and they MUST be avoided and refactored with priority.
+
+### 9.1 Detection: What Counts as a Hard Rule to Refactor
+
+A change exhibiting any of the following MUST be treated as a hardcoded hard
+rule and refactored toward a general solution:
+
+- Dependence on a specific dataset's entity naming or ID shape (e.g.,
+  `AggUnit-\d+`, a specific prefix, or a specific digit count).
+- Assuming fixed table column positions, delimiter layout, or field order to
+  extract values.
+- Using hardcoded natural-language word lists (stop words, trigger words, unit
+  words) that cover only a single language or domain.
+- Using regex/string rules to reconstruct a judgment that should be made
+  semantically (e.g., "is this number the answer", "does this row belong to
+  this entity").
+- Rules that fail as soon as they leave the current corpus's naming, format, or
+  language.
+
+### 9.2 Preferred General Patterns
+
+When refactoring, prefer the following over stacking special cases:
+
+- Semantic/arithmetic division of labor: let the LLM perform the semantics it is
+  good at (selecting operands, judging relevant rows, naming the operation), and
+  let Python perform the deterministic computation it is reliable at (sum, mean,
+  comparison, count). Prefer folding the structured disclosure into an existing
+  LLM call rather than adding a round trip.
+- Structured trace + grounding check: the model emits a machine-readable
+  structure (e.g., `<COMPUTATION_TRACE>{operation, operands, result}`), which is
+  trusted and recomputed deterministically only when the operands are grounded
+  (matched by value) in the evidence, so that no correction is fabricated.
+- Corpus-adaptive statistics instead of fixed word lists: decide
+  "discriminative / stop" using in-corpus statistics such as document frequency,
+  which is inherently cross-language and cross-domain, replacing hardcoded
+  English stop words.
+- Dependency injection instead of embedded rules: tokenizers, thresholds, and
+  lexical policies MUST be injectable and configurable, with a general default
+  implementation, rather than hardcoded inside a module.
+- Intent-level vocabulary instead of entity-level special cases: recognize
+  intents such as sum/mean/count/min/max/difference, mapping synonyms and common
+  CJK expressions onto the same primitive, rather than matching a specific
+  entity name.
+
+### 9.3 Implementation Requirements
+
+- Every replacement behavior MUST have an environment switch (e.g.,
+  `LENS_COMPUTATION_TRACE`), default to the new implementation, allow
+  single-item rollback on failure, and be registered centrally in
+  `config/env.example`.
+- An implementation MUST NOT fall back to an entity-level or format-level
+  special case merely to meet a benchmark target. When a temporary special case
+  is genuinely unavoidable, it MUST explicitly annotate its applicability
+  boundary, and the plan MUST state why it cannot generalize.
+- After refactoring, a real-corpus regression MUST confirm that the target query
+  types are no worse than the prior implementation before the new behavior is
+  kept enabled by default.
+- Unit tests MUST verify generalization: use entity names, column layouts, and
+  languages that differ from the target benchmark, and cover the negative case
+  where grounding fails and therefore no correction is applied.
+
+### 9.4 Canonical Example
+
+- Removed: `_deterministic_aggregation_sum` (hardcoded `AggUnit-\d+` and
+  fixed-column summation).
+- Replaced by: `_verify_computation_trace` + evidence grounding +
+  `_reduce_operation`; operands are disclosed by the model within the same
+  answer-synthesis call, and the ReAct layer captures `<COMPUTATION_TRACE>` into
+  telemetry before answer sanitization.
+- Removed: `_TOPIC_STOP_WORDS` (fixed English stop words) and the embedded
+  `_TOPIC_TOKEN_RE` in `corpus_topic_map`.
+- Replaced by: an injectable tokenizer (with a general default implementation)
+  plus corpus document-frequency adaptive stop-word pruning.
+
+### 9.5 Prohibition of Dataset/Benchmark Overfitting
+
+Overfitting to a specific dataset or benchmark at the expense of generalization
+ability is PROHIBITED. This is a first-class rule; Sections 9.1–9.4 are specific
+instances of it.
+
+- Definition. A change is considered overfitting when its correctness, or its
+  measured improvement, depends on incidental properties of a particular
+  evaluation set — its naming scheme, value distribution, file layout, language,
+  question templates, or the identities of its gold samples — rather than on the
+  general semantics of the task. Such a change is expected to degrade or
+  silently break on a different but equivalent corpus.
+- Prohibited practices (non-exhaustive): keying logic on known sample IDs, gold
+  answers, or answer positions; branching on dataset-specific entity or
+  file-name patterns; tuning thresholds or rules directly on the test/holdout
+  split; special-casing the exact question phrasings of a benchmark; and adding
+  any "detector" whose only purpose is to recognize a benchmark's items.
+- Required safeguards. A feature MAY be developed and inspected on a benchmark,
+  but its logic MUST depend only on general, corpus-agnostic signals; thresholds
+  MUST be calibrated on a dedicated calibration split, never on the frozen test
+  set, as governed by Section 2.5; and the change MUST be validated on inputs
+  that differ from the benchmark (different entities, layouts, and languages)
+  together with adversarial and negative cases.
+- Reviewer test. Before a change is kept enabled by default, apply this check:
+  "If the entity names, file paths, column order, and language of the evaluation
+  set were replaced with equivalent but different ones, would this change still
+  be correct?" If the honest answer is no, the change overfits and MUST be
+  redesigned per Section 9.2.
+- Reporting. Any residual, unavoidable dataset-specific assumption MUST be
+  documented explicitly at the call site and surfaced in the change's final
+  report, together with its applicability boundary and the generalization risk
+  it carries.
+
+### 9.6 Retrieval Cost Invariants (Query Hot Path)
+
+The query hot path MUST have a bounded per-file and per-query cost that does not
+grow unbounded with corpus size or shape. These invariants are cost/capability
+policies (corpus-agnostic), enforced centrally in `GrepRetriever` and configured
+in `config/env.example`:
+
+- Per-file size cap: `GREP_MAX_FILESIZE_MB` skips any file over the cap,
+  regardless of type.
+- Bounded adapters only: `GREP_RGA_ADAPTERS` keeps bounded document extractors
+  (poppler/pandoc) and disables the unbounded recursive/streaming adapters
+  (decompress/zip/tar/sqlite/ffmpeg) so archives are never inline-decompressed
+  during a query.
+- Tiered scan: `GREP_TIERED_SCAN` runs a fast native-rg pass over all files
+  unioned with an rga pass restricted to `GREP_RICH_EXTENSIONS`, so rga's
+  per-file adapter dispatch never walks the whole tree.
+- Fail-fast budgets: the rg text pass uses `GREP_TEXT_TIMEOUT`; the rga rich
+  pass uses `GREP_TIMEOUT`; on timeout the search degrades to native rg rather
+  than hanging.
+- Offline-only container recursion: archive/container/compression adapters MAY
+  be enabled ONLY in an offline compile/extraction step (never the query hot
+  path), by overriding `GREP_RGA_ADAPTERS` in that context. Extracted content
+  is then searched as normal files.
+- Amortized rich extraction: `GrepRetriever.prewarm_rich_cache` MAY be called
+  offline to populate the rga cache for pdf/docx-heavy corpora so the first
+  query is warm.
+
+A change that can make a single file or a single query cost grow without bound
+(e.g., enabling inline decompression on the hot path, or pointing rga's adapter
+engine at an unbounded raw tree) violates these invariants and MUST be
+redesigned.

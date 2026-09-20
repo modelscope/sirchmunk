@@ -9,12 +9,16 @@ ranks the most promising document candidates for a given query.
 This is a *zero-index* approach — no pre-built vector indices required.
 """
 import asyncio
+import copy
+import hashlib
 import random
 import json
 import logging
+import re
 import mimetypes
 import os
 import threading
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -28,7 +32,6 @@ except ImportError:
     _pypdf = None  # type: ignore[assignment]
 
 from sirchmunk.llm.openai_chat import OpenAIChat
-from sirchmunk.utils.file_utils import fast_extract
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +105,29 @@ class FileCandidate:
             "reason": self.reason,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FileCandidate":
+        """Restore a cached candidate without loading full file content."""
+        return cls(
+            path=str(data.get("path") or ""),
+            filename=str(data.get("filename") or ""),
+            extension=str(data.get("extension") or ""),
+            size_bytes=int(data.get("size_bytes") or 0),
+            modified_at=data.get("modified_at"),
+            created_at=data.get("created_at"),
+            mime_type=str(data.get("mime_type") or "application/octet-stream"),
+            title=str(data.get("title") or ""),
+            author=str(data.get("author") or ""),
+            page_count=int(data.get("page_count") or 0),
+            encoding=str(data.get("encoding") or ""),
+            line_count=int(data.get("line_count") or 0),
+            keywords=[str(item) for item in data.get("keywords", [])],
+            preview=str(data.get("preview") or ""),
+            content_loaded=False,
+            relevance=data.get("relevance"),
+            reason=str(data.get("reason") or ""),
+        )
+
     def to_summary(self, root_dir: str = "") -> str:
         """Compact text summary for LLM consumption.
 
@@ -152,6 +178,17 @@ class FileCandidate:
             return f"{self.size_bytes / (1024 * 1024):.1f}MB"
 
 
+@dataclass(frozen=True)
+class DirectorySemanticHit:
+    """Auditable confidence signal from deterministic directory ranking."""
+
+    path: str
+    confidence: float
+    signal_count: int
+    direct_match: bool
+    components: Dict[str, float] = field(default_factory=dict)
+
+
 @dataclass
 class ScanResult:
     """Aggregated result of a directory scan.
@@ -171,6 +208,12 @@ class ScanResult:
     total_dirs: int = 0
     scan_duration_ms: float = 0.0
     rank_duration_ms: float = 0.0
+    cache_hit: bool = False
+    cache_mode: str = "off"
+    cache_validation_ms: float = 0.0
+    files_reused: int = 0
+    files_refreshed: int = 0
+    fingerprint: str = ""
 
     @property
     def high_relevance(self) -> List[FileCandidate]:
@@ -179,6 +222,96 @@ class ScanResult:
     @property
     def medium_relevance(self) -> List[FileCandidate]:
         return [c for c in self.ranked_candidates if c.relevance == "medium"]
+
+
+class DirectoryScanCache:
+    """Freshness-safe cache for query-independent directory metadata."""
+
+    def __init__(self, mode: str, cache_dir: Optional[Path], ttl_seconds: float) -> None:
+        self.mode = mode if mode in {"off", "memory", "disk"} else "memory"
+        self.cache_dir = cache_dir
+        self.ttl_seconds = max(0.0, ttl_seconds)
+        self._memory: Dict[str, Tuple[str, float, ScanResult]] = {}
+        if self.mode == "disk" and self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, key: str) -> Optional[Path]:
+        return self.cache_dir / f"{key}.json" if self.cache_dir else None
+
+    def get(self, key: str, fingerprint: str) -> Optional[ScanResult]:
+        if self.mode == "off":
+            return None
+        now = time.time()
+        cached = self._memory.get(key)
+        if cached is not None:
+            cached_fingerprint, created_at, result = cached
+            fresh_ttl = not self.ttl_seconds or now - created_at <= self.ttl_seconds
+            if fresh_ttl and cached_fingerprint == fingerprint:
+                restored = copy.deepcopy(result)
+                restored.cache_hit = True
+                restored.files_reused = len(restored.candidates)
+                restored.files_refreshed = 0
+                return restored
+        if self.mode != "disk":
+            return None
+        path = self._path(key)
+        if path is None or not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            created_at = float(payload.get("created_at") or 0.0)
+            fresh_ttl = not self.ttl_seconds or now - created_at <= self.ttl_seconds
+            if not fresh_ttl or payload.get("fingerprint") != fingerprint:
+                return None
+            result = ScanResult(
+                candidates=[
+                    FileCandidate.from_dict(item)
+                    for item in payload.get("candidates", [])
+                ],
+                total_files=int(payload.get("total_files") or 0),
+                total_dirs=int(payload.get("total_dirs") or 0),
+                scan_duration_ms=0.0,
+                cache_hit=True,
+                cache_mode="disk",
+                files_reused=len(payload.get("candidates", [])),
+                fingerprint=fingerprint,
+            )
+            self._memory[key] = (fingerprint, created_at, result)
+            return copy.deepcopy(result)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def put(self, key: str, fingerprint: str, result: ScanResult) -> None:
+        if self.mode == "off":
+            return
+        created_at = time.time()
+        stored = copy.deepcopy(result)
+        stored.cache_hit = False
+        self._memory[key] = (fingerprint, created_at, stored)
+        if self.mode != "disk":
+            return
+        path = self._path(key)
+        if path is None:
+            return
+        payload = {
+            "version": 1,
+            "created_at": created_at,
+            "fingerprint": fingerprint,
+            "total_files": result.total_files,
+            "total_dirs": result.total_dirs,
+            "candidates": [
+                {**candidate.to_dict(), "preview": candidate.preview}
+                for candidate in result.candidates
+            ],
+        }
+        temporary = path.with_suffix(".json.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8",
+            )
+            temporary.replace(path)
+        except OSError:
+            logger.debug("[DirScanner] Failed to persist scan cache: %s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +397,9 @@ class DirectoryScanner:
         exclude_patterns: Optional[List[str]] = None,
         max_file_size_bytes: Optional[int] = None,
         oversized_pdf_timeout_s: float = 1.0,
+        cache_mode: Optional[str] = None,
+        cache_dir: Optional[Union[str, Path]] = None,
+        cache_ttl_seconds: Optional[float] = None,
     ) -> None:
         self.llm = llm
         self.max_depth = max_depth
@@ -275,8 +411,160 @@ class DirectoryScanner:
         self.exclude_patterns.update(self.DEFAULT_EXCLUDE)
         self.max_file_size_bytes = max_file_size_bytes
         self.oversized_pdf_timeout_s = oversized_pdf_timeout_s
+        resolved_cache_mode = (
+            cache_mode or os.getenv("SIRCHMUNK_DIR_SCAN_CACHE", "memory")
+        ).strip().lower()
+        ttl = cache_ttl_seconds
+        if ttl is None:
+            try:
+                ttl = float(os.getenv(
+                    "SIRCHMUNK_DIR_SCAN_CACHE_TTL_SECONDS", "0",
+                ))
+            except ValueError:
+                ttl = 0.0
+        self._scan_cache = DirectoryScanCache(
+            resolved_cache_mode,
+            Path(cache_dir).expanduser().resolve() if cache_dir else None,
+            ttl,
+        )
 
     # ---- Public API ----
+
+    @staticmethod
+    def semantic_rank_detailed(
+        scan_result: "ScanResult",
+        *,
+        expected_doc_type: str = "general",
+        entities: Optional[List[str]] = None,
+        concepts: Optional[List[str]] = None,
+        expected_sections: Optional[List[str]] = None,
+        top_k: int = 30,
+    ) -> List[DirectorySemanticHit]:
+        """Return calibrated and auditable directory-semantic matches."""
+        doc_type = (expected_doc_type or "general").lower()
+        path_markers: Dict[str, Tuple[str, ...]] = {
+            "wiki": ("wiki", "article", "articles", "pages", "encyclopedia"),
+            "article": ("article", "articles", "docs", "documents", "content"),
+            "report": ("report", "reports", "results", "output", "analysis", "paper"),
+            "code": ("src", "lib", "app", "package", "module", "components"),
+            "data": ("data", "dataset", "datasets", "corpus", "raw", "tables"),
+            "general": (),
+        }
+        extensions: Dict[str, Tuple[str, ...]] = {
+            "wiki": (".txt", ".md", ".json", ".jsonl"),
+            "article": (".txt", ".md", ".pdf", ".html"),
+            "report": (".pdf", ".docx", ".md", ".txt", ".xlsx"),
+            "code": (".py", ".js", ".ts", ".tsx", ".java", ".go", ".rs"),
+            "data": (".csv", ".json", ".jsonl", ".parquet", ".xlsx", ".tsv"),
+            "general": (),
+        }
+        entity_terms = [str(term).strip().lower() for term in entities or [] if str(term).strip()]
+        concept_terms = [str(term).strip().lower() for term in concepts or [] if str(term).strip()]
+        section_terms = [str(term).strip().lower() for term in expected_sections or [] if str(term).strip()]
+        terms = entity_terms + concept_terms + section_terms
+        markers = path_markers.get(doc_type, ())
+        preferred_exts = extensions.get(doc_type, ())
+
+        hits: List[DirectorySemanticHit] = []
+        for candidate in scan_result.candidates:
+            path_text = Path(candidate.path).as_posix().lower()
+            path_search_text = path_text.replace("_", " ").replace("-", " ")
+            metadata_text = " ".join([
+                candidate.filename,
+                candidate.title,
+                " ".join(candidate.keywords or []),
+                candidate.preview[:500],
+            ]).lower()
+            components: Dict[str, float] = {}
+            marker_hits = sum(
+                1 for marker in markers
+                if f"/{marker}/" in f"/{path_text}/" or marker in Path(path_text).parts
+            )
+            if marker_hits:
+                components["path_type"] = min(0.30, marker_hits * 0.20)
+            if preferred_exts and candidate.extension.lower() in preferred_exts:
+                components["extension"] = 0.10
+
+            path_matches = sum(1 for term in terms if term in path_search_text)
+            metadata_matches = sum(
+                1 for term in terms
+                if term not in path_search_text and term in metadata_text
+            )
+            if path_matches:
+                components["path_term"] = min(0.45, path_matches * 0.35)
+            if metadata_matches:
+                components["metadata_term"] = min(0.40, metadata_matches * 0.25)
+            filename_text = candidate.filename.strip().lower()
+            stem_text = Path(candidate.filename).stem.lower()
+            if any(
+                entity in {filename_text, stem_text}
+                for entity in entity_terms
+            ):
+                components["filename_exact"] = 0.45
+            title_text = candidate.title.strip().lower()
+            if title_text and any(
+                entity == title_text or entity in title_text
+                for entity in entity_terms
+            ):
+                components["title_entity"] = 0.20
+
+            weak_overlap = 0.0
+            path_tokens = set(re.findall(r"[a-z0-9]{3,}", path_text))
+            for term in terms:
+                term_tokens = set(re.findall(r"[a-z0-9]{3,}", term))
+                if term_tokens:
+                    weak_overlap = max(
+                        weak_overlap,
+                        len(term_tokens & path_tokens) / len(term_tokens),
+                    )
+            if weak_overlap:
+                components["token_overlap"] = min(0.10, 0.10 * weak_overlap)
+
+            direct_match = any(
+                term in path_search_text or term in metadata_text
+                for term in entity_terms + section_terms
+            )
+            signal_count = sum(1 for value in components.values() if value > 0)
+            score = sum(components.values())
+            # Confidence is deliberately capped below the dominant threshold
+            # when there is no direct entity/section match or only one signal.
+            confidence = min(1.0, score)
+            if not direct_match or signal_count < 2:
+                confidence = min(confidence, 0.74)
+            if confidence > 0.0:
+                hits.append(DirectorySemanticHit(
+                    path=candidate.path,
+                    confidence=round(confidence, 4),
+                    signal_count=signal_count,
+                    direct_match=direct_match,
+                    components=components,
+                ))
+
+        hits.sort(key=lambda item: (-item.confidence, item.path))
+        return hits[:max(1, top_k)]
+
+    @staticmethod
+    def semantic_rank(
+        scan_result: "ScanResult",
+        *,
+        expected_doc_type: str = "general",
+        entities: Optional[List[str]] = None,
+        concepts: Optional[List[str]] = None,
+        expected_sections: Optional[List[str]] = None,
+        top_k: int = 30,
+    ) -> List[Tuple[str, float]]:
+        """Backward-compatible tuple view of ``semantic_rank_detailed``."""
+        return [
+            (hit.path, hit.confidence)
+            for hit in DirectoryScanner.semantic_rank_detailed(
+                scan_result,
+                expected_doc_type=expected_doc_type,
+                entities=entities,
+                concepts=concepts,
+                expected_sections=expected_sections,
+                top_k=top_k,
+            )
+        ]
 
     async def scan(
         self,
@@ -299,20 +587,29 @@ class DirectoryScanner:
         paths = [Path(p).resolve() for p in paths]
 
         t_start = datetime.now()
-        result = ScanResult()
+        validation_started = time.perf_counter()
+        all_files, total_dirs, fingerprint = self._collect_files_with_fingerprint(paths)
+        validation_ms = (time.perf_counter() - validation_started) * 1000
+        cache_key = self._cache_key(paths)
+        cached = self._scan_cache.get(cache_key, fingerprint)
+        if cached is not None:
+            cached.cache_validation_ms = validation_ms
+            cached.scan_duration_ms = validation_ms
+            cached.cache_mode = self._scan_cache.mode
+            logger.info(
+                "[DirScanner] Cache hit: %d candidates validated in %.0fms",
+                len(cached.candidates), validation_ms,
+            )
+            return cached
 
-        # Collect all file paths
-        all_files: List[Path] = []
-        for root in paths:
-            if root.is_file():
-                all_files.append(root)
-                continue
-            if not root.is_dir():
-                logger.warning(f"[DirScanner] Scan path not found: {root}")
-                continue
-            self._walk(root, all_files, result, depth=0)
-
-        result.total_files = len(all_files)
+        result = ScanResult(
+            total_files=len(all_files),
+            total_dirs=total_dirs,
+            cache_hit=False,
+            cache_mode=self._scan_cache.mode,
+            cache_validation_ms=validation_ms,
+            fingerprint=fingerprint,
+        )
         logger.info(f"[DirScanner] Found {result.total_files} files in {result.total_dirs} dirs")
 
         if len(all_files) > self.max_files:
@@ -331,9 +628,11 @@ class DirectoryScanner:
             )
 
         result.candidates = candidates
+        result.files_refreshed = len(candidates)
 
         content_loaded = sum(1 for c in candidates if c.content_loaded)
         result.scan_duration_ms = (datetime.now() - t_start).total_seconds() * 1000
+        self._scan_cache.put(cache_key, fingerprint, result)
         logger.info(
             f"[DirScanner] Scan complete: {len(candidates)} candidates "
             f"({content_loaded} fully loaded) in {result.scan_duration_ms:.0f}ms"
@@ -415,6 +714,68 @@ class DirectoryScanner:
         return await self.rank(query, result, top_k=top_k)
 
     # ---- Filesystem walking ----
+
+    def _cache_key(self, paths: List[Path]) -> str:
+        payload = {
+            "paths": [str(path) for path in paths],
+            "max_depth": self.max_depth,
+            "max_files": self.max_files,
+            "max_preview_chars": self.max_preview_chars,
+            "small_file_threshold": self.small_file_threshold,
+            "exclude_patterns": sorted(self.exclude_patterns),
+            "max_file_size_bytes": self.max_file_size_bytes,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def _collect_files_with_fingerprint(
+        self, paths: List[Path],
+    ) -> Tuple[List[Path], int, str]:
+        """Collect the complete eligible universe and hash freshness metadata."""
+        files: List[Path] = []
+        total_dirs = 0
+        digest = hashlib.sha256()
+
+        def _visit(path: Path, depth: int) -> None:
+            nonlocal total_dirs
+            if path.is_file():
+                if path.suffix.lower() in _SCANNABLE_EXTENSIONS:
+                    files.append(path)
+                return
+            if not path.is_dir() or depth > self.max_depth:
+                return
+            total_dirs += 1
+            try:
+                entries = sorted(path.iterdir(), key=lambda item: item.name)
+            except (OSError, PermissionError):
+                return
+            for entry in entries:
+                name = entry.name
+                if name.startswith(".") or name in self.exclude_patterns:
+                    continue
+                if any(
+                    entry.match(pattern)
+                    for pattern in self.exclude_patterns if "*" in pattern
+                ):
+                    continue
+                if entry.is_dir():
+                    _visit(entry, depth + 1)
+                elif entry.is_file() and entry.suffix.lower() in _SCANNABLE_EXTENSIONS:
+                    files.append(entry)
+
+        for root in paths:
+            _visit(root, 0)
+        files = sorted(set(files), key=lambda path: str(path))
+        for file_path in files:
+            try:
+                stat = file_path.stat()
+                digest.update(str(file_path).encode("utf-8"))
+                digest.update(str(stat.st_size).encode("ascii"))
+                digest.update(str(stat.st_mtime_ns).encode("ascii"))
+            except OSError:
+                digest.update(f"missing:{file_path}".encode("utf-8"))
+        return files, total_dirs, digest.hexdigest()
 
     def _walk(
         self,

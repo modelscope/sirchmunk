@@ -21,8 +21,10 @@ from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.utils import LogCallback, create_logger
 from sirchmunk.utils.file_utils import get_fast_hash
 
-# File-size threshold: skip tree indexing for small files
-_TREE_MIN_CHARS = 10_000  # 10 K characters (lowered from 20K for broader coverage)
+# File-size threshold: skip tree indexing only for truly small files.  Documents
+# below the LLM threshold use deterministic heading/paragraph trees.
+_TREE_MIN_CHARS = 3_000
+_TREE_HEURISTIC_MAX_CHARS = 50_000
 
 # Adaptive depth thresholds: (min_chars, max_depth) — evaluated top-down;
 # **must** be sorted by min_chars descending so the first match wins.
@@ -258,7 +260,30 @@ class DocumentTreeIndexer:
                 )
                 return tree
 
-        # Fallback: existing recursive LLM path (with adaptive depth)
+        # Mid-sized documents use deterministic heading/paragraph trees.  This
+        # materially increases tree coverage without adding compile-time LLM
+        # calls.  Large unstructured documents retain the recursive LLM path.
+        heuristic_v2 = os.getenv(
+            "LENS_TREE_HEURISTIC_VERSION", "v2",
+        ).strip().lower() == "v2"
+        if heuristic_v2 or len(content) < _TREE_HEURISTIC_MAX_CHARS:
+            root = self._build_tree_heuristic(content)
+            if root is not None:
+                tree = DocumentTree(
+                    file_path=file_path,
+                    file_hash=file_hash,
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                    total_chars=len(content),
+                    total_pages=total_pages,
+                    root=root,
+                )
+                self._save_cache(file_hash, tree)
+                await self._log.info(
+                    f"[TreeIndexer] Built heuristic tree: {self._count_nodes(root)} nodes"
+                )
+                return tree
+
+        # Fallback: recursive LLM path for large unstructured documents.
         root = await self._build_node(content, level=0, max_depth=effective_depth)
         if root is None:
             return None
@@ -401,7 +426,7 @@ class DocumentTreeIndexer:
                 seen_ids.add(n.node_id)
                 unique.append(n)
         leaves = unique[:max_results]
-        _page_valid = sum(1 for l in leaves if getattr(l, 'page_range', None) and len(l.page_range) == 2 and l.page_range[0])
+        _page_valid = sum(1 for leaf in leaves if getattr(leaf, 'page_range', None) and len(leaf.page_range) == 2 and leaf.page_range[0])
         print(f"SEARCH_WIKI_DEBUG [T4] navigate result: leaves={len(leaves)}, page_range_valid={_page_valid}", flush=True)
         return leaves
 
@@ -422,6 +447,182 @@ class DocumentTreeIndexer:
     # ------------------------------------------------------------------ #
     #  Internals                                                          #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _heuristic_leaf_count(nodes: List[TreeNode]) -> int:
+        return sum(len(node.all_leaves()) for node in nodes)
+
+    def _coarsen_heuristic_children(
+        self,
+        children: List[TreeNode],
+        *,
+        max_nodes: int,
+        seen_ids: set,
+    ) -> List[TreeNode]:
+        """Bound an over-segmented heuristic tree while preserving ranges."""
+        leaves: List[TreeNode] = []
+        for child in children:
+            leaves.extend(child.all_leaves())
+        leaves.sort(key=lambda node: node.char_range[0])
+        if len(leaves) <= max_nodes:
+            return children
+        group_size = max(2, math.ceil(len(leaves) / max_nodes))
+        grouped: List[TreeNode] = []
+        for offset in range(0, len(leaves), group_size):
+            group = leaves[offset:offset + group_size]
+            start = min(node.char_range[0] for node in group)
+            end = max(node.char_range[1] for node in group)
+            title = group[0].title
+            if len(group) > 1 and group[-1].title != title:
+                title = f"{title} — {group[-1].title}"
+            grouped.append(TreeNode(
+                node_id=self._unique_node_id(start, seen_ids),
+                title=title[:160],
+                summary="; ".join(node.summary for node in group if node.summary)[:500],
+                char_range=(start, end),
+                level=1,
+                table_count=sum(node.table_count for node in group),
+                content_type=(
+                    "table" if any(node.content_type == "table" for node in group)
+                    else "text"
+                ),
+            ))
+        return grouped
+
+    @staticmethod
+    def _heuristic_summary(text: str) -> str:
+        """Keep a readable lead plus sparse identifiers from the full section."""
+        normalized = re.sub(r"\s+", " ", text.strip())
+        lead = normalized[:_TOC_NODE_SUMMARY_MAX_CHARS]
+        identifiers = list(dict.fromkeys(re.findall(
+            r"\b[A-Za-z][A-Za-z0-9_]*-\d{2,}\b", text,
+        )))[:16]
+        if not identifiers:
+            return lead
+        suffix = "Identifiers: " + ", ".join(identifiers)
+        return f"{lead}; {suffix}"[:500]
+
+    def _build_paragraph_nodes(
+        self, content: str, seen_ids: set,
+    ) -> List[TreeNode]:
+        """Build coarse, contiguous fallback nodes from paragraph boundaries."""
+        children: List[TreeNode] = []
+        target_size = 4_000
+        cursor = 0
+        segment_index = 1
+        while cursor < len(content):
+            tentative_end = min(len(content), cursor + target_size)
+            if tentative_end < len(content):
+                boundary = content.find("\n\n", tentative_end)
+                if boundary != -1 and boundary - tentative_end <= 1_000:
+                    tentative_end = boundary + 2
+            segment = content[cursor:tentative_end]
+            first_line = next(
+                (line.strip() for line in segment.splitlines() if line.strip()),
+                f"Segment {segment_index}",
+            )
+            title = re.sub(r"\s+", " ", first_line)[:100]
+            summary = self._heuristic_summary(segment)
+            children.append(TreeNode(
+                node_id=self._unique_node_id(cursor, seen_ids),
+                title=title or f"Segment {segment_index}",
+                summary=summary,
+                char_range=(cursor, tentative_end),
+                level=1,
+                content_type=(
+                    "table" if self._detect_structured_content(segment) else "text"
+                ),
+            ))
+            segment_index += 1
+            cursor = tentative_end
+        return children
+
+    def _build_tree_heuristic(self, content: str) -> Optional[TreeNode]:
+        """Build a zero-LLM tree from headings or paragraph groups.
+
+        Heading detection reuses ``HeadingTocExtractor`` so Markdown, numbered
+        sections, and structural keywords share one implementation.  When no
+        explicit headings exist, paragraph groups provide coarse but useful
+        navigation regions instead of leaving the document without a tree.
+        """
+        from sirchmunk.learnings.toc_extractor import (
+            HeadingTocExtractor,
+            TOCExtractor,
+        )
+
+        toc_result = HeadingTocExtractor.extract(content)
+        entries = list(toc_result.entries or [])
+        seen_ids: set = set()
+
+        if len(entries) >= 2:
+            hierarchy = TOCExtractor._build_hierarchy(entries)
+
+            def _assign_ends(items: List[Any], parent_end: int) -> None:
+                for index, entry in enumerate(items):
+                    next_start = (
+                        items[index + 1].char_start
+                        if index + 1 < len(items) else parent_end
+                    )
+                    current_end = getattr(entry, "char_end", None)
+                    if current_end is None or current_end <= entry.char_start:
+                        entry.char_end = next_start
+                    if getattr(entry, "children", None):
+                        _assign_ends(entry.children, entry.char_end)
+
+            _assign_ends(hierarchy, len(content))
+            children = self._toc_entries_to_nodes(
+                hierarchy,
+                content,
+                len(content),
+                seen_ids,
+                fallback_level=1,
+            )
+        else:
+            children = self._build_paragraph_nodes(content, seen_ids)
+
+        heuristic_v2 = os.getenv(
+            "LENS_TREE_HEURISTIC_VERSION", "v2",
+        ).strip().lower() == "v2"
+        if heuristic_v2:
+            # Unwrap boilerplate containers while preserving their descendants.
+            while len(children) == 1 and children[0].children:
+                children = children[0].children
+            leaf_count = self._heuristic_leaf_count(children)
+            valid_leaves = [
+                leaf for child in children for leaf in child.all_leaves()
+                if 0 <= leaf.char_range[0] < leaf.char_range[1] <= len(content)
+            ]
+            covered = sum(
+                end - start
+                for start, end in sorted({leaf.char_range for leaf in valid_leaves})
+            )
+            coverage = min(1.0, covered / max(len(content), 1))
+            if leaf_count < 2 or coverage < 0.25:
+                # Structured-heading extraction can yield a single wrapper or
+                # sparse offsets for DOCX/RST conversions.  Preserve coverage by
+                # falling back to contiguous paragraph regions.
+                children = self._build_paragraph_nodes(content, seen_ids)
+                leaf_count = len(children)
+            if leaf_count < 2:
+                return None
+            try:
+                max_nodes = max(8, int(os.getenv("LENS_TREE_MAX_NODES", "96")))
+            except ValueError:
+                max_nodes = 96
+            children = self._coarsen_heuristic_children(
+                children, max_nodes=max_nodes, seen_ids=seen_ids,
+            )
+        elif len(children) < 2:
+            return None
+        root_summary = "; ".join(child.title for child in children[:8])[:500]
+        return TreeNode(
+            node_id=self._unique_node_id(0, seen_ids),
+            title="Document",
+            summary=root_summary,
+            char_range=(0, len(content)),
+            level=0,
+            children=children,
+        )
 
     async def _build_tree_from_toc(
         self,
@@ -643,7 +844,7 @@ class DocumentTreeIndexer:
             end = entry.char_end if entry.char_end and entry.char_end > start else parent_end
             end = min(end, content_len)
 
-            section_text = content[start:min(start + _TOC_NODE_SUMMARY_MAX_CHARS, end)]
+            section_text = content[start:end]
             nid = DocumentTreeIndexer._unique_node_id(start, seen_ids)
             level = entry.level if entry.level > 0 else fallback_level
 
@@ -670,8 +871,8 @@ class DocumentTreeIndexer:
             # to help LLM-driven navigation prioritize data-rich sections.
             # Deliberately keeps content_type="text" so _classify_leaves
             # routes to kreuzberg char_range (higher fidelity than pypdf).
-            summary_text = section_text.strip()
-            section_sample = content[start:min(start + 2000, end)]
+            summary_text = DocumentTreeIndexer._heuristic_summary(section_text)
+            section_sample = section_text[:2000]
             if DocumentTreeIndexer._detect_structured_content(section_sample):
                 summary_text = f"[Data/Tables] {summary_text}"
 

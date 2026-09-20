@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import re
+import statistics
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,8 +40,17 @@ from sirchmunk.llm.prompts import (
     DEEP_PAGE_SELECT,
     DEEP_CHECK_REQUIREMENTS,
     DEEP_TOC_ANALYSIS,
+    QUERY_INTELLIGENCE_PROMPT,
 )
+from sirchmunk.schema.query_intelligence import QueryIntelligence
 from sirchmunk.renderers.search_response import render_search_response
+from sirchmunk.retrieve.confidence import (
+    ConfidenceDecision,
+    ConfidenceFusionPolicy,
+    LexicalConfidenceFeatures,
+    calibrate_lexical_features,
+    calibrate_match_score,
+)
 from sirchmunk.retrieve.text_retriever import GrepRetriever
 from sirchmunk.scheduler.evolver import KnowledgeEvolver
 from sirchmunk.schema.knowledge import (
@@ -152,6 +162,19 @@ class _PathScope:
 # When enabled, search relies solely on tree index navigation, skipping rga keyword search.
 _PURE_TREE_SEARCH: bool = os.getenv("SIRCHMUNK_PURE_TREE_SEARCH", "false").lower() == "true"
 
+
+def _deep_retrieval_profile() -> str:
+    """Return the per-search DEEP retrieval profile.
+
+    Read dynamically because experiment arms switch the profile inside one
+    Python process.  ``legacy_keyword`` is a true lexical-only ablation; all
+    public output and answer-resolution behavior remains shared.
+    """
+    profile = os.getenv(
+        "SIRCHMUNK_DEEP_RETRIEVAL_PROFILE", "multipath",
+    ).strip().lower()
+    return profile if profile in {"multipath", "legacy_keyword"} else "multipath"
+
 # Prior-warmed agentic loop for DEEP synthesis. When enabled (default), the
 # parallel prior (Phases 1-3) warm-starts a single stateful agent loop that
 # both retrieves and answers, replacing the split extract-then-synthesize
@@ -189,6 +212,14 @@ _SLOT_VERIFY_RETRY: bool = os.getenv("LENS_SLOT_VERIFY_RETRY", "true").lower() =
 
 # P0-1: evidence triage — reduce warm-start noise before agentic loop.
 _EVIDENCE_TRIAGE: bool = os.getenv("LENS_EVIDENCE_TRIAGE", "true").lower() == "true"
+
+# Plan E: computation trace verification. The answering LLM discloses the exact
+# numeric operands and operation it used; Python re-computes deterministically
+# and corrects the final number. This replaces corpus-specific row/column regex
+# with a general "LLM extracts operands (semantic), code does arithmetic
+# (mechanical)" division of labour, and stays grounded by requiring operands to
+# appear in the evidence. Disable to fall back to inline-expression checking.
+_COMPUTATION_TRACE: bool = os.getenv("LENS_COMPUTATION_TRACE", "true").lower() == "true"
 
 # Phase 1A: Format-agnostic retrieval — use snippet content (not filename
 # semantics) to score files and extract articles from JSON-lines shards.
@@ -272,6 +303,7 @@ class CompileArtifacts:
     tree_available_paths: Set[str]  # file paths that have cached tree indices
     manifest_map: Dict[str, Any] = field(default_factory=dict)  # {path: FileManifestEntry}
     summary_index: Optional[Any] = None  # CompileSummaryIndex (lazy-loaded)
+    topic_map: Optional[Any] = None  # CorpusTopicMap (tree-title cross-document routing)
 
 
 @dataclass
@@ -422,6 +454,7 @@ class AgenticSearch(BaseSearch):
         )
 
         self.grep_retriever: GrepRetriever = GrepRetriever(work_path=self.work_path)
+        self._confidence_policy = ConfidenceFusionPolicy()
 
         # Create bound logger with callback - returns AsyncLogger instance
         self._log_callback: LogCallback = log_callback
@@ -1688,19 +1721,209 @@ class AgenticSearch(BaseSearch):
                         continue
         return results
 
+    _COMPUTATION_TRACE_RE = re.compile(
+        r"<COMPUTATION_TRACE>\s*(\{.*?\})\s*</COMPUTATION_TRACE>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    # Number token used to ground trace operands against the evidence text.
+    _NUMBER_TOKEN_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
+    @staticmethod
+    def _format_number(value: float) -> str:
+        """Render a computed number without spurious trailing zeros."""
+        if value == int(value):
+            return str(int(value))
+        return f"{value:.10f}".rstrip("0").rstrip(".")
+
+    @classmethod
+    def _reduce_operation(
+        cls,
+        operation: str,
+        operands: List[float],
+    ) -> Optional[float]:
+        """Deterministically evaluate an aggregation over operands.
+
+        The operation vocabulary is intent-level (sum/mean/count/min/max/product/
+        difference/range), not corpus-specific. Synonyms and common CJK terms map
+        onto the same primitives so the trace stays model- and language-agnostic.
+        """
+        if not operands:
+            return None
+        op = (operation or "").strip().lower()
+
+        def _has(*keys: str) -> bool:
+            return any(key in op for key in keys)
+
+        if _has("sum", "total", "add", "总和", "总计", "总值", "合计", "求和", "累计"):
+            return math.fsum(operands)
+        if _has("mean", "average", "avg", "均值", "平均"):
+            return math.fsum(operands) / len(operands)
+        if _has("count", "计数", "个数", "数量"):
+            return float(len(operands))
+        if _has("min", "最小", "最低"):
+            return min(operands)
+        if _has("max", "最大", "最高"):
+            return max(operands)
+        if _has("product", "multiply", "乘积", "乘。"):
+            product = 1.0
+            for value in operands:
+                product *= value
+            return product
+        if _has("range", "极差"):
+            return max(operands) - min(operands)
+        if _has("diff", "difference", "subtract", "差值", "相减", "减"):
+            total = operands[0]
+            for value in operands[1:]:
+                total -= value
+            return total
+        return None
+
+    @classmethod
+    def _grounded_trace_operands(
+        cls,
+        operands: List[float],
+        evidence: str,
+    ) -> bool:
+        """Confirm the trace operands are drawn from the evidence, not invented.
+
+        Trusting the model's *arithmetic* is unsafe, but trusting its *evidence
+        extraction* only holds if the operands actually occur in the evidence.
+        Matching is by numeric value against every number in the evidence, so it
+        is independent of formatting, layout, or entity naming.
+        """
+        if not evidence:
+            return False
+        evidence_values: List[float] = []
+        for token in cls._NUMBER_TOKEN_RE.findall(evidence):
+            try:
+                evidence_values.append(float(token.replace(",", "")))
+            except ValueError:
+                continue
+        if not evidence_values:
+            return False
+        tolerance = cls._ARITH_TOLERANCE
+        for operand in operands:
+            if not any(abs(operand - value) <= tolerance for value in evidence_values):
+                return False
+        return True
+
+    @classmethod
+    def _parse_computation_trace(
+        cls,
+        source: str,
+    ) -> Optional[Tuple[str, List[float]]]:
+        """Extract ``(operation, operands)`` from a trace payload or block.
+
+        ``source`` may be a bare JSON object (as captured into telemetry) or any
+        text still wrapping it in ``<COMPUTATION_TRACE>`` tags.
+        """
+        if not source:
+            return None
+        candidate = source.strip()
+        block = cls._COMPUTATION_TRACE_RE.search(candidate)
+        if block:
+            candidate = block.group(1)
+        try:
+            payload = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        operation = str(payload.get("operation") or payload.get("op") or "")
+        raw_operands = payload.get("operands")
+        if not isinstance(raw_operands, list) or len(raw_operands) < 2:
+            return None
+        operands: List[float] = []
+        for item in raw_operands:
+            try:
+                operands.append(float(str(item).replace(",", "").strip()))
+            except (TypeError, ValueError):
+                return None
+        return operation, operands
+
+    def _verify_computation_trace(
+        self,
+        answer: str,
+        evidence: str,
+        context: Optional["SearchContext"],
+    ) -> Optional[Tuple[str, bool]]:
+        """Deterministically re-check a model-disclosed computation trace.
+
+        The trace is read from ``context.telemetry`` first — the ReAct agent
+        captures it from the raw response before answer sanitization strips JSON
+        — and from the answer text as a fallback. Returns ``(answer,
+        was_corrected)`` when a grounded, recomputable trace exists, otherwise
+        ``None`` so the caller can fall back to inline-expression verification.
+        """
+        trace_source = ""
+        telemetry = getattr(context, "telemetry", None)
+        if isinstance(telemetry, dict):
+            trace_source = str(telemetry.get("computation_trace") or "")
+        parsed = self._parse_computation_trace(trace_source)
+        if parsed is None:
+            parsed = self._parse_computation_trace(answer)
+        if parsed is None:
+            return None
+        operation, operands = parsed
+        if not self._grounded_trace_operands(operands, evidence):
+            return None
+        computed = self._reduce_operation(operation, operands)
+        if computed is None:
+            return None
+        expected = self._format_number(computed)
+        current = self._extract_answer_span(answer)
+        current_number = re.search(r"-?\d[\d,]*(?:\.\d+)?", current or "")
+        normalized_current = (
+            current_number.group(0).replace(",", "") if current_number else ""
+        )
+        self._record_context_telemetry(
+            context,
+            computation_deterministic_verified=True,
+            computation_deterministic_result=expected,
+        )
+        if normalized_current == expected:
+            return answer, False
+        self._record_context_telemetry(
+            context,
+            computation_deterministic_corrected=True,
+            computation_answer_before=(current or "")[:200],
+            computation_answer_after=expected,
+        )
+        return self._replace_answer_span(answer, expected), True
+
     async def _verify_computation(
         self,
         query: str,
         answer: str,
+        evidence: str = "",
+        context: Optional["SearchContext"] = None,
     ) -> Tuple[str, bool]:
         """Verify arithmetic in computation-type answers.
 
-        Extracts arithmetic expressions, evaluates them with Python, and
-        re-prompts the LLM if a discrepancy is detected.
+        Two general, corpus-agnostic strategies, in order of confidence:
+
+        1. A model-disclosed ``<COMPUTATION_TRACE>`` (operands + operation) whose
+           operands are grounded in the evidence is re-computed in Python; the
+           final number is corrected on a mismatch. This trusts the model for
+           evidence extraction (semantic) but never for arithmetic (mechanical).
+        2. Otherwise, inline ``a op b = c`` expressions written in the answer are
+           evaluated and, on discrepancy, the model is re-prompted to revise.
 
         Returns:
             ``(corrected_answer, was_corrected)``.
         """
+        if _COMPUTATION_TRACE:
+            trace_result = self._verify_computation_trace(answer, evidence, context)
+            if trace_result is not None:
+                verified_answer, was_corrected = trace_result
+                if was_corrected:
+                    await self._logger.info(
+                        "[Phase 4.5:Verify] Grounded computation-trace correction "
+                        f"applied ({self._extract_answer_span(answer) or '<missing>'} "
+                        f"-> {self._extract_answer_span(verified_answer)})"
+                    )
+                return verified_answer, was_corrected
+
         expressions = self._extract_arithmetic_expressions(answer)
         if not expressions:
             return answer, False
@@ -2080,7 +2303,7 @@ class AgenticSearch(BaseSearch):
         max_token_budget: int = 128000,
         max_depth: Optional[int] = 5,
         top_k_files: int = 5,
-        enable_dir_scan: bool = False,
+        enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         return_context: Optional[bool] = None,
@@ -2127,19 +2350,18 @@ class AgenticSearch(BaseSearch):
         ├──────────────────────────────────────────────────────────┤
         │ Phase 0  Cluster reuse check (instant, short-circuit)    │
         ├──────────────────────────────────────────────────────────┤
-        │ Phase 1  Parallel probing (all concurrent):              │
-        │  ├─ LLM keyword extraction                               │
+        │ Phase 1  Parallel query intelligence and cache probes:   │
+        │  ├─ merged query/intent/requirement analysis (one call)  │
         │  ├─ DirectoryScanner.scan() (filesystem only, fast)      │
-        │  ├─ Knowledge cache similarity search                    │
-        │  └─ Spec-path cache load                                 │
+        │  ├─ Knowledge/spec cache and compile artifacts           │
+        │  └─ multi-query/entity/structure hypotheses              │
         ├──────────────────────────────────────────────────────────┤
-        │ Phase 2  Parallel retrieval (depends on Phase 1):        │
-        │  ├─ keyword_search per extracted keyword (concurrent rga)│
-        │  └─ DirectoryScanner.rank() (LLM ranks candidates)      │
+        │ Phase 2  Four-path parallel retrieval (zero LLM):        │
+        │  ├─ batched multi-query rga + exact entity phrases       │
+        │  ├─ tree/TOC structure + corpus topic map                │
+        │  └─ deterministic directory-semantic routing             │
         ├──────────────────────────────────────────────────────────┤
-        │ Phase 3  Merge + evidence assembly:                      │
-        │  └─ knowledge_base.build() (parallel per-file Monte      │
-        │     Carlo evidence sampling)                             │
+        │ Phase 3  Weighted RRF fusion + target-file selection     │
         ├──────────────────────────────────────────────────────────┤
         │ Phase 4  Summary / ReAct refinement:                     │
         │  └─ If evidence sufficient → LLM summary                 │
@@ -2233,14 +2455,24 @@ class AgenticSearch(BaseSearch):
                 llm_fallback=llm_fallback,
             )
         else:
-            answer, cluster, context = await self._search_deep(
-                query=query, paths=paths,
-                max_loops=max_loops, max_token_budget=max_token_budget,
-                max_depth=max_depth, top_k_files=top_k_files,
-                enable_dir_scan=enable_dir_scan,
-                include=include, exclude=exclude,
-                spec_stale_hours=spec_stale_hours,
-                llm_fallback=llm_fallback,
+            budget_token = self.llm.bind_token_budget(max_token_budget)
+            budget_snapshot: Dict[str, Any] = {"enabled": False}
+            try:
+                answer, cluster, context = await self._search_deep(
+                    query=query, paths=paths,
+                    max_loops=max_loops, max_token_budget=max_token_budget,
+                    max_depth=max_depth, top_k_files=top_k_files,
+                    enable_dir_scan=enable_dir_scan,
+                    include=include, exclude=exclude,
+                    spec_stale_hours=spec_stale_hours,
+                    llm_fallback=llm_fallback,
+                )
+                budget_snapshot = self.llm.token_budget_snapshot()
+            finally:
+                self.llm.reset_token_budget(budget_token)
+            self._record_context_telemetry(
+                context,
+                hard_token_budget=budget_snapshot,
             )
 
         # ---- Knowledge evolution ----
@@ -2301,7 +2533,7 @@ class AgenticSearch(BaseSearch):
         max_token_budget: int = 128000,
         max_depth: Optional[int] = 5,
         top_k_files: int = 5,
-        enable_dir_scan: bool = False,
+        enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         spec_stale_hours: float = 72.0,
@@ -2331,6 +2563,17 @@ class AgenticSearch(BaseSearch):
         # --- Adaptive compile artifact detection (shared with FAST) ---
         _scope = _PathScope(paths)
         artifacts = self._detect_compile_artifacts(paths)
+        retrieval_profile = _deep_retrieval_profile()
+        legacy_keyword_only = retrieval_profile == "legacy_keyword"
+        confidence_policy = getattr(
+            self, "_confidence_policy", ConfidenceFusionPolicy(),
+        )
+        route_collapse_enabled = os.getenv(
+            "LENS_ROUTE_COLLAPSE", "true",
+        ).strip().lower() == "true"
+        self._record_context_telemetry(
+            context, deep_retrieval_profile=retrieval_profile,
+        )
 
         # ==============================================================
         # Phase 0a: Direct document analysis (intent-gated short-circuit)
@@ -2348,150 +2591,316 @@ class AgenticSearch(BaseSearch):
         if reused is not None:
             return self._enrich_reused_content(reused), reused, context
 
-        # P2: gradient reuse — extract hints from moderately similar clusters
-        soft_hit = await self._try_soft_reuse(query, paths)
+        # P2: gradient reuse — excluded from the lexical-only ablation so the
+        # baseline measures the original query-to-rga path without learned hints.
+        soft_hit = (
+            None if legacy_keyword_only else await self._try_soft_reuse(query, paths)
+        )
 
         await self._logger.info(f"[search] Starting multi-path retrieval for: '{query[:80]}'")
 
         # ==============================================================
-        # Phase 1: Parallel probing — five paths fire concurrently
+        # Phase 1: Query intelligence + independent zero-index probes
         # ==============================================================
-        await self._logger.info("[Phase 1] Parallel probing: keywords + dir_scan + knowledge + spec_cache + tree_index")
+        await self._logger.info(
+            "[Phase 1] Parallel probing: query_intelligence + dir_scan + "
+            "knowledge + spec_cache + compile artifacts"
+        )
         context.increment_loop()
 
-        # Query analysis (intent + data requirements) depends only on the query
-        # text, never on retrieval output, yet it sat on the critical path
-        # between retrieval and file selection. Launch it here so it overlaps
-        # Phase 1-2 and is awaited in Phase 3, where its result is first
-        # needed. Touch the usage buffer first: the child task inherits a copy
-        # of the context whose ContextVar still points at this list object, so
-        # appends land in this search's accounting only if it already exists.
-        _ = self.llm_usages
-        analysis_task = asyncio.ensure_future(self._analyze_query_for_retrieval(query))
+        if legacy_keyword_only:
+            with self._phase("phase1_legacy_keyword"):
+                legacy_results = await asyncio.gather(
+                    self._probe_keywords(query),
+                    self._analyze_query_for_retrieval(query),
+                    return_exceptions=True,
+                )
+            keyword_result = (
+                legacy_results[0]
+                if not isinstance(legacy_results[0], Exception)
+                else ({query: 5.0}, [query])
+            )
+            analysis_result = (
+                legacy_results[1]
+                if not isinstance(legacy_results[1], Exception)
+                else None
+            )
+            keyword_map, keyword_list = keyword_result
+            if analysis_result is None:
+                complexity = self._classify_query_complexity(query)
+                intent = "computation" if complexity != "simple" else "lookup"
+                data_reqs = DataRequirements(
+                    data_points=[query], likely_sources=[], formula=None,
+                    time_period=None, intent=intent,
+                    hop_type=self._detect_hop_type(query),
+                )
+            else:
+                complexity, intent, data_reqs = analysis_result
+            qi = QueryIntelligence(
+                keywords=dict(keyword_map),
+                intent=intent,
+                complexity=complexity,
+                data_points=list(data_reqs.data_points),
+                likely_sources=list(data_reqs.likely_sources),
+                formula=data_reqs.formula,
+                time_period=data_reqs.time_period,
+                expected_answer_type=data_reqs.expected_answer_type,
+                target_slot=data_reqs.target_slot,
+                answer_constraints=list(data_reqs.answer_constraints),
+                hop_type=data_reqs.hop_type,
+                reformulations=[query],
+            )
+            scan_result = None
+            knowledge_probe = KnowledgeProbeResult([], [], "")
+            spec_context = ""
+            compile_hints = CompileHints([], [])
+            summary_index_hits = []
+            catalog_deep_hits = []
+            self._record_context_telemetry(
+                context,
+                query_intelligence_used=False,
+                legacy_keyword_count=len(keyword_list),
+            )
+        else:
+            with self._phase("phase1_probe"):
+                phase1_results = await asyncio.gather(
+                    self._build_query_intelligence(query),
+                    self._probe_dir_scan(paths, enable_dir_scan),
+                    self._probe_knowledge_cache(query),
+                    self._load_spec_context(paths, stale_hours=spec_stale_hours),
+                    self._probe_compile_hints([query], scope=_scope),
+                    self._probe_summary_index(query, artifacts, scope=_scope),
+                    self._probe_catalog_for_deep(query, artifacts),
+                    return_exceptions=True,
+                )
 
-        with self._phase("phase1_probe"):
-            phase1_results = await asyncio.gather(
-                self._probe_keywords(query),
-                self._probe_dir_scan(paths, enable_dir_scan),
-                self._probe_knowledge_cache(query),
-                self._load_spec_context(paths, stale_hours=spec_stale_hours),
-                self._probe_tree_index(query, scope=_scope),
-                self._probe_compile_hints([query], scope=_scope),
-                self._probe_summary_index(query, artifacts, scope=_scope),    # GAP 2: zero-LLM BM25
-                self._probe_catalog_for_deep(query, artifacts),  # GAP 4: zero-LLM keyword overlap
-                return_exceptions=True,
+            qi = phase1_results[0] if not isinstance(phase1_results[0], Exception) else QueryIntelligence(
+                keywords={query: 5.0}, data_points=[query], reformulations=[query],
+            )
+            scan_result = phase1_results[1] if not isinstance(phase1_results[1], Exception) else None
+            knowledge_probe = phase1_results[2] if not isinstance(phase1_results[2], Exception) else KnowledgeProbeResult([], [], "")
+            spec_context = phase1_results[3] if not isinstance(phase1_results[3], Exception) else ""
+            compile_hints = phase1_results[4] if not isinstance(phase1_results[4], Exception) else CompileHints([], [])
+            summary_index_hits = phase1_results[5] if not isinstance(phase1_results[5], Exception) else []
+            catalog_deep_hits = phase1_results[6] if not isinstance(phase1_results[6], Exception) else []
+
+            labels = [
+                "query_intelligence", "dir_scan", "knowledge", "spec_cache",
+                "compile_hints", "summary_index", "catalog_deep",
+            ]
+            for i, label in enumerate(labels):
+                if isinstance(phase1_results[i], Exception):
+                    await self._logger.warning(
+                        f"[Phase 1] {label} probe failed: {phase1_results[i]}"
+                    )
+
+        # Backwards compat: knowledge_probe may be a plain list from old paths.
+        if isinstance(knowledge_probe, list):
+            knowledge_probe = KnowledgeProbeResult(
+                file_paths=knowledge_probe, extra_keywords=[], background_context="",
             )
 
-        kw_result = phase1_results[0] if not isinstance(phase1_results[0], Exception) else ({}, [])
-        scan_result = phase1_results[1] if not isinstance(phase1_results[1], Exception) else None
-        knowledge_probe = phase1_results[2] if not isinstance(phase1_results[2], Exception) else KnowledgeProbeResult([], [], "")
-        spec_context = phase1_results[3] if not isinstance(phase1_results[3], Exception) else ""
-        tree_hits = phase1_results[4] if not isinstance(phase1_results[4], Exception) else []
-        compile_hints = phase1_results[5] if not isinstance(phase1_results[5], Exception) else CompileHints([], [])
-        summary_index_hits = phase1_results[6] if not isinstance(phase1_results[6], Exception) else []
-        catalog_deep_hits = phase1_results[7] if not isinstance(phase1_results[7], Exception) else []
+        query_keywords = self._expand_keywords_from_reformulations(qi)
+        initial_keywords = list(query_keywords)
 
-        for i, label in enumerate(["keywords", "dir_scan", "knowledge", "spec_cache", "tree_index", "compile_hints", "summary_index", "catalog_deep"]):
-            if isinstance(phase1_results[i], Exception):
-                await self._logger.warning(f"[Phase 1] {label} probe failed: {phase1_results[i]}")
-
-        # Backwards compat: knowledge_probe may be a plain list from old code paths
-        if isinstance(knowledge_probe, list):
-            knowledge_probe = KnowledgeProbeResult(file_paths=knowledge_probe, extra_keywords=[], background_context="")
-
-        query_keywords, initial_keywords = kw_result if isinstance(kw_result, tuple) else ({}, [])
-
-        # P2: inject soft-hit patterns into keywords
+        # Reuse signals enrich the merged prior without another oracle call.
         if soft_hit:
-            for p in soft_hit.patterns:
-                if p not in initial_keywords:
-                    initial_keywords.append(p)
-                if p not in query_keywords:
-                    query_keywords[p] = 0.6
+            for pattern in soft_hit.patterns:
+                if pattern not in query_keywords:
+                    query_keywords[pattern] = 6.0
+                    initial_keywords.append(pattern)
+        for keyword in knowledge_probe.extra_keywords:
+            if keyword not in query_keywords:
+                query_keywords[keyword] = 5.0
+                initial_keywords.append(keyword)
+        for keyword in compile_hints.extra_keywords:
+            if keyword not in query_keywords:
+                query_keywords[keyword] = 5.0
+                initial_keywords.append(keyword)
+        initial_keywords = initial_keywords[:32]
 
-        # P3: inject extra keywords from structured knowledge probe
-        for kw in knowledge_probe.extra_keywords:
-            if kw not in initial_keywords:
-                initial_keywords.append(kw)
-            if kw not in query_keywords:
-                query_keywords[kw] = 0.5
-
-        # P4: inject compile-hint extra keywords into Phase 2 keyword list
-        for kw in compile_hints.extra_keywords:
-            if kw not in initial_keywords:
-                initial_keywords.append(kw)
-            if kw not in query_keywords:
-                query_keywords[kw] = 0.5
-
-        # P2 + P3: append background context for Phase 4 LLM prompt
         if soft_hit and soft_hit.context_summary:
-            spec_context = f"{spec_context}\n\n{soft_hit.context_summary}" if spec_context else soft_hit.context_summary
+            spec_context = (
+                f"{spec_context}\n\n{soft_hit.context_summary}"
+                if spec_context else soft_hit.context_summary
+            )
         if knowledge_probe.background_context:
-            spec_context = f"{spec_context}\n\n{knowledge_probe.background_context}" if spec_context else knowledge_probe.background_context
+            spec_context = (
+                f"{spec_context}\n\n{knowledge_probe.background_context}"
+                if spec_context else knowledge_probe.background_context
+            )
 
+        self._record_context_telemetry(
+            context,
+            query_intelligence_used=not legacy_keyword_only,
+            dir_scan_cache_hit=(scan_result.cache_hit if scan_result else False),
+            dir_scan_cache_mode=(scan_result.cache_mode if scan_result else "off"),
+            dir_scan_cache_validation_ms=(
+                scan_result.cache_validation_ms if scan_result else 0.0
+            ),
+            dir_scan_files_reused=(scan_result.files_reused if scan_result else 0),
+            dir_scan_files_refreshed=(scan_result.files_refreshed if scan_result else 0),
+            query_reformulations=qi.reformulations,
+            query_entities=qi.entities,
+            query_concepts=qi.concepts,
+            expected_doc_type=qi.expected_doc_type,
+            expected_sections=qi.expected_sections,
+        )
         await self._logger.info(
             f"[Phase 1] Results: keywords={len(initial_keywords)}, "
+            f"reformulations={len(qi.reformulations)}, entities={len(qi.entities)}, "
             f"dir_scan={'OK' if scan_result else 'N/A'}, "
             f"knowledge_files={len(knowledge_probe.file_paths)}, "
-            f"tree_hits={len(tree_hits)}, "
             f"compile_hints={len(compile_hints.file_paths)}, "
             f"summary_index={len(summary_index_hits)}, "
             f"catalog_deep={len(catalog_deep_hits)}, "
-            f"soft_hit={'YES' if soft_hit else 'NO'}, "
-            f"spec_cache={'YES' if spec_context else 'NO'}"
+            f"soft_hit={'YES' if soft_hit else 'NO'}"
         )
 
         # ==============================================================
-        # Phase 2: Parallel retrieval — keyword search + dir_scan rank
+        # Phase 2: Four-path parallel retrieval (all indexless)
         # ==============================================================
-        keyword_files: List[str] = []
-        dir_scan_files: List[str] = []
-        # Matched lines per file from the keyword probe: the literal hit
-        # locations are carried forward so extraction and answer synthesis can
-        # anchor on them rather than rescanning each document.
-        match_snippets: Dict[str, List[str]] = {}
+        await self._logger.info(
+            "[Phase 2] Parallel retrieval: multi-query rga + exact entities + "
+            "document structure + directory semantics"
+        )
+        context.increment_loop()
+        broad_keywords = [
+            term for term in initial_keywords
+            if term.lower() not in {entity.lower() for entity in qi.entities}
+        ] or initial_keywords
 
-        if _PURE_TREE_SEARCH:
-            # Pure tree search mode: skip rga and dir_scan, rely solely on tree hits
-            await self._logger.info("[Phase 2:PureTree] Skipping rga keyword search and dir_scan")
-            context.increment_loop()
+        if legacy_keyword_only:
+            with self._phase("phase2_legacy_keyword"):
+                legacy_probe = await self._probe_keyword_matches(
+                    initial_keywords[:24], paths,
+                    max_depth=max_depth, include=include, exclude=exclude,
+                ) if initial_keywords and not _PURE_TREE_SEARCH else ([], {})
+            keyword_files, match_snippets = legacy_probe
+            lexical_confidence = {}
+            lexical_features = {}
+            phrase_files, phrase_snippets, entity_confidence = [], {}, {}
+            structure_results = []
+            directory_results, directory_details = [], {}
+            topic_map_results = []
+            cheap_dominant_evidence: Dict[str, str] = {}
+            broad_search_skipped = False
         else:
-            await self._logger.info("[Phase 2] Parallel retrieval: rga keyword search + dir_scan LLM rank")
-            context.increment_loop()
+            cheap_route_first = os.getenv(
+                "LENS_CHEAP_ROUTE_FIRST", "true",
+            ).strip().lower() == "true"
+            cheap_dominant_evidence = {}
 
-            phase2_tasks = []
-
-            if initial_keywords:
-                phase2_tasks.append(
-                    self._probe_keyword_matches(
-                        initial_keywords, paths,
-                        max_depth=max_depth, include=include, exclude=exclude,
+            # Directory semantics is memory-only after the Phase 1 scan.  Run it
+            # first so an exact filename/dataset match can avoid every rga call.
+            if _PURE_TREE_SEARCH or scan_result is None or not enable_dir_scan:
+                directory_probe = ([], {})
+            else:
+                try:
+                    directory_probe = await self._directory_semantic_probe(
+                        qi, scan_result,
                     )
+                except Exception as exc:
+                    await self._logger.warning(
+                        f"[Phase 2] directory_semantic path failed: {exc}"
+                    )
+                    directory_probe = ([], {})
+            directory_results, directory_details = directory_probe
+            if directory_results:
+                directory_top_path, directory_top_score = directory_results[0]
+                directory_second_score = directory_results[1][1] if len(directory_results) > 1 else 0.0
+                detail = directory_details.get(directory_top_path, {})
+                if (
+                    directory_top_score >= confidence_policy.config.directory_high_threshold
+                    and directory_top_score - directory_second_score
+                    >= confidence_policy.config.margin_threshold
+                    and bool(detail.get("direct_match"))
+                    and int(detail.get("signal_count") or 0) >= 2
+                ):
+                    cheap_dominant_evidence[directory_top_path] = (
+                        "directory_direct_match"
+                    )
+
+            directory_short_circuit = bool(
+                cheap_route_first
+                and route_collapse_enabled
+                and confidence_policy.config.mode == "soft"
+                and qi.hop_type == "single"
+                and cheap_dominant_evidence
+            )
+            if directory_short_circuit:
+                phrase_files, phrase_snippets, entity_confidence = [], {}, {}
+                structure_results = []
+                topic_map_results = []
+            else:
+                secondary_tasks = [
+                    self._async_noop(([], {}, {})) if _PURE_TREE_SEARCH or not qi.entities else
+                    self._probe_entity_phrases(
+                        qi.entities, paths,
+                        max_depth=max_depth, include=include, exclude=exclude,
+                    ),
+                    self._structure_guided_probe(qi, artifacts, _scope),
+                    self._probe_corpus_topic_map(qi, artifacts, _scope),
+                ]
+                with self._phase("phase2_secondary_routes"):
+                    secondary_results = await asyncio.gather(
+                        *secondary_tasks, return_exceptions=True,
+                    )
+                labels = ["entity_phrase", "structure", "corpus_topic_map"]
+                for index, label in enumerate(labels):
+                    if isinstance(secondary_results[index], Exception):
+                        await self._logger.warning(
+                            f"[Phase 2] {label} path failed: {secondary_results[index]}"
+                        )
+                phrase_probe = secondary_results[0] if not isinstance(secondary_results[0], Exception) else ([], {}, {})
+                structure_results = secondary_results[1] if not isinstance(secondary_results[1], Exception) else []
+                topic_map_results = secondary_results[2] if not isinstance(secondary_results[2], Exception) else []
+                phrase_files, phrase_snippets, entity_confidence = phrase_probe
+                if len(phrase_files) == 1 and entity_confidence.get(phrase_files[0], 0.0) >= 0.90:
+                    cheap_dominant_evidence[phrase_files[0]] = "unique_exact_entity"
+
+            broad_search_skipped = bool(
+                cheap_route_first
+                and route_collapse_enabled
+                and confidence_policy.config.mode == "soft"
+                and qi.hop_type == "single"
+                and cheap_dominant_evidence
+            )
+            if broad_search_skipped:
+                keyword_probe = ([], {}, {}, {})
+                await self._logger.info(
+                    "[Phase 2] Strong cheap route found; skipping remaining broad retrieval"
                 )
             else:
-                phase2_tasks.append(self._async_noop(([], {})))
+                with self._phase("phase2_multi_query"):
+                    keyword_probe = (
+                        await self._probe_multi_query_matches(
+                            qi, broad_keywords[:32], paths,
+                            max_depth=max_depth, include=include, exclude=exclude,
+                        )
+                        if not _PURE_TREE_SEARCH and broad_keywords
+                        else ([], {}, {}, {})
+                    )
+            keyword_files, match_snippets, lexical_confidence, lexical_features = keyword_probe
+        for file_path, snippets in phrase_snippets.items():
+            bucket = match_snippets.setdefault(file_path, [])
+            for snippet in snippets:
+                if snippet not in bucket:
+                    bucket.append(snippet)
+        dir_scan_files = [item[0] for item in directory_results]
 
-            if scan_result is not None and enable_dir_scan:
-                phase2_tasks.append(
-                    self._rank_dir_scan_candidates(query, scan_result)
-                )
-            else:
-                phase2_tasks.append(self._async_noop([]))
-
-            with self._phase("phase2_retrieve_rank"):
-                phase2_results = await asyncio.gather(*phase2_tasks, return_exceptions=True)
-
-            keyword_probe = phase2_results[0] if not isinstance(phase2_results[0], Exception) else ([], {})
-            keyword_files, match_snippets = keyword_probe
-            dir_scan_files = phase2_results[1] if not isinstance(phase2_results[1], Exception) else []
-
-            for i, label in enumerate(["keyword_search", "dir_scan_rank"]):
-                if isinstance(phase2_results[i], Exception):
-                    await self._logger.warning(f"[Phase 2] {label} failed: {phase2_results[i]}")
+        if not legacy_keyword_only:
+            self._record_context_telemetry(
+                context,
+                cheap_route_first_enabled=cheap_route_first,
+                broad_multi_query_skipped=broad_search_skipped,
+                cheap_dominant_evidence=cheap_dominant_evidence,
+            )
 
         await self._logger.info(
-            f"[Phase 2] Results: keyword_files={len(keyword_files)}, "
-            f"dir_scan_files={len(dir_scan_files)}"
+            f"[Phase 2] Results: keyword={len(keyword_files)}, "
+            f"entity={len(phrase_files)}, structure={len(structure_results)}, "
+            f"directory={len(directory_results)}, topic_map={len(topic_map_results)}"
         )
 
         # --- Phase 2.5: Zero-hit rescue --------------------------------
@@ -2503,9 +2912,10 @@ class AgenticSearch(BaseSearch):
         # relaxed acceptance level before giving up.
         if _ZERO_HIT_RESCUE and not _PURE_TREE_SEARCH:
             _probe_hits = (
-                len(keyword_files) + len(dir_scan_files) + len(tree_hits)
-                + len(catalog_deep_hits) + len(compile_hints.file_paths)
-                + len(summary_index_hits) + len(knowledge_probe.file_paths)
+                len(keyword_files) + len(phrase_files) + len(dir_scan_files)
+                + len(structure_results) + len(catalog_deep_hits)
+                + len(compile_hints.file_paths) + len(summary_index_hits)
+                + len(topic_map_results) + len(knowledge_probe.file_paths)
             )
             if _probe_hits == 0:
                 with self._phase("zero_hit_rescue"):
@@ -2522,62 +2932,137 @@ class AgenticSearch(BaseSearch):
                     )
                 keyword_files = rescue_keyword_files or keyword_files
                 dir_scan_files = rescue_scan_files or dir_scan_files
+                if rescue_scan_files:
+                    directory_results = [
+                        (file_path, 0.1) for file_path in rescue_scan_files
+                    ]
 
         # ==============================================================
-        # Phase 3: Query analysis + file selection
+        # Phase 3: Query projection + weighted RRF file fusion
         # ==============================================================
         context.increment_loop()
-        try:
-            _query_complexity, _query_intent, data_reqs = await analysis_task
-        except Exception as exc:
-            # Never let the overlapped analysis break the pipeline: fall back to
-            # running it inline on the critical path.
-            await self._logger.warning(
-                f"[Phase 3] overlapped query analysis failed ({exc}); retrying inline"
-            )
-            _query_complexity, _query_intent, data_reqs = (
-                await self._analyze_query_for_retrieval(query)
-            )
-        context.increment_loop()
+        _query_complexity = qi.complexity
+        _query_intent = qi.intent
+        data_reqs = self._query_intelligence_data_requirements(qi)
 
         await self._logger.info(
             f"[Phase 3] Query: complexity={_query_complexity}, "
-            f"intent={_query_intent}, "
+            f"intent={_query_intent}, hop={data_reqs.hop_type}, "
             f"data_points={len(data_reqs.data_points)}, "
             f"formula={data_reqs.formula or 'N/A'}"
         )
 
-        extra_knowledge_files = knowledge_probe.file_paths
+        extra_knowledge_files = list(knowledge_probe.file_paths)
         if soft_hit:
             extra_knowledge_files = soft_hit.file_paths + extra_knowledge_files
-
-        merged_files = self._merge_file_paths(
-            keyword_files=list(tree_hits) + catalog_deep_hits + compile_hints.file_paths + summary_index_hits + keyword_files,
-            dir_scan_files=dir_scan_files,
-            knowledge_hits=extra_knowledge_files,
+        existing_results = (
+            [item[0] for item in topic_map_results]
+            + catalog_deep_hits + compile_hints.file_paths + summary_index_hits
+            + extra_knowledge_files
         )
-        merged_files, reranking_scores = self._rerank_files_for_evidence_coverage(
-            merged_files,
-            query,
-            data_reqs,
-            match_snippets=match_snippets,
-        )
-        if reranking_scores:
-            self._record_context_telemetry(
-                context,
-                evidence_reranking_applied=True,
-                evidence_reranking_scores=reranking_scores,
-                evidence_reranking_terms=sorted(self._evidence_coverage_terms(query, data_reqs))[:50],
+        if legacy_keyword_only:
+            merged_files, fusion_scores = self._rerank_files_for_evidence_coverage(
+                keyword_files,
+                query,
+                data_reqs,
+                match_snippets=match_snippets,
             )
+            confidence_decision = ConfidenceDecision(
+                ranked_files=list(merged_files),
+                fusion_scores=dict(fusion_scores),
+                global_confidence={},
+                route_confidence={},
+                supporting_routes={},
+                reason="legacy_keyword_profile",
+            )
+        else:
+            route_rankings = {
+                "lexical": keyword_files,
+                "entity": phrase_files,
+                "structure": [item[0] for item in structure_results],
+                "directory": [item[0] for item in directory_results],
+                "existing": existing_results,
+            }
+            route_scores = {
+                "lexical": lexical_confidence,
+                "entity": entity_confidence,
+                "structure": {item[0]: item[1] for item in structure_results},
+                "directory": {item[0]: item[1] for item in directory_results},
+                "existing": {item[0]: min(0.65, item[1]) for item in topic_map_results},
+            }
+            route_collapse_eligible = (
+                route_collapse_enabled
+                and data_reqs.hop_type == "single"
+                and _query_intent in {"lookup", "computation"}
+            )
+            confidence_decision = confidence_policy.fuse(
+                route_rankings,
+                route_scores,
+                fast_track_eligible=route_collapse_eligible,
+                dominant_evidence=cheap_dominant_evidence,
+                allow_loop_reduction=(
+                    _query_intent == "lookup" and len(data_reqs.data_points) <= 2
+                ),
+            )
+            merged_files = confidence_decision.ranked_files
+            fusion_scores = confidence_decision.fusion_scores
+        if not merged_files:
+            merged_files = self._merge_file_paths(
+                keyword_files=keyword_files + phrase_files,
+                dir_scan_files=dir_scan_files,
+                knowledge_hits=existing_results,
+            )
+        structure_anchors = {
+            file_path: anchors
+            for file_path, _score, anchors in structure_results
+            if anchors
+        }
+        self._record_context_telemetry(
+            context,
+            **confidence_decision.telemetry(),
+            confidence_mode=confidence_policy.config.mode,
+            confidence_thresholds={
+                "global": confidence_policy.config.global_threshold,
+                "margin": confidence_policy.config.margin_threshold,
+                "route_support": confidence_policy.config.route_support_threshold,
+                "directory_high": confidence_policy.config.directory_high_threshold,
+                "entity_high": confidence_policy.config.entity_high_threshold,
+                "min_supporting_routes": confidence_policy.config.min_supporting_routes,
+            },
+            directory_semantic_details=directory_details,
+            lexical_confidence_features=lexical_features,
+            lexical_confidence_version=os.getenv(
+                "LENS_LEXICAL_CONFIDENCE_VERSION", "v2",
+            ),
+            structure_probe_anchors=structure_anchors,
+            evidence_reranking_applied=bool(fusion_scores),
+            evidence_reranking_scores=fusion_scores,
+        )
         target_files = self._select_target_files(
             merged_files,
             _scope,
             artifacts,
             max_files=top_k_files,
         )
+        standard_target_files = list(target_files)
+        fast_track_active = bool(
+            confidence_decision.fast_track
+            and confidence_decision.dominant_file in target_files
+        )
+        if fast_track_active:
+            fast_limit = confidence_policy.config.fast_track_max_files
+            dominant = confidence_decision.dominant_file
+            target_files = [dominant] + [
+                file_path for file_path in target_files if file_path != dominant
+            ][: max(0, fast_limit - 1)]
         self._record_context_telemetry(
             context,
             evidence_reranking_selected_files=target_files,
+            dominant_route_original_targets=standard_target_files,
+            dominant_route_selected_targets=target_files,
+            dominant_route_saved_file_reads=max(
+                0, len(standard_target_files) - len(target_files),
+            ) if fast_track_active else 0,
         )
 
         await self._logger.info(
@@ -2606,11 +3091,75 @@ class AgenticSearch(BaseSearch):
         )
         if _AGENTIC_LOOP_MODE:
             with self._phase("phase4_loop"):
+                # Preserve the loop path's historical six-iteration ceiling;
+                # ``max_loops`` may lower it, while confidence fast-track can
+                # lower it further for a dominant single-document route.
+                standard_loop_limit = max(1, min(max_loops, 6))
+                loop_limit = (
+                    min(
+                        confidence_policy.config.fast_track_max_loops,
+                        standard_loop_limit,
+                    )
+                    if (
+                        fast_track_active
+                        and confidence_decision.reasoning_profile == "reduced"
+                    ) else standard_loop_limit
+                )
+                try:
+                    fast_token_fraction = max(0.25, min(
+                        0.8,
+                        float(os.getenv("LENS_FAST_TRACK_TOKEN_FRACTION", "0.55")),
+                    ))
+                except ValueError:
+                    fast_token_fraction = 0.55
+                attempt_token_budget = (
+                    max(4_096, int(max_token_budget * fast_token_fraction))
+                    if fast_track_active else max_token_budget
+                )
                 answer, should_save = await self._agentic_loop_search(
                     query, data_reqs, target_files, context, paths=paths,
                     match_snippets=match_snippets,
-                    max_token_budget=max_token_budget,
+                    structure_anchors=structure_anchors,
+                    dominant_route=fast_track_active,
+                    max_loops=loop_limit,
+                    max_token_budget=attempt_token_budget,
                 )
+                if (
+                    fast_track_active
+                    and (
+                        standard_target_files != target_files
+                        or loop_limit < max_loops
+                    )
+                    and self._fast_track_requires_fallback(answer, context)
+                ):
+                    self._record_context_telemetry(
+                        context,
+                        dominant_route_fallback=True,
+                        dominant_route_fallback_reason="insufficient_fast_track_evidence",
+                    )
+                    await self._logger.info(
+                        "[Phase 4] Dominant-route evidence insufficient; "
+                        "restoring the full fused candidate set"
+                    )
+                    target_files = standard_target_files
+                    answer, should_save = await self._agentic_loop_search(
+                        query, data_reqs, target_files, context, paths=paths,
+                        match_snippets=match_snippets,
+                        structure_anchors=structure_anchors,
+                        dominant_route=False,
+                        max_loops=standard_loop_limit,
+                        max_token_budget=max_token_budget,
+                    )
+                elif fast_track_active:
+                    self._record_context_telemetry(
+                        context,
+                        dominant_route_fallback=False,
+                        dominant_route_loop_budget=loop_limit,
+                        dominant_route_skipped_work=[
+                            "additional_target_file_reads",
+                            "extended_agent_loops",
+                        ],
+                    )
             answer = self._finalize_answer(query, answer, data_reqs)
             cluster = None
             self._record_context_telemetry(
@@ -2647,6 +3196,7 @@ class AgenticSearch(BaseSearch):
                 retrieval = await self._agentic_retrieve(
                     query, data_reqs, target_files, context, paths=paths,
                     match_snippets=match_snippets,
+                    structure_anchors=structure_anchors,
                 )
             await self._logger.info(
                 f"[Phase 4] Retrieval: {retrieval.rounds_used} rounds, "
@@ -2700,7 +3250,12 @@ class AgenticSearch(BaseSearch):
         # Phase 4.75: Computation verification
         # ==============================================================
         if answer and answer != _NO_RESULTS_MESSAGE and _query_intent == "computation":
-            answer, was_corrected = await self._verify_computation(query, answer)
+            answer, was_corrected = await self._verify_computation(
+                query,
+                answer,
+                evidence=self._loop_evidence_text(context),
+                context=context,
+            )
             if was_corrected:
                 _, should_save, _ = self._parse_summary_response(answer)
 
@@ -3197,7 +3752,7 @@ class AgenticSearch(BaseSearch):
         *,
         max_depth: Optional[int] = 5,
         top_k_files: int = 3,
-        enable_dir_scan: bool = False,
+        enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         llm_fallback: bool = False,
@@ -4580,6 +5135,16 @@ class AgenticSearch(BaseSearch):
             except Exception:
                 pass
 
+        # Load cross-document topic map derived from tree/TOC titles.
+        topic_map = None
+        topic_map_path = self.work_path / ".cache" / "compile" / "corpus_topic_map.json"
+        if topic_map_path.exists():
+            try:
+                from sirchmunk.learnings.corpus_topic_map import CorpusTopicMap
+                topic_map = CorpusTopicMap.load(topic_map_path)
+            except Exception:
+                pass
+
         # --- Apply search-path scope filtering ---
         if not scope.is_empty:
             if catalog:
@@ -4598,6 +5163,7 @@ class AgenticSearch(BaseSearch):
             tree_available_paths=tree_paths,
             manifest_map=manifest_map,
             summary_index=summary_index,
+            topic_map=topic_map,
         )
 
     def _build_tree_root_hints(self, artifacts: CompileArtifacts) -> str:
@@ -6664,6 +7230,679 @@ class AgenticSearch(BaseSearch):
     # Phase 1 probes (each designed to run concurrently)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _query_intelligence_data_requirements(
+        qi: QueryIntelligence,
+    ) -> DataRequirements:
+        """Project merged query intelligence onto the legacy requirements type."""
+        return DataRequirements(
+            data_points=qi.data_points,
+            likely_sources=qi.likely_sources,
+            formula=qi.formula,
+            time_period=qi.time_period,
+            intent=qi.intent,
+            expected_answer_type=qi.expected_answer_type,
+            target_slot=qi.target_slot,
+            answer_constraints=qi.answer_constraints,
+            hop_type=qi.hop_type,
+        )
+
+    async def _build_query_intelligence(self, query: str) -> QueryIntelligence:
+        """Analyze *query* once for every retrieval path.
+
+        This merged call replaces the legacy keyword, intent, and data-
+        requirement calls while also producing multi-query reformulations,
+        entities, concepts, and document-structure hypotheses.  A complete
+        fallback to the legacy analyzers keeps the DEEP path operational when
+        the model returns malformed JSON or omits required fields.
+        """
+
+        def _strings(value: Any, *, limit: int = 8) -> List[str]:
+            if not isinstance(value, list):
+                return []
+            result: List[str] = []
+            for item in value:
+                text = str(item).strip()
+                if text and text not in result:
+                    result.append(text)
+                if len(result) >= limit:
+                    break
+            return result
+
+        def _weighted_map(value: Any) -> Dict[str, float]:
+            if not isinstance(value, dict):
+                return {}
+            result: Dict[str, float] = {}
+            for raw_term, raw_weight in value.items():
+                term = str(raw_term).strip()
+                if not term:
+                    continue
+                try:
+                    weight = max(0.0, min(10.0, float(raw_weight)))
+                except (TypeError, ValueError):
+                    weight = 5.0
+                result[term] = weight
+            return result
+
+        try:
+            response = await self.llm.achat(
+                messages=[{
+                    "role": "user",
+                    "content": QUERY_INTELLIGENCE_PROMPT.format(query=query),
+                }],
+                stream=False,
+            )
+            self.llm_usages.append(response.usage)
+            data = self._extract_json_object((response.content or "").strip())
+            if not data:
+                raise ValueError("query intelligence response contained no JSON object")
+
+            level1 = _weighted_map(data.get("keywords_level1"))
+            level2 = _weighted_map(data.get("keywords_level2"))
+            alternatives = _weighted_map(data.get("keywords_alt"))
+            if not level1 and not level2 and not alternatives:
+                raise ValueError("query intelligence response contained no keywords")
+
+            # Compound phrases lead the ordered mapping so exact rga searches
+            # run before atomic recall terms, matching the legacy behavior.
+            keywords: Dict[str, float] = {}
+            for source in (level1, level2):
+                for term, weight in source.items():
+                    keywords.setdefault(term, weight)
+
+            intent = str(data.get("intent") or "lookup").lower()
+            if intent not in self._VALID_INTENTS:
+                intent = "lookup"
+            complexity = str(data.get("complexity") or "simple").lower()
+            if complexity not in self._VALID_COMPLEXITIES:
+                complexity = self._classify_query_complexity(query)
+            hop_type = str(data.get("hop_type") or "").lower()
+            if hop_type not in {"single", "bridge", "comparison"}:
+                hop_type = self._detect_hop_type(query)
+            if not _SEARCH_DEPTH_ENHANCEMENT:
+                hop_type = "single"
+
+            doc_type = str(data.get("expected_doc_type") or "general").lower()
+            if doc_type not in {"wiki", "article", "report", "code", "data", "general"}:
+                doc_type = "general"
+            location_hint = str(data.get("location_hint") or "any").lower()
+            if location_hint not in {"heading", "table", "body", "beginning", "any"}:
+                location_hint = "any"
+            try:
+                multi_source_score = max(
+                    0.0, min(1.0, float(data.get("multi_source_score") or 0.0))
+                )
+            except (TypeError, ValueError):
+                multi_source_score = 0.0
+
+            qi = QueryIntelligence(
+                keywords=keywords,
+                alt_keywords=alternatives,
+                intent=intent,
+                complexity=complexity,
+                data_points=_strings(data.get("data_points"), limit=8) or [query],
+                likely_sources=_strings(data.get("likely_sources"), limit=8),
+                formula=(str(data["formula"]).strip() if data.get("formula") else None),
+                time_period=(
+                    str(data["time_period"]).strip() if data.get("time_period") else None
+                ),
+                expected_answer_type=str(data.get("expected_answer_type") or ""),
+                target_slot=str(data.get("target_slot") or ""),
+                answer_constraints=_strings(data.get("answer_constraints"), limit=8),
+                hop_type=hop_type,
+                reformulations=_strings(data.get("reformulations"), limit=5),
+                entities=_strings(data.get("entities"), limit=8),
+                concepts=_strings(data.get("concepts"), limit=8),
+                expected_doc_type=doc_type,
+                expected_sections=_strings(data.get("expected_sections"), limit=10),
+                location_hint=location_hint,
+                multi_source_score=multi_source_score,
+            )
+            self._multi_source_intent = multi_source_score
+            await self._logger.info(
+                "[QueryIntelligence] "
+                f"keywords={len(qi.keywords)}, reformulations={len(qi.reformulations)}, "
+                f"entities={len(qi.entities)}, hop={qi.hop_type}, doc_type={doc_type}"
+            )
+            return qi
+        except Exception as exc:
+            await self._logger.warning(
+                f"[QueryIntelligence] merged analysis failed ({exc}); using legacy fallback"
+            )
+
+        # Legacy analyzers are independent and can recover concurrently.
+        kw_result, analysis_result = await asyncio.gather(
+            self._probe_keywords(query),
+            self._analyze_query_for_retrieval(query),
+            return_exceptions=True,
+        )
+        if isinstance(kw_result, Exception):
+            keyword_map, _ = {}, []
+        else:
+            keyword_map, _ = kw_result
+        if isinstance(analysis_result, Exception):
+            complexity = self._classify_query_complexity(query)
+            intent = "computation" if complexity != "simple" else "lookup"
+            reqs = DataRequirements(
+                data_points=[query], likely_sources=[], formula=None,
+                time_period=None, intent=intent,
+                hop_type=self._detect_hop_type(query) if _SEARCH_DEPTH_ENHANCEMENT else "single",
+            )
+        else:
+            complexity, intent, reqs = analysis_result
+        return QueryIntelligence(
+            keywords=dict(keyword_map),
+            intent=intent,
+            complexity=complexity,
+            data_points=reqs.data_points,
+            likely_sources=reqs.likely_sources,
+            formula=reqs.formula,
+            time_period=reqs.time_period,
+            expected_answer_type=reqs.expected_answer_type,
+            target_slot=reqs.target_slot,
+            answer_constraints=reqs.answer_constraints,
+            hop_type=reqs.hop_type,
+            reformulations=[query],
+            entities=[],
+            concepts=[],
+        )
+
+    @staticmethod
+    def _expand_keywords_from_reformulations(
+        qi: QueryIntelligence,
+        *,
+        max_terms: int = 32,
+    ) -> Dict[str, float]:
+        """Expand the search prior from entities, concepts and reformulations.
+
+        This step is deterministic and indexless.  Ordered insertion preserves
+        the priority of original compound phrases, then entity phrases,
+        concepts, and finally broad reformulation tokens.
+        """
+        expanded: Dict[str, float] = dict(qi.keywords)
+        for term, weight in qi.alt_keywords.items():
+            expanded.setdefault(term, weight)
+        for entity in qi.entities:
+            expanded.setdefault(entity, 9.0)
+        for concept in qi.concepts:
+            expanded.setdefault(concept, 6.0)
+
+        for reformulation in qi.reformulations:
+            tokens = re.findall(
+                r"[a-zA-Z0-9][a-zA-Z0-9_\-]{2,}|[\u4e00-\u9fff]{2,}",
+                reformulation,
+            )
+            for token in tokens:
+                cleaned = token.strip()
+                if cleaned.lower() in _STOP_WORDS:
+                    continue
+                expanded.setdefault(cleaned, 5.0)
+                if len(expanded) >= max_terms:
+                    return expanded
+        return dict(list(expanded.items())[:max_terms])
+
+    async def _probe_multi_query_matches(
+        self,
+        qi: QueryIntelligence,
+        expanded_keywords: List[str],
+        paths: List[str],
+        *,
+        max_depth: Optional[int] = 5,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+    ) -> Tuple[
+        List[str], Dict[str, List[str]], Dict[str, float], Dict[str, Dict[str, Any]],
+    ]:
+        """Path A: search three query views with at most three rga processes.
+
+        Each group is escaped and submitted as one regex alternation.  This
+        avoids the legacy one-subprocess-per-keyword fan-out while preserving
+        independent evidence from original terms, concepts, and reformulations.
+        """
+        entity_keys = {entity.lower() for entity in qi.entities}
+        base_terms = [
+            term for term in dict.fromkeys([
+                *qi.keywords.keys(), *qi.alt_keywords.keys(),
+            ])
+            if term.lower() not in entity_keys
+        ][:12]
+        concept_terms = list(dict.fromkeys(qi.concepts))[:8]
+        reserved = {
+            term.lower() for term in base_terms + concept_terms + qi.entities
+        }
+        broad_terms = [
+            term for term in expanded_keywords
+            if term.lower() not in reserved
+        ][:12]
+        groups = [
+            (1.0, base_terms),
+            (0.7, concept_terms),
+            (0.5, broad_terms),
+        ]
+
+        async def _search_group(terms: List[str]) -> List[Dict[str, Any]]:
+            if not terms:
+                return []
+            escaped = [re.escape(term) for term in terms if term]
+            if not escaped:
+                return []
+            raw = await self.grep_retriever.retrieve(
+                terms=escaped,
+                path=paths,
+                logic="or",
+                case_sensitive=False,
+                literal=False,
+                regex=True,
+                max_depth=max_depth if max_depth is not None else 5,
+                include=include,
+                exclude=exclude,
+                rank=False,
+            )
+            return self.grep_retriever.merge_results(raw, limit=10)
+
+        grouped_results = await asyncio.gather(
+            *[_search_group(terms) for _weight, terms in groups],
+            return_exceptions=True,
+        )
+        scores: Dict[str, float] = {}
+        snippets: Dict[str, List[str]] = {}
+        first_seen: Dict[str, int] = {}
+        file_groups: Dict[str, Set[int]] = {}
+        file_terms: Dict[str, Set[str]] = {}
+        term_documents: Dict[str, Set[str]] = {}
+        file_match_counts: Dict[str, int] = {}
+        file_backends: Dict[str, Set[str]] = {}
+        file_search_ms: Dict[str, float] = {}
+        file_fallback_reasons: Dict[str, Set[str]] = {}
+        active_groups = [terms for _weight, terms in groups if terms]
+        normalized_terms = {
+            term.lower(): term
+            for terms in active_groups for term in terms if term
+        }
+        for group_index, ((weight, _terms), results) in enumerate(
+            zip(groups, grouped_results)
+        ):
+            if isinstance(results, Exception):
+                await self._logger.warning(
+                    f"[Retrieve:MultiQuery] group {group_index} failed: {results}"
+                )
+                continue
+            for item in results:
+                file_path = str(item.get("path") or "")
+                if not file_path:
+                    continue
+                first_seen.setdefault(file_path, len(first_seen))
+                total_matches = max(1, int(item.get("total_matches") or 1))
+                scores[file_path] = scores.get(file_path, 0.0) + weight * (
+                    1.0 + math.log1p(total_matches)
+                )
+                file_match_counts[file_path] = (
+                    file_match_counts.get(file_path, 0) + total_matches
+                )
+                file_groups.setdefault(file_path, set()).add(group_index)
+                bucket = snippets.setdefault(file_path, [])
+                item_matches = [
+                    match for match in item.get("matches", [])
+                    if isinstance(match, dict)
+                ]
+                for match in item_matches:
+                    file_backends.setdefault(file_path, set()).add(
+                        str(match.get("_search_backend", "rga"))
+                    )
+                    file_search_ms[file_path] = max(
+                        file_search_ms.get(file_path, 0.0),
+                        float(match.get("_search_elapsed_ms", 0.0) or 0.0),
+                    )
+                    if match.get("_fallback_reason"):
+                        file_fallback_reasons.setdefault(file_path, set()).add(
+                            str(match["_fallback_reason"])
+                        )
+                item_lines = [str(line) for line in item.get("lines", [])[:10]]
+                joined = "\n".join(item_lines).lower()
+                matched_terms = {
+                    normalized for normalized in normalized_terms
+                    if normalized in joined
+                }
+                file_terms.setdefault(file_path, set()).update(matched_terms)
+                for term in matched_terms:
+                    term_documents.setdefault(term, set()).add(file_path)
+                for line in item_lines[:5]:
+                    text = str(line).strip()
+                    if text and text not in bucket:
+                        bucket.append(text)
+
+        use_v2 = os.getenv(
+            "LENS_LEXICAL_CONFIDENCE_VERSION", "v2",
+        ).strip().lower() == "v2"
+        confidences: Dict[str, float] = {}
+        feature_telemetry: Dict[str, Dict[str, Any]] = {}
+        candidate_count = max(len(scores), 1)
+        active_group_count = max(len(active_groups), 1)
+        all_term_count = max(len(normalized_terms), 1)
+        base_compounds = [
+            term.lower() for term in base_terms
+            if " " in term.strip() or "-" in term.strip()
+        ]
+        for file_path, raw_score in scores.items():
+            matched = file_terms.get(file_path, set())
+            rarity_values = [
+                math.log((candidate_count + 1) / (len(term_documents.get(term, set())) + 1))
+                / max(math.log(candidate_count + 1), 1e-9)
+                for term in matched
+            ]
+            features = LexicalConfidenceFeatures(
+                term_coverage=len(matched) / all_term_count,
+                group_coverage=len(file_groups.get(file_path, set())) / active_group_count,
+                rarity=(statistics.mean(rarity_values) if rarity_values else 0.0),
+                density=min(
+                    1.0,
+                    math.log1p(file_match_counts.get(file_path, 0)) / math.log(11),
+                ),
+                exact_phrase=any(
+                    phrase in "\n".join(snippets.get(file_path, [])).lower()
+                    for phrase in base_compounds
+                ),
+            )
+            confidence = (
+                calibrate_lexical_features(features)
+                if use_v2 else round(calibrate_match_score(raw_score), 4)
+            )
+            confidences[file_path] = confidence
+            feature_telemetry[file_path] = {
+                "term_coverage": round(features.term_coverage, 4),
+                "group_coverage": round(features.group_coverage, 4),
+                "rarity": round(features.rarity, 4),
+                "density": round(features.density, 4),
+                "exact_phrase": features.exact_phrase,
+                "confidence": confidence,
+                "search_backends": sorted(file_backends.get(file_path, set())),
+                "search_elapsed_ms": round(file_search_ms.get(file_path, 0.0), 3),
+                "fallback_reasons": sorted(
+                    file_fallback_reasons.get(file_path, set())
+                ),
+            }
+        ranked = sorted(
+            scores,
+            key=lambda path: (
+                -confidences.get(path, 0.0),
+                -scores[path],
+                first_seen.get(path, 0),
+            ),
+        )
+        await self._logger.info(
+            f"[Retrieve:MultiQuery] {len(ranked)} files from "
+            f"{sum(1 for _weight, terms in groups if terms)} batched rga groups"
+        )
+        return ranked[:60], snippets, confidences, {
+            path: feature_telemetry[path] for path in ranked[:20]
+        }
+
+    async def _probe_entity_phrases(
+        self,
+        entities: List[str],
+        paths: List[str],
+        *,
+        max_depth: Optional[int] = 5,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+    ) -> Tuple[List[str], Dict[str, List[str]], Dict[str, float]]:
+        """Path B: exact-phrase retrieval for named entities.
+
+        ``KeywordSearchTool`` already uses one literal ``rga -F`` invocation
+        per term, so this dedicated path preserves exact multi-word entity
+        boundaries and remains independent of broad reformulation terms.
+        """
+        phrases: List[str] = []
+        for entity in entities:
+            normalized = str(entity).strip()
+            if len(normalized) >= 3 and normalized not in phrases:
+                phrases.append(normalized)
+        if not phrases:
+            return [], {}, {}
+        files, snippets = await self._probe_keyword_matches(
+            phrases[:8],
+            paths,
+            max_depth=max_depth,
+            include=include,
+            exclude=exclude,
+        )
+        normalized_phrases = [phrase.lower() for phrase in phrases[:8]]
+        confidences: Dict[str, float] = {}
+        for file_path in files:
+            evidence = " ".join(snippets.get(file_path, [])).lower()
+            matched = sum(1 for phrase in normalized_phrases if phrase in evidence)
+            coverage = matched / max(len(normalized_phrases), 1)
+            # Exact phrases are high-precision; a unique full-entity hit may
+            # dominate through the explicit unique_exact_entity policy.
+            confidences[file_path] = round(
+                min(0.95, 0.55 + 0.4 * coverage), 4,
+            )
+        await self._logger.info(
+            f"[Retrieve:EntityPhrase] {len(files)} files for {len(phrases[:8])} entities"
+        )
+        return files, snippets, confidences
+
+    @staticmethod
+    def _structure_probe_tokens(text: str) -> Set[str]:
+        """Normalize text into multilingual structure-matching tokens."""
+        tokens: Set[str] = set()
+        for token in re.findall(
+            r"[a-zA-Z0-9][a-zA-Z0-9_\-]{1,}|[\u4e00-\u9fff]{2,}",
+            text or "",
+        ):
+            normalized = token.lower()
+            if normalized in _STOP_WORDS:
+                continue
+            tokens.add(normalized)
+            if re.fullmatch(r"[\u4e00-\u9fff]{3,}", normalized):
+                for width in (2, 3):
+                    tokens.update(
+                        normalized[index:index + width]
+                        for index in range(len(normalized) - width + 1)
+                    )
+        return tokens
+
+    async def _structure_guided_probe(
+        self,
+        qi: QueryIntelligence,
+        artifacts: Optional[CompileArtifacts],
+        scope: "_PathScope",
+    ) -> List[Tuple[str, float, List[Tuple[int, int]]]]:
+        """Path C: rank compiled files by local tree/TOC structure signals.
+
+        No LLM is used.  Expected section names are matched against node titles
+        using token Jaccard overlap, while query entities/concepts are matched
+        against titles and summaries.  Character ranges from the best nodes are
+        returned as evidence-sampling anchors.
+        """
+        if artifacts is None or not artifacts.tree_available_paths:
+            return []
+        indexer = artifacts.tree_indexer or self._get_tree_indexer()
+        if indexer is None:
+            return []
+
+        section_tokens = [
+            self._structure_probe_tokens(section)
+            for section in qi.expected_sections
+            if section
+        ]
+        entity_terms = [
+            term.lower().strip() for term in qi.entities if str(term).strip()
+        ]
+        concept_terms = [
+            term.lower().strip() for term in qi.concepts if str(term).strip()
+        ]
+        semantic_terms = entity_terms + concept_terms
+        if not section_tokens and not semantic_terms:
+            return []
+
+        # Bound tree loads for large corpora.  Catalog summaries and paths form
+        # a cheap first-stage shortlist; the full node walk only runs for the
+        # most plausible trees.  If metadata has no overlap, retain a bounded
+        # deterministic sample so structure discovery never disappears.
+        hint_tokens = set().union(*section_tokens) if section_tokens else set()
+        hint_tokens.update(self._structure_probe_tokens(" ".join(semantic_terms)))
+        candidate_scores: List[Tuple[float, str]] = []
+        scoped_paths = sorted(
+            file_path
+            for file_path in artifacts.tree_available_paths
+            if scope.contains(file_path)
+        )
+        for file_path in scoped_paths:
+            catalog_entry = artifacts.catalog_map.get(file_path, {})
+            metadata = " ".join([
+                file_path,
+                str(catalog_entry.get("name", "")),
+                str(catalog_entry.get("summary", "")),
+            ])
+            metadata_tokens = self._structure_probe_tokens(metadata)
+            overlap = len(hint_tokens & metadata_tokens)
+            substring_hits = sum(
+                1 for term in semantic_terms if term in metadata.lower()
+            )
+            candidate_scores.append((overlap + 0.5 * substring_hits, file_path))
+        candidate_scores.sort(key=lambda item: (-item[0], item[1]))
+        positive = [item[1] for item in candidate_scores if item[0] > 0]
+        candidate_paths = (
+            positive[: self._TREE_CACHE_SCAN_LIMIT]
+            if positive else scoped_paths[: self._TREE_CACHE_SCAN_LIMIT]
+        )
+
+        results: List[Tuple[str, float, List[Tuple[int, int]]]] = []
+        for file_path in candidate_paths:
+            try:
+                tree = indexer.load_tree(file_path)
+            except Exception:
+                continue
+            if tree is None or tree.root is None:
+                continue
+
+            scored_nodes: List[Tuple[float, Tuple[int, int]]] = []
+            stack = [tree.root]
+            while stack:
+                node = stack.pop()
+                stack.extend(getattr(node, "children", []) or [])
+                title = str(getattr(node, "title", "") or "")
+                summary = str(getattr(node, "summary", "") or "")
+                node_tokens = self._structure_probe_tokens(title)
+
+                section_score = 0.0
+                for expected in section_tokens:
+                    union = node_tokens | expected
+                    if union:
+                        section_score = max(
+                            section_score, len(node_tokens & expected) / len(union)
+                        )
+
+                haystack = f"{title}\n{summary}".lower()
+                term_hits = sum(1 for term in semantic_terms if term in haystack)
+                entity_hits = sum(1 for term in entity_terms if term in haystack)
+                semantic_score = term_hits / max(len(semantic_terms), 1)
+                type_bonus = 0.0
+                if qi.location_hint == "table" and (
+                    getattr(node, "content_type", "text") == "table"
+                    or getattr(node, "table_count", 0) > 0
+                ):
+                    type_bonus = 0.2
+                score = 0.65 * section_score + 0.35 * semantic_score
+                if entity_hits:
+                    score = max(score, 0.75)
+                score = min(1.0, score + type_bonus)
+
+                raw_range = getattr(node, "char_range", None)
+                if score >= 0.15 and raw_range and len(raw_range) == 2:
+                    start, end = int(raw_range[0]), int(raw_range[1])
+                    if end > start >= 0:
+                        scored_nodes.append((score, (start, end)))
+
+            if not scored_nodes:
+                continue
+            scored_nodes.sort(key=lambda item: item[0], reverse=True)
+            anchors = [item[1] for item in scored_nodes[:4]]
+            file_score = min(
+                1.0,
+                scored_nodes[0][0] + 0.05 * min(len(scored_nodes) - 1, 4),
+            )
+            results.append((file_path, round(file_score, 4), anchors))
+
+        results.sort(key=lambda item: item[1], reverse=True)
+        await self._logger.info(
+            f"[Probe:Structure] matched {len(results)} tree-indexed files"
+        )
+        return results
+
+    async def _probe_corpus_topic_map(
+        self,
+        qi: QueryIntelligence,
+        artifacts: Optional[CompileArtifacts],
+        scope: "_PathScope",
+    ) -> List[Tuple[str, float]]:
+        """Path E: discover files through cross-document section topics."""
+        if artifacts is None or artifacts.topic_map is None:
+            return []
+        terms = qi.entities + qi.concepts + qi.expected_sections
+        if not terms:
+            return []
+        try:
+            ranked = artifacts.topic_map.search(terms, top_k=30)
+        except Exception:
+            return []
+        scoped = [item for item in ranked if scope.contains(item[0])]
+        await self._logger.info(
+            f"[Probe:CorpusTopicMap] matched {len(scoped)} files"
+        )
+        return scoped
+
+    @staticmethod
+    def _fuse_retrieval_results(
+        keyword_results: List[str],
+        phrase_results: List[str],
+        structure_results: List[Tuple[str, float, List[Tuple[int, int]]]],
+        directory_results: List[Tuple[str, float]],
+        existing_results: List[str],
+        *,
+        rrf_k: int = 60,
+    ) -> Tuple[List[str], Dict[str, float]]:
+        """Fuse independent retrieval rankings with weighted RRF.
+
+        RRF is robust to incomparable raw score scales and lets an exact entity
+        hit, a structural match, and a broad lexical hit reinforce one another
+        without a learned ranker or persistent index.
+        """
+        rankings: List[Tuple[float, List[str]]] = [
+            (1.0, keyword_results),
+            (1.2, phrase_results),
+            (0.8, [item[0] for item in structure_results]),
+            (0.5, [item[0] for item in directory_results]),
+            (0.7, existing_results),
+        ]
+        scores: Dict[str, float] = {}
+        first_seen: Dict[str, int] = {}
+        ordinal = 0
+        for weight, ranking in rankings:
+            seen_in_path: Set[str] = set()
+            path_rank = 0
+            for file_path in ranking:
+                if not file_path or file_path in seen_in_path:
+                    continue
+                seen_in_path.add(file_path)
+                path_rank += 1
+                if file_path not in first_seen:
+                    first_seen[file_path] = ordinal
+                    ordinal += 1
+                scores[file_path] = scores.get(file_path, 0.0) + (
+                    weight / (rrf_k + path_rank)
+                )
+
+        ranked = sorted(
+            scores,
+            key=lambda path: (-scores[path], first_seen.get(path, 0)),
+        )
+        return ranked, {
+            path: round(scores[path], 8)
+            for path in ranked[:50]
+        }
+
     async def _probe_keywords(
         self, query: str,
     ) -> Tuple[Dict[str, float], List[str]]:
@@ -6816,7 +8055,7 @@ class AgenticSearch(BaseSearch):
         self,
         paths: List[str],
         enable: bool = True,
-        max_files: int = 500,
+        max_files: Optional[int] = None,
     ):
         """Scan directories for file metadata (filesystem only, no LLM).
 
@@ -6835,14 +8074,24 @@ class AgenticSearch(BaseSearch):
 
         from sirchmunk.scan.dir_scanner import DirectoryScanner
 
+        if max_files is None:
+            try:
+                max_files = max(1, int(os.getenv("SIRCHMUNK_DIR_SCAN_MAX_FILES", "2000")))
+            except ValueError:
+                max_files = 2000
         if self._dir_scanner is None or self._dir_scanner.max_files != max_files:
-            self._dir_scanner = DirectoryScanner(llm=self.llm, max_files=max_files)
+            self._dir_scanner = DirectoryScanner(
+                llm=self.llm,
+                max_files=max_files,
+                cache_dir=self.work_path / ".cache" / "dir_scan",
+            )
 
         await self._logger.info("[Probe:DirScan] Scanning directories...")
         scan_result = await self._dir_scanner.scan(paths)
         await self._logger.info(
             f"[Probe:DirScan] Found {scan_result.total_files} files "
-            f"in {scan_result.total_dirs} dirs ({scan_result.scan_duration_ms:.0f}ms)"
+            f"in {scan_result.total_dirs} dirs ({scan_result.scan_duration_ms:.0f}ms, "
+            f"cache={scan_result.cache_mode}:{'hit' if scan_result.cache_hit else 'miss'})"
         )
         return scan_result
 
@@ -7561,6 +8810,39 @@ class AgenticSearch(BaseSearch):
             zero_hit_rescue_recovered_files=recovered,
         )
         return keyword_files, dir_scan_files
+
+    async def _directory_semantic_probe(
+        self,
+        qi: QueryIntelligence,
+        scan_result,
+        *,
+        top_k: int = 30,
+    ) -> Tuple[List[Tuple[str, float]], Dict[str, Dict[str, Any]]]:
+        """Path D: zero-LLM semantic ranking with auditable confidence."""
+        if scan_result is None or self._dir_scanner is None:
+            return [], {}
+        detailed = self._dir_scanner.semantic_rank_detailed(
+            scan_result,
+            expected_doc_type=qi.expected_doc_type,
+            entities=qi.entities,
+            concepts=qi.concepts,
+            expected_sections=qi.expected_sections,
+            top_k=top_k,
+        )
+        ranked = [(hit.path, hit.confidence) for hit in detailed]
+        details = {
+            hit.path: {
+                "confidence": hit.confidence,
+                "signal_count": hit.signal_count,
+                "direct_match": hit.direct_match,
+                "components": hit.components,
+            }
+            for hit in detailed
+        }
+        await self._logger.info(
+            f"[Probe:DirectorySemantic] ranked {len(ranked)} files without LLM"
+        )
+        return ranked, details
 
     async def _rank_dir_scan_candidates(
         self,
@@ -8728,6 +10010,85 @@ class AgenticSearch(BaseSearch):
         drft = re.sub(r"\s+", " ", norm(draft)).strip()
         return bool(drft) and cand != drft and cand.startswith(drft + " ")
 
+    _QUANTITY_UNIT_RE = re.compile(
+        r"(?:[%％$€£¥]|\b(?:percent|percentage|thousand|million|billion|trillion|"
+        r"usd|eur|gbp|cny|rmb|dollars?|euros?|yuan|qps|kqps|tflops?|gflops?|"
+        r"ops(?:/s)?|km|kilometers?|kilometres?|meters?|metres?|kg|kilograms?|"
+        r"hours?|days?|years?)\b|"
+        r"(?:百分比|百分之|百万|千万|亿|万|美元|欧元|英镑|人民币|元|公里|千米|米|"
+        r"公斤|千克|小时|天|年))",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _is_compact_quantity_with_unit(cls, value: str) -> bool:
+        """Return whether *value* is a bounded numeric span with an explicit unit."""
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not text or len(text) > 80:
+            return False
+        starts_with_number = bool(re.match(
+            r"^(?:[$€£¥]|USD|EUR|GBP|CNY|RMB)?\s*[+-]?\d", text,
+            flags=re.IGNORECASE,
+        ))
+        return starts_with_number and bool(cls._QUANTITY_UNIT_RE.search(text))
+
+    @staticmethod
+    def _number_answer_requires_unit(
+        query: str,
+        data_reqs: Optional["DataRequirements"],
+    ) -> bool:
+        """Infer whether a numeric answer is incomplete without its source unit."""
+        signals = " ".join([
+            query or "",
+            (data_reqs.target_slot if data_reqs else "") or "",
+            *((data_reqs.answer_constraints if data_reqs else []) or []),
+        ]).lower()
+        return bool(re.search(
+            r"revenue|income|price|cost|amount|monetary|currency|percentage|"
+            r"percent|throughput|bandwidth|distance|length|height|weight|duration|"
+            r"营收|收入|金额|货币|价格|成本|百分比|吞吐|带宽|距离|长度|高度|重量|时长",
+            signals,
+        ))
+
+    @staticmethod
+    def _preserves_target_form(
+        candidate: str,
+        draft: str,
+        data_reqs: Optional["DataRequirements"],
+    ) -> bool:
+        """Keep target-slot-specific surface forms such as complete filenames."""
+        if data_reqs is None:
+            return True
+        signals = " ".join([
+            data_reqs.target_slot or "",
+            *(data_reqs.answer_constraints or []),
+        ]).lower()
+        if not re.search(r"filename|file name|文件名", signals):
+            return True
+        draft_extension = re.search(r"\.[a-z0-9]{1,12}$", draft.strip(), re.IGNORECASE)
+        if not draft_extension:
+            return True
+        candidate_extension = re.search(
+            r"\.[a-z0-9]{1,12}$", candidate.strip(), re.IGNORECASE,
+        )
+        return bool(
+            candidate_extension
+            and candidate_extension.group(0).lower()
+            == draft_extension.group(0).lower()
+        )
+
+    @staticmethod
+    def _preserves_numeric_tokens(candidate: str, draft: str) -> bool:
+        """Prevent answer re-anchoring from silently changing numeric identifiers."""
+        def numbers(value: str) -> Set[str]:
+            return {
+                token.replace(",", "").lstrip("0") or "0"
+                for token in re.findall(r"\d[\d,]*(?:\.\d+)?", value or "")
+            }
+
+        draft_numbers = numbers(draft)
+        return not draft_numbers or draft_numbers <= numbers(candidate)
+
     @staticmethod
     def _is_micro_edit(candidate: str, draft: str, max_edits: int = 2) -> bool:
         """Reject near-identical respellings of the draft (edit distance <= 2).
@@ -8807,6 +10168,8 @@ class AgenticSearch(BaseSearch):
             "county, do not answer with a town inside it.\n"
             "- Never prepend roles, ranks or honorifics (President, "
             "Congressman, General) unless the question asks for the title.\n"
+            "- A numeric monetary, percentage, or measured answer is incomplete "
+            "without its magnitude and unit; keep both in the minimal span.\n"
             "- If the draft answer is already the best verbatim span, return "
             "it in both fields."
         )
@@ -8821,12 +10184,24 @@ class AgenticSearch(BaseSearch):
             return answer
         relational = self._clean_answer_candidate(str(data.get("relational") or ""))
         minimal = self._clean_answer_candidate(str(data.get("minimal") or ""))
-        if expected in self._CANONICAL_FORM_TYPES:
+        quantity_unit_required = bool(re.search(r"\d", short)) and (
+            self._number_answer_requires_unit(query, data_reqs)
+        )
+        if quantity_unit_required:
+            ranked = sorted(
+                [("minimal", minimal), ("relational", relational)],
+                key=lambda item: not self._is_compact_quantity_with_unit(item[1]),
+            )
+        elif expected in self._CANONICAL_FORM_TYPES:
             ranked = [("relational", relational), ("minimal", minimal)]
         else:
             ranked = [("minimal", minimal), ("relational", relational)]
         short_norm = re.sub(r"\s+", " ", short).strip().lower()
         for choice, candidate in ranked:
+            quantity_candidate = (
+                quantity_unit_required
+                and self._is_compact_quantity_with_unit(candidate)
+            )
             if (
                 not candidate
                 or self._is_no_answer_value(candidate)
@@ -8835,8 +10210,13 @@ class AgenticSearch(BaseSearch):
                 or self._is_overlong_entity_answer(candidate)
                 or not self._is_verbatim_span(candidate, evidence)
                 or not self._shares_content_token(candidate, short)
+                or not self._preserves_numeric_tokens(candidate, short)
+                or not self._preserves_target_form(candidate, short, data_reqs)
                 or self._is_role_prefixed_variant(candidate, short)
-                or self._is_suffix_extension(candidate, short)
+                or (
+                    self._is_suffix_extension(candidate, short)
+                    and not quantity_candidate
+                )
                 or self._is_micro_edit(candidate, short)
             ):
                 continue
@@ -9208,6 +10588,31 @@ class AgenticSearch(BaseSearch):
             hop_type=self._detect_hop_type(query) if _SEARCH_DEPTH_ENHANCEMENT else "single",
         )
 
+    def _fast_track_requires_fallback(
+        self,
+        answer: str,
+        context: Optional["SearchContext"],
+    ) -> bool:
+        """Return whether a dominant-route attempt lacks usable evidence."""
+        if (
+            not answer
+            or answer == _NO_RESULTS_MESSAGE
+            or self._is_rescuable_refusal(answer)
+            or self._is_garbage_answer(answer)
+        ):
+            return True
+        telemetry = getattr(context, "telemetry", None)
+        if isinstance(telemetry, dict):
+            sufficiency = str(
+                telemetry.get("evidence_sufficiency") or ""
+            ).strip().lower()
+            if sufficiency in {"absent", "unsupported", "insufficient"}:
+                return True
+            snippets = telemetry.get("evidence_snippets") or []
+            if not snippets and not getattr(context, "read_file_ids", set()):
+                return True
+        return False
+
     def _select_target_files(
         self,
         merged_files: List[str],
@@ -9221,14 +10626,13 @@ class AgenticSearch(BaseSearch):
         if not scoped:
             scoped = list(merged_files)
 
-        tree_paths = (
-            artifacts.tree_available_paths if artifacts else set()
-        )
-        with_tree = [fp for fp in scoped if fp in tree_paths]
-        without_tree = [fp for fp in scoped if fp not in tree_paths]
-        ranked = with_tree + without_tree
+        # ``merged_files`` is already ordered by weighted RRF.  Older code
+        # moved every tree-indexed file ahead of that ranking, which erased the
+        # consensus signal from exact entities, lexical hits, and directory
+        # semantics.  Tree availability now contributes inside the fusion
+        # score, so selection must preserve the fused order.
         limit = max_files if max_files and max_files > 0 else self._AGENTIC_MAX_FILES
-        return ranked[:limit]
+        return scoped[:limit]
 
     @contextlib.contextmanager
     def _phase(self, label: str):
@@ -9467,6 +10871,46 @@ class AgenticSearch(BaseSearch):
                 f"[Phase 4] Data requirements check failed: {exc}"
             )
         return True, []
+
+    async def _extract_structured_anchor_content(
+        self,
+        file_path: str,
+        anchors: List[Tuple[int, int]],
+        *,
+        max_chars: int,
+        padding: int = 600,
+    ) -> Optional[str]:
+        """Extract bounded evidence around compiled structure ranges."""
+        if max_chars <= 0 or not anchors or os.getenv(
+            "LENS_STRUCTURE_ANCHORS", "true",
+        ).strip().lower() != "true":
+            return None
+        try:
+            from sirchmunk.utils.file_utils import fast_extract
+            extraction = await fast_extract(file_path=file_path)
+            content = extraction.content or ""
+        except Exception:
+            return None
+        if not content.strip():
+            return None
+        parts: List[str] = []
+        used = 0
+        for start, end in anchors[:4]:
+            bounded_start = max(0, int(start) - padding)
+            bounded_end = min(len(content), int(end) + padding)
+            if bounded_end <= bounded_start:
+                continue
+            segment = content[bounded_start:bounded_end].strip()
+            if not segment:
+                continue
+            remaining = max_chars - used
+            if remaining <= 0:
+                break
+            parts.append(segment[:remaining])
+            used += min(len(segment), remaining)
+        if not parts:
+            return None
+        return f"[{Path(file_path).name} structure anchors]\n" + "\n\n---\n\n".join(parts)
 
     async def _extract_non_paginated_content(
         self,
@@ -10389,7 +11833,50 @@ class AgenticSearch(BaseSearch):
                 )
         if data_reqs and getattr(data_reqs, "target_slot", None):
             parts.append(f"Target relation to fill: {data_reqs.target_slot}")
+        if data_reqs:
+            for constraint in data_reqs.answer_constraints or []:
+                if constraint:
+                    parts.append(f"Answer constraint: {constraint}")
+            if self._number_answer_requires_unit("", data_reqs):
+                parts.append(
+                    "For a monetary or measured quantity, include its magnitude "
+                    "and unit as one answer span."
+                )
+        if _COMPUTATION_TRACE and self._answer_may_require_arithmetic(data_reqs):
+            parts.extend([
+                "",
+                "If — and only if — the answer is obtained by arithmetic over several "
+                "numbers from the evidence (e.g. a sum, average, count, min/max, or "
+                "difference), then AFTER <EVIDENCE_SUFFICIENCY> emit one line:",
+                "<COMPUTATION_TRACE>{\"operation\": \"sum|mean|count|min|max|product|"
+                "difference\", \"operands\": [<each exact number you took from the "
+                "evidence>], \"result\": <your computed value>}</COMPUTATION_TRACE>",
+                "List every operand exactly as it appears in the evidence. This block "
+                "is for verification only and never changes what goes in <ANSWER>. "
+                "Omit it entirely when the answer is looked up directly rather than "
+                "computed.",
+            ])
         return "\n".join(parts)
+
+    @staticmethod
+    def _answer_may_require_arithmetic(
+        data_reqs: Optional["DataRequirements"],
+    ) -> bool:
+        """Heuristic gate for requesting a computation trace.
+
+        Kept intentionally permissive: a false positive only adds an optional,
+        ignored block, while the trace itself carries the corpus-agnostic
+        verification signal.
+        """
+        if not data_reqs:
+            return False
+        if getattr(data_reqs, "formula", None):
+            return True
+        answer_type = str(getattr(data_reqs, "expected_answer_type", "") or "").lower()
+        return answer_type in {
+            "number", "integer", "float", "percentage", "percent",
+            "currency", "amount", "quantity",
+        }
 
     _TRIAGE_TOP_K: int = 2
     _TRIAGE_MAX_CHARS: int = 30_000
@@ -10499,6 +11986,8 @@ class AgenticSearch(BaseSearch):
         match_snippets: Optional[Dict[str, List[str]]],
         context: "SearchContext",
         data_reqs: Optional[DataRequirements] = None,
+        structure_anchors: Optional[Dict[str, List[Tuple[int, int]]]] = None,
+        exact_snippets_only: bool = False,
     ) -> str:
         """Extract the prior-selected files into one warm-start evidence block.
 
@@ -10511,11 +12000,38 @@ class AgenticSearch(BaseSearch):
         provenance instead of dumping whole files, which a text-only warm start
         would lose.
 
-        Handing the agent full extracted text rather than leads is deliberate:
-        a leads-only warm start measurably raises the agent's self-directed
-        searching but loses more evidence than the extra activity recovers
-        within the loop's budget.
+        A dominant exact-match route starts from the matched source lines alone.
+        This avoids spending the reduced-attempt budget on speculative page
+        selection before the agent sees the strongest evidence. If those lines
+        are insufficient, the normal dominant-route fallback still restores the
+        complete candidate and reasoning budget.
         """
+        matched_sources: List[Tuple[str, str]] = []
+        for file_path in target_files:
+            lines = (match_snippets or {}).get(str(file_path), [])
+            if lines:
+                matched_sources.append((
+                    file_path,
+                    f"[{Path(file_path).name} exact matches]\n"
+                    + "\n".join(str(line) for line in lines[:8]),
+                ))
+        matched_blocks = [block for _file_path, block in matched_sources]
+        if exact_snippets_only and matched_blocks:
+            for file_path, block in matched_sources:
+                context.add_log(
+                    tool_name="exact_match_snippet",
+                    tokens=max(len(block) // 4, 1),
+                    metadata={"file_path": file_path, "path": file_path},
+                )
+                self._record_evidence_snippet(context, block)
+            self._record_context_telemetry(
+                context,
+                warm_start_exact_snippets=True,
+                warm_start_exact_snippet_files=len(matched_blocks),
+                warm_start_exact_only=True,
+            )
+            return "\n\n".join(matched_blocks)[: self._LOOP_MAX_PRELOAD_CHARS]
+
         reqs = data_reqs or DataRequirements(
             data_points=[], likely_sources=[], formula=None, time_period=None,
             intent="lookup", expected_answer_type="", target_slot="",
@@ -10524,7 +12040,19 @@ class AgenticSearch(BaseSearch):
             query, reqs, target_files, context,
             paths=None,
             match_snippets=match_snippets,
+            structure_anchors=structure_anchors,
         )
+        # Grep snippets are direct source evidence and often locate an exact
+        # entity inside a large PDF/Office file more precisely than page
+        # selection.  Preserve them explicitly in the warm start.
+        evidence = retrieval.evidence or ""
+        if matched_blocks:
+            evidence = "\n\n".join(matched_blocks + ([evidence] if evidence else []))
+            self._record_context_telemetry(
+                context,
+                warm_start_exact_snippets=True,
+                warm_start_exact_snippet_files=len(matched_blocks),
+            )
         if retrieval.pages_extracted:
             self._record_context_telemetry(
                 context,
@@ -10534,7 +12062,7 @@ class AgenticSearch(BaseSearch):
                     if pages
                 },
             )
-        return (retrieval.evidence or "")[: self._LOOP_MAX_PRELOAD_CHARS]
+        return evidence[: self._LOOP_MAX_PRELOAD_CHARS]
 
     async def _agentic_loop_search(
         self,
@@ -10544,6 +12072,8 @@ class AgenticSearch(BaseSearch):
         context: "SearchContext",
         paths: List[str],
         match_snippets: Optional[Dict[str, List[str]]] = None,
+        structure_anchors: Optional[Dict[str, List[Tuple[int, int]]]] = None,
+        dominant_route: bool = False,
         max_loops: int = 6,
         max_token_budget: int = 128_000,
     ) -> Tuple[str, bool]:
@@ -10590,24 +12120,38 @@ class AgenticSearch(BaseSearch):
         registry.register(FileReadTool(max_chars_per_file=30_000))
 
         preloaded = await self._build_prior_observations(
-            query, target_files[:effective_max_files], match_snippets, context, data_reqs=data_reqs,
+            query,
+            target_files[:effective_max_files],
+            match_snippets,
+            context,
+            data_reqs=data_reqs,
+            structure_anchors=structure_anchors,
+            exact_snippets_only=dominant_route,
         )
         # P0-1: Evidence triage — reduce noise for better synthesis
         preloaded = self._triage_evidence_for_loop(query, data_reqs, preloaded)
         subgoals = [str(dp) for dp in (data_reqs.data_points or []) if str(dp).strip()][:8]
 
+        answer_contract = self._build_loop_answer_contract(data_reqs)
+        if dominant_route:
+            answer_contract += (
+                "\nThe preloaded evidence comes from a high-confidence unique file route. "
+                "If it already contains every required fact or row, answer directly without "
+                "calling keyword_search or file_read merely to reconfirm the same source."
+            )
         agent = ReActSearchAgent(
             llm=self.llm,
             tool_registry=registry,
             max_loops=effective_max_loops,
             max_token_budget=max_token_budget,
             log_callback=self._log_callback,
-            answer_style_instruction=self._build_loop_answer_contract(data_reqs),
+            answer_style_instruction=answer_contract,
         )
         answer, loop_ctx = await agent.run(
             query=query,
             preloaded_observations=preloaded,
             subgoals=subgoals,
+            trust_preloaded=dominant_route,
         )
         answer = self._collapse_repeated_span(answer)
         self._merge_loop_telemetry(context, loop_ctx)
@@ -10746,6 +12290,7 @@ class AgenticSearch(BaseSearch):
         context: "SearchContext",
         paths: Optional[List[str]] = None,
         match_snippets: Optional[Dict[str, List[str]]] = None,
+        structure_anchors: Optional[Dict[str, List[Tuple[int, int]]]] = None,
     ) -> RetrievalResult:
         """Core agentic retrieval loop: select pages → extract → check → repeat.
 
@@ -10770,6 +12315,27 @@ class AgenticSearch(BaseSearch):
         non_paginated_files: List[str] = []
 
         for fp in target_files:
+            anchor_ranges = (structure_anchors or {}).get(fp, [])
+            if anchor_ranges:
+                remaining = self._AGENTIC_EVIDENCE_MAX_CHARS - sum(
+                    len(part) for part in evidence_parts
+                )
+                anchored = await self._extract_structured_anchor_content(
+                    fp, anchor_ranges, max_chars=max(0, remaining),
+                )
+                if anchored:
+                    evidence_parts.append(anchored)
+                    pages_extracted[fp] = set()
+                    self._record_deep_evidence_read(
+                        context, fp, anchored, source="structure_anchor",
+                    )
+                    self._record_context_telemetry(
+                        context, structure_anchor_extraction_used=True,
+                    )
+                    continue
+                self._record_context_telemetry(
+                    context, structure_anchor_fallback=True,
+                )
             ext = Path(fp).suffix.lower()
             is_paginated = ext in self._PAGINATED_EXTENSIONS
 

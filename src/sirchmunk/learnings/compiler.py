@@ -23,9 +23,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
+from loguru import logger as _loguru_logger
+
+from sirchmunk.learnings.corpus_topic_map import CorpusTopicMap
 from sirchmunk.learnings.tree_indexer import (
     DocumentTree,
     DocumentTreeIndexer,
+    TreeNode,
 )
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.schema.knowledge import (
@@ -484,6 +488,7 @@ class KnowledgeCompiler:
 
         if not to_compile:
             await self._log.info("[Compile] No files to compile (all up-to-date)")
+            self._build_corpus_topic_map(manifest)
             report.elapsed_seconds = time.monotonic() - t0
             return report
 
@@ -566,6 +571,7 @@ class KnowledgeCompiler:
         self._storage.force_sync()
 
         self._build_document_catalog(manifest)
+        self._build_corpus_topic_map(manifest)
 
         await self._build_summary_index(manifest)
 
@@ -1497,7 +1503,7 @@ class KnowledgeCompiler:
                 col_count = max((len(row) for row in cells if isinstance(row, (list, tuple))), default=0)
             elif markdown:
                 # Estimate from markdown lines
-                lines = [l for l in markdown.strip().split("\n") if l.strip().startswith("|")]
+                lines = [line for line in markdown.strip().split("\n") if line.strip().startswith("|")]
                 row_count = max(0, len(lines) - 1)  # exclude separator
                 col_count = lines[0].count("|") - 1 if lines else 0
 
@@ -1539,8 +1545,6 @@ class KnowledgeCompiler:
         For leaf nodes with matching tables, creates dedicated TreeNode children
         with ``content_type="table"``.
         """
-        from sirchmunk.learnings.tree_indexer import TreeNode
-
         if node is None:
             return
 
@@ -1594,7 +1598,7 @@ class KnowledgeCompiler:
                 default=0,
             )
         elif markdown:
-            lines = [l for l in markdown.strip().split("\n") if l.strip().startswith("|")]
+            lines = [line for line in markdown.strip().split("\n") if line.strip().startswith("|")]
             col_count = (lines[0].count("|") - 1) if lines else 0
         return col_count <= 1
 
@@ -1609,8 +1613,6 @@ class KnowledgeCompiler:
 
         Also inserts a text-content sibling preserving the original leaf content.
         """
-        from sirchmunk.learnings.tree_indexer import TreeNode
-
         child_level = node.level + 1
 
         # Preserve original text content as first child
@@ -2625,6 +2627,27 @@ class KnowledgeCompiler:
                     "page_number": pc.page_number,
                 })
         return tables
+
+    # ------------------------------------------------------------------ #
+    #  Cross-document structural topic map                                #
+    # ------------------------------------------------------------------ #
+
+    def _build_corpus_topic_map(self, manifest: CompileManifest) -> None:
+        """Rebuild the lightweight topic map from cached tree titles."""
+        try:
+            tree_paths = [
+                file_path
+                for file_path, entry in manifest.files.items()
+                if entry.has_tree and Path(file_path).exists()
+            ]
+            topic_map = CorpusTopicMap.build_from_indexer(
+                self._tree_indexer,
+                tree_paths,
+            )
+            topic_map.save(self._compile_dir / "corpus_topic_map.json")
+        except Exception as exc:
+            # Derived routing artifacts must never fail the primary compile.
+            _loguru_logger.warning(f"Failed to build corpus topic map: {exc}")
 
     # ------------------------------------------------------------------ #
     #  Summary index for embedding + BM25 fallback                        #

@@ -8,7 +8,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from loguru import logger
 
@@ -19,12 +19,18 @@ from ..utils.constants import (
     GREP_FALLBACK_TIMEOUT,
     GREP_FALLBACK_TO_RG,
     GREP_KEYWORD_CONCURRENT_LIMIT,
+    GREP_MAX_FILESIZE_MB,
+    GREP_MAX_MATCHES_PER_FILE,
     GREP_PROCESS_KILL_TIMEOUT,
     GREP_QUEUE_TIMEOUT,
+    GREP_RGA_ADAPTERS,
     GREP_RGA_BACKOFF_SECONDS,
+    GREP_RICH_EXTENSIONS,
+    GREP_TEXT_TIMEOUT,
+    GREP_TIERED_SCAN,
     GREP_TIMEOUT,
 )
-from ..utils.file_utils import StorageStructure
+from ..utils.file_utils import StorageStructure, fast_extract
 from .base import BaseRetriever
 
 RGA_SEMAPHORE = asyncio.Semaphore(value=GREP_CONCURRENT_LIMIT)
@@ -68,6 +74,142 @@ class GrepRetriever(BaseRetriever):
             self.work_path / StorageStructure.CACHE_DIR / StorageStructure.GREP_DIR
         )
         self.rga_cache.mkdir(parents=True, exist_ok=True)
+        self._native_text_cache: Dict[str, Tuple[int, int, str]] = {}
+
+    async def retrieve_native_formats(
+        self,
+        terms: List[str],
+        path: Union[str, Path, List[str], List[Path], None] = None,
+        *,
+        max_depth: Optional[int] = None,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+        max_results: int = 50,
+        max_lines: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Search formats that frequently fail rga preprocessing.
+
+        The fallback is exact-term oriented and only activates for discriminative
+        terms (digits, hyphens, or multi-word phrases).  Extracted text is cached
+        by file size and nanosecond mtime for warm-query reuse.
+        """
+        if os.getenv("SIRCHMUNK_NATIVE_FORMAT_FALLBACK", "true").lower() != "true":
+            return []
+        precise_terms = [
+            str(term).strip() for term in terms
+            if str(term).strip() and (
+                any(char.isdigit() for char in str(term))
+                or "-" in str(term)
+                or " " in str(term).strip()
+            )
+        ]
+        if not precise_terms:
+            return []
+        roots = path if isinstance(path, list) else [path or Path.cwd()]
+        target_extensions = {".log", ".xlsx", ".xls", ".pptx", ".ppt"}
+        excluded = set(exclude or [])
+        candidates: List[Path] = []
+        for raw_root in roots:
+            root = Path(raw_root).expanduser().resolve()
+            if root.is_file():
+                discovered = [root]
+            elif root.is_dir():
+                discovered = root.rglob("*")
+            else:
+                continue
+            for file_path in discovered:
+                if not file_path.is_file() or file_path.suffix.lower() not in target_extensions:
+                    continue
+                if any(file_path.match(pattern) for pattern in excluded):
+                    continue
+                if include and not any(file_path.match(pattern) for pattern in include):
+                    continue
+                if max_depth is not None and root.is_dir():
+                    try:
+                        if len(file_path.relative_to(root).parts) - 1 > max_depth:
+                            continue
+                    except ValueError:
+                        continue
+                candidates.append(file_path)
+
+        semaphore = asyncio.Semaphore(4)
+
+        async def _extract(
+            file_path: Path,
+        ) -> Optional[Tuple[str, str, bool, float]]:
+            async with semaphore:
+                started_at = time.perf_counter()
+                try:
+                    stat = file_path.stat()
+                    key = str(file_path)
+                    cached = self._native_text_cache.get(key)
+                    if cached and cached[:2] == (stat.st_size, stat.st_mtime_ns):
+                        return key, cached[2], True, (
+                            time.perf_counter() - started_at
+                        ) * 1000
+                    output = await fast_extract(file_path)
+                    content = output.content or ""
+                    self._native_text_cache[key] = (
+                        stat.st_size, stat.st_mtime_ns, content,
+                    )
+                    return key, content, False, (
+                        time.perf_counter() - started_at
+                    ) * 1000
+                except Exception as exc:
+                    logger.debug(
+                        "[native_format_search] extraction failed for %s: %s",
+                        file_path, exc,
+                    )
+                    return None
+
+        extracted = await asyncio.gather(
+            *[_extract(file_path) for file_path in candidates],
+        )
+        results: List[Dict[str, Any]] = []
+        lower_terms = [(term, term.lower()) for term in precise_terms]
+        for extracted_item in extracted:
+            if extracted_item is None:
+                continue
+            file_path, content, cache_hit, extraction_ms = extracted_item
+            lines: List[str] = []
+            matched_terms: List[str] = []
+            for line in content.splitlines():
+                lowered = line.lower()
+                line_terms = [original for original, term in lower_terms if term in lowered]
+                if not line_terms:
+                    continue
+                for term in line_terms:
+                    if term not in matched_terms:
+                        matched_terms.append(term)
+                text = line.strip()
+                if text and text not in lines:
+                    lines.append(text)
+                if len(lines) >= max_lines:
+                    break
+            if not lines:
+                continue
+            matches = [
+                {
+                    "type": "match",
+                    "data": {"lines": {"text": line}},
+                    "_keyword": matched_terms[0] if matched_terms else precise_terms[0],
+                    "_search_backend": "native_extract",
+                    "_search_cache_hit": cache_hit,
+                    "_conversion_elapsed_ms": round(extraction_ms, 3),
+                }
+                for line in lines
+            ]
+            results.append({
+                "path": file_path,
+                "matches": matches,
+                "lines": lines,
+                "total_matches": len(lines),
+                "total_score": float(len(matched_terms)),
+            })
+        results.sort(
+            key=lambda item: (-item["total_score"], -item["total_matches"], item["path"]),
+        )
+        return results[:max_results]
 
     async def retrieve(
         self,
@@ -486,10 +628,12 @@ class GrepRetriever(BaseRetriever):
         json_output: bool,
     ) -> Dict[str, Any]:
         """Run a bounded search process with cancellation-safe cleanup."""
+        queued_at = time.perf_counter()
         acquired = False
         try:
             await asyncio.wait_for(semaphore.acquire(), timeout=queue_timeout)
             acquired = True
+            queue_wait_ms = (time.perf_counter() - queued_at) * 1000
         except asyncio.TimeoutError as exc:
             raise SearchProcessTimeoutError(
                 command, "queue wait", queue_timeout
@@ -511,6 +655,7 @@ class GrepRetriever(BaseRetriever):
             elif os.name == "nt":
                 process_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
 
+            execution_started = time.perf_counter()
             try:
                 process = await asyncio.create_subprocess_exec(
                     *cmd, **process_kwargs
@@ -536,13 +681,18 @@ class GrepRetriever(BaseRetriever):
                 )
                 raise
 
-            return GrepRetriever._parse_async_result(
+            result = GrepRetriever._parse_async_result(
                 command,
                 process.returncode,
                 stdout,
                 stderr,
                 json_output=json_output,
             )
+            result["queue_wait_ms"] = queue_wait_ms
+            result["execution_ms"] = (
+                time.perf_counter() - execution_started
+            ) * 1000
+            return result
         finally:
             if acquired:
                 semaphore.release()
@@ -561,6 +711,7 @@ class GrepRetriever(BaseRetriever):
     ) -> Dict[str, Any]:
         """Run rga, falling back to rg when rga is unavailable or times out."""
         global _RGA_BACKOFF_UNTIL
+        started_at = time.perf_counter()
 
         if (
             allow_rg_fallback
@@ -576,10 +727,13 @@ class GrepRetriever(BaseRetriever):
                 json_output=json_output,
             )
             result["fallback_reason"] = "rga circuit breaker is open"
+            result["fallback_used"] = True
+            result["fallback_elapsed_ms"] = result.get("execution_ms", 0.0)
+            result["total_elapsed_ms"] = (time.perf_counter() - started_at) * 1000
             return result
 
         try:
-            return await GrepRetriever._run_search_process(
+            result = await GrepRetriever._run_search_process(
                 "rga",
                 args,
                 semaphore=RGA_SEMAPHORE,
@@ -587,6 +741,10 @@ class GrepRetriever(BaseRetriever):
                 execution_timeout=timeout,
                 json_output=json_output,
             )
+            result["fallback_used"] = False
+            result["fallback_elapsed_ms"] = 0.0
+            result["total_elapsed_ms"] = (time.perf_counter() - started_at) * 1000
+            return result
         except (
             SearchProcessTimeoutError,
             SearchExecutableNotFoundError,
@@ -606,6 +764,7 @@ class GrepRetriever(BaseRetriever):
                     time.monotonic() + GREP_RGA_BACKOFF_SECONDS,
                 )
             logger.warning("{} Falling back to native rg.", exc)
+            fallback_started = time.perf_counter()
             result = await GrepRetriever._run_search_process(
                 "rg",
                 GrepRetriever._rg_compatible_args(args),
@@ -615,6 +774,12 @@ class GrepRetriever(BaseRetriever):
                 json_output=json_output,
             )
             result["fallback_reason"] = str(exc)
+            result["fallback_used"] = True
+            result["fallback_elapsed_ms"] = (
+                time.perf_counter() - fallback_started
+            ) * 1000
+            result["primary_failure_stage"] = getattr(exc, "stage", "execution")
+            result["total_elapsed_ms"] = (time.perf_counter() - started_at) * 1000
             return result
 
     @staticmethod
@@ -684,61 +849,223 @@ class GrepRetriever(BaseRetriever):
         if rga_cache_path:
             args.extend([f"--rga-cache-path={str(rga_cache_path)}"])
 
-        args.append(pattern)
+        # Corpus-agnostic cost bounds for the query hot path (see AGENTS.md §9.5):
+        #   * --max-filesize skips any oversized blob regardless of type.
+        #   * --rga-adapters keeps only bounded document extractors and drops the
+        #     unbounded recursive/streaming adapters, so archives are never
+        #     inline-decompressed during a query.
+        # --max-filesize is shared with ripgrep and survives the rg fallback;
+        # --rga-adapters is rga-only and is stripped by _rg_compatible_args.
+        if GREP_MAX_FILESIZE_MB > 0:
+            args.append(f"--max-filesize={GREP_MAX_FILESIZE_MB}M")
+        if GREP_RGA_ADAPTERS:
+            args.append(f"--rga-adapters={GREP_RGA_ADAPTERS}")
 
+        # Resolve the search paths into a suffix reused by both tiered passes.
+        path_args: List[str] = []
         if path is not None:
             if isinstance(path, (str, Path)):
-                args.append(str(path))
+                path_args.append(str(path))
             elif isinstance(path, list):
-                for p in path:
-                    args.append(str(p))
+                path_args.extend(str(p) for p in path)
             else:
                 raise TypeError(f"Unsupported type for 'path': {type(path)}")
 
-        # keys: returncode, stdout, stderr
-        result: Dict[str, Any] = await GrepRetriever._run_rga_async(
-            args=args,
-            json_output=not count_only,
-            timeout=timeout,
+        # P1 tiered scan applies only to a broad content search. When the caller
+        # constrains the file set (include globs / ripgrep --type) or wants only
+        # counts, honour that intent with the original single rga pass.
+        tiered = (
+            GREP_TIERED_SCAN
+            and not count_only
+            and not include
+            and not file_type
+            and bool(GREP_RICH_EXTENSIONS)
         )
 
+        started_at = time.perf_counter()
+        if not tiered:
+            result = await GrepRetriever._run_rga_async(
+                args=args + [pattern] + path_args,
+                json_output=not count_only,
+                timeout=timeout,
+            )
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            return GrepRetriever._parse_single_result(
+                result,
+                count_only=count_only,
+                rga_no_cache=rga_no_cache,
+                elapsed_ms=elapsed_ms,
+            )
+
+        # Text pass: native rg over everything. rg auto-detects and skips binary
+        # files and never decompresses archives, so this is O(bytes) fast and
+        # covers all plain-text/markup/code formats (including extensionless).
+        text_args = GrepRetriever._rg_compatible_args(list(args))
+        # Cap matches per file on the text pass ONLY: rg over the whole tree can
+        # match a huge number of files (a broad term across a large text corpus),
+        # and unbounded --json output there is what blows the scan budget. The
+        # rga rich pass stays uncapped so a needle deep inside a single pdf/docx
+        # is never truncated out of the evidence.
+        if GREP_MAX_MATCHES_PER_FILE > 0:
+            text_args.append(f"--max-count={GREP_MAX_MATCHES_PER_FILE}")
+        text_args = text_args + [pattern] + path_args
+        # Rich pass: rga restricted to the binary document formats rg cannot read.
+        rich_globs: List[str] = []
+        for ext in GREP_RICH_EXTENSIONS:
+            rich_globs.extend(["-g", f"*.{ext}"])
+        rich_args = args + rich_globs + [pattern] + path_args
+
+        text_result, rich_result = await asyncio.gather(
+            GrepRetriever._run_search_process(
+                "rg",
+                text_args,
+                semaphore=RG_FALLBACK_SEMAPHORE,
+                queue_timeout=GREP_QUEUE_TIMEOUT,
+                execution_timeout=GREP_TEXT_TIMEOUT,
+                json_output=True,
+            ),
+            GrepRetriever._run_rga_async(
+                args=rich_args, json_output=True, timeout=timeout,
+            ),
+            return_exceptions=True,
+        )
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        merged: List[Dict[str, Any]] = []
+        for label, res in (("rg", text_result), ("rga", rich_result)):
+            if isinstance(res, Exception):
+                logger.warning("tiered {} pass failed: {}", label, res)
+                continue
+            try:
+                merged.extend(
+                    GrepRetriever._parse_single_result(
+                        res,
+                        count_only=False,
+                        rga_no_cache=rga_no_cache,
+                        elapsed_ms=elapsed_ms,
+                    )
+                )
+            except Exception as exc:  # a genuine backend failure in one pass
+                logger.warning("tiered {} parse failed: {}", label, exc)
+        return merged
+
+    @staticmethod
+    def _parse_single_result(
+        result: Dict[str, Any],
+        *,
+        count_only: bool,
+        rga_no_cache: bool,
+        elapsed_ms: float,
+    ) -> List[Dict[str, Any]]:
+        """Parse one rga/rg subprocess result into match dicts (or count dicts).
+
+        Exit codes: 0 = matches found, 1 = no matches, 2 = partial errors (some
+        files failed preprocessing but results may still be present).
+        """
         returncode = result["returncode"]
         stderr_str = result.get("stderr", "").strip()
-
-        # Exit codes: 0 = matches found, 1 = no matches, 2 = partial errors
-        # (some files failed preprocessing but results may still be present)
         if returncode in (0, 2):
             if count_only:
-                counts = []
+                counts: List[Dict[str, Any]] = []
                 raw = result["stdout"]
                 if isinstance(raw, str):
                     for line in raw.strip().splitlines():
                         if ":" in line:
                             p, c = line.rsplit(":", 1)
-                            counts.append({"path": p, "count": int(c)})
+                            try:
+                                counts.append({"path": p, "count": int(c)})
+                            except ValueError:
+                                continue
                 return counts
-            else:
-                stdout = result["stdout"]
-                parsed = stdout if isinstance(stdout, list) else []
-                backend = str(result.get("search_backend", "rga"))
-                fallback_reason = result.get("fallback_reason")
-                for item in parsed:
-                    if isinstance(item, dict):
-                        item.setdefault("_search_backend", backend)
-                        if fallback_reason:
-                            item.setdefault("_fallback_reason", fallback_reason)
-                if returncode == 2 and not parsed and stderr_str:
-                    logger.warning(
-                        f"rga exit 2 with no results — preprocessing may have failed "
-                        f"(missing poppler-utils/pandoc?): {stderr_str[:300]}"
+            stdout = result["stdout"]
+            parsed = stdout if isinstance(stdout, list) else []
+            backend = str(result.get("search_backend", "rga"))
+            fallback_reason = result.get("fallback_reason")
+            for item in parsed:
+                if isinstance(item, dict):
+                    item.setdefault("_search_backend", backend)
+                    item.setdefault("_search_elapsed_ms", elapsed_ms)
+                    item.setdefault(
+                        "_search_queue_wait_ms", result.get("queue_wait_ms", 0.0),
                     )
-                return parsed
+                    item.setdefault(
+                        "_search_execution_ms", result.get("execution_ms", 0.0),
+                    )
+                    item.setdefault(
+                        "_fallback_elapsed_ms", result.get("fallback_elapsed_ms", 0.0),
+                    )
+                    item.setdefault("_search_cache_enabled", not rga_no_cache)
+                    if result.get("primary_failure_stage"):
+                        item.setdefault(
+                            "_primary_failure_stage", result["primary_failure_stage"],
+                        )
+                    if fallback_reason:
+                        item.setdefault("_fallback_reason", fallback_reason)
+            if returncode == 2 and not parsed and stderr_str:
+                logger.warning(
+                    f"rga exit 2 with no results — preprocessing may have failed "
+                    f"(missing poppler-utils/pandoc?): {stderr_str[:300]}"
+                )
+            return parsed
         elif returncode == 1:
             return []
         else:
             raise RuntimeError(
                 f"ripgrep-all failed (exit {returncode}): {stderr_str}"
             )
+
+    async def prewarm_rich_cache(
+        self,
+        path: Union[str, Path, List[str], List[Path]],
+        *,
+        max_depth: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Populate the rga cache for binary document formats ahead of queries.
+
+        Runs the rga rich pass with a token that essentially never occurs in
+        prose, so poppler/pandoc conversions are cached without producing output.
+        This amortizes the cold rich-format extraction cost (which the tiered
+        scan otherwise pays on the first query over pdf/docx-heavy corpora) into
+        an offline / compile step. Best effort: failures are swallowed so they
+        never block the caller.
+        """
+        if not GREP_RICH_EXTENSIONS:
+            return {"prewarmed": False, "reason": "no rich extensions configured"}
+        paths = (
+            [str(path)] if isinstance(path, (str, Path))
+            else [str(p) for p in path]
+        )
+        rga_cache_path = str(Path(self.rga_cache).resolve())
+        args: List[str] = [
+            "-i",
+            "--rga-cache-max-blob-len=10000000",
+            f"--rga-cache-path={rga_cache_path}",
+        ]
+        if GREP_MAX_FILESIZE_MB > 0:
+            args.append(f"--max-filesize={GREP_MAX_FILESIZE_MB}M")
+        if GREP_RGA_ADAPTERS:
+            args.append(f"--rga-adapters={GREP_RGA_ADAPTERS}")
+        if max_depth is not None:
+            args.extend(["--max-depth", str(max_depth)])
+        for ext in GREP_RICH_EXTENSIONS:
+            args.extend(["-g", f"*.{ext}"])
+        args.append("zzqx_prewarm_nomatch_xqzz")
+        args.extend(paths)
+        started = time.perf_counter()
+        try:
+            await GrepRetriever._run_rga_async(
+                args=args,
+                json_output=False,
+                timeout=timeout or GREP_TIMEOUT,
+                allow_rg_fallback=False,
+            )
+            return {
+                "prewarmed": True,
+                "elapsed_ms": (time.perf_counter() - started) * 1000,
+            }
+        except Exception as exc:
+            logger.warning("rich cache prewarm failed: {}", exc)
+            return {"prewarmed": False, "reason": str(exc)}
 
     @staticmethod
     async def _retrieve_or(

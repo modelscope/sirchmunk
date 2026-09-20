@@ -4,7 +4,7 @@ import json
 import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 from sirchmunk.learnings.evidence_processor import (
@@ -126,6 +126,7 @@ class KnowledgeBase:
         top_k_snippets: int,
         verbose: bool,
         tree_indexer=None,
+        initial_anchors: Optional[List[Tuple[int, int]]] = None,
     ) -> Optional[EvidenceUnit]:
         """Extract evidence from a single file.
 
@@ -152,8 +153,11 @@ class KnowledgeBase:
 
             tree_path_ids = None
 
-            # Try tree-based navigation for focused extraction
-            if tree_indexer is not None:
+            # Try tree-based navigation for focused extraction.  When the
+            # upstream structure probe already supplied exact ranges, preserve
+            # the full document and warm-start MCES at those positions instead
+            # of paying for another LLM tree-navigation pass.
+            if tree_indexer is not None and not initial_anchors:
                 tree = tree_indexer.load_tree(file_path_or_url)
                 if tree is not None:
                     await self._log.info(
@@ -172,12 +176,18 @@ class KnowledgeBase:
                         if segments:
                             doc_content = "\n\n---\n\n".join(segments)
 
+            sampling_anchors = [
+                ((start + end) // 2, max(1, end - start), 1.0)
+                for start, end in (initial_anchors or [])
+                if end > start >= 0
+            ]
             sampler = LensEvidenceSampler(
                 llm=self.llm,
                 doc_content=doc_content,
                 verbose=verbose,
                 log_callback=self.log_callback,
                 lens_config=self.lens_config,
+                initial_anchors=sampling_anchors,
             )
             roi_result: RoiResult = await sampler.get_roi(
                 query=query,
@@ -215,6 +225,7 @@ class KnowledgeBase:
         confidence_threshold: Optional[float] = 8.0,
         verbose: bool = True,
         tree_indexer=None,
+        structure_anchors: Optional[Dict[str, List[Tuple[int, int]]]] = None,
     ) -> Union[KnowledgeCluster, None]:
         """Build a knowledge cluster from retrieved information and metadata.
 
@@ -260,6 +271,7 @@ class KnowledgeBase:
                 top_k_snippets=top_k_snippets,
                 verbose=verbose,
                 tree_indexer=tree_indexer,
+                initial_anchors=(structure_anchors or {}).get(info["path"]),
             )
             for info in retrieved_infos
         ]

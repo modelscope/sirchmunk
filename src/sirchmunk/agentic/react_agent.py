@@ -9,15 +9,16 @@ state is tracked via SearchContext (token budget, file dedup, logs).
 """
 import json
 import logging
+import os
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 from sirchmunk.agentic.prompts import (
     REACT_CONTINUATION_PROMPT,
     REACT_SYSTEM_PROMPT,
 )
 from sirchmunk.agentic.tools import ToolRegistry
-from sirchmunk.llm.openai_chat import OpenAIChat
+from sirchmunk.llm.openai_chat import LLMTokenBudgetExceeded, OpenAIChat
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.utils import LogCallback, create_logger
 
@@ -30,6 +31,13 @@ _ANSWER_PATTERN = re.compile(r"<ANSWER>(.*?)</ANSWER>", re.DOTALL)
 _SUFFICIENCY_PATTERN = re.compile(
     r"<EVIDENCE_SUFFICIENCY>\s*(sufficient|partial|absent)\s*</EVIDENCE_SUFFICIENCY>",
     re.IGNORECASE,
+)
+# Optional machine-readable computation disclosure. Captured from the raw
+# response (before answer sanitization strips JSON) so the pipeline can
+# deterministically re-check the arithmetic behind a numeric answer.
+_COMPUTATION_TRACE_PATTERN = re.compile(
+    r"<COMPUTATION_TRACE>\s*(\{.*?\})\s*</COMPUTATION_TRACE>",
+    re.DOTALL | re.IGNORECASE,
 )
 
 # Patterns indicating JSON/code garbage in extracted answers
@@ -69,6 +77,15 @@ def _extract_sufficiency(text: str) -> Optional[str]:
     return m.group(1).strip().lower() if m else None
 
 
+def _set_telemetry(context: SearchContext, **fields: Any) -> None:
+    """Attach diagnostic fields to a search context."""
+    telemetry = getattr(context, "telemetry", None)
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+        setattr(context, "telemetry", telemetry)
+    telemetry.update(fields)
+
+
 def _record_sufficiency(context: SearchContext, content: str) -> None:
     """Attach the evidence rating to ``context.telemetry`` when present.
 
@@ -84,6 +101,23 @@ def _record_sufficiency(context: SearchContext, content: str) -> None:
         telemetry = {}
         setattr(context, "telemetry", telemetry)
     telemetry["evidence_sufficiency"] = sufficiency
+
+
+def _record_computation_trace(context: SearchContext, content: str) -> None:
+    """Stash a raw ``<COMPUTATION_TRACE>`` payload from the final response.
+
+    The trace is captured here, before answer sanitization removes JSON blocks,
+    and handed to the deterministic computation verifier via telemetry. It is
+    advisory only — absence simply means no arithmetic disclosure was made.
+    """
+    match = _COMPUTATION_TRACE_PATTERN.search(content or "")
+    if not match:
+        return
+    telemetry = getattr(context, "telemetry", None)
+    if not isinstance(telemetry, dict):
+        telemetry = {}
+        setattr(context, "telemetry", telemetry)
+    telemetry["computation_trace"] = match.group(1).strip()
 
 
 def _is_garbage_content(text: str) -> bool:
@@ -231,6 +265,7 @@ class ReActSearchAgent:
         initial_keywords: Optional[List[str]] = None,
         preloaded_observations: Optional[str] = None,
         subgoals: Optional[List[str]] = None,
+        trust_preloaded: bool = False,
     ) -> Tuple[str, SearchContext]:
         """Execute a full ReAct search session.
 
@@ -282,6 +317,17 @@ class ReActSearchAgent:
         # next action itself — this raises the starting evidence quality without
         # taking control away from the answering agent.
         if preloaded_observations and preloaded_observations.strip():
+            preload_limit = min(
+                24_000,
+                max(4_000, int(self.max_token_budget * 0.375)),
+            )
+            if len(preloaded_observations) > preload_limit:
+                preloaded_observations = preloaded_observations[:preload_limit]
+                _set_telemetry(
+                    context,
+                    preloaded_evidence_truncated=True,
+                    preloaded_evidence_chars=preload_limit,
+                )
             context.increment_loop()
             messages.append({
                 "role": "assistant",
@@ -290,17 +336,27 @@ class ReActSearchAgent:
                     "question, then decide what else is needed."
                 ),
             })
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"**Preloaded evidence** (starting leads from a broad prior "
-                    f"retrieval — it may be incomplete and may contain unrelated "
-                    f"files):\n{preloaded_observations}\n\n"
+            if trust_preloaded:
+                evidence_instruction = (
+                    "This evidence was extracted from a high-confidence unique "
+                    "source. Treat verbatim facts and complete table rows as "
+                    "confirmed. Answer directly when all subgoals are present; "
+                    "call a tool only for genuinely missing information."
+                )
+            else:
+                evidence_instruction = (
                     "Treat this as leads, not conclusions. For each thing you "
                     "still need to establish that is not already stated "
                     "verbatim above, issue a keyword_search with the specific "
                     "entity name to confirm it before answering — do not answer "
-                    "from the leads alone if a required fact is unconfirmed.\n\n"
+                    "from the leads alone if a required fact is unconfirmed."
+                )
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"**Preloaded evidence** (starting evidence from prior "
+                    f"retrieval):\n{preloaded_observations}\n\n"
+                    f"{evidence_instruction}\n\n"
                     f"{self._build_continuation_prompt(context)}"
                 ),
             })
@@ -343,8 +399,19 @@ class ReActSearchAgent:
             context.increment_loop()
             await self._logger.info(f"[ReAct] Loop {context.loop_count}/{context.max_loops} | {context.summary()}")
 
-            # Call LLM
-            llm_response = await self._call_llm(messages)
+            # Call LLM.  The task-local guard in OpenAIChat reserves prompt +
+            # completion tokens before network I/O, preventing one oversized
+            # call from crossing the session budget.
+            try:
+                llm_response = await self._call_llm(messages, context)
+            except LLMTokenBudgetExceeded as exc:
+                _set_telemetry(
+                    context,
+                    hard_budget_exhausted=True,
+                    hard_budget_reason=str(exc),
+                )
+                await self._logger.warning(f"[ReAct] {exc}")
+                break
             content = llm_response.content or ""
 
             # Track LLM token usage
@@ -359,6 +426,7 @@ class ReActSearchAgent:
             if answer:
                 final_answer = answer
                 _record_sufficiency(context, content)
+                _record_computation_trace(context, content)
                 await self._logger.success(f"[ReAct] Answer found at loop {context.loop_count}")
                 break
 
@@ -422,15 +490,26 @@ class ReActSearchAgent:
                     "If you cannot determine the answer, output your best guess as a simple phrase."
                 ),
             })
-            llm_response = await self._call_llm(messages)
-            content = llm_response.content or ""
-            usage = llm_response.usage or {}
-            total_tok = usage.get("total_tokens", 0)
-            if total_tok == 0:
-                total_tok = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
-            context.add_llm_tokens(total_tok, usage=usage if usage else None)
-            final_answer = _extract_answer(content) or content
-            _record_sufficiency(context, content)
+            try:
+                llm_response = await self._call_llm(messages, context)
+            except LLMTokenBudgetExceeded as exc:
+                _set_telemetry(
+                    context,
+                    hard_budget_exhausted=True,
+                    hard_budget_reason=str(exc),
+                )
+                final_answer = "No results found."
+                await self._logger.warning(f"[ReAct] synthesis skipped: {exc}")
+                llm_response = None
+            if llm_response is not None:
+                content = llm_response.content or ""
+                usage = llm_response.usage or {}
+                total_tok = usage.get("total_tokens", 0)
+                if total_tok == 0:
+                    total_tok = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                context.add_llm_tokens(total_tok, usage=usage if usage else None)
+                final_answer = _extract_answer(content) or content
+                _record_sufficiency(context, content)
 
             # If the forced synthesis still produced garbage, strip and retry
             if final_answer and _is_garbage_content(final_answer):
@@ -447,12 +526,25 @@ class ReActSearchAgent:
     async def _call_llm(
         self,
         messages: List[Dict[str, Any]],
+        context: SearchContext,
     ):
-        """Call the LLM with the given messages.
-
-        Uses stream=False for tool-calling loops to get complete responses.
-        """
-        return await self.llm.achat(messages=messages, stream=False)
+        """Call the LLM within both local-loop and task-global budgets."""
+        prompt_estimate = self.llm._estimate_message_tokens(messages)
+        local_remaining = context.budget_remaining
+        requested = min(
+            int(os.getenv("LENS_MAX_COMPLETION_TOKENS", "4096")),
+            max(0, local_remaining - prompt_estimate),
+        )
+        if requested < 128:
+            raise LLMTokenBudgetExceeded(
+                f"ReAct budget exhausted: remaining={local_remaining}, "
+                f"estimated_prompt={prompt_estimate}"
+            )
+        return await self.llm.achat(
+            messages=messages,
+            stream=False,
+            max_tokens=requested,
+        )
 
     def _build_system_prompt(self, context: SearchContext, tool_descriptions: str) -> str:
         """Format the system prompt with tool descriptions and context state."""

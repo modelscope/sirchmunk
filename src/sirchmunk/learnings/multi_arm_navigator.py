@@ -198,6 +198,103 @@ class MultiArmNavigator:
     # Round 1: Initialization
     # ------------------------------------------------------------------
 
+    def initialize_with_anchors(
+        self,
+        doc_length: int,
+        anchors: List[Tuple[int, int, float]],
+        n_global_arms: int = 2,
+    ) -> List[SampleWindow]:
+        """Initialize arms around structure/snippet anchors.
+
+        Args:
+            doc_length: Full document length in characters.
+            anchors: ``(center, range_width, confidence)`` tuples.  Higher-
+                confidence anchors receive priority when the arm budget is
+                smaller than the anchor set.
+            n_global_arms: Arms reserved for uniform global exploration.
+
+        Returns:
+            One initial sample per created arm.
+        """
+        effective_len = max(0, doc_length or self.doc_len)
+        if effective_len <= 0:
+            return []
+        k = max(1, self.config.k_arms)
+        global_count = min(max(0, n_global_arms), max(0, k - 1))
+        anchor_budget = max(1, k - global_count)
+
+        normalized: List[Tuple[int, int, float]] = []
+        seen_centers: set = set()
+        for center, width, confidence in sorted(
+            anchors or [], key=lambda item: item[2], reverse=True,
+        ):
+            bounded_center = max(0, min(int(center), effective_len - 1))
+            if bounded_center in seen_centers:
+                continue
+            seen_centers.add(bounded_center)
+            normalized.append((
+                bounded_center,
+                max(self.probe_window, int(width)),
+                max(0.0, min(1.0, float(confidence))),
+            ))
+            if len(normalized) >= anchor_budget:
+                break
+
+        if not normalized:
+            return []
+
+        self.arms = []
+        for index, (center, width, _confidence) in enumerate(normalized):
+            self.arms.append(Arm(
+                arm_id=f"anchor_{index}",
+                center=center,
+                sigma=max(float(self.probe_window), width / 3.0),
+            ))
+
+        remaining = k - len(self.arms)
+        if remaining > 0:
+            # Generate more uniform candidates than needed, then greedily pick
+            # those farthest from anchored arms.  This avoids accidentally
+            # dropping every global arm when anchors happen to sit at segment
+            # midpoints.
+            candidate_count = max(k * 2, remaining)
+            candidate_centers = [
+                min(
+                    effective_len - 1,
+                    max(0, int((index + 0.5) * effective_len / candidate_count)),
+                )
+                for index in range(candidate_count)
+            ]
+            for index in range(remaining):
+                if not candidate_centers:
+                    break
+                center = max(
+                    candidate_centers,
+                    key=lambda candidate: min(
+                        abs(arm.center - candidate) for arm in self.arms
+                    ),
+                )
+                candidate_centers.remove(center)
+                self.arms.append(Arm(
+                    arm_id=f"global_{index}",
+                    center=center,
+                    sigma=max(
+                        float(self.probe_window),
+                        effective_len / max(candidate_count * 2, 1),
+                    ),
+                ))
+
+        samples: List[SampleWindow] = []
+        for arm in self.arms:
+            samples.extend(
+                self._sample_around_arm(arm, 1, self.doc_content, effective_len)
+            )
+        logger.debug(
+            f"[MultiArmNavigator] Anchor initialization: "
+            f"{len(normalized)} anchors, {len(self.arms)} arms"
+        )
+        return samples
+
     async def _initialize_and_explore(
         self,
         query: str,

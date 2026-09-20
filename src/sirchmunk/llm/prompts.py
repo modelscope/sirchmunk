@@ -1037,6 +1037,85 @@ Return ONLY a JSON object, no extra text:
 
 
 # ---------------------------------------------------------------------------
+# Query Intelligence prompt (LENS multi-path retrieval)
+# ---------------------------------------------------------------------------
+
+QUERY_INTELLIGENCE_PROMPT = """### Role: Search Intelligence Analyst
+
+### Task:
+Analyze the user query and produce a comprehensive retrieval plan in **one** JSON object.
+You MUST extract every field described below — this single call replaces keyword extraction,
+intent classification, data-requirement analysis, and query reformulation.
+
+### User Query:
+{query}
+
+### Output JSON Schema:
+Return ONLY a single JSON object (no markdown fences, no extra text):
+{{
+  "keywords_level1": {{"multi-word phrase": idf_value, ...}},
+  "keywords_level2": {{"atomic term": idf_value, ...}},
+  "keywords_alt": {{"cross-lingual term": idf_value, ...}},
+  "intent": "lookup | comparison | computation",
+  "complexity": "simple | moderate | complex",
+  "data_points": ["fact/datum needed to answer", ...],
+  "likely_sources": ["probable document or section name", ...],
+  "formula": "computation formula or null",
+  "time_period": "temporal scope or null",
+  "expected_answer_type": "person | date | number | yes/no | entity | ...",
+  "target_slot": "relation the answer fills (e.g. 'director of')",
+  "answer_constraints": ["constraint on answer form", ...],
+  "hop_type": "single | bridge | comparison",
+  "reformulations": [
+    "diverse restatement 1 of the query",
+    "diverse restatement 2 focusing on different keywords",
+    "diverse restatement 3 using synonyms or paraphrases"
+  ],
+  "entities": ["named entity 1", "named entity 2", ...],
+  "concepts": ["abstract topic 1", "abstract topic 2", ...],
+  "expected_doc_type": "wiki | article | report | code | data | general",
+  "expected_sections": ["section title likely containing answer", ...],
+  "location_hint": "heading | table | body | beginning | any",
+  "multi_source_score": 0.3
+}}
+
+### Field Guidelines:
+
+**Keywords** (IDF range 0-10: 0-3 common, 4-6 moderate, 7-9 rare, 10 specialized):
+- Level 1: 3-5 multi-word compound phrases likely to appear verbatim in documents
+- Level 2: 3-5 fine-grained atomic terms / single words
+- Alt: 2-4 cross-lingual translations of the most important terms (Chinese<->English)
+
+**Intent & Complexity**:
+- intent: "lookup" (factoid/entity), "comparison" (compare entities), "computation" (calculate)
+- complexity: "simple" (single fact), "moderate" (2-3 facts), "complex" (multi-step reasoning)
+
+**Data Requirements**:
+- data_points: Specific facts/data the answer requires (1-6 items)
+- likely_sources: Document names, section headings, or table types that would contain the data
+- hop_type: "single" (answer in one document), "bridge" (entity from doc A needed to find doc B),
+  "comparison" (compare facts across documents)
+
+**Reformulations** (CRITICAL for recall):
+- Generate 3-5 diverse restatements that:
+  - Use different word orderings and synonym choices
+  - Emphasize different aspects of the query
+  - Include both natural-language and keyword-style phrasings
+  - Cover alternative terminology a document author might use
+
+**Entities & Concepts**:
+- entities: Named entities (people, organizations, places, works, events) — exact names
+- concepts: Abstract topics ("economy", "population", "filmography") — broad recall terms
+
+**Structure Hypothesis**:
+- expected_doc_type: What kind of document likely holds the answer
+- expected_sections: Section headings likely to contain the evidence
+- location_hint: Where in a document the answer typically appears
+- multi_source_score: 0.0-1.0, how likely the answer needs multiple document sections
+"""
+
+
+# ---------------------------------------------------------------------------
 # Listwise Ranking prompt (LENS BatchRankingEvaluator)
 # ---------------------------------------------------------------------------
 
