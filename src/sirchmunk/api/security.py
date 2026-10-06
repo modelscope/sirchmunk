@@ -95,11 +95,28 @@ def _has_symlink_in_chain(path: str) -> bool:
         return True  # Fail-closed on errors
 
 
+def _management_private_path(requested: str) -> bool:
+    from sirchmunk.storage.lifecycle import get_runtime
+    runtime = get_runtime()
+    if runtime is None:
+        return False
+    try:
+        target = Path(requested).expanduser().resolve()
+        private = runtime.root / ".control"
+        # Also reject recursive scans of an ancestor (including the work root).
+        # The private snapshot may contain credentials not exposed by Web APIs.
+        return target.is_relative_to(private) or private.is_relative_to(target)
+    except (OSError, ValueError):
+        return True
+
+
 def is_path_allowed(requested: str) -> bool:
     """Check whether *requested* falls under an allowed base path.
 
     When SIRCHMUNK_ALLOWED_PATHS is unset, all paths are allowed (backward-compat).
     """
+    if _management_private_path(requested):
+        return False
     env_raw = os.getenv("SIRCHMUNK_ALLOWED_PATHS", "")
     if not env_raw.strip():
         return True  # unrestricted when unconfigured
@@ -120,7 +137,7 @@ def is_path_allowed_strict(requested: str) -> bool:
     ``SIRCHMUNK_ALLOWED_PATHS`` is not explicitly configured.  Use this for
     remote-mode access control.
     """
-    if _has_symlink_in_chain(requested):
+    if _management_private_path(requested) or _has_symlink_in_chain(requested):
         logger.warning("Symlink detected in path: %s", requested)
         return False
     allowed = get_allowed_paths()

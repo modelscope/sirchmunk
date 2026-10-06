@@ -1205,6 +1205,13 @@ result = await search.search(
 
 欢迎 [贡献](https://github.com/modelscope/sirchmunk/pulls)！
 
+后端扩展与部署说明：
+
+- [多 LLM、模型池与 HTTP API](docs/llm-pools.md)
+- [后端改进与可选管理能力](docs/backend-improvements.md)
+- [持久管理协议](docs/platform-control.md)与[独立备份回执](docs/backup-operation-receipts.md)
+- [验证结果与可复现验收](docs/backend-validation.md)
+
 ---
 
 ## 📄 许可

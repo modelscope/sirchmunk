@@ -72,40 +72,50 @@ def _load_env_file(env_file: Path) -> bool:
     """
     if not env_file.exists():
         return False
+    def protected(key: str) -> bool:
+        upper = key.upper()
+        return upper.startswith("SIRCHMUNK_MANAGEMENT_") or upper in {"SIRCHMUNK_DEPLOYMENT_ID", "SIRCHMUNK_RELEASE_ROOT"}
 
+    trusted = {key: value for key, value in os.environ.items() if protected(key)}
+    for key in trusted:
+        os.environ.pop(key, None)
     try:
-        from dotenv import load_dotenv
-        load_dotenv(env_file, override=False)
-        # Expand ~ in path-related values loaded by dotenv
-        for key in ("SIRCHMUNK_WORK_PATH", "EMBEDDING_CACHE_DIR"):
-            val = os.environ.get(key)
-            if val and "~" in val:
-                os.environ[key] = os.path.expanduser(val)
-        return True
-    except ImportError:
-        # Fallback: manual parsing if python-dotenv not installed
         try:
-            _PATH_KEYS = {"SIRCHMUNK_WORK_PATH", "EMBEDDING_CACHE_DIR"}
-            with open(env_file, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        key, _, value = line.partition("=")
-                        key = key.strip()
-                        value = value.strip().strip('"').strip("'")
-                        if key and key not in os.environ:
-                            if key in _PATH_KEYS:
-                                os.environ[key] = os.path.expanduser(value)
-                            else:
-                                os.environ[key] = value
-            # Expand ~ in path keys regardless of source (matching dotenv block behavior)
-            for key in _PATH_KEYS:
+            from dotenv import load_dotenv
+            load_dotenv(env_file, override=False)
+            # Expand ~ in path-related values loaded by dotenv
+            for key in ("SIRCHMUNK_WORK_PATH", "EMBEDDING_CACHE_DIR"):
                 val = os.environ.get(key)
                 if val and "~" in val:
                     os.environ[key] = os.path.expanduser(val)
             return True
-        except Exception:
-            return False
+        except ImportError:
+            # Fallback: manual parsing if python-dotenv not installed
+            try:
+                path_keys = {"SIRCHMUNK_WORK_PATH", "EMBEDDING_CACHE_DIR"}
+                with open(env_file, "r") as source:
+                    for line in source:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            key, _, value = line.partition("=")
+                            key = key.strip()
+                            value = value.strip().strip('"').strip("'")
+                            if key and key not in os.environ:
+                                os.environ[key] = os.path.expanduser(value) if key in path_keys else value
+                for key in path_keys:
+                    val = os.environ.get(key)
+                    if val and "~" in val:
+                        os.environ[key] = os.path.expanduser(val)
+                return True
+            except Exception:
+                return False
+    finally:
+        # Never let a business-editable .env replace or interpolate the
+        # supervisor's management identity into another visible setting.
+        for key in tuple(os.environ):
+            if protected(key):
+                os.environ.pop(key, None)
+        os.environ.update(trusted)
 
 
 def _generate_env_file(env_file: Path, work_path: Path):
@@ -1929,6 +1939,23 @@ def run_cmd():
 
     # Execute command
     if hasattr(args, "func"):
+        # Provisioned managed roots belong to the supervised Web process.
+        # CLI/MCP/compile cannot become a second writer, even between restarts.
+        writes_root = args.command not in ("version", "upload") and not (
+            args.command == "search" and getattr(args, "api", False)
+        ) and not (args.command == "mcp" and getattr(args, "mcp_command", None) == "version")
+        if writes_root:
+            from sirchmunk.storage.lifecycle import claim_work_root, LifecycleError
+            web_server = args.command == "serve" or (
+                args.command == "web" and getattr(args, "web_command", None) == "serve"
+            )
+            supervised = web_server and os.getenv("SIRCHMUNK_MANAGEMENT_LIFECYCLE_ENABLED", "false").lower() == "true"
+            try:
+                if supervised and (getattr(args, "reload", False) or getattr(args, "dev", False)):
+                    raise LifecycleError("managed_web_requires_single_worker_without_reload")
+                claim_work_root(getattr(args, "work_path", None), _managed=supervised)
+            except LifecycleError as exc:
+                parser.exit(2, f"Sirchmunk: {exc}\n")
         sys.exit(args.func(args))
     else:
         parser.print_help()

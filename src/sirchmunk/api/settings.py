@@ -11,10 +11,11 @@ _update_env_file() + os.environ.
 """
 
 import os
+import re
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
-from typing import Dict, Any, Optional
+from fastapi import APIRouter, HTTPException, Request
+from typing import Dict, Any, Optional, Literal
 from pydantic import BaseModel
 
 from sirchmunk.utils.embedding_util import EmbeddingUtil
@@ -130,8 +131,8 @@ def _update_env_file(updates: Dict[str, str]):
 # === Request/Response Models ===
 
 class UISettings(BaseModel):
-    theme: str = "light"
-    language: str = "en"
+    theme: Literal["light", "dark"] = "light"
+    language: Literal["en", "zh"] = "en"
 
 class EnvironmentVariables(BaseModel):
     SIRCHMUNK_WORK_PATH: Optional[str] = None
@@ -184,7 +185,8 @@ def get_current_env_variables() -> Dict[str, Any]:
             "category": "llm"
         },
         "LLM_API_KEY": {
-            "value": os.getenv("LLM_API_KEY", ""),
+            "value": "***" if os.getenv("LLM_API_KEY", "") else "",
+            "configured": bool(os.getenv("LLM_API_KEY", "")),
             "default": "",
             "description": "API key for LLM service",
             "category": "llm",
@@ -273,8 +275,33 @@ async def get_environment_variables():
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("")
-async def save_settings(request: SaveSettingsRequest):
+async def save_settings(request: SaveSettingsRequest, raw_request: Request = None):
     """Save settings (UI and/or environment variables)"""
+    # The business API never provisions the independent management identity or
+    # token. Managed Web capacity and work-root changes must not bypass the
+    # management CAS/admission boundary through arbitrary .env updates.
+    if request.environment:
+        from sirchmunk.storage.lifecycle import get_runtime
+        holder = getattr(raw_request.app.state, "management_holder", None) if raw_request else None
+        managed = holder is not None and holder.state is not None
+        lifecycle_managed = get_runtime() is not None
+        for key, value in request.environment.items():
+            if (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", key)
+                    or any(ord(ch) < 32 or ord(ch) == 127 or ch in "\u0085\u2028\u2029" for ch in value)):
+                raise HTTPException(status_code=422, detail="Invalid setting name or value")
+            normalized = key.upper()
+            if (normalized.startswith("SIRCHMUNK_MANAGEMENT_")
+                    or normalized in {"SIRCHMUNK_DEPLOYMENT_ID", "SIRCHMUNK_RELEASE_ROOT"}
+                    or (managed and normalized in ("SIRCHMUNK_WORK_PATH", "SIRCHMUNK_MAX_WS_CONNECTIONS"))
+                    or (lifecycle_managed and normalized in (
+                        "SIRCHMUNK_WORK_PATH", "EMBEDDING_DIM", "EMBEDDING_MODEL_ID",
+                        "EMBEDDING_CACHE_DIR", "MODELSCOPE_CACHE", "HF_HOME", "TRANSFORMERS_CACHE",
+                        "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "SENTENCE_TRANSFORMERS_HOME",
+                        "TORCH_HOME", "HF_MODULES_CACHE", "XDG_CACHE_HOME", "TRITON_CACHE_DIR",
+                        "TORCHINDUCTOR_CACHE_DIR", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE",
+                        "HF_HUB_DISABLE_TELEMETRY",
+                    ))):
+                raise HTTPException(status_code=403, detail="Setting is managed outside the business API")
     try:
         saved_items = []
         env_updates: Dict[str, str] = {}
@@ -357,63 +384,13 @@ async def update_ui_settings(ui: UISettings):
 
 @router.get("/test/llm")
 async def test_llm_connection():
-    """Test LLM connection"""
-    from sirchmunk.llm import OpenAIChat
-
+    """Compatibility endpoint: probe the explicitly selected route."""
+    from .llm_pools import test_configuration
+    from sirchmunk.llm.pool_config import get_store, ConfigError
     try:
-        base_url = os.getenv("LLM_BASE_URL", _DEFAULT_LLM_BASE_URL)
-        api_key = os.getenv("LLM_API_KEY", "")
-        model = os.getenv("LLM_MODEL_NAME", _DEFAULT_LLM_MODEL_NAME)
-
-        print(f"[DEBUG] Testing LLM connection with base_url={base_url}, model={model}, api_key={'***' if api_key else '(not set)'}")
-
-        if not api_key:
-            return {
-                "success": False,
-                "status": "error",
-                "message": "LLM API key is not configured",
-                "model": None
-            }
-
-        if not base_url:
-            return {
-                "success": False,
-                "status": "error",
-                "message": "LLM base URL is not configured",
-                "model": None
-            }
-
-        llm = OpenAIChat(
-            base_url=base_url,
-            api_key=api_key,
-            model=model
-        )
-
-        messages = [
-            {"role": "system",
-             "content": "You are a helpful AI assistant."},
-            {"role": "user", "content": "Output the word: 'test'."}
-        ]
-        resp = await llm.achat(
-            messages=messages,
-            stream=False
-        )
-        print(f"[DEBUG] LLM response: {resp.content}")
-
-        return {
-            "success": True,
-            "status": "configured",
-            "message": "LLM connection successful",
-            "model": model,
-            "base_url": base_url
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "status": "error",
-            "message": str(e),
-            "model": None
-        }
+        return await test_configuration(get_store().read())
+    except ConfigError as exc:
+        return {"success": False, "status": "error", "message": str(exc), "model": None}
 
 @router.get("/status")
 async def get_settings_status():
@@ -421,11 +398,8 @@ async def get_settings_status():
     try:
         ui_settings = get_default_ui_settings()
 
-        llm_api_key = os.getenv("LLM_API_KEY", "")
-        llm_base_url = os.getenv("LLM_BASE_URL", _DEFAULT_LLM_BASE_URL)
-        llm_model = os.getenv("LLM_MODEL_NAME", _DEFAULT_LLM_MODEL_NAME)
-
-        llm_configured = bool(llm_api_key and llm_base_url and llm_model)
+        from sirchmunk.llm.factory import configuration_status
+        llm_status = configuration_status()
 
         return {
             "success": True,
@@ -434,11 +408,7 @@ async def get_settings_status():
                     "theme": ui_settings.get("theme", "light"),
                     "language": ui_settings.get("language", "en")
                 },
-                "llm": {
-                    "configured": llm_configured,
-                    "model": llm_model if llm_configured else None,
-                    "status": "ready" if llm_configured else "not_configured"
-                }
+                "llm": llm_status
             }
         }
     except Exception as e:

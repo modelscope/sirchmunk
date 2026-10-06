@@ -397,6 +397,8 @@ class KnowledgeCompiler:
         self._storage = knowledge_storage
         self._tree_indexer = tree_indexer
         self._work_path = Path(work_path).expanduser().resolve()
+        from sirchmunk.storage.lifecycle import claim_work_root
+        claim_work_root(self._work_path)
         self._log = create_logger(log_callback=log_callback)
 
         self._compile_dir = self._work_path / ".cache" / "compile"

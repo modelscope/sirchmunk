@@ -12,6 +12,31 @@ the API and the WebUI.
 import os
 from pathlib import Path
 
+# Management identity and credentials must come from the process supervisor,
+# never from the business-editable work-path .env file.
+_management_launch_env = {
+    key: os.environ.get(key)
+    for key in (
+        "SIRCHMUNK_WORK_PATH", "SIRCHMUNK_MANAGEMENT_ENABLED",
+        "SIRCHMUNK_MANAGEMENT_CONFIG_ENABLED", "SIRCHMUNK_MANAGEMENT_INSTANCE_ID",
+        "SIRCHMUNK_MANAGEMENT_LIFECYCLE_ENABLED",
+        "SIRCHMUNK_RELEASE_ROOT", "SIRCHMUNK_MANAGEMENT_SHUTDOWN_TIMEOUT_SECONDS",
+        "SIRCHMUNK_MANAGEMENT_PORT", "SIRCHMUNK_MANAGEMENT_TOKEN",
+        "SIRCHMUNK_DEPLOYMENT_ID",
+    )
+}
+
+def _protected_management_key(key: str) -> bool:
+    upper = key.upper()
+    return upper.startswith("SIRCHMUNK_MANAGEMENT_") or upper in {"SIRCHMUNK_DEPLOYMENT_ID", "SIRCHMUNK_RELEASE_ROOT"}
+
+# Keep the independent management identity out of the business process env.
+# In particular, dotenv interpolation of ordinary LLM/UI values must never
+# expand the supervisor's management token.
+for _key in tuple(os.environ):
+    if _protected_management_key(_key):
+        os.environ.pop(_key, None)
+
 # Load .env file from Sirchmunk work directory before any module imports.
 # This ensures environment variables (LLM_API_KEY, LLM_BASE_URL, etc.) are
 # available when constants.py and other modules are first imported.
@@ -38,7 +63,16 @@ if _env_file.exists():
         except Exception:
             pass
 
+for _key in tuple(os.environ):
+    if _protected_management_key(_key):
+        os.environ.pop(_key, None)
+
 import logging
+
+from sirchmunk.storage.lifecycle import bootstrap_managed_root
+
+# Root ownership is acquired before any router constructs persistent storage.
+_managed_runtime = bootstrap_managed_root(_management_launch_env)
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,6 +80,7 @@ from fastapi.responses import JSONResponse
 from starlette.responses import FileResponse, Response
 
 from .security import SecurityHeadersMiddleware, verify_token
+from .management import AdmissionMiddleware, ManagementHolder, start_management, stop_management, close_managed_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +92,7 @@ from .chat import router as chat_router
 from .monitor import router as monitor_router
 from .search import router as search_router
 from .files import router as files_router
+from .llm_pools import router as llm_pools_router
 
 # Determine whether to serve the WebUI static files.
 # Set by `sirchmunk web serve` via environment variable.
@@ -74,6 +110,10 @@ app = FastAPI(
     docs_url="/docs" if _debug else None,
     redoc_url="/redoc" if _debug else None,
 )
+
+_management_holder = ManagementHolder()
+app.state.management_holder = _management_holder
+app.add_middleware(AdmissionMiddleware, holder=_management_holder)
 
 # Configure CORS
 _allowed_origins_raw = os.getenv("SIRCHMUNK_ALLOWED_ORIGINS", "")
@@ -100,25 +140,60 @@ async def auth_middleware(request: Request, call_next):
     exempt = (
         path in ("/health", "/favicon.ico")
         or path.startswith("/_next/")
-        or path == "/api/v1/settings/ui"
+        or (path == "/api/v1/settings/ui" and request.method == "GET")
         or request.method == "OPTIONS"
     )
     if not exempt and path.startswith("/api/"):
-        await verify_token(request)
+        try:
+            await verify_token(request)
+        except HTTPException as exc:
+            # Exceptions raised from user middleware sit outside FastAPI's
+            # route exception handler; return the intended HTTP status here.
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     response = await call_next(request)
     return response
 
 
 @app.on_event("startup")
-def _prewarm_chat_search():
-    """Create the chat search singleton at startup so the embedding model starts loading immediately.
+async def _start_management_listener():
+    await start_management(_management_holder, _work_path, _management_launch_env)
+    if _managed_runtime:
+        import asyncio
+        try:
+            await asyncio.to_thread(_management_holder.state.require_lifecycle().initialize)
+        except BaseException:
+            await stop_management(_management_holder)
+            raise
+
+
+@app.on_event("startup")
+async def _prewarm_chat_search():
+    """Warm cached embedding resources in a short-lived request scope at startup.
     This reduces the chance of the first user request blocking on model load (e.g. in Docker).
     """
+    if _managed_runtime:
+        # Managed readiness proves local storage, not remote model availability.
+        # Embeddings load offline on demand; startup must not download models.
+        return
     try:
         from .chat import get_search_instance
-        get_search_instance()
+        from sirchmunk.llm.factory import llm_request_scope
+        async with llm_request_scope():
+            get_search_instance()
     except Exception:
         pass
+
+
+@app.on_event("shutdown")
+async def _stop_management_listener():
+    try:
+        if _managed_runtime:
+            timeout = float(_management_launch_env.get("SIRCHMUNK_MANAGEMENT_SHUTDOWN_TIMEOUT_SECONDS") or 60)
+            if not 1 <= timeout <= 600:
+                raise RuntimeError("invalid_managed_shutdown_timeout")
+            await close_managed_runtime(_management_holder, timeout)
+    finally:
+        await stop_management(_management_holder)
 
 
 # Include all API routers (registered before static mount so they take priority)
@@ -130,6 +205,7 @@ app.include_router(chat_router)
 app.include_router(monitor_router)
 app.include_router(search_router)
 app.include_router(files_router)
+app.include_router(llm_pools_router)
 
 # Root endpoint: return API info when UI is not served,
 # otherwise let the static mount handle "/"

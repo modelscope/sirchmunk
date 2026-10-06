@@ -36,6 +36,7 @@ from .base import BaseRetriever
 RGA_SEMAPHORE = asyncio.Semaphore(value=GREP_CONCURRENT_LIMIT)
 RG_FALLBACK_SEMAPHORE = asyncio.Semaphore(value=GREP_FALLBACK_CONCURRENT_LIMIT)
 _RGA_BACKOFF_UNTIL = 0.0
+_MANAGED_PROCESS_TASKS: set[asyncio.Task] = set()
 
 
 class SearchProcessTimeoutError(RuntimeError):
@@ -69,7 +70,9 @@ class GrepRetriever(BaseRetriever):
     def __init__(self, work_path: Union[str, Path] = None, **kwargs):
         super().__init__()
 
-        self.work_path: Path = Path(work_path or DEFAULT_SIRCHMUNK_WORK_PATH).expanduser().resolve()
+        self.work_path: Path = Path(work_path or os.getenv("SIRCHMUNK_WORK_PATH") or DEFAULT_SIRCHMUNK_WORK_PATH).expanduser().resolve()
+        from sirchmunk.storage.lifecycle import claim_work_root
+        claim_work_root(self.work_path)
         self.rga_cache: Path = (
             self.work_path / StorageStructure.CACHE_DIR / StorageStructure.GREP_DIR
         )
@@ -575,6 +578,12 @@ class GrepRetriever(BaseRetriever):
                         process.pid,
                         GREP_PROCESS_KILL_TIMEOUT,
                     )
+        from sirchmunk.storage.lifecycle import get_runtime
+        runtime = get_runtime()
+        if runtime and (process.returncode is None or (
+                communicate_task is not None and not communicate_task.done())):
+            runtime.fail("search_process_cleanup_unknown")
+            raise RuntimeError("search_process_cleanup_unknown")
 
     @staticmethod
     def _parse_async_result(
@@ -628,6 +637,36 @@ class GrepRetriever(BaseRetriever):
         json_output: bool,
     ) -> Dict[str, Any]:
         """Run a bounded search process with cancellation-safe cleanup."""
+        from sirchmunk.storage.lifecycle import get_runtime
+        runtime = get_runtime()
+        arguments = dict(semaphore=semaphore, queue_timeout=queue_timeout,
+                         execution_timeout=execution_timeout, json_output=json_output)
+        if runtime is None:
+            return await GrepRetriever._run_search_process_impl(command, args, **arguments)
+        release = runtime.reserve_background()
+        try:
+            task = asyncio.create_task(GrepRetriever._run_search_process_impl(command, args, **arguments))
+        except BaseException:
+            release()
+            raise
+        _MANAGED_PROCESS_TASKS.add(task)
+        def finished(done):
+            _MANAGED_PROCESS_TASKS.discard(done)
+            if done.cancelled():
+                runtime.fail("search_process_cleanup_unknown")
+            else:
+                done.exception()  # Retrieve detached errors; caller may be gone.
+            release()
+        task.add_done_callback(finished)
+        # A disconnected client must not abandon spawn/kill/reap halfway through.
+        # Retain the bounded process task until its real timeout or completion.
+        return await asyncio.shield(task)
+
+    @staticmethod
+    async def _run_search_process_impl(
+        command: str, args: List[str], *, semaphore: asyncio.Semaphore,
+        queue_timeout: float, execution_timeout: float, json_output: bool,
+    ) -> Dict[str, Any]:
         queued_at = time.perf_counter()
         acquired = False
         try:

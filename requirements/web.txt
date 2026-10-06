@@ -15,3 +15,6 @@ python-dotenv>=1.0.0
 
 # --- System & Utilities ---
 psutil
+# Fixed Windows supervisor validates local control-file ACLs. Ubuntu uses
+# native uid/mode checks and does not install this Windows adapter dependency.
+pywin32>=306; sys_platform == "win32"

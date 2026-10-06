@@ -23,6 +23,9 @@ import openai
 
 from sirchmunk.search import AgenticSearch
 from sirchmunk.llm.openai_chat import OpenAIChat
+from sirchmunk.llm.factory import create_configured_llm, configuration_status, llm_request_scope, track_search_instance
+from sirchmunk.llm.pool_router import PoolError
+from sirchmunk.llm.pool_config import ConfigError
 from sirchmunk.api.components.history_storage import HistoryStorage
 from sirchmunk.api.components.monitor_tracker import llm_usage_tracker
 from sirchmunk.api.security import (
@@ -58,6 +61,8 @@ def _is_transient_llm_error(exc: Exception) -> bool:
 
 def _classify_error(exc: Exception) -> str:
     """Return a human-readable error class for user-facing messages."""
+    if isinstance(exc, (PoolError, ConfigError)):
+        return str(exc)
     if isinstance(exc, openai.AuthenticationError):
         return "LLM authentication failed — check LLM_API_KEY"
     if isinstance(exc, openai.PermissionDeniedError):
@@ -274,19 +279,45 @@ _MAX_WS_CONNECTIONS = int(os.getenv("SIRCHMUNK_MAX_WS_CONNECTIONS", "100"))
 class ChatConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
+        self._capacity_lock = threading.Lock()
+        self._pending_connections = 0
+        self._limit = _MAX_WS_CONNECTIONS
+
+    def get_limit(self) -> int:
+        with self._capacity_lock:
+            return self._limit
+
+    def set_limit(self, limit: int) -> None:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("invalid WebSocket capacity")
+        with self._capacity_lock:
+            self._limit = limit
 
     async def connect(self, websocket: WebSocket) -> bool:
         """Accept a WebSocket connection if capacity allows."""
-        if len(self.active_connections) >= _MAX_WS_CONNECTIONS:
+        with self._capacity_lock:
+            at_capacity = len(self.active_connections) + self._pending_connections >= self._limit
+            if not at_capacity:
+                self._pending_connections += 1
+        if at_capacity:
+            # A close before the handshake is normally surfaced as HTTP 403;
+            # accepting first lets clients observe the intended 1013 code.
+            await websocket.accept()
             await websocket.close(code=1013, reason="Server at capacity")
             return False
-        await websocket.accept()
-        self.active_connections.append(websocket)
+        try:
+            await websocket.accept()
+            with self._capacity_lock:
+                self.active_connections.append(websocket)
+        finally:
+            with self._capacity_lock:
+                self._pending_connections -= 1
         return True
 
     def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+        with self._capacity_lock:
+            if websocket in self.active_connections:
+                self.active_connections.remove(websocket)
 
     async def send_personal_message(self, message: str, websocket: WebSocket):
         await websocket.send_text(message)
@@ -513,77 +544,16 @@ def get_envs() -> Dict[str, Any]:
     )
 
 
-_chat_search_instance: Optional[AgenticSearch] = None
-_chat_search_config: Optional[tuple] = None
-_chat_search_lock = threading.Lock()
-
-
 def get_search_instance(log_callback=None):
-    """Get or create a cached AgenticSearch instance.
-
-    Uses double-checked locking to ensure thread-safe singleton creation
-    while keeping the fast path (reuse) lock-free.
-
-    The heavy resources (embedding model, knowledge storage) are
-    initialised only once.  Subsequent calls reuse the singleton and
-    merely swap the per-request ``log_callback`` via
-    ``update_log_callback``.
-
-    The instance is automatically recreated when the LLM configuration
-    (env vars) changes, e.g. after a settings update in the WebUI.
-
-    Args:
-        log_callback: Optional callback for streaming search logs
-
-    Returns:
-        Configured AgenticSearch instance
-    """
-    global _chat_search_instance, _chat_search_config
-
-    try:
-        envs = get_envs()
-    except Exception:
-        logger.warning("LLM configuration incomplete, check LLM_BASE_URL/LLM_API_KEY/LLM_MODEL_NAME")
-        envs = {
-            "base_url": os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
-            "api_key": os.getenv("LLM_API_KEY", ""),
-            "model_name": os.getenv("LLM_MODEL_NAME", "gpt-5.2"),
-        }
-
-    current_config = (envs["api_key"], envs["base_url"], envs["model_name"])
-
-    # Fast path (lock-free): reuse existing instance when config unchanged
-    if _chat_search_instance is not None and current_config == _chat_search_config:
-        _chat_search_instance.update_log_callback(log_callback)
-        return _chat_search_instance
-
-    # Slow path: acquire lock and double-check before creating
-    with _chat_search_lock:
-        if _chat_search_instance is not None and current_config == _chat_search_config:
-            _chat_search_instance.update_log_callback(log_callback)
-            return _chat_search_instance
-
-        llm = OpenAIChat(
-            base_url=envs["base_url"],
-            api_key=envs["api_key"],
-            model=envs["model_name"],
-            log_callback=log_callback,
-        )
-
-        enable_cluster_reuse = os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true"
-        cluster_sim_threshold = float(os.getenv("CLUSTER_SIM_THRESHOLD", "0.85"))
-        cluster_sim_top_k = int(os.getenv("CLUSTER_SIM_TOP_K", "3"))
-
-        _chat_search_instance = AgenticSearch(
-            llm=llm,
-            log_callback=log_callback,
-            reuse_knowledge=enable_cluster_reuse,
-            cluster_sim_threshold=cluster_sim_threshold,
-            cluster_sim_top_k=cluster_sim_top_k,
-            work_path=os.getenv("SIRCHMUNK_WORK_PATH") or None,
-        )
-        _chat_search_config = current_config
-        return _chat_search_instance
+    """Isolate callbacks and mutable search state for each request."""
+    return track_search_instance(AgenticSearch(
+        llm=create_configured_llm(log_callback=log_callback),
+        log_callback=log_callback,
+        reuse_knowledge=os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true",
+        cluster_sim_threshold=float(os.getenv("CLUSTER_SIM_THRESHOLD", "0.85")),
+        cluster_sim_top_k=int(os.getenv("CLUSTER_SIM_TOP_K", "3")),
+        work_path=os.getenv("SIRCHMUNK_WORK_PATH") or None,
+    ))
 
 
 _COOLDOWN_SECONDS = 1.0
@@ -758,12 +728,7 @@ async def _chat_only(
         llm_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
 
         envs: Dict[str, Any] = get_envs()
-        llm = OpenAIChat(
-            api_key=envs["api_key"],
-            base_url=envs["base_url"],
-            model=envs["model_name"],
-            log_callback=llm_log_callback
-        )
+        llm = create_configured_llm(log_callback=llm_log_callback)
 
         messages = [
             {"role": "system", "content": "You are a helpful AI assistant. Provide clear, accurate, and helpful responses."},
@@ -870,9 +835,7 @@ async def _chat_rag(
     search_query = message
     if history:
         envs: Dict[str, Any] = get_envs()
-        rewrite_llm = OpenAIChat(
-            api_key=envs["api_key"], base_url=envs["base_url"], model=envs["model_name"],
-        )
+        rewrite_llm = create_configured_llm()
         search_query = await _rewrite_query_with_context(message, history, rewrite_llm)
 
     for attempt in range(_RAG_PIPELINE_MAX_RETRIES + 1):
@@ -886,10 +849,9 @@ async def _chat_rag(
                 search_query, paths, search_mode, search_log_callback,
             )
 
-            search_engine = get_search_instance()
             for usage in llm_usages:
                 llm_usage_tracker.record_usage(
-                    model=search_engine.llm._model,
+                    model=usage.get("_model") or get_envs()["model_name"],
                     usage=usage,
                 )
 
@@ -908,6 +870,8 @@ async def _chat_rag(
             return search_result, sources
 
         except Exception as e:
+            if isinstance(e, (PoolError, ConfigError)):
+                raise  # Routing already owns retries; never replay partial output.
             friendly = _classify_error(e)
 
             if _is_transient_llm_error(e) and attempt < _RAG_PIPELINE_MAX_RETRIES:
@@ -982,10 +946,7 @@ async def _chat_web_search(
 
     envs: Dict[str, Any] = get_envs()
     llm_log_callback = await LogCallbackManager.create_search_log_callback(websocket, manager)
-    llm = OpenAIChat(
-        api_key=envs["api_key"], base_url=envs["base_url"],
-        model=envs["model_name"], log_callback=llm_log_callback,
-    )
+    llm = create_configured_llm(log_callback=llm_log_callback)
 
     messages = [
         {"role": "system", "content": "You are a helpful AI assistant. Use the provided web search results to answer the user's question accurately."},
@@ -1027,9 +988,7 @@ async def _chat_rag_web_search(
     search_query = message
     if history:
         envs_rw: Dict[str, Any] = get_envs()
-        rewrite_llm = OpenAIChat(
-            api_key=envs_rw["api_key"], base_url=envs_rw["base_url"], model=envs_rw["model_name"],
-        )
+        rewrite_llm = create_configured_llm()
         search_query = await _rewrite_query_with_context(message, history, rewrite_llm)
 
     rag_result = None
@@ -1045,10 +1004,9 @@ async def _chat_rag_web_search(
                 search_query, paths, search_mode, search_log_callback,
             )
 
-            search_engine = get_search_instance()
             for usage in llm_usages:
                 llm_usage_tracker.record_usage(
-                    model=search_engine.llm._model,
+                    model=usage.get("_model") or get_envs()["model_name"],
                     usage=usage,
                 )
 
@@ -1067,6 +1025,8 @@ async def _chat_rag_web_search(
             break  # success
 
         except Exception as e:
+            if isinstance(e, (PoolError, ConfigError)):
+                raise
             friendly = _classify_error(e)
 
             if _is_transient_llm_error(e) and attempt < _RAG_PIPELINE_MAX_RETRIES:
@@ -1137,11 +1097,14 @@ async def chat_websocket(websocket: WebSocket):
     if not connected:
         return
     
+    scope = None
     try:
         while True:
             # Receive message from client
             data = await websocket.receive_text()
             request_data = json.loads(data)
+            scope = llm_request_scope()
+            await scope.__aenter__()
             
             message = request_data.get("message", "")
             session_id = request_data.get("session_id")
@@ -1200,11 +1163,7 @@ async def chat_websocket(websocket: WebSocket):
 
             if chat_history:
                 envs_for_filter: Dict[str, Any] = get_envs()
-                filter_llm = OpenAIChat(
-                    api_key=envs_for_filter["api_key"],
-                    base_url=envs_for_filter["base_url"],
-                    model=envs_for_filter["model_name"],
-                )
+                filter_llm = create_configured_llm()
                 chat_history = await _filter_relevant_history(message, chat_history, filter_llm)
 
             # ============================================================
@@ -1282,20 +1241,25 @@ async def chat_websocket(websocket: WebSocket):
             
             # Update session in persistent storage
             history_storage.save_session(session)
+            await scope.__aexit__(None, None, None)
+            scope = None
             
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-    except Exception:
+    except Exception as exc:
         logger.error("WebSocket error occurred")
         logger.exception("WebSocket exception details")
         try:
             await manager.send_personal_message(json.dumps({
                 "type": "error",
-                "message": "An internal error occurred. Please try again."
+                "message": str(exc) if isinstance(exc, (PoolError, ConfigError)) else "An internal error occurred. Please try again."
             }), websocket)
         except Exception:
             pass
         manager.disconnect(websocket)
+    finally:
+        if scope is not None:
+            await scope.__aexit__(None, None, None)
 
 
 # File picker endpoints

@@ -221,6 +221,51 @@ def _build_tool_descriptions(registry: ToolRegistry) -> str:
     return "\n".join(lines)
 
 
+def _compact_history(messages, keep):
+    """Keep complete recent exchanges and one bounded, non-evidence digest."""
+    if keep == 0:
+        return messages
+    prefix_len = 4 if len(messages) > 3 and str(messages[3].get("content", "")).startswith("**Preloaded evidence**") else 2
+    prefix, tail = messages[:prefix_len], messages[prefix_len:]
+    digest = ""
+    if tail and str(tail[0].get("content", "")).startswith("**Compressed history**"):
+        digest = tail[0]["content"].split("\n", 1)[-1]
+        tail = tail[1:]
+    # Every loop appends an assistant/user pair (including nudges).
+    if len(tail) <= keep * 2:
+        return messages
+    old, recent = tail[:-keep * 2], tail[-keep * 2:]
+    notes = [digest] if digest else []
+    for message in old:
+        if message.get("role") == "user":
+            notes.append(re.sub(r"\s+", " ", str(message.get("content", "")))[:240])
+    digest = "\n".join(notes)[-2400:]
+    return prefix + [{"role": "user", "content":
+        "**Compressed history** (navigation hints only; re-read sources before citing discarded evidence):\n" + digest}] + recent
+
+
+def _duplicate_tool_query(tool_name, arguments, recent):
+    if tool_name != "keyword_search" or os.getenv("LENS_QUERY_DEDUP", "true").lower() == "false":
+        return None
+    keywords = arguments.get("keywords") or []
+    if isinstance(keywords, str):
+        keywords = [keywords]
+    if not isinstance(keywords, (list, tuple)):
+        return None
+    words = {str(k).strip().casefold() for k in keywords if str(k).strip()}
+    if not words:
+        return None
+    # All remaining arguments matter: paths, file IDs, include/exclude and limits.
+    scope = json.dumps({k: v for k, v in arguments.items() if k != "keywords"}, sort_keys=True, ensure_ascii=False)
+    duplicate = any(scope == old_scope and len(words & old) / len(words | old) >= 0.6
+                    for old_scope, old in recent[-3:])
+    if duplicate:
+        return "Similar keywords were already searched in this same scope. Read a source or change the query/scope."
+    recent.append((scope, words))
+    del recent[:-3]
+    return None
+
+
 class ReActSearchAgent:
     """Iterative ReAct agent for agentic information retrieval.
 
@@ -364,6 +409,14 @@ class ReActSearchAgent:
                 f"[ReAct] Prior-warmed with {len(preloaded_observations)} chars of evidence"
             )
 
+        history_keep = int(os.getenv("LENS_HISTORY_KEEP", "3"))
+        if not 0 <= history_keep <= 100:
+            raise ValueError("LENS_HISTORY_KEEP must be between 0 and 100")
+        recent_tool_queries: List[Tuple[str, set]] = []
+
+        def _dup_tool_query(tool_name, tool_args):
+            return _duplicate_tool_query(tool_name, tool_args, recent_tool_queries)
+
         # Optionally execute pre-extracted keywords before the first LLM call
         if initial_keywords and "keyword_search" in tool_names:
             context.increment_loop()
@@ -396,6 +449,7 @@ class ReActSearchAgent:
                 )
 
         while not context.is_loop_limit_reached() and not context.is_budget_exceeded():
+            messages = _compact_history(messages, history_keep)
             context.increment_loop()
             await self._logger.info(f"[ReAct] Loop {context.loop_count}/{context.max_loops} | {context.summary()}")
 
@@ -449,6 +503,18 @@ class ReActSearchAgent:
             tool_name, tool_args = tool_call
             await self._logger.info(f"[ReAct] Calling tool: {tool_name}({json.dumps(tool_args, ensure_ascii=False)[:200]})")
 
+            # P1-7: short-circuit near-duplicate searches with a hint instead
+            # of spending another retrieval round on the same keywords.
+            dup_hint = _dup_tool_query(tool_name, tool_args)
+            if dup_hint is not None:
+                await self._logger.info(f"[ReAct] {dup_hint}")
+                messages.append({"role": "assistant", "content": content})
+                messages.append({
+                    "role": "user",
+                    "content": f"{dup_hint}\n\n{self._build_continuation_prompt(context)}",
+                })
+                continue
+
             # Execute the tool
             result_text, meta = await self.registry.execute(
                 tool_name=tool_name,
@@ -475,8 +541,13 @@ class ReActSearchAgent:
                 ),
             })
 
+            # P1-6: fold older tool results into a digest so context growth
+            # is sub-linear in loop count.  Done after appending so the
+            # newest exchanges always stay verbatim.
+            messages = _compact_history(messages, history_keep)
+
         # If loop exited without answer, ask LLM to synthesize
-        if final_answer is None:
+        if final_answer is None and not (getattr(context, "telemetry", {}) or {}).get("hard_budget_exhausted"):
             await self._logger.warning("[ReAct] Loop limit or budget reached — forcing synthesis")
             messages.append({
                 "role": "user",
@@ -498,8 +569,13 @@ class ReActSearchAgent:
                     hard_budget_exhausted=True,
                     hard_budget_reason=str(exc),
                 )
-                final_answer = "No results found."
-                await self._logger.warning(f"[ReAct] synthesis skipped: {exc}")
+                # Return a partial status without claiming that collected
+                # snippets constitute a verified answer. The caller also checks
+                # budget telemetry before considering a fallback attempt.
+                final_answer = (self._compose_degraded_answer(messages, context)
+                                if os.getenv("LENS_DEGRADED_ANSWER", "true").lower() != "false"
+                                else "No results found.")
+                await self._logger.warning(f"[ReAct] synthesis skipped (degraded answer composed): {exc}")
                 llm_response = None
             if llm_response is not None:
                 content = llm_response.content or ""
@@ -517,11 +593,32 @@ class ReActSearchAgent:
                 if cleaned:
                     final_answer = cleaned
 
+        # A mid-loop hard-budget exit bypasses forced synthesis entirely.
+        if not final_answer:
+            _set_telemetry(context, degraded_answer_used=True)
+            final_answer = (self._compose_degraded_answer(messages, context)
+                            if os.getenv("LENS_DEGRADED_ANSWER", "true").lower() != "false"
+                            else "No results found.")
+
         await self._logger.success(f"[ReAct] Completed: {context.summary()}")
 
         return final_answer, context
 
     # ---- Internal helpers ----
+
+    @staticmethod
+    def _compose_degraded_answer(messages, context) -> str:
+        """A partial status, not a synthesized or verified answer."""
+        telemetry = getattr(context, "telemetry", {}) or {}
+        reason = ("token budget exhausted" if telemetry.get("hard_budget_exhausted")
+                  or context.is_budget_exceeded() else "retrieval limit reached without a conclusive answer")
+        _set_telemetry(context, degraded_answer_used=True, answer_status="partial",
+                       degraded_reason=reason, evidence_sufficiency="insufficient")
+        files = sorted(str(f) for f in (context.read_file_ids or set()))
+        parts = [f"Incomplete result: {reason}. No conclusive answer was synthesized."]
+        if files:
+            parts.append("Sources consulted (not a verified answer): " + ", ".join(files[:8]))
+        return "\n\n".join(parts)
 
     async def _call_llm(
         self,

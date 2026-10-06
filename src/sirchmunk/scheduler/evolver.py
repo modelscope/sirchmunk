@@ -20,8 +20,10 @@ and >= _EVO_GLOBAL_UPDATE_COUNT change in non-meta cluster count)
 import asyncio
 import json
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -44,6 +46,7 @@ from sirchmunk.schema.knowledge import (
     WeakSemanticEdge
 )
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
+from sirchmunk.storage.lifecycle import LifecycleError, get_runtime, write_json_atomic
 from sirchmunk.utils.embedding_util import EmbeddingUtil, compute_text_hash
 from sirchmunk.utils import LogCallback, create_logger
 
@@ -117,7 +120,41 @@ class EvolveManifest:
         return json.dumps(asdict(self), ensure_ascii=False, indent=2)
 
     @classmethod
-    def from_json(cls, json_str: str) -> "EvolveManifest":
+    def from_json(cls, json_str: str, *, strict: bool = False) -> "EvolveManifest":
+        """Read v1.0 without migration; strict mode validates the complete format.
+
+        Lists may contain repeated IDs (multiple requests can enqueue one cluster).
+        The permissive default retains the standalone SDK's legacy behaviour.
+        """
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("Duplicate evolve manifest field")
+                result[key] = value
+            return result
+
+        def invalid_constant(_value):
+            raise ValueError("Non-finite evolve manifest value")
+
+        if strict:
+            data = json.loads(json_str, object_pairs_hook=unique_object,
+                              parse_constant=invalid_constant)
+            if not isinstance(data, dict) or set(data) != {item.name for item in fields(cls)}:
+                raise ValueError("Invalid evolve manifest field set")
+            if data["version"] != "1.0":
+                raise ValueError("Unsupported evolve manifest version")
+            for item in fields(cls):
+                value = data[item.name]
+                if item.default_factory is list:
+                    if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+                        raise ValueError(f"Invalid evolve manifest list: {item.name}")
+                elif type(item.default) is int:
+                    if type(value) is not int or value < 0:
+                        raise ValueError(f"Invalid evolve manifest counter: {item.name}")
+                elif item.name == "last_evolve_at" and value is not None and not isinstance(value, str):
+                    raise ValueError("Invalid evolve manifest timestamp type")
+            return cls(**data)
         data = json.loads(json_str)
         return cls(
             version=data.get("version", "1.0"),
@@ -131,6 +168,19 @@ class EvolveManifest:
             last_global_update_step=data.get("last_global_update_step", 0),
             last_global_update_cluster_count=data.get("last_global_update_cluster_count", 0)
         )
+
+
+def _managed_failure(method):
+    """Never report a partially applied managed evolution as successful."""
+    @wraps(method)
+    async def checked(self, *args, **kwargs):
+        try:
+            return await method(self, *args, **kwargs)
+        except BaseException:
+            if self._runtime is not None:
+                self._runtime.fail("evolution_failed")
+            raise
+    return checked
 
 
 class KnowledgeEvolver:
@@ -151,15 +201,32 @@ class KnowledgeEvolver:
         self._embedding = embedding
         self._storage = knowledge_storage
         self._work_path = Path(work_path).expanduser().resolve()
+        self._runtime = get_runtime(self._work_path)
         self._log = create_logger(log_callback=log_callback)
 
         self._evolve_dir = self._work_path / ".cache" / "evolve"
-        self._evolve_dir.mkdir(parents=True, exist_ok=True)
         self._manifest_path = self._evolve_dir / "manifest.json"
-        self._manifest = self._load_manifest()
-
-        # A lock to ensure that only one evolve step is processed at a time
-        self._evolve_lock = asyncio.Lock()
+        if self._runtime is not None:
+            # Requests own their LLM/logging, but the root owns the authoritative
+            # manifest and phase lock. Do not reload a second stale copy.
+            with self._runtime.io_lock:
+                self._ensure_writable()
+                try:
+                    self._evolve_dir.mkdir(parents=True, exist_ok=True)
+                    if not hasattr(self._runtime, "_evolve_manifest"):
+                        manifest = self._load_manifest()
+                        self._runtime._evolve_manifest = manifest
+                    if not hasattr(self._runtime, "_evolve_lock"):
+                        self._runtime._evolve_lock = asyncio.Lock()
+                    self._manifest = self._runtime._evolve_manifest
+                    self._evolve_lock = self._runtime._evolve_lock
+                except BaseException:
+                    self._runtime.fail("evolve_manifest_initialization_failed")
+                    raise
+        else:
+            self._evolve_dir.mkdir(parents=True, exist_ok=True)
+            self._manifest = self._load_manifest()
+            self._evolve_lock = asyncio.Lock()
         
         # A semaphore to limit the concurrent LLM calls during evolver phases
         self._llm_semaphore = asyncio.Semaphore(_EVO_LLM_MAX_CONCURRENCY)
@@ -168,6 +235,7 @@ class KnowledgeEvolver:
     #  Public API                                                        #
     # ------------------------------------------------------------------ #
 
+    @_managed_failure
     async def step(self, cluster: KnowledgeCluster):
         """
         Step the evolver with locking to ensure only one step is processed at a time.
@@ -175,11 +243,11 @@ class KnowledgeEvolver:
         Args:
             cluster (KnowledgeCluster): The new knowledge cluster to process.
         """
-        # Update the current step count
-        self._manifest.current_step += 1
-
-        self._manifest.cluster_ids_buffer.append(cluster.id)
-        self._save_manifest(self._manifest)
+        with self._manifest_guard():
+            self._ensure_writable()
+            self._manifest.current_step += 1
+            self._manifest.cluster_ids_buffer.append(cluster.id)
+            self._save_manifest(self._manifest)
 
         if self._evolve_lock.locked():
             await self._log.info(
@@ -189,6 +257,7 @@ class KnowledgeEvolver:
             return
 
         async with self._evolve_lock:
+            self._ensure_writable()
             await self._log.info(
                 "[Evolve] Starting evolver step with "
                 f"{len(self._manifest.cluster_ids_buffer)} clusters in the buffer."
@@ -196,11 +265,18 @@ class KnowledgeEvolver:
             await self._step()
             await self._log.info("[Evolve] Evolver step completed.")
 
+    @_managed_failure
     async def _step(self):
         """Step the evolver to process the clusters in the buffer."""
         # Deduplicate and clear the buffer after processing
-        cluster_ids = list(set(self._manifest.cluster_ids_buffer))
-        self._manifest.cluster_ids_buffer.clear()
+        with self._manifest_guard():
+            self._ensure_writable()
+            cluster_ids = list(set(self._manifest.cluster_ids_buffer))
+            buffered_count = len(self._manifest.cluster_ids_buffer)
+            if self._runtime is None:
+                self._manifest.cluster_ids_buffer.clear()
+
+        new_ids, refreshed_ids = [], []
 
         # Check the cluster is created or reused
         # created: | last_modified - created | < 1 second
@@ -214,10 +290,26 @@ class KnowledgeEvolver:
 
             if abs((cluster.last_modified - cluster.create_time).total_seconds()) < 1:
                 # This cluster is newly created
-                self._manifest.connect_merge_cluster_ids.append(cluster.id)
+                if self._runtime is None:
+                    self._manifest.connect_merge_cluster_ids.append(cluster.id)
+                else:
+                    new_ids.append(cluster.id)
             else:
                 # This cluster is reused with embedding refresh
-                self._manifest.edge_refresh_cluster_ids.append(cluster.id)
+                if self._runtime is None:
+                    self._manifest.edge_refresh_cluster_ids.append(cluster.id)
+                else:
+                    refreshed_ids.append(cluster.id)
+
+        if self._runtime is not None:
+            # Keep the captured prefix durable during awaits. Arrivals can save
+            # the shared manifest while classification is still in progress.
+            # Move only that prefix to the phase queues, then persist before IO.
+            with self._runtime.io_lock:
+                self._manifest.connect_merge_cluster_ids.extend(new_ids)
+                self._manifest.edge_refresh_cluster_ids.extend(refreshed_ids)
+                del self._manifest.cluster_ids_buffer[:buffered_count]
+                self._save_manifest(self._manifest)
 
         # Check and execute phases based on triggers
         has_evolved = False
@@ -260,12 +352,21 @@ class KnowledgeEvolver:
                 has_evolved = True
 
         except Exception as e:
+            if self._runtime is not None:
+                raise
             await self._log.error(f"[Evolve] Error during evolve step: {e}")
         finally:
-            # Update the last evolve timestamp and save the manifest
-            if has_evolved:
-                self._manifest.last_evolve_at = datetime.now(timezone.utc).isoformat()
-            self._save_manifest(self._manifest)
+            # Legacy mode still checkpoints partial progress on failure. Managed
+            # mode only commits below after every triggered phase has succeeded.
+            if self._runtime is None:
+                if has_evolved:
+                    self._manifest.last_evolve_at = datetime.now(timezone.utc).isoformat()
+                self._save_manifest(self._manifest)
+        if self._runtime is not None:
+            with self._runtime.io_lock:
+                if has_evolved:
+                    self._manifest.last_evolve_at = datetime.now(timezone.utc).isoformat()
+                self._save_manifest(self._manifest)
 
     # ------------------------------------------------------------------ #
     #  Trigger Functions                                                 #
@@ -327,6 +428,7 @@ class KnowledgeEvolver:
     #  Phase 1: Connect and Merge                                        #
     # ------------------------------------------------------------------ #
 
+    @_managed_failure
     async def _connect_and_merge(self):
         """Phase 1: Connect and Merge for newly created clusters.
 
@@ -391,12 +493,14 @@ class KnowledgeEvolver:
             f"[Evolve] Connected and merged clusters for {len(self._manifest.connect_merge_cluster_ids)} newly created clusters."
         )
         # Clear the list of newly created clusters after processing
-        self._manifest.connect_merge_cluster_ids.clear()
+        with self._manifest_guard():
+            self._manifest.connect_merge_cluster_ids.clear()
 
     # ------------------------------------------------------------------ #
     #  Phase 2: Refresh Edges                                            #
     # ------------------------------------------------------------------ #
 
+    @_managed_failure
     async def _refresh_edges(self):
         """Phase 2: Refresh Edges for clusters with updated embeddings.
 
@@ -432,12 +536,14 @@ class KnowledgeEvolver:
             f"[Evolve] Refreshed edges for {len(self._manifest.edge_refresh_cluster_ids)} clusters."
         )
         # Clear the list of clusters with refreshed embeddings after processing
-        self._manifest.edge_refresh_cluster_ids.clear()
+        with self._manifest_guard():
+            self._manifest.edge_refresh_cluster_ids.clear()
 
     # ------------------------------------------------------------------ #
     #  Phase 3: Detect Meta Clusters                                     #
     # ------------------------------------------------------------------ #
 
+    @_managed_failure
     async def _detect_meta_clusters(self):
         """Phase 3: Detect Meta Clusters using Leiden community detection algorithm.
 
@@ -498,7 +604,7 @@ class KnowledgeEvolver:
 
             meta_cluster_coroutines.append(self._build_meta_cluster(community_id, cluster_ids))
         
-        await asyncio.gather(*meta_cluster_coroutines, return_exceptions=True)
+        await self._gather_phase(meta_cluster_coroutines)
 
         await self._log.info(
             f"[Evolve] Created {len(community_to_cluster_ids)} meta clusters "
@@ -506,13 +612,15 @@ class KnowledgeEvolver:
         )
 
         # Update the last meta detection step and cluster count in the manifest
-        self._manifest.last_meta_detection_step = self._manifest.current_step
-        self._manifest.last_meta_detection_cluster_count = non_meta_cluster_count
+        with self._manifest_guard():
+            self._manifest.last_meta_detection_step = self._manifest.current_step
+            self._manifest.last_meta_detection_cluster_count = non_meta_cluster_count
 
     # ------------------------------------------------------------------ #
     #  Phase 4: Global Update                                            #
     # ------------------------------------------------------------------ #
 
+    @_managed_failure
     async def _global_update(self):
         """Phase 4: Global Update to ensure the knowledge graph is up-to-date.
 
@@ -550,14 +658,14 @@ class KnowledgeEvolver:
                 else:
                     updated_related_clusters.append(edge)
             cluster.related_clusters = updated_related_clusters
-            await self._storage.update(cluster)
+            self._require_write(await self._storage.update(cluster))
 
         # Refine the clusters with hotness and confidence below the thresholds
         cluster_ids_to_refine = self._get_cluster_ids_to_refine()
         refine_coroutines = [
             self._refine_cluster(cluster_id) for cluster_id in cluster_ids_to_refine
         ]
-        await asyncio.gather(*refine_coroutines, return_exceptions=True)
+        await self._gather_phase(refine_coroutines)
 
         # Perform phase 1, 2 and 3 again to ensure the knowledge graph is up-to-date
         await self._connect_and_merge()
@@ -565,12 +673,39 @@ class KnowledgeEvolver:
         await self._detect_meta_clusters()
 
         # Update the last global update step and cluster count in the manifest
-        self._manifest.last_global_update_step = self._manifest.current_step
-        self._manifest.last_global_update_cluster_count = self._get_non_meta_cluster_count()
+        non_meta_cluster_count = self._get_non_meta_cluster_count()
+        with self._manifest_guard():
+            self._manifest.last_global_update_step = self._manifest.current_step
+            self._manifest.last_global_update_cluster_count = non_meta_cluster_count
 
     # ------------------------------------------------------------------ #
     #  Shared Helper Functions                                           #
     # ------------------------------------------------------------------ #
+
+    def _manifest_guard(self):
+        return self._runtime.io_lock if self._runtime is not None else nullcontext()
+
+    def _ensure_writable(self):
+        if self._runtime is not None:
+            if self._runtime.failure:
+                raise LifecycleError(self._runtime.failure)
+            if self._runtime.closing or self._runtime.closed or self._runtime.frozen:
+                raise LifecycleError("managed_evolution_not_writable")
+
+    def _require_write(self, result):
+        if self._runtime is not None and result is False:
+            raise LifecycleError("evolution_storage_write_failed")
+
+    @_managed_failure
+    async def _gather_phase(self, coroutines):
+        # Settle *all* siblings before raising, so the owning step/lease cannot
+        # finish while another coroutine is still applying storage changes.
+        results = await asyncio.gather(*coroutines, return_exceptions=True)
+        if self._runtime is not None:
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+        return results
 
     def _get_non_meta_cluster_count(self) -> int:
         """Get the count of non-meta clusters in the knowledge storage."""
@@ -580,6 +715,7 @@ class KnowledgeEvolver:
         )
         return result[0] if result else 0
 
+    @_managed_failure
     async def _update_cluster_embedding(self, cluster: KnowledgeCluster):
         """Update the embedding of a cluster based on its queries."""
         if not cluster.queries:
@@ -589,13 +725,15 @@ class KnowledgeEvolver:
             text_hash = compute_text_hash(combined_text)
             embedding_vector = (await self._embedding.embed([combined_text]))[0]
 
-            await self._storage.store_embedding(
+            self._require_write(await self._storage.store_embedding(
                 cluster_id=cluster.id,
                 embedding_vector=embedding_vector,
                 embedding_model=self._embedding.model_id,
                 embedding_text_hash=text_hash
-            )
+            ))
         except Exception as e:
+            if self._runtime is not None:
+                raise
             await self._log.error(f"Failed to update embedding for cluster {cluster.id}: {e}")
             return
 
@@ -603,19 +741,23 @@ class KnowledgeEvolver:
     #  Phase 1 Helper Functions                                          #
     # ------------------------------------------------------------------ #
 
+    @_managed_failure
     async def _merge_clusters(self, source: KnowledgeCluster, target: KnowledgeCluster):
         """Merge source cluster into target cluster and update the storage."""
         merged_cluster = await self._storage.merge([target, source])
         if merged_cluster is None:
+            if self._runtime is not None:
+                raise LifecycleError("evolution_storage_merge_failed")
             return
         # Update embedding with merged queries
         await self._update_cluster_embedding(merged_cluster)
-        self._manifest.edge_refresh_cluster_ids.append(merged_cluster.id)
+        with self._manifest_guard():
+            self._manifest.edge_refresh_cluster_ids.append(merged_cluster.id)
 
         # Update lifecycle if merge count exceeds threshold
         if merged_cluster.merge_count >= 3 and merged_cluster.lifecycle == Lifecycle.EMERGING:
             merged_cluster.lifecycle = Lifecycle.STABLE
-        await self._storage.update(merged_cluster)
+        self._require_write(await self._storage.update(merged_cluster))
 
     # ------------------------------------------------------------------ #
     #  Phase 2 Helper Functions                                          #
@@ -637,6 +779,7 @@ class KnowledgeEvolver:
             WeakSemanticEdge(target_cluster_id=target_cluster_id, weight=weight, source=edge_source)
         )
 
+    @_managed_failure
     async def _create_weak_semantic_edge(
         self,
         source: KnowledgeCluster,
@@ -648,8 +791,8 @@ class KnowledgeEvolver:
         self._add_edge(source, target.id, edge_source, weight)
         self._add_edge(target, source.id, edge_source, weight)
         # Update the clusters in storage
-        await self._storage.update(source)
-        await self._storage.update(target)
+        self._require_write(await self._storage.update(source))
+        self._require_write(await self._storage.update(target))
 
     # ------------------------------------------------------------------ #
     #  Phase 3 Helper Functions                                          #
@@ -687,6 +830,7 @@ class KnowledgeEvolver:
             weights.append(row[2])
         return edges, weights
 
+    @_managed_failure
     async def _build_meta_cluster(self, community_id: int, cluster_ids: List[str]):
         """Build a meta cluster for a given community of clusters."""
         async with self._llm_semaphore:
@@ -720,6 +864,8 @@ class KnowledgeEvolver:
             if rows:
                 cluster_queries, most_common_abstraction_level = rows[0], rows[1]
             else:
+                if self._runtime is not None:
+                    raise LifecycleError("evolution_meta_queries_missing")
                 await self._log.error(f"[Evolve] Failed to fetch queries for meta cluster {meta_cluster_id}.")
                 return
 
@@ -756,7 +902,7 @@ class KnowledgeEvolver:
                 queries=[meta_query],
             )
 
-            await self._storage.insert(meta_cluster)
+            self._require_write(await self._storage.insert(meta_cluster))
             await self._update_cluster_embedding(meta_cluster)
 
     # ------------------------------------------------------------------ #
@@ -765,14 +911,15 @@ class KnowledgeEvolver:
 
     def _get_all_embed_sim_edges(self) -> List[Tuple[str, str, float, float]]:
         """Get all edges with their old and new weights for global update phase."""
+        dim = self._storage.embedding_dim
         query = f"""
         SELECT
             kc.id AS source_id,
             json_extract_string(edge, '$.target_cluster_id') AS target_id,
             CAST(json_extract(edge, '$.weight') AS DOUBLE) AS old_weight,
             list_cosine_similarity(
-                kc.embedding_vector::FLOAT[384],
-                target.embedding_vector::FLOAT[384]
+                kc.embedding_vector::FLOAT[{dim}],
+                target.embedding_vector::FLOAT[{dim}]
             ) AS new_weight
         FROM {self._storage.table_name} kc,
              unnest(CAST(kc.related_clusters::JSON AS JSON[])) AS t(edge),
@@ -804,6 +951,7 @@ class KnowledgeEvolver:
         rows = self._storage.db.fetch_all(query, parameters)
         return [row[0] for row in rows]
 
+    @_managed_failure
     async def _refine_cluster(self, cluster_id: str):
         """Refine a cluster by invoking the LLM to improve its queries and content."""
         async with self._llm_semaphore:
@@ -834,11 +982,14 @@ class KnowledgeEvolver:
                 cluster.lifecycle = Lifecycle.EMERGING
 
                 # Update the storage and embedding
-                await self._storage.update(cluster)
+                self._require_write(await self._storage.update(cluster))
                 await self._update_cluster_embedding(cluster)
-                self._manifest.edge_refresh_cluster_ids.append(cluster_id)
+                with self._manifest_guard():
+                    self._manifest.edge_refresh_cluster_ids.append(cluster_id)
 
             except Exception as e:
+                if self._runtime is not None:
+                    raise
                 await self._log.error(f"[Evolve] Failed to parse LLM response for cluster {cluster_id}: {e}")
                 return
 
@@ -857,6 +1008,20 @@ class KnowledgeEvolver:
     #  Manifest I/O                                                      #
     # ------------------------------------------------------------------ #
     def _load_manifest(self) -> EvolveManifest:
+        if self._runtime is not None:
+            with self._runtime.io_lock:
+                try:
+                    content = self._manifest_path.read_text(encoding="utf-8")
+                except FileNotFoundError:
+                    return EvolveManifest()
+                except BaseException:
+                    self._runtime.fail("evolve_manifest_read_failed")
+                    raise
+                try:
+                    return EvolveManifest.from_json(content, strict=True)
+                except BaseException:
+                    self._runtime.fail("evolve_manifest_invalid")
+                    raise
         if self._manifest_path.exists():
             try:
                 return EvolveManifest.from_json(
@@ -871,6 +1036,20 @@ class KnowledgeEvolver:
 
         This prevents partial JSON on disk if the process is killed mid-write.
         """
+        if self._runtime is not None:
+            with self._runtime.io_lock:
+                self._ensure_writable()
+                try:
+                    # Validate memory too; do not publish malformed state that
+                    # the next supervised startup would have to reject.
+                    EvolveManifest.from_json(manifest.to_json(), strict=True)
+                    if manifest is not self._runtime._evolve_manifest:
+                        raise LifecycleError("evolve_manifest_not_authoritative")
+                    write_json_atomic(self._manifest_path, asdict(manifest))
+                except BaseException:
+                    self._runtime.fail("evolve_manifest_write_failed")
+                    raise
+            return
         tmp_path = self._manifest_path.with_suffix(".json.tmp")
         tmp_path.write_text(manifest.to_json(), encoding="utf-8")
         tmp_path.replace(self._manifest_path)

@@ -9,16 +9,19 @@ to eliminate file locking issues in multi-process deployments.
 
 import os
 import json
+import threading
+from uuid import uuid4
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 from datetime import datetime
 from loguru import logger
 
-from sirchmunk.storage.duckdb import DuckDBManager
+from sirchmunk.storage.duckdb import DuckDBManager, serialized_io
+from sirchmunk.storage.lifecycle import ManagedStorageMeta, get_runtime
 from sirchmunk.utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH
 
 
-class HistoryStorage:
+class HistoryStorage(metaclass=ManagedStorageMeta):
     """
     Manages persistent storage of chat history using DuckDB
 
@@ -40,19 +43,69 @@ class HistoryStorage:
         # Get work path from env if not provided, and expand ~ in path
         if work_path is None:
             work_path = os.getenv("SIRCHMUNK_WORK_PATH", DEFAULT_SIRCHMUNK_WORK_PATH)
+        self._runtime = get_runtime(work_path)
+        self._io_lock = self._runtime.io_lock if self._runtime else threading.RLock()
+        self.db = None
 
         # Create history storage path (expand ~ and resolve to absolute path)
         self.history_path = Path(work_path).expanduser().resolve() / ".cache" / "history"
+        if self._runtime and not self.history_path.resolve().is_relative_to(self._runtime.root):
+            self._runtime.fail("history_path_outside_managed_root")
+            raise ValueError("History path is outside the managed root")
         self.history_path.mkdir(parents=True, exist_ok=True)
 
         # Initialize DuckDB in persist mode (in-memory + periodic disk writeback)
         self.db_path = str(self.history_path / "chat_history.db")
-        self.db = DuckDBManager(persist_path=self.db_path, sync_interval=60, sync_threshold=50)
-
-        # Create tables if not exist
-        self._initialize_tables()
+        try:
+            self.db = DuckDBManager(
+                persist_path=self.db_path, sync_interval=60, sync_threshold=50,
+                runtime=self._runtime,
+            )
+            self._io_lock = self.db._io_lock
+            if self._runtime and Path(self.db_path).exists():
+                self._validate_managed_schema()
+            self._initialize_tables()
+        except BaseException:
+            if self.db is not None:
+                # Do not write a partially initialized schema on startup failure.
+                self.db._stop_event.set()
+                with self._io_lock:
+                    self.db.connection.close()
+                    self.db.connection = None
+            if self._runtime:
+                self._runtime.fail("history_storage_initialization_failed")
+            raise
 
         logger.info(f"History storage initialized at: {self.db_path}")
+
+    @serialized_io
+    def _validate_managed_schema(self):
+        """Validate v0.2.0 data, including snapshots whose CTAS lost keys.
+
+        This deliberately does not add constraints or migrate column types.
+        A recognized legacy file remains usable; an unknown schema never gains
+        a compatibility claim merely through CREATE TABLE IF NOT EXISTS.
+        """
+        expected = {
+            "chat_sessions": {
+                "session_id": "VARCHAR", "title": "VARCHAR",
+                "created_at": "TIMESTAMP", "updated_at": "TIMESTAMP",
+                "settings": "JSON", "message_count": "INTEGER",
+            },
+            "chat_messages": {
+                "id": "VARCHAR", "session_id": "VARCHAR", "role": "VARCHAR",
+                "content": "VARCHAR", "timestamp": "TIMESTAMP",
+                "search_logs": "JSON", "is_streaming": "BOOLEAN",
+            },
+        }
+        if set(self.db.list_tables()) != set(expected):
+            raise ValueError("Unrecognized managed history tables")
+        for table, columns in expected.items():
+            actual = {row[0]: row[1] for row in self.db.fetch_all(f"DESCRIBE {table}")}
+            # Several read APIs unpack SELECT * positionally, so order is part
+            # of this format contract, not merely a presentation preference.
+            if list(actual.items()) != list(columns.items()):
+                raise ValueError(f"Incompatible managed history schema: {table}")
 
     def _initialize_tables(self):
         """Create database tables for chat history"""
@@ -84,6 +137,7 @@ class HistoryStorage:
         if not self.db.table_exists("chat_messages"):
             self.db.create_index("chat_messages", ["session_id"], "idx_messages_session")
 
+    @serialized_io
     def save_session(self, session_data: Dict[str, Any]) -> bool:
         """
         Save or update a chat session
@@ -138,8 +192,12 @@ class HistoryStorage:
 
         except Exception as e:
             logger.error(f"Failed to save session: {e}")
+            if self._runtime:
+                self._runtime.fail("history_operation_failed")
+                raise
             return False
 
+    @serialized_io
     def save_message(self, session_id: str, message_data: Dict[str, Any]) -> bool:
         """
         Save a chat message
@@ -158,7 +216,7 @@ class HistoryStorage:
         """
         try:
             # Generate message ID
-            message_id = f"{session_id}_{datetime.now().timestamp()}"
+            message_id = f"{session_id}_{uuid4().hex}"
 
             # Handle timestamp conversion
             timestamp = message_data.get("timestamp")
@@ -199,8 +257,12 @@ class HistoryStorage:
 
         except Exception as e:
             logger.error(f"Failed to save message: {e}")
+            if self._runtime:
+                self._runtime.fail("history_operation_failed")
+                raise
             return False
 
+    @serialized_io
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
         Retrieve a chat session with all messages
@@ -258,6 +320,9 @@ class HistoryStorage:
 
         except Exception as e:
             logger.error(f"Failed to get session {session_id}: {e}")
+            if self._runtime:
+                self._runtime.fail("history_operation_failed")
+                raise
             return None
 
     def get_all_sessions(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
@@ -297,8 +362,12 @@ class HistoryStorage:
 
         except Exception as e:
             logger.error(f"Failed to get all sessions: {e}")
+            if self._runtime:
+                self._runtime.fail("history_operation_failed")
+                raise
             return []
 
+    @serialized_io
     def delete_session(self, session_id: str) -> bool:
         """
         Delete a chat session and all its messages
@@ -321,6 +390,9 @@ class HistoryStorage:
 
         except Exception as e:
             logger.error(f"Failed to delete session {session_id}: {e}")
+            if self._runtime:
+                self._runtime.fail("history_operation_failed")
+                raise
             return False
 
     def get_recent_messages(
@@ -356,6 +428,9 @@ class HistoryStorage:
             return [{"role": r[0], "content": r[1]} for r in rows]
         except Exception as e:
             logger.warning(f"Failed to get recent messages for {session_id}: {e}")
+            if self._runtime:
+                self._runtime.fail("history_operation_failed")
+                raise
             return []
 
     def get_session_count(self) -> int:
@@ -419,13 +494,30 @@ class HistoryStorage:
 
         except Exception as e:
             logger.error(f"Failed to search sessions: {e}")
+            if self._runtime:
+                self._runtime.fail("history_operation_failed")
+                raise
             return []
 
     def close(self):
         """Close database connection (triggers final sync to disk)"""
+        if self._runtime and not self._runtime.closing:
+            return
         if self.db:
             self.db.close()
             logger.info("History storage closed")
+
+    @serialized_io
+    def durable_flush(self):
+        """Flush the real history database; errors propagate to the barrier."""
+        if self.db is None:
+            raise RuntimeError("History storage is not initialized")
+        self.db.durable_flush()
+
+    @serialized_io
+    def durable_close(self):
+        if self.db:
+            self.db.durable_close()
 
     def __enter__(self):
         """Context manager entry"""
@@ -438,4 +530,7 @@ class HistoryStorage:
     def __del__(self):
         """Destructor to ensure connection is closed"""
         if hasattr(self, 'db') and self.db:
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                logger.exception("History finalizer failed; explicit durable close required")

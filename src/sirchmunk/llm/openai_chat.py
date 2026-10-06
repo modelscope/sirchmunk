@@ -219,8 +219,17 @@ class OpenAIChat:
             **kwargs: Extra keyword arguments forwarded to the API ``create`` call.
         """
         self.base_url = base_url
-        self._client = OpenAI(api_key=api_key, base_url=base_url)
-        self._async_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        # P0-4 (2026-09-22): per-request client timeout.  Without it the
+        # openai SDK default (~600s) applies per attempt; combined with
+        # retries a single ReAct LLM round could stall ~30 minutes under a
+        # congested gateway.  LLM_TIMEOUT env overrides (seconds).
+        import math
+        _timeout = float(os.getenv("LLM_TIMEOUT", "120"))
+        if not math.isfinite(_timeout) or _timeout <= 0:
+            raise ValueError("LLM_TIMEOUT must be finite and positive")
+        # This wrapper owns retries; do not multiply them by SDK retries.
+        self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=_timeout, max_retries=0)
+        self._async_client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=_timeout, max_retries=0)
 
         self._model = model
         self._kwargs = kwargs

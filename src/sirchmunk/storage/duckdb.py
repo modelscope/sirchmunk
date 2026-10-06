@@ -20,8 +20,55 @@ from pathlib import Path
 import logging
 from contextlib import contextmanager
 from datetime import datetime
+from functools import wraps
+from uuid import uuid4
+
+from .lifecycle import (
+    claim_work_root, get_runtime, durable_file, durable_directory, durable_replace,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def serialized_io(method):
+    """Keep a synchronous storage operation (including result fetch) atomic."""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._io_lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
+def _claim_database_root(path, runtime):
+    """Apply the same single-writer boundary to direct SDK database users."""
+    if not path or str(path) == ":memory:":
+        return runtime
+    target = Path(path).expanduser().resolve()
+    if runtime is not None and not target.is_relative_to(runtime.root):
+        raise RuntimeError("Managed database path is outside its work root")
+    configured = os.getenv("SIRCHMUNK_WORK_PATH")
+    root = None
+    if configured:
+        configured = Path(configured).expanduser().resolve()
+        if target.is_relative_to(configured):
+            root = configured
+    # A provisioned ancestor takes precedence over a deeper ad-hoc directory.
+    # This also prevents callers from changing the environment to evade a
+    # previously provisioned root's supervisor requirement.
+    for parent in target.parents:
+        control = parent / ".control"
+        if ((control / "data-schema.json").exists()
+                or (control / "work-root.lock").exists()):
+            root = parent
+            break
+    root = root or (runtime.root if runtime else target.parent)
+    claim_work_root(root)
+    inferred = get_runtime(root)
+    if runtime is not None and runtime is not inferred:
+        raise RuntimeError("Database runtime does not own the claimed work root")
+    if inferred is not None and not target.is_relative_to(inferred.root):
+        raise RuntimeError("Managed database path is outside its work root")
+    return inferred
 
 
 class DuckDBManager:
@@ -45,7 +92,7 @@ class DuckDBManager:
     def __init__(self, db_path: Optional[str] = None, read_only: bool = False,
                  persist_path: Optional[str] = None,
                  sync_interval: int = 60,
-                 sync_threshold: int = 100):
+                 sync_threshold: int = 100, runtime=None):
         """
         Initialize DuckDB connection
 
@@ -61,30 +108,65 @@ class DuckDBManager:
             sync_threshold: Dirty write count that triggers immediate sync (default: 100).
                             Only effective when persist_path is set.
         """
+        if db_path and str(db_path) != ":memory:":
+            db_path = str(Path(db_path).expanduser().resolve())
+        if persist_path:
+            persist_path = str(Path(persist_path).expanduser().resolve())
         self.db_path = db_path
         self.read_only = read_only
         self.persist_path = persist_path
         self.connection = None
+        self._runtime = _claim_database_root(persist_path or db_path, runtime)
+        self._io_lock = self._runtime.io_lock if self._runtime else threading.RLock()
+        self._initialized = False
+        self._transaction_depth = 0
+        self._suspended = False
 
         # Writeback state (only active in persist mode)
         self._dirty_count = 0
         self._sync_threshold = sync_threshold
-        self._sync_lock = threading.Lock()
+        self._sync_lock = self._io_lock
         self._stop_event = threading.Event()
         self._daemon_thread = None
         self._shutdown_registered = False
 
-        if persist_path:
-            # Persist mode: in-memory DB with disk writeback
-            Path(persist_path).parent.mkdir(parents=True, exist_ok=True)
-            self.connection = duckdb.connect(":memory:")
-            logger.info(f"Connected to in-memory DuckDB (persist: {persist_path})")
-            self._load_from_disk()
+        with self._io_lock:
+            opening = False
+            try:
+                if self._runtime and (self._runtime.closing or self._runtime.closed):
+                    raise RuntimeError("Managed database runtime is closing")
+                persistent = persist_path or (db_path if db_path != ":memory:" else None)
+                if self._runtime and persistent:
+                    # Never permit two authoritative in-memory copies of the
+                    # same file, including callers bypassing HistoryStorage.
+                    key = str(Path(persistent).expanduser().resolve())
+                    managers = getattr(self._runtime, "_duckdb_managers", {})
+                    previous = managers.get(key)
+                    if previous is not None and (previous.connection is not None or previous._suspended):
+                        raise RuntimeError("Managed database already open; use the shared storage")
+                opening = True
+                if persist_path:
+                    Path(persist_path).parent.mkdir(parents=True, exist_ok=True)
+                    self.connection = duckdb.connect(":memory:")
+                    self._load_from_disk()
+                else:
+                    self._connect()
+                self._initialized = True
+                if self._runtime and persistent:
+                    managers[key] = self
+                    self._runtime._duckdb_managers = managers
+                    self._runtime.register_storage(self)
+            except BaseException:
+                # Failed startup must never write a partial/empty replacement.
+                if self.connection is not None:
+                    self.connection.close()
+                    self.connection = None
+                if opening and self._runtime:
+                    self._runtime.fail("database_initialization_failed")
+                raise
+        if persist_path and not self._runtime:
             self._start_sync_daemon(sync_interval)
             self._register_shutdown_hook()
-        else:
-            # Direct mode: original behavior
-            self._connect()
 
     def _connect(self):
         """Establish database connection (direct mode only)"""
@@ -98,6 +180,23 @@ class DuckDBManager:
         except Exception as e:
             logger.error(f"Failed to connect to DuckDB: {e}")
             raise
+
+    def _resume_direct(self):
+        """Reopen a direct file connection released by the managed barrier.
+
+        The root lock and runtime io_lock remain owned while its native file
+        handle is released, so no cooperating writer can enter this interval.
+        """
+        if self._suspended:
+            if self._runtime and (self._runtime.closing or self._runtime.closed):
+                raise RuntimeError("Managed database runtime is closing")
+            try:
+                self._connect()
+                self._suspended = False
+            except Exception:
+                if self._runtime:
+                    self._runtime.fail("database_reopen_failed")
+                raise
 
     # ------------------------------------------------------------------ #
     #  Persist mode: disk load / sync / daemon thread / shutdown hook     #
@@ -119,31 +218,14 @@ class DuckDBManager:
         logger.info(
             f"Stale WAL detected at {wal_file}, checkpointing before load"
         )
-        try:
-            tmp_conn = duckdb.connect(db_file)
+        # A WAL may contain the only committed copy of a write. Never discard
+        # it to make a damaged database appear readable.
+        with duckdb.connect(db_file) as tmp_conn:
             tmp_conn.execute("CHECKPOINT")
-            tmp_conn.close()
-            logger.info(f"WAL checkpoint completed for {db_file}")
-        except Exception as e:
-            logger.warning(f"WAL checkpoint failed for {db_file}: {e}")
-            # Last resort: remove the stale WAL so READ_ONLY ATTACH can proceed
-            try:
-                wal_file.unlink()
-                logger.info(f"Removed stale WAL file {wal_file}")
-            except Exception:
-                pass
+        durable_file(Path(db_file))
+        durable_directory(Path(db_file).parent)
 
-    @staticmethod
-    def _cleanup_wal(db_file: str):
-        """Remove leftover WAL file for the given database path if present."""
-        wal_file = Path(f"{db_file}.wal")
-        if wal_file.exists():
-            try:
-                wal_file.unlink()
-                logger.debug(f"Cleaned up WAL file {wal_file}")
-            except Exception:
-                pass
-
+    @serialized_io
     def _load_from_disk(self):
         """
         Load all tables from disk DuckDB file into in-memory database.
@@ -155,6 +237,8 @@ class DuckDBManager:
         READ_ONLY ATTACH does not fail.
         """
         if not self.persist_path or not Path(self.persist_path).exists():
+            if self.persist_path and Path(f"{self.persist_path}.wal").exists():
+                raise IOError("Database is missing but its recovery WAL still exists")
             logger.info(
                 f"No disk file at {self.persist_path}, starting with empty database"
             )
@@ -169,64 +253,82 @@ class DuckDBManager:
                 f"ATTACH '{escaped_path}' AS disk_db (READ_ONLY)"
             )
 
-            # Use duckdb_tables() to list tables from the attached database
-            # (information_schema does not support cross-database queries)
-            tables = self.connection.execute(
-                "SELECT table_name FROM duckdb_tables() "
-                "WHERE database_name = 'disk_db' AND schema_name = 'main'"
-            ).fetchall()
-
-            for (table_name,) in tables:
-                self.connection.execute(
-                    f"CREATE TABLE main.{table_name} AS "
-                    f"SELECT * FROM disk_db.{table_name}"
-                )
+            # COPY FROM DATABASE preserves constraints, indexes and sequences;
+            # CREATE TABLE AS would silently drop PRIMARY KEY on every restart.
+            self.connection.execute("COPY FROM DATABASE disk_db TO memory")
 
             self.connection.execute("DETACH disk_db")
-            logger.info(f"Loaded {len(tables)} tables from {self.persist_path}")
+            logger.info(f"Loaded database from {self.persist_path}")
 
         except Exception as e:
-            logger.warning(f"Failed to load from disk {self.persist_path}: {e}")
+            logger.error(f"Failed to load from disk {self.persist_path}: {e}")
             try:
                 self.connection.execute("DETACH disk_db")
             except Exception:
                 pass
+            raise
 
-    def sync_to_disk(self):
+    def sync_to_disk(self, strict: bool = False):
         """
         Sync in-memory data to disk file atomically.
         Uses ATTACH to a temp DuckDB file, copies all tables, then
         performs atomic os.replace() to swap the disk file.
         Thread-safe via _sync_lock.
         """
-        if not self.persist_path:
-            return
-
         with self._sync_lock:
-            if self._dirty_count == 0:
+            if self._suspended:
+                # No writes since the last verified checkpoint. Leave the file
+                # handle closed so the root's final fsync/backup can read it.
+                if strict:
+                    try:
+                        durable_file(Path(self.db_path))
+                        durable_directory(Path(self.db_path).parent)
+                        self._verify_disk(self.db_path)
+                    except Exception:
+                        if self._runtime:
+                            self._runtime.fail("database_durable_flush_failed")
+                        raise
+                return
+            if not self._initialized or self.connection is None:
+                if strict:
+                    raise RuntimeError("Cannot flush an uninitialized/closed database")
+                return
+            if self._transaction_depth:
+                raise RuntimeError("Cannot flush inside a database transaction")
+            if not self.persist_path:
+                if strict and self.db_path and self.db_path != ":memory:":
+                    try:
+                        if not self.read_only:
+                            self.connection.execute("CHECKPOINT")
+                        # Windows DuckDB denies a second writable file handle.
+                        # Close under the shared IO lock before fsync/verification;
+                        # managed consumers resume lazily after the full barrier.
+                        self.connection.close()
+                        self.connection = None
+                        self._suspended = True
+                        durable_file(Path(self.db_path))
+                        durable_directory(Path(self.db_path).parent)
+                        self._verify_disk(self.db_path)
+                        self._dirty_count = 0
+                    except Exception:
+                        if self._runtime:
+                            self._runtime.fail("database_durable_flush_failed")
+                        raise
+                    finally:
+                        if not self._runtime:
+                            self._resume_direct()
+                return
+            if self._dirty_count == 0 and not strict:
                 return
 
-            tables = self.list_tables()
-            if not tables:
-                self._dirty_count = 0
-                return
-
-            # Use PID in temp filename to avoid cross-process conflicts
-            temp_path = f"{self.persist_path}.{os.getpid()}.tmp"
+            temp_path = f"{self.persist_path}.{uuid4().hex}.tmp"
             try:
-                # Remove leftover temp file from a previous failed sync
-                if Path(temp_path).exists():
-                    Path(temp_path).unlink()
-
                 escaped_temp = temp_path.replace("'", "''")
                 self.connection.execute(f"ATTACH '{escaped_temp}' AS sync_db")
 
                 try:
-                    for table in tables:
-                        self.connection.execute(
-                            f"CREATE TABLE sync_db.{table} AS "
-                            f"SELECT * FROM main.{table}"
-                        )
+                    self.connection.execute("COPY FROM DATABASE memory TO sync_db")
+                    self.connection.execute("CHECKPOINT sync_db")
                     self.connection.execute("DETACH sync_db")
                 except Exception:
                     # Ensure DETACH even on failure
@@ -236,25 +338,26 @@ class DuckDBManager:
                         pass
                     raise
 
-                # Clean up temp WAL file left by ATTACH/DETACH
-                self._cleanup_wal(temp_path)
-
-                # Atomically replace the disk file
-                os.replace(temp_path, self.persist_path)
-
-                # Clean up any stale WAL for the persist path (belongs to an
-                # older version of the file, not the one we just swapped in)
-                self._cleanup_wal(self.persist_path)
+                self._checkpoint_wal(temp_path)
+                self._verify_disk(temp_path)
+                durable_file(Path(temp_path))
+                if Path(f"{self.persist_path}.wal").exists():
+                    raise RuntimeError("Refusing to replace a database with an unrecovered WAL")
+                durable_replace(Path(temp_path), Path(self.persist_path))
+                durable_directory(Path(self.persist_path).parent)
+                self._verify_disk(self.persist_path)
 
                 synced_ops = self._dirty_count
                 self._dirty_count = 0
                 logger.info(
-                    f"Synced {len(tables)} tables ({synced_ops} dirty ops) "
+                    f"Synced database ({synced_ops} dirty ops) "
                     f"to {self.persist_path}"
                 )
 
             except Exception as e:
                 logger.error(f"Failed to sync to disk: {e}")
+                # Keep dirty even if a strict forced sync began at zero.
+                self._dirty_count = max(1, self._dirty_count)
                 # Clean up temp file and its WAL on failure
                 for p in (temp_path, f"{temp_path}.wal"):
                     if Path(p).exists():
@@ -262,18 +365,43 @@ class DuckDBManager:
                             Path(p).unlink()
                         except Exception:
                             pass
+                if strict or self._runtime:
+                    if self._runtime:
+                        self._runtime.fail("database_durable_flush_failed")
+                    raise
 
+    @staticmethod
+    def _verify_disk(path):
+        """Reopen the checkpointed snapshot before acknowledging durability."""
+        if not Path(path).is_file() or Path(path).stat().st_size == 0:
+            raise IOError("Database snapshot is missing or empty")
+        with duckdb.connect(str(path), read_only=True) as check:
+            tables = check.execute(
+                "SELECT schema_name, table_name FROM duckdb_tables() "
+                "WHERE NOT internal"
+            ).fetchall()
+            for schema, table in tables:
+                schema = schema.replace('"', '""')
+                table = table.replace('"', '""')
+                check.execute(f'SELECT * FROM "{schema}"."{table}" LIMIT 1').fetchall()
+
+    def durable_flush(self):
+        """Synchronous flush: any checkpoint, fsync or verification error raises."""
+        self.sync_to_disk(strict=True)
+
+    @serialized_io
     def force_sync(self):
         """Force immediate sync to disk regardless of dirty count"""
         if self.persist_path and self.connection:
             if self._dirty_count == 0:
                 self._dirty_count = 1
-            self.sync_to_disk()
+            self.sync_to_disk(strict=bool(self._runtime))
 
     def _mark_dirty(self):
         """Increment dirty counter and trigger sync if threshold reached"""
         self._dirty_count += 1
-        if self._dirty_count >= self._sync_threshold:
+        if (self.persist_path and not self._runtime and not self._transaction_depth
+                and self._dirty_count >= self._sync_threshold):
             self.sync_to_disk()
 
     def _start_sync_daemon(self, interval: int):
@@ -307,6 +435,8 @@ class DuckDBManager:
 
     def _shutdown_sync(self):
         """Stop daemon thread and perform final sync (called by atexit)"""
+        if self._runtime:
+            return  # Shared storage is flushed/closed by the root runtime.
         self._stop_event.set()
         if self._daemon_thread and self._daemon_thread.is_alive():
             self._daemon_thread.join(timeout=5)
@@ -326,25 +456,52 @@ class DuckDBManager:
 
     def close(self):
         """Close database connection (with final sync in persist mode)"""
+        if self._runtime and not self._runtime.closing:
+            return
+        if self._runtime:
+            self.durable_close()
+            return
         if self.persist_path:
             self._shutdown_sync()
-        if self.connection:
-            self.connection.close()
+        with self._io_lock:
+            if self.connection:
+                self.connection.close()
+                self.connection = None
+                logger.info("DuckDB connection closed")
+            self._suspended = False
+            if self._shutdown_registered:
+                atexit.unregister(self._shutdown_sync)
+                self._shutdown_registered = False
+
+    @serialized_io
+    def durable_close(self):
+        """Final close; failed durability keeps the live connection recoverable."""
+        if self.connection is not None or self._suspended:
+            self.durable_flush()
+            if self.connection is not None:
+                self.connection.close()
             self.connection = None
-            logger.info("DuckDB connection closed")
+            self._suspended = False
 
     @contextmanager
     def transaction(self):
         """Context manager for database transactions"""
-        try:
+        with self._io_lock:
+            self._resume_direct()
             self.connection.begin()
-            yield self.connection
-            self.connection.commit()
-        except Exception as e:
-            self.connection.rollback()
-            logger.error(f"Transaction rolled back: {e}")
-            raise
+            self._transaction_depth += 1
+            try:
+                yield self.connection
+                self.connection.commit()
+                if self.persist_path:
+                    self._dirty_count += 1
+            except BaseException:
+                self.connection.rollback()
+                raise
+            finally:
+                self._transaction_depth -= 1
 
+    @serialized_io
     def execute(self, query: str, parameters: Optional[List] = None):
         """
         Execute SQL query
@@ -357,19 +514,20 @@ class DuckDBManager:
             Query result
         """
         try:
+            self._resume_direct()
             if parameters:
                 result = self.connection.execute(query, parameters)
             else:
                 result = self.connection.execute(query)
 
-            # Track write operations in persist mode
-            if self.persist_path:
-                first_word = (
-                    query.strip().split(maxsplit=1)[0].upper()
-                    if query.strip() else ""
-                )
-                if first_word in self._WRITE_KEYWORDS:
-                    self._mark_dirty()
+            # Track memory-only writes too: the knowledge store persists them
+            # to Parquet and must not reload a stale snapshot over raw SQL edits.
+            first_word = (
+                query.strip().split(maxsplit=1)[0].upper()
+                if query.strip() else ""
+            )
+            if first_word in self._WRITE_KEYWORDS:
+                self._mark_dirty()
 
             return result
         except Exception as e:
@@ -377,6 +535,7 @@ class DuckDBManager:
             logger.error(f"Query: {query}")
             raise
 
+    @serialized_io
     def fetch_all(self, query: str, parameters: Optional[List] = None) -> List[Tuple]:
         """
         Execute query and fetch all results
@@ -391,6 +550,7 @@ class DuckDBManager:
         result = self.execute(query, parameters)
         return result.fetchall()
 
+    @serialized_io
     def fetch_one(self, query: str, parameters: Optional[List] = None) -> Optional[Tuple]:
         """
         Execute query and fetch one result
@@ -405,6 +565,7 @@ class DuckDBManager:
         result = self.execute(query, parameters)
         return result.fetchone()
 
+    @serialized_io
     def fetch_df(self, query: str, parameters: Optional[List] = None) -> pd.DataFrame:
         """
         Execute query and return results as pandas DataFrame
@@ -448,6 +609,7 @@ class DuckDBManager:
         self.execute(query)
         logger.info(f"Table {table_name} dropped successfully")
 
+    @serialized_io
     def insert_data(self, table_name: str, data: Union[Dict, List[Dict], pd.DataFrame]):
         """
         Insert data into table
@@ -475,9 +637,12 @@ class DuckDBManager:
 
         elif isinstance(data, pd.DataFrame):
             # Use DuckDB's efficient DataFrame insertion
+            self._resume_direct()
             self.connection.register("temp_df", data)
-            self.execute(f"INSERT INTO {table_name} SELECT * FROM temp_df")
-            self.connection.unregister("temp_df")
+            try:
+                self.execute(f"INSERT INTO {table_name} SELECT * FROM temp_df")
+            finally:
+                self.connection.unregister("temp_df")
 
         logger.info(f"Data inserted into {table_name}")
 
@@ -635,8 +800,7 @@ class DuckDBManager:
             table_name: Source table name
             file_path: Output Parquet file path
         """
-        query = f"COPY {table_name} TO '{file_path}' (FORMAT PARQUET)"
-        self.execute(query)
+        self.execute(f"COPY {table_name} TO ? (FORMAT PARQUET)", [str(file_path)])
         logger.info(f"Table {table_name} exported to Parquet: {file_path}")
 
     def import_from_parquet(self, table_name: str, file_path: str, create_table: bool = True):
@@ -889,7 +1053,10 @@ class DuckDBManager:
     def __del__(self):
         """Destructor to ensure connection is closed"""
         if hasattr(self, 'connection') and self.connection:
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                logger.exception("Database finalizer could not flush; explicit close is required")
 
 
 # Utility functions for common operations

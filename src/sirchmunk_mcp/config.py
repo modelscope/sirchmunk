@@ -11,7 +11,6 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -222,9 +221,12 @@ class Config(BaseModel):
         # Load .env from work_path (default: ~/.sirchmunk/.env)
         work_path = Path(os.getenv("SIRCHMUNK_WORK_PATH", str(Path.home() / ".sirchmunk")))
         work_path = work_path.expanduser().resolve()
+        from sirchmunk.storage.lifecycle import claim_work_root
+        claim_work_root(work_path)
         env_file = work_path / ".env"
 
         if env_file.exists():
+            from dotenv import load_dotenv
             load_dotenv(env_file, override=False)
 
         # Expand ~ in path-related env vars after dotenv load, mirroring

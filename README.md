@@ -1207,6 +1207,12 @@ You can query them using DuckDB or the `KnowledgeManager` API.
 
 We welcome [contributions](https://github.com/modelscope/sirchmunk/pulls) !
 
+Backend deployment and extension documentation:
+
+- [LLM connections, pools and HTTP API](docs/llm-pools.md)
+- [Backend safeguards and optional management](docs/backend-improvements.md)
+- [Validation results and reproducible acceptance](docs/backend-validation.md)
+
 ---
 
 ## 📄 License

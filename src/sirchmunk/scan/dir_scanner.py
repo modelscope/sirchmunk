@@ -358,6 +358,33 @@ _SMALL_FILE_THRESHOLD = 100 * 1024
 # Scanner
 # ---------------------------------------------------------------------------
 
+def extract_identifiers(text: str) -> List[str]:
+    """Conservative mixed letter/digit identifiers, independent of a chip family.
+
+    Preserve numeric/hyphen variants; filenames without the requested variant
+    are not promoted as exact matches. CJK boundaries do not consume ASCII IDs.
+    """
+    tokens = re.findall(r"[A-Za-z0-9]+(?:[-.][A-Za-z0-9]+)*", text or "")
+    found = {}
+    for token in tokens:
+        if len(token) >= 4 and re.search(r"[A-Za-z]", token) and re.search(r"[0-9]", token):
+            found.setdefault(token.casefold(), token)
+    return sorted(found.values(), key=lambda token: (-len(token), token.casefold()))
+
+
+def identifier_matches_filename(identifier: str, filename: str) -> bool:
+    """A package suffix is a routing hint, never proof of component identity.
+
+    Alphabetic suffixes are allowed; numeric continuations are not. In
+    particular X123 cannot boost X1234, nor Series-7 boost Series-8.
+    """
+    if identifier.casefold() not in {x.casefold() for x in extract_identifiers(identifier)}:
+        return False
+    stem = Path(filename).stem.casefold()
+    pattern = r"(?<![a-z0-9])" + re.escape(identifier.casefold()) + r"(?:[a-z]+)?(?![a-z0-9])"
+    return re.search(pattern, stem) is not None
+
+
 class DirectoryScanner:
     """Recursively pre-scan directories and use LLM to discover candidates.
 
@@ -501,6 +528,18 @@ class DirectoryScanner:
                 for entity in entity_terms
             ):
                 components["filename_exact"] = 0.45
+            else:
+                # P-fix B (2026-09-22): stem *prefix* match for part numbers.
+                # "tca9555" never equals "tca9555pwr_ti", so the exact check
+                # above never fired; a >=4-char alphanumeric entity that is a
+                # prefix of the stem (or a whole token inside it) is a strong
+                # filename signal and should score the same as exact.
+                for entity in entity_terms:
+                    ent = entity.strip().lower()
+                    if os.getenv("LENS_IDENTIFIER_ROUTING", "true").lower() != "false":
+                        if identifier_matches_filename(ent, candidate.filename):
+                            components["filename_exact"] = 0.45
+                            break
             title_text = candidate.title.strip().lower()
             if title_text and any(
                 entity == title_text or entity in title_text

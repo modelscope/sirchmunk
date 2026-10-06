@@ -18,9 +18,13 @@ import threading
 from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 from datetime import datetime, timezone
+from uuid import uuid4
 from loguru import logger
 
-from .duckdb import DuckDBManager
+from .duckdb import DuckDBManager, serialized_io
+from .lifecycle import (
+    ManagedStorageMeta, get_runtime, durable_file, durable_directory, durable_replace,
+)
 from sirchmunk.schema.knowledge import (
     KnowledgeCluster,
     EvidenceUnit,
@@ -30,9 +34,14 @@ from sirchmunk.schema.knowledge import (
     AbstractionLevel
 )
 from ..utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH
+from ..utils.embedding_util import get_embedding_dim
 
 
-class KnowledgeStorage:
+class EmbeddingCompatibilityError(ValueError):
+    """Existing vectors cannot be used with the configured embedding setup."""
+
+
+class KnowledgeStorage(metaclass=ManagedStorageMeta):
     """
     Manages persistent storage of KnowledgeCluster objects using DuckDB and Parquet
 
@@ -57,19 +66,33 @@ class KnowledgeStorage:
             sync_interval: Seconds between periodic Parquet syncs (default: 60)
             sync_threshold: Dirty write count that triggers immediate sync (default: 100)
         """
+        self.embedding_dim = get_embedding_dim()
+        self.embedding_model = os.getenv("EMBEDDING_MODEL_ID") or None
         # Get work path from env if not provided, and expand ~ in path
         if work_path is None:
             work_path = os.getenv("SIRCHMUNK_WORK_PATH", DEFAULT_SIRCHMUNK_WORK_PATH)
+        self._runtime = get_runtime(work_path)
+        self._io_lock = self._runtime.io_lock if self._runtime else threading.RLock()
+        self._initialized = False
 
         # Create knowledge storage path (expand ~ and resolve to absolute path)
         self.knowledge_path = Path(work_path).expanduser().resolve() / ".cache" / "knowledge"
+        if self._runtime and not self.knowledge_path.resolve().is_relative_to(self._runtime.root):
+            self._runtime.fail("knowledge_path_outside_managed_root")
+            raise ValueError("Knowledge path is outside the managed root")
         self.knowledge_path.mkdir(parents=True, exist_ok=True)
 
         # Parquet file path
         self.parquet_file = str(self.knowledge_path / "knowledge_clusters.parquet")
+        if self._runtime and Path(self.parquet_file).is_symlink():
+            self._runtime.fail("linked_knowledge_snapshot")
+            raise ValueError("Managed knowledge snapshot cannot be a symbolic link")
 
         # Initialize DuckDB (in-memory for fast operations)
-        self.db = DuckDBManager(db_path=None)  # In-memory database
+        self.db = DuckDBManager(db_path=None, runtime=self._runtime)
+        # Non-managed storage still serializes its Parquet and SQL operations.
+        self.db._io_lock = self._io_lock
+        self.db._sync_lock = self._io_lock
 
         # Table name
         self.table_name = "knowledge_clusters"
@@ -80,24 +103,49 @@ class KnowledgeStorage:
         # change and reload automatically.
         self._parquet_loaded_mtime: float = 0.0
 
-        # Load data from parquet if exists
-        self._load_from_parquet()
-
         # Parquet sync state (daemon thread + dirty tracking)
         self._parquet_dirty_count = 0
         self._parquet_sync_threshold = sync_threshold
-        self._parquet_sync_lock = threading.Lock()
+        self._parquet_sync_lock = self._io_lock
         self._stop_event = threading.Event()
         self._daemon_thread = None
         self._shutdown_registered = False
 
+        # Initialize cleanup state before loading: incompatible data may raise.
+        try:
+            self._load_from_parquet()
+            self._initialized = True
+        except BaseException:
+            self.db.durable_close()
+            self.db = None
+            if self._runtime:
+                self._runtime.fail("knowledge_storage_initialization_failed")
+            raise
+
         # Start daemon thread and register shutdown hook
-        self._start_parquet_sync_daemon(sync_interval)
-        self._register_shutdown_hook()
+        if not self._runtime:
+            self._start_parquet_sync_daemon(sync_interval)
+            self._register_shutdown_hook()
 
         logger.info(f"Knowledge Manager initialized at: {self.knowledge_path}")
 
+    @serialized_io
     def _load_from_parquet(self):
+        if self._runtime and (self._parquet_dirty_count or self.db._dirty_count):
+            raise RuntimeError("Cannot reload knowledge storage with unflushed changes")
+        # Failed reload preserves the previous live table instead of a partial
+        # schema. Startup propagates the same failure without creating an empty
+        # replacement file.
+        try:
+            with self.db.transaction():
+                self._load_from_parquet_locked()
+        except Exception:
+            if self._runtime:
+                self._runtime.fail("knowledge_load_failed")
+            raise
+        self.db._dirty_count = 0
+
+    def _load_from_parquet_locked(self):
         """Load knowledge clusters from parquet file into DuckDB.
 
         Uses an explicit ``CREATE TABLE`` with the canonical schema followed
@@ -119,6 +167,32 @@ class KnowledgeStorage:
         try:
             pq = Path(self.parquet_file)
             if pq.exists():
+                # Validate before touching the live table. Never silently clear
+                # a library when a model configuration changes.
+                columns = self._get_parquet_columns(self.parquet_file)
+                if self._runtime:
+                    self._validate_managed_parquet()
+                if "embedding_vector" in columns:
+                    dimensions = self.db.fetch_all(
+                        "SELECT DISTINCT array_length(embedding_vector) "
+                        "FROM read_parquet(?) WHERE embedding_vector IS NOT NULL",
+                        [self.parquet_file],
+                    )
+                    if any(row[0] != self.embedding_dim for row in dimensions):
+                        raise EmbeddingCompatibilityError(
+                            "Stored vector dimension differs from EMBEDDING_DIM; "
+                            "restore the original configuration or migrate a copy explicitly."
+                        )
+                    if self.embedding_model and "embedding_model" in columns:
+                        models = self.db.fetch_all(
+                            "SELECT DISTINCT embedding_model FROM read_parquet(?) "
+                            "WHERE embedding_vector IS NOT NULL",
+                            [self.parquet_file],
+                        )
+                        if any(row[0] != self.embedding_model for row in models):
+                            raise EmbeddingCompatibilityError(
+                                "Stored embedding model differs from EMBEDDING_MODEL_ID."
+                            )
                 # Drop existing table first to avoid conflicts
                 self.db.drop_table(self.table_name, if_exists=True)
                 # Create table with explicit schema (preserves FLOAT[384])
@@ -129,21 +203,12 @@ class KnowledgeStorage:
                 table_cols = self._get_table_columns()
 
                 if not parquet_cols or not table_cols:
-                    logger.warning(
-                        "Could not detect columns for adaptive mapping, "
-                        "skipping parquet load"
-                    )
+                    raise ValueError("Knowledge snapshot has no readable schema")
                 else:
                     parquet_col_set = set(parquet_cols)
                     table_col_set = set(table_cols)
-                    # Compute common columns (preserve table column order)
-                    common_cols = [c for c in table_cols if c in parquet_col_set]
-
-                    if not common_cols:
-                        logger.warning(
-                            "No common columns between parquet and table, "
-                            "skipping parquet load"
-                        )
+                    if not {"id", "name"}.issubset(parquet_col_set):
+                        raise ValueError("Knowledge snapshot is missing identity columns")
                     else:
                         # Log column mismatches as warnings
                         ignored_cols = parquet_col_set - table_col_set
@@ -177,7 +242,7 @@ class KnowledgeStorage:
                         self.db.execute(
                             f"INSERT INTO {self.table_name} ({cols_str}) "
                             f"SELECT {select_clause} "
-                            f"FROM read_parquet('{self.parquet_file}')"
+                            "FROM read_parquet(?)", [self.parquet_file]
                         )
 
                 count = self.db.get_table_count(self.table_name)
@@ -189,15 +254,11 @@ class KnowledgeStorage:
                 self._create_table()
                 self._parquet_loaded_mtime = 0.0
                 logger.info("Created new knowledge clusters table")
+        except EmbeddingCompatibilityError:
+            raise
         except Exception as e:
-            logger.warning(f"Failed to load from parquet (non-blocking): {e}")
-            # Try to recreate table so retrieval can still work
-            try:
-                self.db.drop_table(self.table_name, if_exists=True)
-                self._create_table()
-            except Exception as recreate_err:
-                logger.warning(f"Failed to recreate table after load failure: {recreate_err}")
-            self._parquet_loaded_mtime = 0.0
+            logger.error(f"Failed to load knowledge snapshot: {e}")
+            raise
 
     def _get_schema_columns(self) -> List[str]:
         """Return the ordered list of column names in the canonical schema."""
@@ -214,27 +275,26 @@ class KnowledgeStorage:
     def _get_parquet_columns(self, parquet_path: str) -> List[str]:
         """Get column names from a parquet file's schema.
 
-        Uses DuckDB's ``parquet_schema()`` function.  The returned metadata
-        rows use a ``name`` field (not ``column_name``).
+        DESCRIBE exposes only top-level columns. parquet_schema() also returns
+        nested list/element nodes, which are not SQL columns.
 
         Returns:
-            Ordered list of column names, or empty list on failure.
+            Ordered list of column names. Unreadable schemas raise.
         """
         try:
             rows = self.db.fetch_all(
-                f"SELECT name FROM parquet_schema('{parquet_path}') "
-                f"WHERE name != 'duckdb_schema'"
+                "DESCRIBE SELECT * FROM read_parquet(?)", [parquet_path]
             )
             return [row[0] for row in rows]
         except Exception as e:
             logger.warning(f"Failed to read parquet schema: {e}")
-            return []
+            raise
 
     def _get_table_columns(self) -> List[str]:
         """Get column names from the current DuckDB table.
 
         Returns:
-            Ordered list of column names, or empty list on failure.
+            Ordered list of column names. Unreadable schemas raise.
         """
         try:
             rows = self.db.fetch_all(
@@ -245,8 +305,9 @@ class KnowledgeStorage:
             return [row[0] for row in rows]
         except Exception as e:
             logger.warning(f"Failed to read table columns: {e}")
-            return []
+            raise
 
+    @serialized_io
     def _check_and_reload(self):
         """Check if the parquet file was modified externally and reload if so.
 
@@ -255,6 +316,10 @@ class KnowledgeStorage:
         the same parquet file.  The API's singleton instance can call this
         before read operations to pick up the latest data without a restart.
         """
+        # A managed root has exactly one authoritative in-memory store. Its
+        # own flush must not trigger a reload or erase subsequent dirty edits.
+        if self._runtime or self._parquet_dirty_count or self.db._dirty_count:
+            return
         try:
             pq = Path(self.parquet_file)
             if not pq.exists():
@@ -265,6 +330,8 @@ class KnowledgeStorage:
                     "Parquet file changed externally, reloading knowledge clusters"
                 )
                 self._load_from_parquet()
+        except EmbeddingCompatibilityError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to check parquet staleness: {e}")
 
@@ -276,9 +343,8 @@ class KnowledgeStorage:
         logger.info("Force reloading knowledge clusters from parquet")
         self._load_from_parquet()
 
-    def _create_table(self):
-        """Create knowledge clusters table with schema"""
-        schema = {
+    def _column_schema(self):
+        return {
             "id": "VARCHAR PRIMARY KEY",
             "name": "VARCHAR NOT NULL",
             "description": "VARCHAR",
@@ -300,32 +366,61 @@ class KnowledgeStorage:
             "search_results": "VARCHAR",  # JSON array
             "queries": "VARCHAR",  # JSON array of historical queries
             "merge_count": "INTEGER",  # compile merge counter
-            "embedding_vector": "FLOAT[384]",  # 384-dim embedding vector
+            "embedding_vector": f"FLOAT[{self.embedding_dim}]",  # embedding vector
             "embedding_model": "VARCHAR",  # Model identifier
             "embedding_timestamp": "TIMESTAMP",  # Embedding computation time
             "embedding_text_hash": "VARCHAR",  # Hash of embedded text
         }
-        self.db.create_table(self.table_name, schema, if_not_exists=True)
+
+    def _validate_managed_parquet(self):
+        """Accept the canonical schema and known pre-embedding/pre-merge files.
+
+        Missing additive metadata is projected to NULL (merge_count to zero)
+        in memory, matching the existing v0.2.0 reader. No source file is
+        rewritten at startup. Unknown columns/types require explicit migration.
+        """
+        canonical = self._column_schema()
+        expected = {name: kind.split(" PRIMARY KEY")[0].split(" NOT NULL")[0]
+                    for name, kind in canonical.items()}
+        expected["embedding_vector"] = "FLOAT[]"  # Parquet lists are variable length.
+        actual = {row[0]: row[1] for row in self.db.fetch_all(
+            "DESCRIBE SELECT * FROM read_parquet(?)", [self.parquet_file]
+        )}
+        additive = {"merge_count", "embedding_vector", "embedding_model",
+                    "embedding_timestamp", "embedding_text_hash"}
+        if not (set(expected) - additive).issubset(actual) or set(actual) - set(expected):
+            raise ValueError("Unrecognized managed knowledge columns")
+        if any(kind != expected[name] for name, kind in actual.items()):
+            raise ValueError("Incompatible managed knowledge column types")
+
+    def _create_table(self):
+        """Create knowledge clusters table with schema"""
+        self.db.create_table(self.table_name, self._column_schema(), if_not_exists=True)
         logger.info(f"Created table {self.table_name}")
 
     # ------------------------------------------------------------------ #
     #  Parquet sync: daemon thread + dirty tracking + shutdown hook       #
     # ------------------------------------------------------------------ #
 
-    def _sync_to_parquet(self):
+    def _sync_to_parquet(self, strict: bool = False):
         """
         Sync in-memory knowledge clusters to parquet file with atomic write.
         Uses temp file + os.replace() for atomicity. Thread-safe via lock.
         Called by the daemon thread or on threshold / shutdown.
         """
         with self._parquet_sync_lock:
-            if self._parquet_dirty_count == 0:
+            if not self._initialized or self.db is None:
+                if strict:
+                    raise RuntimeError("Cannot flush uninitialized/closed knowledge storage")
+                return
+            if self._parquet_dirty_count == 0 and not strict:
                 return
 
             temp_file = None
             try:
-                # Generate temporary file path with PID for uniqueness
-                temp_file = f"{self.parquet_file}.{os.getpid()}.tmp"
+                # Unique to this attempt; cleanup never touches an older WAL
+                # or a different writer's recovery file.
+                temp_file = f"{self.parquet_file}.{uuid4().hex}.tmp"
 
                 # Export table to temporary parquet file
                 self.db.export_to_parquet(self.table_name, temp_file)
@@ -334,11 +429,16 @@ class KnowledgeStorage:
                 if not Path(temp_file).exists():
                     raise IOError(f"Temporary file not created: {temp_file}")
 
-                # Atomically replace the target file with the temporary file
-                os.replace(temp_file, self.parquet_file)
+                self._verify_parquet(temp_file)
+                durable_file(Path(temp_file))
+                durable_replace(Path(temp_file), Path(self.parquet_file))
+                durable_directory(Path(self.parquet_file).parent)
+                self._verify_parquet(self.parquet_file)
 
                 synced_ops = self._parquet_dirty_count
                 self._parquet_dirty_count = 0
+                self.db._dirty_count = 0
+                self._parquet_loaded_mtime = Path(self.parquet_file).stat().st_mtime
                 logger.debug(
                     f"Synced knowledge clusters ({synced_ops} dirty ops) "
                     f"to {self.parquet_file}"
@@ -346,6 +446,7 @@ class KnowledgeStorage:
 
             except Exception as e:
                 logger.error(f"Failed to sync to parquet: {e}")
+                self._parquet_dirty_count = max(1, self._parquet_dirty_count)
                 # Clean up temporary file if it exists
                 if temp_file and Path(temp_file).exists():
                     try:
@@ -354,11 +455,30 @@ class KnowledgeStorage:
                         logger.warning(
                             f"Failed to clean up temp file {temp_file}: {cleanup_error}"
                         )
+                if strict or self._runtime:
+                    if self._runtime:
+                        self._runtime.fail("knowledge_durable_flush_failed")
+                    raise
 
+    def _verify_parquet(self, path):
+        if not Path(path).is_file() or Path(path).stat().st_size == 0:
+            raise IOError("Knowledge snapshot is missing or empty")
+        # Read all columns for one row as well as the row count. A successful
+        # COPY alone is not proof that the resulting file can be reopened.
+        self.db.fetch_all("SELECT * FROM read_parquet(?) LIMIT 1", [str(path)])
+        count = self.db.fetch_one("SELECT count(*) FROM read_parquet(?)", [str(path)])[0]
+        if count != self.db.get_table_count(self.table_name):
+            raise IOError("Knowledge snapshot row count mismatch")
+
+    def durable_flush(self):
+        """Synchronous verified snapshot, including initially empty libraries."""
+        self._sync_to_parquet(strict=True)
+
+    @serialized_io
     def _mark_parquet_dirty(self):
         """Increment dirty counter and trigger sync if threshold reached"""
         self._parquet_dirty_count += 1
-        if self._parquet_dirty_count >= self._parquet_sync_threshold:
+        if not self._runtime and self._parquet_dirty_count >= self._parquet_sync_threshold:
             self._sync_to_parquet()
 
     def _start_parquet_sync_daemon(self, interval: int):
@@ -391,23 +511,25 @@ class KnowledgeStorage:
 
     def _shutdown_parquet_sync(self):
         """Stop daemon thread and perform final parquet sync (called by atexit)"""
+        if self._runtime:
+            return
         self._stop_event.set()
         if self._daemon_thread and self._daemon_thread.is_alive():
             self._daemon_thread.join(timeout=5)
 
-        # Force a final sync regardless of dirty count
-        if self._parquet_dirty_count == 0:
-            self._parquet_dirty_count = 1  # Force sync
+        # Read-only instances must not overwrite newer data on shutdown.
+        # Explicit force_sync remains available to callers with raw SQL writes.
         try:
             self._sync_to_parquet()
         except Exception as e:
             logger.error(f"Final parquet shutdown sync failed: {e}")
 
+    @serialized_io
     def force_sync(self):
         """Force immediate parquet sync regardless of dirty count"""
         if self._parquet_dirty_count == 0:
             self._parquet_dirty_count = 1
-        self._sync_to_parquet()
+        self._sync_to_parquet(strict=bool(self._runtime))
 
     # ------------------------------------------------------------------ #
     #  Row conversion helpers                                             #
@@ -607,6 +729,9 @@ class KnowledgeStorage:
 
         except Exception as e:
             logger.error(f"Failed to get cluster {cluster_id}: {e}")
+            if self._runtime:
+                self._runtime.fail("knowledge_operation_failed")
+                raise
             return None
 
     async def get_with_embedding(self, cluster_id: str) -> Optional[Tuple[KnowledgeCluster, List[float]]]:
@@ -634,6 +759,9 @@ class KnowledgeStorage:
 
         except Exception as e:
             logger.error(f"Failed to get cluster with embedding {cluster_id}: {e}")
+            if self._runtime:
+                self._runtime.fail("knowledge_operation_failed")
+                raise
             return None
 
     async def insert(self, cluster: KnowledgeCluster) -> bool:
@@ -663,16 +791,18 @@ class KnowledgeStorage:
 
             # Insert into database
             row = self._cluster_to_row(cluster)
-            self.db.insert_data(self.table_name, row)
-
-            # Mark dirty for deferred parquet sync
-            self._mark_parquet_dirty()
+            with self._io_lock:
+                self.db.insert_data(self.table_name, row)
+                self._mark_parquet_dirty()
 
             logger.info(f"Inserted cluster: {cluster.id}")
             return True
 
         except Exception as e:
             logger.error(f"Failed to insert cluster {cluster.id}: {e}")
+            if self._runtime:
+                self._runtime.fail("knowledge_operation_failed")
+                raise
             return False
 
     async def update(self, cluster: KnowledgeCluster) -> bool:
@@ -701,21 +831,23 @@ class KnowledgeStorage:
             set_clause = {k: v for k, v in row.items() if k != "id"}
 
             # Update in database
-            self.db.update_data(
-                self.table_name,
-                set_clause=set_clause,
-                where_clause="id = ?",
-                where_params=[cluster.id]
-            )
-
-            # Mark dirty for deferred parquet sync
-            self._mark_parquet_dirty()
+            with self._io_lock:
+                self.db.update_data(
+                    self.table_name,
+                    set_clause=set_clause,
+                    where_clause="id = ?",
+                    where_params=[cluster.id]
+                )
+                self._mark_parquet_dirty()
 
             logger.info(f"Updated cluster: {cluster.id} (version {cluster.version})")
             return True
 
         except Exception as e:
             logger.error(f"Failed to update cluster {cluster.id}: {e}")
+            if self._runtime:
+                self._runtime.fail("knowledge_operation_failed")
+                raise
             return False
 
     async def remove(self, cluster_id: str) -> bool:
@@ -750,16 +882,18 @@ class KnowledgeStorage:
                         await self.update(target_cluster)
 
             # Delete from database
-            self.db.delete_data(self.table_name, "id = ?", [cluster_id])
-
-            # Mark dirty for deferred parquet sync
-            self._mark_parquet_dirty()
+            with self._io_lock:
+                self.db.delete_data(self.table_name, "id = ?", [cluster_id])
+                self._mark_parquet_dirty()
 
             logger.info(f"Removed cluster: {cluster_id}")
             return True
 
         except Exception as e:
             logger.error(f"Failed to remove cluster {cluster_id}: {e}")
+            if self._runtime:
+                self._runtime.fail("knowledge_operation_failed")
+                raise
             return False
 
     async def clear(self) -> bool:
@@ -770,21 +904,27 @@ class KnowledgeStorage:
             True if successful, False otherwise
         """
         try:
-            # Drop and recreate table
-            self.db.drop_table(self.table_name, if_exists=True)
-            self._create_table()
-
-            # Delete parquet file and reset dirty count
             with self._parquet_sync_lock:
-                if Path(self.parquet_file).exists():
-                    Path(self.parquet_file).unlink()
-                self._parquet_dirty_count = 0
+                self.db.drop_table(self.table_name, if_exists=True)
+                self._create_table()
+                if self._runtime:
+                    # Persist an empty snapshot through the same atomic flush
+                    # path; never unlink the last durable copy before flush.
+                    self._mark_parquet_dirty()
+                else:
+                    if Path(self.parquet_file).exists():
+                        Path(self.parquet_file).unlink()
+                    self._parquet_dirty_count = 0
+                    self.db._dirty_count = 0
 
             logger.info("Cleared all knowledge clusters")
             return True
 
         except Exception as e:
             logger.error(f"Failed to clear knowledge clusters: {e}")
+            if self._runtime:
+                self._runtime.fail("knowledge_operation_failed")
+                raise
             return False
 
     async def find(self, query: str, limit: int = 10) -> List[KnowledgeCluster]:
@@ -845,6 +985,9 @@ class KnowledgeStorage:
 
         except Exception as e:
             logger.error(f"Failed to search clusters with query '{query}': {e}")
+            if self._runtime:
+                self._runtime.fail("knowledge_operation_failed")
+                raise
             return []
 
     async def merge(self, clusters: List[KnowledgeCluster]) -> Optional[KnowledgeCluster]:
@@ -975,6 +1118,9 @@ class KnowledgeStorage:
 
         except Exception as e:
             logger.error(f"Failed to merge clusters: {e}")
+            if self._runtime:
+                self._runtime.fail("knowledge_operation_failed")
+                raise
             return None
 
     async def split(self, cluster: KnowledgeCluster, num_splits: int = 2) -> List[KnowledgeCluster]:
@@ -1048,6 +1194,9 @@ class KnowledgeStorage:
 
         except Exception as e:
             logger.error(f"Failed to split cluster {cluster.id}: {e}")
+            if self._runtime:
+                self._runtime.fail("knowledge_operation_failed")
+                raise
             return [cluster]
 
     # ------------------------------------------------------------------ #
@@ -1110,6 +1259,9 @@ class KnowledgeStorage:
 
         except Exception as e:
             logger.error(f"Failed to get stats: {e}")
+            if self._runtime:
+                self._runtime.fail("knowledge_operation_failed")
+                raise
             return {}
 
     @staticmethod
@@ -1150,34 +1302,39 @@ class KnowledgeStorage:
         """
         try:
             # Verify embedding dimension
-            if len(embedding_vector) != 384:
+            expected_dim = self.embedding_dim
+            if self.embedding_model and embedding_model != self.embedding_model:
+                raise EmbeddingCompatibilityError("Embedding model identity mismatch")
+            if len(embedding_vector) != expected_dim:
                 logger.error(
-                    f"Invalid embedding dimension: expected 384, got {len(embedding_vector)}"
+                    f"Invalid embedding dimension: expected {expected_dim}, got {len(embedding_vector)}"
                 )
                 return False
 
             # Update embedding fields in database
-            self.db.execute(
-                f"""
-                UPDATE {self.table_name}
-                SET
-                    embedding_vector = ?::FLOAT[384],
-                    embedding_model = ?,
-                    embedding_timestamp = CURRENT_TIMESTAMP,
-                    embedding_text_hash = ?
-                WHERE id = ?
-                """,
-                [embedding_vector, embedding_model, embedding_text_hash, cluster_id]
-            )
-
-            # Mark dirty for deferred parquet sync
-            self._mark_parquet_dirty()
+            with self._io_lock:
+                self.db.execute(
+                    f"""
+                    UPDATE {self.table_name}
+                    SET
+                        embedding_vector = ?::FLOAT[{expected_dim}],
+                        embedding_model = ?,
+                        embedding_timestamp = CURRENT_TIMESTAMP,
+                        embedding_text_hash = ?
+                    WHERE id = ?
+                    """,
+                    [embedding_vector, embedding_model, embedding_text_hash, cluster_id]
+                )
+                self._mark_parquet_dirty()
 
             logger.debug(f"Stored embedding for cluster {cluster_id}")
             return True
 
         except Exception as e:
             logger.error(f"Failed to store embedding for cluster {cluster_id}: {e}")
+            if self._runtime:
+                self._runtime.fail("knowledge_operation_failed")
+                raise
             return False
 
     @staticmethod
@@ -1242,9 +1399,10 @@ class KnowledgeStorage:
             self._check_and_reload()
 
             # Verify query embedding dimension
-            if len(query_embedding) != 384:
+            expected_dim = self.embedding_dim
+            if len(query_embedding) != expected_dim:
                 logger.error(
-                    f"Invalid query embedding dimension: expected 384, got {len(query_embedding)}"
+                    f"Invalid query embedding dimension: expected {expected_dim}, got {len(query_embedding)}"
                 )
                 return []
 
@@ -1265,7 +1423,7 @@ class KnowledgeStorage:
             community_query = f"""
             WITH topk_meta AS (
               SELECT id AS meta_id, related_clusters,
-                     list_cosine_similarity(embedding_vector::FLOAT[384], ?::FLOAT[384]) AS meta_sim
+                     list_cosine_similarity(embedding_vector::FLOAT[{expected_dim}], ?::FLOAT[{expected_dim}]) AS meta_sim
               FROM {self.table_name}
               WHERE lifecycle = ?
                 AND embedding_vector IS NOT NULL
@@ -1279,7 +1437,7 @@ class KnowledgeStorage:
               WHERE json_extract_string(edge, '$.target_cluster_id') IS NOT NULL
             )
             SELECT kc.id, kc.name, kc.description, kc.confidence, kc.hotness, kc.search_results,
-                   list_cosine_similarity(kc.embedding_vector::FLOAT[384], ?::FLOAT[384]) AS similarity
+                   list_cosine_similarity(kc.embedding_vector::FLOAT[{expected_dim}], ?::FLOAT[{expected_dim}]) AS similarity
             FROM {self.table_name} kc
             WHERE kc.lifecycle != ?
               AND kc.embedding_vector IS NOT NULL
@@ -1312,7 +1470,7 @@ class KnowledgeStorage:
                 AND json_extract_string(edge, '$.target_cluster_id') IS NOT NULL
             )
             SELECT kc.id, kc.name, kc.description, kc.confidence, kc.hotness, kc.search_results,
-                   list_cosine_similarity(kc.embedding_vector::FLOAT[384], ?::FLOAT[384]) AS similarity
+                   list_cosine_similarity(kc.embedding_vector::FLOAT[{expected_dim}], ?::FLOAT[{expected_dim}]) AS similarity
             FROM {self.table_name} kc
             WHERE kc.lifecycle != ?
               AND kc.embedding_vector IS NOT NULL
@@ -1383,6 +1541,9 @@ class KnowledgeStorage:
 
         except Exception as e:
             logger.error(f"Failed to search similar clusters: {e}", exc_info=True)
+            if self._runtime:
+                self._runtime.fail("knowledge_operation_failed")
+                raise
             return []
 
     # ------------------------------------------------------------------ #
@@ -1391,11 +1552,27 @@ class KnowledgeStorage:
 
     def close(self):
         """Close database connection with final parquet sync"""
+        if self._runtime:
+            if self._runtime.closing:
+                self.durable_close()
+            return
         # Force parquet sync and stop daemon
         self._shutdown_parquet_sync()
         if self.db:
             self.db.close()
+            self.db = None
+            if self._shutdown_registered:
+                atexit.unregister(self._shutdown_parquet_sync)
+                self._shutdown_registered = False
             logger.info("Knowledge Manager closed")
+
+    @serialized_io
+    def durable_close(self):
+        """Close the shared consumer only at the root's final shutdown."""
+        if self.db is not None:
+            self.durable_flush()
+            self.db.durable_close()
+            self.db = None
 
     def __enter__(self):
         """Context manager entry"""
@@ -1408,4 +1585,7 @@ class KnowledgeStorage:
     def __del__(self):
         """Destructor to ensure connection is closed"""
         if hasattr(self, 'db') and self.db:
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                logger.exception("Knowledge finalizer failed; explicit durable close required")

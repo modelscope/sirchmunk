@@ -25,6 +25,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from sirchmunk.llm.openai_chat import OpenAIChat
+from sirchmunk.llm.factory import create_configured_llm, configuration_status, llm_request_scope, track_search_instance
+from sirchmunk.llm.pool_config import ConfigError
+from sirchmunk.llm.pool_router import PoolError
 from sirchmunk.search import AgenticSearch
 from sirchmunk.utils.constants import DEFAULT_SIRCHMUNK_WORK_PATH
 
@@ -120,53 +123,12 @@ _search_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_SEARCHES)
 
 
 # ===================================================================
-#  Cached singleton (for non-streaming endpoint)
+#  Request-scoped search factory
 # ===================================================================
 
-_search_instance: Optional[AgenticSearch] = None
-_search_config: Optional[tuple] = None
-
-
-def _read_llm_config() -> tuple:
-    api_key = os.getenv("LLM_API_KEY", "")
-    base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-    model_name = os.getenv("LLM_MODEL_NAME", "gpt-5.2")
-    return api_key, base_url, model_name
-
-
 def _get_search_instance() -> AgenticSearch:
-    """Get or create AgenticSearch singleton (for non-streaming use)."""
-    global _search_instance, _search_config
-
-    api_key, base_url, model_name = _read_llm_config()
-    current_config = (api_key, base_url, model_name)
-
-    if _search_instance is not None and current_config == _search_config:
-        return _search_instance
-
-    if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="LLM_API_KEY is not configured. Set it in your environment or .env file."
-        )
-
-    llm = OpenAIChat(base_url=base_url, api_key=api_key, model=model_name)
-
-    enable_cluster_reuse = os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true"
-    cluster_sim_threshold = float(os.getenv("CLUSTER_SIM_THRESHOLD", "0.85"))
-    cluster_sim_top_k = int(os.getenv("CLUSTER_SIM_TOP_K", "3"))
-
-    _search_instance = AgenticSearch(
-        llm=llm,
-        work_path=_resolve_work_path(),
-        verbose=False,
-        reuse_knowledge=enable_cluster_reuse,
-        cluster_sim_threshold=cluster_sim_threshold,
-        cluster_sim_top_k=cluster_sim_top_k,
-    )
-    _search_config = current_config
-    logger.info("AgenticSearch instance created for API")
-    return _search_instance
+    """Request-scoped mutable search state; heavy embedding resources are cached."""
+    return _create_search_instance()
 
 
 # ===================================================================
@@ -181,25 +143,13 @@ def _create_search_instance(log_callback=None) -> AgenticSearch:
     (embedding model, sentence-transformers) are cached at module
     level and shared automatically.
     """
-    api_key, base_url, model_name = _read_llm_config()
-    if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="LLM_API_KEY is not configured.",
-        )
-
-    llm = OpenAIChat(
-        base_url=base_url,
-        api_key=api_key,
-        model=model_name,
-        log_callback=log_callback,
-    )
+    llm = create_configured_llm(log_callback=log_callback)
 
     enable_cluster_reuse = os.getenv("SIRCHMUNK_ENABLE_CLUSTER_REUSE", "true").lower() == "true"
     cluster_sim_threshold = float(os.getenv("CLUSTER_SIM_THRESHOLD", "0.85"))
     cluster_sim_top_k = int(os.getenv("CLUSTER_SIM_TOP_K", "3"))
 
-    return AgenticSearch(
+    return track_search_instance(AgenticSearch(
         llm=llm,
         work_path=_resolve_work_path(),
         verbose=False,
@@ -207,7 +157,7 @@ def _create_search_instance(log_callback=None) -> AgenticSearch:
         reuse_knowledge=enable_cluster_reuse,
         cluster_sim_threshold=cluster_sim_threshold,
         cluster_sim_top_k=cluster_sim_top_k,
-    )
+    ))
 
 
 # ===================================================================
@@ -313,7 +263,7 @@ def _format_result(result, request: SearchRequest) -> dict:
 async def execute_search(request: SearchRequest) -> SearchResponse:
     """Execute an AgenticSearch query and return a JSON response."""
     try:
-        async with _search_semaphore:
+        async with llm_request_scope(), _search_semaphore:
             searcher = _get_search_instance()
             kwargs = _build_search_kwargs(request)
             logger.debug(
@@ -329,6 +279,8 @@ async def execute_search(request: SearchRequest) -> SearchResponse:
 
     except HTTPException:
         raise
+    except (ConfigError, PoolError) as e:
+        raise HTTPException(status_code=e.status, detail=str(e)) from None
     except Exception as e:
         logger.error(f"Search failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
@@ -390,7 +342,7 @@ async def execute_search_stream(request: SearchRequest, http_request: Request):
     async def _run_search():
         """Run search in a background task, push result/error via queue."""
         try:
-            async with _search_semaphore:
+            async with llm_request_scope(), _search_semaphore:
                 searcher = _create_search_instance(log_callback=_log_callback)
                 skwargs = _build_search_kwargs(request)
                 logger.debug(
@@ -412,7 +364,17 @@ async def execute_search_stream(request: SearchRequest, http_request: Request):
 
     async def _sse_generator() -> AsyncGenerator[str, None]:
         """Yield SSE frames from the log queue until the search completes."""
-        task = asyncio.create_task(_run_search())
+        from sirchmunk.storage.lifecycle import get_runtime
+        runtime = get_runtime()
+        release = runtime.reserve_background() if runtime else None
+        try:
+            task = asyncio.create_task(_run_search())
+        except BaseException:
+            if release:
+                release()
+            raise
+        if release:
+            task.add_done_callback(lambda _task: release())
         try:
             while True:
                 # Check for client disconnect
@@ -463,8 +425,8 @@ async def execute_search_stream(request: SearchRequest, http_request: Request):
 async def get_search_status():
     """Get search service status."""
     try:
-        api_key, _, model_name = _read_llm_config()
-        has_api_key = bool(api_key)
+        route = configuration_status()
+        has_api_key, model_name = route["configured"], route["model"]
 
         return {
             "success": True,
@@ -472,6 +434,7 @@ async def get_search_status():
                 "status": "ready" if has_api_key else "not_configured",
                 "llm_configured": has_api_key,
                 "llm_model": model_name if has_api_key else None,
+                "llm_target": route["active_target"],
                 "work_path": DEFAULT_SIRCHMUNK_WORK_PATH,
                 "max_concurrent_searches": _MAX_CONCURRENT_SEARCHES,
             }

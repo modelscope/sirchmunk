@@ -14,10 +14,63 @@ import hashlib
 import os
 import threading
 import warnings
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 import numpy as np
 from loguru import logger
+from sirchmunk.storage.lifecycle import get_runtime
+
+
+def _managed_cache(runtime, cache_dir=None):
+    """All writable library caches stay in the explicitly owned work root."""
+    cache = Path(cache_dir or runtime.root / ".cache" / "models").expanduser().resolve()
+    if not cache.is_relative_to(runtime.root):
+        runtime.fail("embedding_cache_outside_managed_root")
+        raise ValueError("Managed embedding cache must be inside the work root")
+    return cache
+
+
+def _configure_managed_libraries(cache, runtime):
+    # Set before importing torch/transformers/model hubs. Explicit loader cache
+    # parameters are also supplied in case another module imported them earlier.
+    variables = {
+        "HF_HOME": str(cache / "huggingface"),
+        "HF_HUB_CACHE": str(cache / "huggingface" / "hub"),
+        "HUGGINGFACE_HUB_CACHE": str(cache / "huggingface" / "hub"),
+        "TRANSFORMERS_CACHE": str(cache / "huggingface" / "hub"),
+        "SENTENCE_TRANSFORMERS_HOME": str(cache),
+        "MODELSCOPE_CACHE": str(cache / "modelscope"),
+        "TORCH_HOME": str(cache / "torch"),
+        "HF_MODULES_CACHE": str(cache / "huggingface" / "modules"),
+        "XDG_CACHE_HOME": str(cache / "xdg"),
+        "TRITON_CACHE_DIR": str(cache / "triton"),
+        "TORCHINDUCTOR_CACHE_DIR": str(cache / "torchinductor"),
+        "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+    }
+    for key, value in variables.items():
+        if value != "1" and not Path(value).resolve().is_relative_to(cache):
+            runtime.fail("linked_embedding_cache_outside_managed_root")
+            raise ValueError("Managed library cache resolves outside the configured cache")
+    os.environ.update(variables)
+
+
+def get_embedding_dim() -> int:
+    """Configured embedding dimension (env ``EMBEDDING_DIM``, default 384).
+
+    Must match the active embedding model output dimension, e.g. 1024 for
+    ``microsoft/harrier-oss-v1-0.6b``.  Consumers that persist vectors with a
+    fixed-size type (DuckDB ``FLOAT[n]``) read the dimension from here.
+    """
+    value = os.getenv("EMBEDDING_DIM", "384")
+    try:
+        dimension = int(value)
+    except ValueError as exc:
+        raise ValueError("EMBEDDING_DIM must be a positive integer") from exc
+    if not 1 <= dimension <= 65536:
+        raise ValueError("EMBEDDING_DIM must be between 1 and 65536")
+    return dimension
 
 
 class EmbeddingUtil:
@@ -39,15 +92,22 @@ class EmbeddingUtil:
         cache_dir: Optional[str] = None,
     ):
         self.model_id = model_id or os.getenv("EMBEDDING_MODEL_ID", self.DEFAULT_MODEL_ID)
+        self._runtime = get_runtime()
+        self.expected_dimension = get_embedding_dim()
         self._cache_dir = cache_dir or os.getenv("EMBEDDING_CACHE_DIR")
         if self._cache_dir:
             self._cache_dir = os.path.expanduser(self._cache_dir)
+        if self._runtime:
+            self._cache_dir = str(_managed_cache(self._runtime, self._cache_dir))
+            _configure_managed_libraries(Path(self._cache_dir), self._runtime)
         self.model = None
 
         # Defer torch import to the background thread to avoid blocking
         # the event loop with the heavy first-import cost.
         if device is not None:
             self.device = device
+        elif self._runtime:
+            self.device = None  # Resolve under the model-loading thread's lease.
         else:
             try:
                 import torch
@@ -68,27 +128,59 @@ class EmbeddingUtil:
         with self._lock:
             if self._loading_started:
                 return
-            self._loading_started = True
+            runtime = self._runtime
+            # Admission rejection is not a failed model load; it may be retried
+            # after maintenance resumes. No future/thread is created on refusal.
+            release = runtime.reserve_background() if runtime else None
+            try:
+                self._loading_started = True
 
-        worker = threading.Thread(
-            target=self._load_model_bg,
-            args=(self.model_id, self._cache_dir),
-            daemon=True,
-        )
-        worker.start()
+                def load():
+                    try:
+                        self._load_model_bg(self.model_id, self._cache_dir)
+                    finally:
+                        if release:
+                            release()
+
+                worker = threading.Thread(target=load, daemon=True,
+                                          name="sirchmunk-embedding-load")
+                worker.start()
+            except BaseException as exc:
+                if runtime:
+                    runtime.fail("embedding_load_dispatch_failed")
+                if release:
+                    release()
+                if not self._model_future.done():
+                    self._model_future.set_exception(exc)
+                raise
         logger.info("Embedding model loading started in background thread")
 
     def _load_model_bg(self, model_id: str, cache_dir: Optional[str]) -> None:
         """Runs in a daemon thread: download, construct, and warm-up."""
         try:
-            model_dir = self._download_model(model_id, cache_dir)
+            if self._runtime:
+                model_dir = self._managed_model_path(model_id, cache_dir, self._runtime)
+                Path(cache_dir).mkdir(parents=True, exist_ok=True)
+                if self.device is None:
+                    import torch
+                    self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            else:
+                model_dir = self._download_model(model_id, cache_dir)
 
             from sentence_transformers import SentenceTransformer
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=".*position_ids.*")
                 warnings.filterwarnings("ignore", category=FutureWarning)
-                model = SentenceTransformer(model_dir, device=self.device)
+                if self._runtime:
+                    model = SentenceTransformer(
+                        model_dir, device=self.device, cache_folder=cache_dir,
+                        local_files_only=True, trust_remote_code=False,
+                    )
+                else:
+                    model = SentenceTransformer(model_dir, device=self.device)
 
+            if model.get_sentence_embedding_dimension() != self.expected_dimension:
+                raise ValueError("Embedding model output does not match EMBEDDING_DIM")
             model.encode(["warmup"], show_progress_bar=False)
 
             self.model = model
@@ -97,13 +189,60 @@ class EmbeddingUtil:
                 f"Embedding model ready: {model_id} "
                 f"(device={self.device}, dim={model.get_sentence_embedding_dimension()})"
             )
-        except Exception as e:
-            self._model_future.set_exception(e)
+        except BaseException as e:
+            if self._runtime:
+                self._runtime.fail("embedding_model_load_failed")
+            if not self._model_future.done():
+                self._model_future.set_exception(e)
             logger.error(f"Embedding model failed to load: {e}")
+
+    @staticmethod
+    def _managed_model_path(model_id, cache_dir, runtime):
+        """Resolve preprovisioned local/ModelScope/HF files without any hub call."""
+        cache = _managed_cache(runtime, cache_dir)
+        direct = Path(model_id).expanduser()
+        if direct.is_dir():
+            candidates = [direct.resolve()]
+        else:
+            # Only safe repository identifiers may be mapped beneath a cache.
+            parts = model_id.replace("\\", "/").split("/")
+            if any(part in {"", ".", ".."} or ":" in part for part in parts):
+                raise RuntimeError("Managed embedding model path is not provisioned")
+            candidates = []
+            for base in (cache, cache / "models", cache / "modelscope" / "models",
+                         cache / "hub" / "models"):
+                candidate = base.joinpath(*parts).resolve()
+                if candidate.is_relative_to(cache):
+                    candidates.append(candidate)
+            for base in (cache, cache / "hub", cache / "huggingface" / "hub"):
+                repo = base / ("models--" + "--".join(parts))
+                reference = repo / "refs" / "main"
+                if reference.is_file() and reference.stat().st_size <= 256:
+                    revision = reference.read_text(encoding="utf-8").strip()
+                    if revision and all(char in "0123456789abcdefABCDEF" for char in revision):
+                        candidate = (repo / "snapshots" / revision).resolve()
+                        if candidate.is_relative_to(cache):
+                            candidates.append(candidate)
+        for candidate in candidates:
+            if candidate.is_dir() and any((candidate / name).is_file()
+                                         for name in ("modules.json", "config.json")):
+                return str(candidate)
+        raise RuntimeError(
+            "Managed embedding model is not provisioned locally; "
+            "provide a model directory or an existing cache before startup. "
+            "Online downloads are disabled."
+        )
 
     @staticmethod
     def _download_model(model_id: str, cache_dir: Optional[str] = None) -> str:
         """Download model weights from ModelScope (or HuggingFace fallback)."""
+        runtime = get_runtime()
+        if runtime:
+            try:
+                return EmbeddingUtil._managed_model_path(model_id, cache_dir, runtime)
+            except Exception:
+                runtime.fail("embedding_model_not_provisioned")
+                raise
         try:
             from modelscope import snapshot_download
         except ImportError:
@@ -160,6 +299,10 @@ class EmbeddingUtil:
         if self.model is not None:
             return self.model
         self.start_loading()
+        if self._runtime:
+            future = asyncio.wrap_future(self._model_future)
+            future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            return await asyncio.wait_for(asyncio.shield(future), timeout)
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(
             None, self._model_future.result, timeout
@@ -184,10 +327,12 @@ class EmbeddingUtil:
 
         await self._ensure_model_async()
 
-        loop = asyncio.get_event_loop()
-        embeddings = await loop.run_in_executor(
-            None, self._encode_sync, texts
-        )
+        if self._runtime:
+            from sirchmunk.llm.factory import run_background_thread
+            embeddings = await run_background_thread(self._encode_sync, texts, runtime=self._runtime)
+        else:
+            loop = asyncio.get_event_loop()
+            embeddings = await loop.run_in_executor(None, self._encode_sync, texts)
         return embeddings.tolist()
 
     def _encode_sync(self, texts: List[str]) -> np.ndarray:
@@ -198,6 +343,35 @@ class EmbeddingUtil:
             show_progress_bar=False,
             convert_to_numpy=True,
         )
+
+    @property
+    def query_instruction(self) -> Optional[str]:
+        """Instruction prefix for query-side embeddings (asymmetric retrieval).
+
+        Only instruction-aware models (e.g. microsoft/harrier-oss-v1) need this.
+        Configured via ``EMBEDDING_QUERY_INSTRUCTION``; when unset, returns None
+        and ``embed_query`` degrades to plain ``embed`` (bge-m3 / MiniLM style).
+        The ``{query}`` placeholder, if present, is replaced with the query text.
+        dotenv does not interpret escape sequences, so a literal ``\\n`` written in
+        ``.env`` is restored to a real newline here (the harrier instruction format
+        requires ``Instruct: ...\\nQuery: `` with a genuine line break).
+        """
+        instr = os.getenv("EMBEDDING_QUERY_INSTRUCTION") or None
+        if instr:
+            instr = instr.replace("\\n", "\n")
+        return instr
+
+    async def embed_query(self, query: str) -> List[float]:
+        """Embed a single *query* with the retrieval instruction prefix.
+
+        Document-side text must keep using :meth:`embed` (no prefix) so that
+        the asymmetric query/document encoding the model was trained on holds.
+        """
+        instr = self.query_instruction
+        if not instr:
+            return (await self.embed([query]))[0]
+        text = instr.replace("{query}", query) if "{query}" in instr else f"{instr}{query}"
+        return (await self.embed([text]))[0]
 
     @property
     def dimension(self) -> int:

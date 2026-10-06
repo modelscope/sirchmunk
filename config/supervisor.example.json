@@ -1,0 +1,11 @@
+{
+  "schema": "sirchmunk-supervisor.v1",
+  "instance_id": "sirchmunk-example",
+  "work_path": "/var/lib/sirchmunk-example",
+  "stop_intent_file": "/run/platform-control/sirchmunk-example/stop-intent.json",
+  "mailbox_directory": "/var/lib/sirchmunk-example/.control/stop-ipc",
+  "host": "127.0.0.1",
+  "port": 18080,
+  "management_port": 18081,
+  "shutdown_timeout_seconds": 60
+}

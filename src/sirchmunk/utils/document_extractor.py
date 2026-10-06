@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, ClassVar, List, Optional, Sequence, Union
 
 from loguru import logger
+from sirchmunk.storage.lifecycle import get_runtime
 
 
 # ---------------------------------------------------------------------------
@@ -26,36 +27,42 @@ from loguru import logger
 # ---------------------------------------------------------------------------
 
 _EXTRACT_TIMEOUT_S = 600
+_MANAGED_EXTRACTION_CHILD = False
 
 
 def _extraction_worker(
-    file_path: str,
+    file_path: Union[str, bytes, list[str]],
     profile_dict: dict[str, Any],
     pipe_w: mp.connection.Connection,
+    operation: str = "file",
+    mime_type: Optional[str] = None,
+    managed: bool = False,
 ) -> None:
     """Child process entry point: run kreuzberg, send result via pipe, exit.
 
     Sends a plain dict so no native kreuzberg/Rust objects cross the
     process boundary.  On failure sends ``{"_error": "<message>"}``.
     """
+    global _MANAGED_EXTRACTION_CHILD
+    _MANAGED_EXTRACTION_CHILD = managed
     try:
         import asyncio as _aio
 
-        async def _run() -> dict[str, Any]:
+        async def _run() -> Union[dict[str, Any], list[dict[str, Any]]]:
             from sirchmunk.utils.document_extractor import (
                 DocumentExtractor,
                 ExtractionProfile,
             )
             profile = ExtractionProfile(**profile_dict)
-            output = await DocumentExtractor.extract(file_path, profile)
-            return {
-                "content": output.content,
-                "mime_type": output.mime_type,
-                "metadata": output.metadata,
-                "tables": output.tables,
-                "detected_languages": output.detected_languages,
-                "page_count": output.page_count,
-            }
+            if operation == "bytes":
+                output = await DocumentExtractor.extract_bytes(file_path, mime_type, profile)
+            elif operation == "batch":
+                output = await DocumentExtractor.batch_extract(file_path, profile)
+            else:
+                output = await DocumentExtractor.extract(file_path, profile)
+            if isinstance(output, list):
+                return [dataclasses.asdict(item) for item in output]
+            return dataclasses.asdict(output)
 
         pipe_w.send(_aio.run(_run()))
     except BaseException as exc:
@@ -68,43 +75,62 @@ def _extraction_worker(
 
 
 def _run_extraction_in_child(
-    file_path: str,
+    file_path: Union[str, bytes, list[str]],
     profile_dict: dict[str, Any],
-) -> dict[str, Any]:
+    operation: str = "file",
+    mime_type: Optional[str] = None,
+) -> Union[dict[str, Any], list[dict[str, Any]]]:
     """Spawn an isolated child process, wait for its result.
 
     Unlike ``ProcessPoolExecutor``, a crash in one child never
     poisons future extractions — each call spawns a fresh process.
     """
-    pipe_r, pipe_w = mp.Pipe(duplex=False)
-    proc = mp.Process(
-        target=_extraction_worker,
-        args=(file_path, profile_dict, pipe_w),
-        daemon=True,
-    )
-    proc.start()
-    pipe_w.close()
-
+    runtime = get_runtime()
+    # A managed child must not inherit the parent's root lock/runtime via fork.
+    context = mp.get_context("spawn") if runtime else mp
+    pipe_r, pipe_w = context.Pipe(duplex=False)
+    proc = None
+    started = False
     try:
+        proc = context.Process(
+            target=_extraction_worker,
+            args=(file_path, profile_dict, pipe_w, operation, mime_type, bool(runtime)),
+            daemon=True,
+        )
+        proc.start()
+        started = True
+        pipe_w.close()
         if not pipe_r.poll(timeout=_EXTRACT_TIMEOUT_S):
-            proc.kill()
-            proc.join(timeout=10)
             raise RuntimeError(
                 f"Extraction timed out after {_EXTRACT_TIMEOUT_S}s"
             )
         result = pipe_r.recv()
     except EOFError:
-        proc.join(timeout=10)
         raise RuntimeError(
             f"Worker crashed (exit code {proc.exitcode})"
         )
     finally:
         pipe_r.close()
+        pipe_w.close()
+        if proc is not None and (started or proc.pid is not None):
+            # Reap on every exit path, including EOF, timeout and malformed IPC.
+            # The caller's worker-thread lease cannot end while native code in
+            # the child could still be running or writing a cache.
+            try:
+                proc.join(timeout=30)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join()
+            except BaseException:
+                if runtime:
+                    runtime.fail("extraction_child_exit_unknown")
+                    # Retain an uncertainty lease: no verified process exit.
+                    # Recovery requires supervisor intervention, never count 0.
+                    runtime.reserve_background()
+                raise
 
-    proc.join(timeout=30)
-    if proc.is_alive():
-        proc.kill()
-        proc.join()
+    if proc.exitcode != 0:
+        raise RuntimeError(f"Extraction worker exited with code {proc.exitcode}")
 
     if isinstance(result, dict) and "_error" in result:
         raise RuntimeError(result["_error"])
@@ -294,6 +320,10 @@ class DocumentExtractor:
             FileNotFoundError: If *file_path* does not exist.
             Exception: Propagates kreuzberg extraction errors after logging.
         """
+        if get_runtime() is not None:
+            # Async Rust cancellation is not a native completion barrier. In
+            # managed mode the child-process exit is the completion proof.
+            return await DocumentExtractor.extract_isolated(file_path, profile)
         from kreuzberg import extract_file
 
         profile = profile or DocumentExtractor.BASIC
@@ -339,7 +369,8 @@ class DocumentExtractor:
         Unlike ``ProcessPoolExecutor``, a crash in one extraction never
         poisons future calls.
 
-        Falls back to in-process extraction on subprocess failure.
+        Unmanaged mode falls back to in-process extraction on subprocess failure.
+        Managed mode requires a verified child exit and never uses that fallback.
         """
         profile = profile or DocumentExtractor.BASIC
         profile_dict = {
@@ -347,14 +378,17 @@ class DocumentExtractor:
             for f in dataclasses.fields(profile)
         }
 
-        loop = asyncio.get_event_loop()
+        runtime = get_runtime()
         try:
-            raw = await loop.run_in_executor(
-                None,
-                _run_extraction_in_child,
-                str(file_path),
-                profile_dict,
-            )
+            if runtime:
+                from sirchmunk.llm.factory import run_background_thread
+                raw = await run_background_thread(
+                    _run_extraction_in_child, str(file_path), profile_dict, runtime=runtime,
+                )
+            else:
+                raw = await asyncio.get_running_loop().run_in_executor(
+                    None, _run_extraction_in_child, str(file_path), profile_dict,
+                )
             return ExtractionOutput(
                 content=raw["content"],
                 mime_type=raw.get("mime_type", ""),
@@ -364,6 +398,9 @@ class DocumentExtractor:
                 page_count=raw.get("page_count"),
             )
         except Exception as exc:
+            if runtime:
+                runtime.fail("managed_extraction_failed")
+                raise  # Never bypass isolation after a managed child fails.
             logger.warning(
                 "Subprocess extraction failed for {}, falling back to in-process: {}",
                 file_path, exc,
@@ -386,6 +423,15 @@ class DocumentExtractor:
         Returns:
             :class:`ExtractionOutput`.
         """
+        runtime = get_runtime()
+        if runtime:
+            from sirchmunk.llm.factory import run_background_thread
+            profile = profile or DocumentExtractor.BASIC
+            raw = await run_background_thread(
+                _run_extraction_in_child, data, dataclasses.asdict(profile),
+                operation="bytes", mime_type=mime_type, runtime=runtime,
+            )
+            return ExtractionOutput(**raw)
         from kreuzberg import extract_bytes as _extract_bytes
 
         profile = profile or DocumentExtractor.BASIC
@@ -412,6 +458,15 @@ class DocumentExtractor:
         Returns:
             List of :class:`ExtractionOutput`, one per input path.
         """
+        runtime = get_runtime()
+        if runtime:
+            from sirchmunk.llm.factory import run_background_thread
+            profile = profile or DocumentExtractor.BASIC
+            raw = await run_background_thread(
+                _run_extraction_in_child, [str(path) for path in file_paths],
+                dataclasses.asdict(profile), operation="batch", runtime=runtime,
+            )
+            return [ExtractionOutput(**item) for item in raw]
         from kreuzberg import batch_extract_files
 
         profile = profile or DocumentExtractor.BASIC
@@ -618,6 +673,8 @@ class DocumentExtractor:
         kwargs: dict[str, Any] = {
             "output_format": output_format,
         }
+        if _MANAGED_EXTRACTION_CHILD:
+            kwargs["use_cache"] = False
         if ocr_config is not None:
             kwargs["ocr"] = ocr_config
         if profile.force_ocr:

@@ -12,10 +12,6 @@ from sirchmunk.version import __version__
 
 __author__ = "ModelScope Contributors"
 
-from .server import create_server, run_stdio_server, run_http_server
-from .service import SirchmunkService
-from .config import Config
-
 __all__ = [
     "create_server",
     "run_stdio_server",
@@ -24,3 +20,18 @@ __all__ = [
     "Config",
     "__version__",
 ]
+
+
+def __getattr__(name):
+    # Reading configuration/claiming a work root must not import the server or
+    # initialize its optional SDK first. Preserve the existing public exports.
+    if name in ("create_server", "run_stdio_server", "run_http_server"):
+        from . import server
+        return getattr(server, name)
+    if name == "SirchmunkService":
+        from .service import SirchmunkService
+        return SirchmunkService
+    if name == "Config":
+        from .config import Config
+        return Config
+    raise AttributeError(name)

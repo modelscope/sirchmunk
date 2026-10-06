@@ -107,6 +107,32 @@ _CHAT_RESPONSE_SYSTEM = (
 
 _NO_RESULTS_MESSAGE = "No results found."
 
+
+def _json_safe(obj: Any) -> Any:
+    """json.dumps fallback for non-serialisable values (P0-3).
+
+    Retrieval-log metadata can carry raw bytes (e.g. rg binary-match output,
+    PDF-derived fields); without this the spec-cache write failed wholesale
+    and every search re-parsed PDFs from scratch.
+    """
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.decode("utf-8", "replace")
+    if isinstance(obj, (set, frozenset)):
+        if all(isinstance(x, (str, int, float, bool, type(None))) for x in obj):
+            return sorted(obj, key=lambda x: (type(x).__name__, str(x)))
+        raise TypeError("Spec-cache sets may contain JSON scalar values only")
+    raise TypeError(f"Unsupported spec-cache value type: {type(obj).__name__}")
+
+
+def _resolve_budget(value: Optional[int], name: str, default: int) -> int:
+    """Only omitted arguments read deployment defaults; explicit values win."""
+    if value is None:
+        value = int(os.getenv(name, str(default)))
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 # Soft-similarity threshold for gradient cluster reuse (P2)
 _SOFT_SIM_THRESHOLD = 0.65
 
@@ -787,7 +813,7 @@ class AgenticSearch(BaseSearch):
 
             await self._logger.info("Searching for similar knowledge clusters...")
 
-            query_embedding = (await self.embedding_client.embed([query]))[0]
+            query_embedding = await self.embedding_client.embed_query(query)
 
             similar_clusters = await self.knowledge_storage.search_similar_clusters(
                 query_embedding=query_embedding,
@@ -884,7 +910,7 @@ class AgenticSearch(BaseSearch):
             return None
 
         try:
-            query_embedding = (await self.embedding_client.embed([query]))[0]
+            query_embedding = await self.embedding_client.embed_query(query)
             similar = await self.knowledge_storage.search_similar_clusters(
                 query_embedding=query_embedding,
                 top_k=5,
@@ -2299,8 +2325,8 @@ class AgenticSearch(BaseSearch):
         paths: Optional[Union[str, Path, List[str], List[Path]]] = None,
         *,
         mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = "DEEP",
-        max_loops: int = 10,
-        max_token_budget: int = 128000,
+        max_loops: Optional[int] = None,
+        max_token_budget: Optional[int] = None,
         max_depth: Optional[int] = 5,
         top_k_files: int = 5,
         enable_dir_scan: bool = True,
@@ -2403,6 +2429,8 @@ class AgenticSearch(BaseSearch):
             - ``Dict``: Serialized SearchContext when ``response_format="json"``.
             - ``List[Dict]``: File matches in FILENAME_ONLY mode.
         """
+        max_loops = _resolve_budget(max_loops, "LENS_DEFAULT_MAX_LOOPS", 10)
+        max_token_budget = _resolve_budget(max_token_budget, "LENS_DEFAULT_TOKEN_BUDGET", 128000)
         response_format = self._coerce_response_format(response_format, return_context)
         mode = (mode or "DEEP").upper()
         if mode not in {"DEEP", "FAST", "FILENAME_ONLY"}:
@@ -2420,6 +2448,8 @@ class AgenticSearch(BaseSearch):
                 ctx,
                 response_format=response_format,
             )
+
+
 
         await self._logger.info(f"[SearchConfig] PURE_TREE_SEARCH={'enabled' if _PURE_TREE_SEARCH else 'disabled'}")
 
@@ -2480,7 +2510,12 @@ class AgenticSearch(BaseSearch):
             # To avoid blocking the return of search results
             # `evolver.step` is invoked in a fire-and-forget manner.
             # In the `evolver.step`, there is a lock to ensure safety
-            task = asyncio.create_task(self.knowledge_evolver.step(cluster=cluster))
+            from sirchmunk.storage.lifecycle import get_runtime
+            if get_runtime() is not None:
+                from sirchmunk.llm.factory import create_background_task
+                task = create_background_task(self.knowledge_evolver.step(cluster=cluster))
+            else:
+                task = asyncio.create_task(self.knowledge_evolver.step(cluster=cluster))
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
 
@@ -2656,6 +2691,7 @@ class AgenticSearch(BaseSearch):
             compile_hints = CompileHints([], [])
             summary_index_hits = []
             catalog_deep_hits = []
+            part_number_hits: List[Tuple[str, float]] = []
             self._record_context_telemetry(
                 context,
                 query_intelligence_used=False,
@@ -2683,6 +2719,17 @@ class AgenticSearch(BaseSearch):
             compile_hints = phase1_results[4] if not isinstance(phase1_results[4], Exception) else CompileHints([], [])
             summary_index_hits = phase1_results[5] if not isinstance(phase1_results[5], Exception) else []
             catalog_deep_hits = phase1_results[6] if not isinstance(phase1_results[6], Exception) else []
+
+            # P-fix A3: exact part-number routing, zero LLM.  Needs scan_result
+            # (dir candidates) + artifacts (catalog), so it runs right after
+            # the gather rather than inside it.
+            part_number_hits: List[Tuple[str, float]] = []
+            try:
+                part_number_hits = await self._probe_part_numbers(
+                    query, artifacts, scan_result, scope=_scope,
+                )
+            except Exception as exc:
+                await self._logger.warning(f"[Phase 1] part_number probe failed: {exc}")
 
             labels = [
                 "query_intelligence", "dir_scan", "knowledge", "spec_cache",
@@ -2976,6 +3023,14 @@ class AgenticSearch(BaseSearch):
                 reason="legacy_keyword_profile",
             )
         else:
+            # Identifier matches belong to the existing entity channel. A new
+            # route key would be ignored by ConfidenceFusionPolicy, and counting
+            # the same evidence twice would inflate confidence.
+            for fp, score in part_number_hits:
+                entity_confidence[fp] = max(entity_confidence.get(fp, 0.0), score)
+            phrase_files = sorted(set(phrase_files) | {fp for fp, _ in part_number_hits},
+                                  key=lambda fp: (-entity_confidence.get(fp, 0.0), fp))
+            self._record_context_telemetry(context, part_number_hits=part_number_hits)
             route_rankings = {
                 "lexical": keyword_files,
                 "entity": phrase_files,
@@ -3160,6 +3215,10 @@ class AgenticSearch(BaseSearch):
                             "extended_agent_loops",
                         ],
                     )
+            if (getattr(context, "telemetry", {}) or {}).get("degraded_answer_used"):
+                # A partial status is not an answer candidate: do not calibrate,
+                # verify via another LLM call or persist it as knowledge.
+                return answer, None, context
             answer = self._finalize_answer(query, answer, data_reqs)
             cluster = None
             self._record_context_telemetry(
@@ -4801,7 +4860,7 @@ class AgenticSearch(BaseSearch):
                 if (self.embedding_client
                         and self.embedding_client.is_ready()
                         and artifacts.summary_index.has_embeddings):
-                    query_emb = (await self.embedding_client.embed([query]))[0]
+                    query_emb = await self.embedding_client.embed_query(query)
 
                 # Tokenize query for BM25
                 from sirchmunk.utils.tokenizer_util import TokenizerUtil
@@ -5199,23 +5258,48 @@ class AgenticSearch(BaseSearch):
     def _tokenize_for_matching(text: str) -> Set[str]:
         """Tokenize text into meaningful units for keyword matching.
 
-        Splits on whitespace and CJK/Latin punctuation boundaries, then
-        generates 2-3 char n-grams for CJK-heavy tokens to handle
+        Splits on whitespace, CJK/Latin punctuation boundaries, AND the
+        boundary between CJK and Latin/digit characters (P-fix A1, 2026-09-22).
+        The last split is what keeps part numbers intact: without it,
+        "TCA9555的INT引脚" stayed one run and was shredded into 2-3 char
+        n-grams, so the catalog/summary probes never saw the token
+        "tca9555" and routing latched onto noise tokens instead.
+
+        Generates 2-3 char n-grams for CJK-heavy tokens to handle
         unsegmented Chinese text.  Returns a set of lowercased tokens.
         """
         import re
         tokens: Set[str] = set()
         raw = re.split(r'[\s,;.!?，；。！？：:、\u201c\u201d\u2018\u2019（）()\[\]{}<>《》\-/]+', text.lower())
-        for t in raw:
-            t = t.strip()
-            if not t:
+        if os.getenv("LENS_CJK_TOKEN_BOUNDARIES", "true").lower() == "false":
+            for token in filter(None, raw):
+                tokens.add(token)
+                if any('\u4e00' <= c <= '\u9fff' for c in token):
+                    tokens.update(token[i:i+n] for n in (2, 3) for i in range(len(token)-n+1))
+            return tokens
+        for piece in raw:
+            piece = piece.strip()
+            if not piece:
                 continue
-            tokens.add(t)
-            if len(t) >= 2 and any('\u4e00' <= c <= '\u9fff' for c in t):
-                for n in (2, 3):
-                    for i in range(len(t) - n + 1):
-                        tokens.add(t[i:i + n])
+            # Split CJK<->Latin/digit boundaries: "tca9555的int引脚" ->
+            # ["tca9555", "的", "int", "引脚"].  Each resulting run is then
+            # tokenised independently (CJK runs get n-grams, Latin/digit
+            # runs are kept whole).
+            runs = re.findall(r'[a-z0-9]+|[\u4e00-\u9fff]+|[^\sa-z0-9\u4e00-\u9fff]+', piece)
+            for t in runs:
+                if not t:
+                    continue
+                tokens.add(t)
+                if len(t) >= 2 and any('\u4e00' <= c <= '\u9fff' for c in t):
+                    for n in (2, 3):
+                        for i in range(len(t) - n + 1):
+                            tokens.add(t[i:i + n])
         return tokens
+
+    @staticmethod
+    def _extract_part_numbers(text: str) -> List[str]:
+        from sirchmunk.scan.dir_scanner import extract_identifiers
+        return extract_identifiers(text)
 
     @staticmethod
     def _extract_catalog_keywords(summary: str, max_kw: int = 3) -> List[str]:
@@ -8111,7 +8195,7 @@ class AgenticSearch(BaseSearch):
             # Prefer embedding search for semantic quality
             if self.embedding_client and self.embedding_client.is_ready():
                 try:
-                    qe = (await self.embedding_client.embed([query]))[0]
+                    qe = await self.embedding_client.embed_query(query)
                     similar = await self.knowledge_storage.search_similar_clusters(
                         query_embedding=qe, top_k=5, similarity_threshold=0.50,
                     )
@@ -8582,6 +8666,75 @@ class AgenticSearch(BaseSearch):
         except Exception as exc:
             await self._logger.warning(f"[DEEP:CatalogProbe] Failed: {exc}")
             return []
+
+    async def _probe_part_numbers(
+        self,
+        query: str,
+        artifacts: Optional["CompileArtifacts"] = None,
+        scan_result=None,
+        *,
+        scope: Optional["_PathScope"] = None,
+    ) -> List[Tuple[str, float]]:
+        """Zero-LLM exact part-number routing (P-fix A3).
+
+        Matches general mixed-letter/digit identifiers in catalog entries and
+        directory candidates, always within the requested scope. Alphabetic
+        package suffixes are routing hints; numeric variants remain distinct.
+        Results augment the existing entity channel (not an independent vote).
+        Scores do not certify component identity or the answer's correctness.
+        """
+        if os.getenv("LENS_IDENTIFIER_ROUTING", "true").lower() == "false":
+            return []
+        part_numbers = self._extract_part_numbers(query)
+        if not part_numbers:
+            return []
+
+        from sirchmunk.scan.dir_scanner import identifier_matches_filename
+        _stem_matches = identifier_matches_filename
+
+        scores: Dict[str, float] = {}
+
+        # Channel 1: compile catalog (filename + summary), most reliable.
+        if artifacts and artifacts.catalog:
+            for entry in artifacts.catalog:
+                fp = entry.get("path", "")
+                if not fp or not Path(fp).exists():
+                    continue
+                if scope is not None and not scope.contains(fp):
+                    continue
+                name = (entry.get("name", "") or os.path.basename(fp)).lower()
+                summary = (entry.get("summary", "") or "").lower()
+                for pn in part_numbers:
+                    pn_l = pn.lower()
+                    if _stem_matches(pn_l, name):
+                        scores[fp] = max(scores.get(fp, 0.0), 1.0)
+                    elif re.search(r"(?<![a-z0-9])" + re.escape(pn_l) + r"(?![a-z0-9.-])", summary):
+                        # Whole-token presence in the LLM summary is strong
+                        # but below a filename prefix hit.
+                        scores[fp] = max(scores.get(fp, 0.0), 0.85)
+
+        # Channel 2: dir-scan candidates (covers files missing from catalog).
+        candidates = getattr(scan_result, "candidates", None) or []
+        for cand in candidates:
+            fp = getattr(cand, "path", "") or ""
+            if not fp or not Path(fp).is_file():
+                continue
+            if scope is not None and not scope.contains(fp):
+                continue
+            name = (getattr(cand, "filename", "") or os.path.basename(fp)).lower()
+            for pn in part_numbers:
+                if _stem_matches(pn.lower(), name):
+                    # Don't downgrade an existing catalog score.
+                    scores[fp] = max(scores.get(fp, 0.0), 0.95)
+
+        if not scores:
+            return []
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        await self._logger.info(
+            f"[PartNumber] {part_numbers} -> "
+            + ", ".join(f"{os.path.basename(fp)}:{sc:.2f}" for fp, sc in ranked)
+        )
+        return ranked
 
     async def _probe_tree_for_fast(
         self, query: str, artifacts: Optional["CompileArtifacts"] = None,
@@ -10594,6 +10747,9 @@ class AgenticSearch(BaseSearch):
         context: Optional["SearchContext"],
     ) -> bool:
         """Return whether a dominant-route attempt lacks usable evidence."""
+        telemetry = getattr(context, "telemetry", None) or {}
+        if telemetry.get("hard_budget_exhausted") or telemetry.get("degraded_answer_used"):
+            return False
         if (
             not answer
             or answer == _NO_RESULTS_MESSAGE
@@ -12108,8 +12264,8 @@ class AgenticSearch(BaseSearch):
         else:
             effective_max_loops = max_loops
             effective_max_files = self._AGENTIC_MAX_FILES
-        # Override max_loops only if hop-aware expansion applies
-        effective_max_loops = max(max_loops, effective_max_loops)
+        # A caller's loop ceiling remains a ceiling for every hop type.
+        effective_max_loops = min(max_loops, effective_max_loops)
 
         registry = ToolRegistry()
         registry.register(KeywordSearchTool(
@@ -12173,7 +12329,8 @@ class AgenticSearch(BaseSearch):
                 # Snippet only: the loop already logged the file_read, so
                 # avoid a second retrieval-log entry for the same read.
                 self._record_evidence_snippet(context, content)
-        should_save = bool(answer) and answer != _NO_RESULTS_MESSAGE
+        should_save = (bool(answer) and answer != _NO_RESULTS_MESSAGE
+                       and not (getattr(context, "telemetry", {}) or {}).get("degraded_answer_used"))
         return answer, should_save
 
     @staticmethod
@@ -13317,10 +13474,15 @@ class AgenticSearch(BaseSearch):
                         ],
                     }
 
-                    # Atomic write: write to temp, then rename
+                    # Atomic write: write to temp, then rename.
+                    # P0-3 (2026-09-22): some retrieval-log metadata fields
+                    # (rg binary output, PDF-derived fields) can be raw bytes
+                    # which make json.dumps fail and the whole spec cache
+                    # never persists (caused per-search PDF re-parsing).
                     tmp_path = spec_file.with_suffix(".tmp")
                     tmp_path.write_text(
-                        json.dumps(data, ensure_ascii=False, indent=2),
+                        json.dumps(data, ensure_ascii=False, indent=2,
+                                   default=_json_safe if os.getenv("LENS_SPEC_JSON_SAFE", "true").lower() != "false" else None),
                         encoding="utf-8",
                     )
                     tmp_path.replace(spec_file)

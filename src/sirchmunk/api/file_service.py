@@ -86,6 +86,9 @@ class FileStorageService:
         max_total_size: Optional[int] = None,
     ):
         # Read from env with defaults
+        from sirchmunk.storage.lifecycle import claim_work_root, get_runtime, root_path
+        root = root_path()
+        claim_work_root(root)
         if upload_root is None:
             work_path = Path(
                 os.getenv("SIRCHMUNK_WORK_PATH", os.path.expanduser("~/.sirchmunk"))
@@ -93,6 +96,8 @@ class FileStorageService:
             upload_root = work_path / "uploads"
 
         self._upload_root = Path(upload_root).resolve()
+        if get_runtime(root) and not self._upload_root.is_relative_to(root):
+            raise ValueError("managed_upload_root_must_be_within_work_root")
 
         # Values are in MB; convert to bytes
         self._max_file_size = (max_file_size or int(
